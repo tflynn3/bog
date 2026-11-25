@@ -120,8 +120,53 @@ type Store struct {
 	publishMu sync.Mutex
 	mu        sync.RWMutex
 	rows      []Row
+	restored  []int          // immutable run for the recovered WAL prefix
 	runs      [][]int        // immutable sorted ordinal runs, one per occupied level
 	blocks    []*blockFilter // immutable summaries of sealed append-ordinal blocks
+}
+
+// RecoveryBuilder collects validated WAL frames before the store becomes ready.
+type RecoveryBuilder struct {
+	rows    []Row
+	blocks  []*blockFilter
+	ordered bool
+}
+
+func NewRecoveryBuilder() *RecoveryBuilder { return &RecoveryBuilder{ordered: true} }
+
+// Add appends decoded rows in WAL order and builds summaries of sealed blocks.
+func (b *RecoveryBuilder) Add(rows []Row) {
+	for _, row := range rows {
+		if len(b.rows) > 0 && row.TS.Before(b.rows[len(b.rows)-1].TS) {
+			b.ordered = false
+		}
+		b.rows = append(b.rows, row)
+		if len(b.rows)%blockSize == 0 {
+			b.blocks = append(b.blocks, buildBlock(b.rows[len(b.rows)-blockSize:]))
+		}
+	}
+}
+
+// Install publishes the complete recovered prefix. It must be called before live writes.
+func (b *RecoveryBuilder) Install(s *Store) {
+	run := make([]int, len(b.rows))
+	for i := range run {
+		run[i] = i
+	}
+	if !b.ordered {
+		sort.Slice(run, func(i, j int) bool {
+			a, c := run[i], run[j]
+			if b.rows[a].TS.Equal(b.rows[c].TS) {
+				return a < c
+			}
+			return b.rows[a].TS.Before(b.rows[c].TS)
+		})
+	}
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rows, s.restored, s.runs, s.blocks = b.rows, run, nil, b.blocks
 }
 
 // Publish serializes writers, but leaves readers free to use the previous snapshot
@@ -225,6 +270,11 @@ func (s *Store) QueryPage(start, end time.Time, contains string, limit int, snap
 func (s *Store) query(start, end time.Time, contains string, limit int, snapshot *int, after *Position, lookahead bool) ([]Row, int, *Position, bool) {
 	s.mu.RLock()
 	rows, runs, blocks := s.rows, s.runs, s.blocks
+	if len(s.restored) > 0 {
+		combined := make([][]int, 0, len(runs)+1)
+		combined = append(combined, s.restored)
+		runs = append(combined, runs...)
+	}
 	count := len(rows)
 	if snapshot != nil {
 		count = *snapshot

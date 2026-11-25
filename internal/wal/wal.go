@@ -202,7 +202,8 @@ func Open(dir string, s *store.Store) (*Log, error) {
 		}
 		committedEnd = int64(len(magic))
 	}
-	if err = l.replay(committedEnd); err != nil {
+	builder := store.NewRecoveryBuilder()
+	if err = l.replay(committedEnd, builder); err != nil {
 		l.Close()
 		return nil, err
 	}
@@ -242,10 +243,11 @@ func Open(dir string, s *store.Store) (*Log, error) {
 		l.Close()
 		return nil, err
 	}
+	builder.Install(s)
 	success = true
 	return l, nil
 }
-func (l *Log) replay(end int64) error {
+func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
 	info, err := l.f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return err
@@ -261,12 +263,13 @@ func (l *Log) replay(end int64) error {
 		return errors.New("invalid WAL magic")
 	}
 	pos := int64(len(magic))
+	var payload []byte
+	var h [16]byte
 	for pos < info {
 		if info-pos < 16 {
 			return l.recoverTail(pos)
 		}
-		h := make([]byte, 16)
-		_, err = io.ReadFull(l.f, h)
+		_, err = io.ReadFull(l.f, h[:])
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return l.recoverTail(pos)
 		}
@@ -276,14 +279,18 @@ func (l *Log) replay(end int64) error {
 		if crc32.Checksum(h[:12], table) != binary.LittleEndian.Uint32(h[12:]) {
 			return fmt.Errorf("invalid WAL header checksum at %d", pos)
 		}
-		n := binary.LittleEndian.Uint32(h)
+		n := binary.LittleEndian.Uint32(h[:])
 		if n == 0 || n > store.MaxBatch || binary.LittleEndian.Uint32(h[4:]) != ^n {
 			return fmt.Errorf("invalid WAL header at %d", pos)
 		}
 		if int64(n) > info-pos-16 {
 			return l.recoverTail(pos)
 		}
-		payload := make([]byte, n)
+		if cap(payload) < int(n) {
+			payload = make([]byte, n)
+		} else {
+			payload = payload[:n]
+		}
 		_, err = io.ReadFull(l.f, payload)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return l.recoverTail(pos)
@@ -298,7 +305,7 @@ func (l *Log) replay(end int64) error {
 		if err != nil {
 			return fmt.Errorf("invalid WAL payload at %d: %w", pos, err)
 		}
-		l.s.Publish(rows)
+		builder.Add(rows)
 		pos += 16 + int64(n)
 	}
 	l.offset = pos

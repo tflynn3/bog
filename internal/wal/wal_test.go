@@ -10,6 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -788,5 +791,129 @@ func TestConcurrentCloseWaitsForDescriptors(t *testing.T) {
 	}
 	if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("file still open: %v", err)
+	}
+}
+
+// Recovery must preserve append ordinals even when a later append seals its tail block.
+func TestRecoveryCursorAndBackfill(t *testing.T) {
+	dir := t.TempDir()
+	var initial store.Store
+	l, err := Open(dir, &initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	var all []store.Row
+	appendBatch := func(rows []store.Row) {
+		t.Helper()
+		var payload strings.Builder
+		for _, row := range rows {
+			fmt.Fprintf(&payload, "{\"ts\":%q,\"line\":%q}\n", row.TS.Format(time.RFC3339Nano), row.Line)
+		}
+		if err := l.Append([]byte(payload.String()), rows); err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, rows...)
+	}
+	for batch := 0; batch < 3; batch++ {
+		var rows []store.Row
+		for i := 0; i < 50; i++ {
+			n := batch*50 + i
+			rows = append(rows, store.Row{TS: epoch.Add(time.Duration((n*17)%7) * time.Second), Line: fmt.Sprintf("needle %03d", n)})
+		}
+		appendBatch(rows)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var restored store.Store
+	l, err = Open(dir, &restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	end := epoch.Add(time.Minute)
+	first, count, cursor, ok := restored.QueryPage(epoch, end, "needle", 11, nil, nil)
+	if !ok || cursor == nil {
+		t.Fatal("missing initial cursor")
+	}
+	oldCount := len(all)
+	var backfill []store.Row
+	for i := 0; i < 106; i++ {
+		backfill = append(backfill, store.Row{TS: epoch.Add(time.Duration(i%3) * time.Second), Line: fmt.Sprintf("needle backfill %03d", i)})
+	}
+	appendBatch(backfill)
+	oracle := func(rows []store.Row) []store.Row {
+		out := append([]store.Row(nil), rows...)
+		sort.SliceStable(out, func(i, j int) bool { return out[i].TS.Before(out[j].TS) })
+		return out
+	}
+	walk := func(got []store.Row, snap *int, pos *store.Position) []store.Row {
+		for {
+			page, n, next, valid := restored.QueryPage(epoch, end, "needle", 13, snap, pos)
+			if !valid {
+				t.Fatal("invalid cursor")
+			}
+			got = append(got, page...)
+			if next == nil {
+				return got
+			}
+			snap, pos = &n, next
+		}
+	}
+	if got, want := walk(first, &count, cursor), oracle(all[:oldCount]); !slices.Equal(got, want) {
+		t.Fatalf("old walk mismatch: got %d, want %d", len(got), len(want))
+	}
+	if got, want := walk(nil, nil, nil), oracle(all); !slices.Equal(got, want) {
+		t.Fatalf("fresh walk mismatch: got %d, want %d", len(got), len(want))
+	}
+}
+
+func BenchmarkReplay(b *testing.B) {
+	for _, shuffled := range []bool{false, true} {
+		name := "steady"
+		if shuffled {
+			name = "shuffled"
+		}
+		b.Run(name, func(b *testing.B) {
+			dir := b.TempDir()
+			l, err := Open(dir, &store.Store{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+			for frame := 0; frame < 100; frame++ {
+				var payload strings.Builder
+				for i := 0; i < 100; i++ {
+					n := frame*100 + i
+					if shuffled {
+						n = (n * 7919) % 10000
+					}
+					fmt.Fprintf(&payload, "{\"ts\":%q,\"line\":\"benchmark row\"}\n", epoch.Add(time.Duration(n)*time.Second).Format(time.RFC3339Nano))
+				}
+				data := []byte(payload.String())
+				rows, err := store.Decode(data)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err = l.Append(data, rows); err != nil {
+					b.Fatal(err)
+				}
+			}
+			if err := l.Close(); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				l, err := Open(dir, &store.Store{})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := l.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

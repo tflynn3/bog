@@ -312,6 +312,56 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		offsets[i] = lo
 	}
 	wide := len(contains) >= 4 && bound >= 32768
+	active := -1
+	for i, offset := range offsets {
+		if offset < len(runs[i]) && rows[runs[i][offset]].TS.Before(end) {
+			if active >= 0 {
+				active = -2
+				break
+			}
+			active = i
+		}
+	}
+	var directResult []Row
+	var directLast int
+	directOffset := 0
+	if active >= 0 {
+		directOffset = offsets[active]
+	}
+	direct := func(budget int) ([]Row, *Position, bool) {
+		run := runs[active]
+		examined := 0
+		for directOffset < len(run) {
+			ordinal := run[directOffset]
+			row := rows[ordinal]
+			if !row.TS.Before(end) {
+				break
+			}
+			if budget > 0 && examined >= budget {
+				return nil, nil, false
+			}
+			directOffset++
+			examined++
+			if ordinal >= count || !strings.Contains(row.Line, contains) {
+				continue
+			}
+			if len(directResult) == limit {
+				return directResult, &Position{rows[directLast].TS, directLast}, true
+			}
+			if directResult == nil {
+				directResult = make([]Row, 0, min(limit, count))
+			}
+			directResult = append(directResult, row)
+			directLast = ordinal
+			if !lookahead && len(directResult) == limit {
+				return directResult, nil, true
+			}
+		}
+		if directResult == nil {
+			directResult = []Row{}
+		}
+		return directResult, nil, true
+	}
 	ordered := func(budget int) ([]Row, *Position, bool) {
 		h := &candidates{rows: rows, items: make([]candidate, 0, len(runs))}
 		for i, offset := range offsets {
@@ -365,7 +415,11 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		} else {
 			budget = int(^uint(0) >> 1)
 		}
-		if result, next, complete := ordered(budget); complete {
+		attempt := ordered
+		if active >= 0 {
+			attempt = direct
+		}
+		if result, next, complete := attempt(budget); complete {
 			return result, count, next, true
 		}
 		probes := literalProbes(contains)
@@ -390,6 +444,10 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			result, next := queryBlocks(rows, possible, count, start, end, contains, limit, after, lookahead)
 			return result, count, next, true
 		}
+	}
+	if active >= 0 {
+		result, next, _ := direct(0)
+		return result, count, next, true
 	}
 	// The unbounded merge skips non-matches within each run before touching the
 	// heap, avoiding heap maintenance for every rejected row.

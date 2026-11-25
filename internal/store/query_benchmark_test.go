@@ -81,3 +81,41 @@ func BenchmarkLiteralContinuationBloom(b *testing.B) {
 		s.QueryPage(epoch, epoch.Add(48*time.Hour), "rare needle", 1, &count, &after)
 	}
 }
+
+func BenchmarkRestoredSingleRun(b *testing.B) {
+	epoch := time.Unix(1700000000, 0)
+	rows := make([]Row, 100000)
+	for i := range rows {
+		line := "dense ordinary log message"
+		if i%25000 == 0 || i == len(rows)-1 {
+			line += " raretoken"
+		}
+		rows[i] = Row{epoch.Add(time.Duration(i) * time.Second), line}
+	}
+	count := len(rows)
+	// A dense prefix followed by a sparse tail exercises the bounded attempt and fallback.
+	for i := 1000; i < len(rows)-1; i++ {
+		rows[i].Line = "ordinary log message"
+	}
+	rows[len(rows)-1].Line = "dense raretoken"
+	builder := NewRecoveryBuilder()
+	builder.Add(rows)
+	var s Store
+	builder.Install(&s)
+	after := Position{rows[999].TS, 999}
+	for _, tc := range []struct {
+		name, literal string
+		snapshot      *int
+		after         *Position
+	}{
+		{"dense", "ordinary", nil, nil}, {"rare", "raretoken", nil, nil},
+		{"absent", "absenttoken", nil, nil}, {"dense_to_sparse", "dense", &count, &after},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				s.QueryPage(epoch, epoch.Add(48*time.Hour), tc.literal, 100, tc.snapshot, tc.after)
+			}
+		})
+	}
+}

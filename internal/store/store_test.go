@@ -442,3 +442,83 @@ func TestWideSkewedPaginationOracle(t *testing.T) {
 		}
 	}
 }
+
+func TestRecoveredRunOracle(t *testing.T) {
+	epoch := time.Unix(1700000000, 0)
+	for _, shuffled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("shuffled=%v", shuffled), func(t *testing.T) {
+			rows := make([]Row, 120)
+			for i := range rows {
+				rows[i] = Row{epoch.Add(time.Duration(i/3) * time.Second), fmt.Sprintf("needle-%d", i/2)}
+			}
+			if shuffled {
+				rand.New(rand.NewSource(42)).Shuffle(len(rows), func(i, j int) { rows[i], rows[j] = rows[j], rows[i] })
+			}
+			builder := NewRecoveryBuilder()
+			builder.Add(rows[:47])
+			builder.Add(rows[47:])
+			var s Store
+			builder.Install(&s)
+			// A live run outside the time range must not prevent a direct scan.
+			s.Publish([]Row{{epoch.Add(-time.Hour), "needle outside"}})
+			start, end := epoch.Add(3*time.Second), epoch.Add(33*time.Second)
+			var want []Row
+			for _, row := range rows {
+				if !row.TS.Before(start) && row.TS.Before(end) {
+					want = append(want, row)
+				}
+			}
+			sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+			if got := s.Query(start, end, "needle", 17); !slices.Equal(got, want[:17]) {
+				t.Fatal("ordinary query mismatch")
+			}
+			page, count, cursor, ok := s.QueryPage(start, end, "needle", 15, nil, nil)
+			if !ok || cursor == nil || count != len(rows)+1 {
+				t.Fatal("first page")
+			}
+			got := append([]Row(nil), page...)
+			s.Publish([]Row{{epoch.Add(10 * time.Second), "needle backfill"}})
+			for cursor != nil {
+				page, _, cursor, ok = s.QueryPage(start, end, "needle", 15, &count, cursor)
+				if !ok {
+					t.Fatal("invalid continuation")
+				}
+				got = append(got, page...)
+				if len(got) == len(want) && cursor != nil {
+					t.Fatal("cursor on exact-limit terminal page")
+				}
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("got %d rows, want %d", len(got), len(want))
+			}
+		})
+	}
+}
+
+func TestRecoveredDirectScanResumesAfterBloomDeclines(t *testing.T) {
+	epoch := time.Unix(1700000000, 0)
+	rows := make([]Row, 34000)
+	for i := range rows {
+		// Every block contains the literal, so Bloom cannot skip enough blocks.
+		line := "ordinary"
+		if i%blockSize == 0 || i == 600 {
+			line = "needle"
+		}
+		rows[i] = Row{epoch.Add(time.Duration(i) * time.Second), line}
+	}
+	builder := NewRecoveryBuilder()
+	builder.Add(rows)
+	var s Store
+	builder.Install(&s)
+	var want []Row
+	for _, row := range rows {
+		if strings.Contains(row.Line, "needle") {
+			want = append(want, row)
+		}
+	}
+	end := epoch.Add(48 * time.Hour)
+	got, count, next, ok := s.QueryPage(epoch, end, "needle", 300, nil, nil)
+	if !ok || count != len(rows) || next != nil || !slices.Equal(got, want) {
+		t.Fatalf("got %d rows, want %d, cursor %v", len(got), len(want), next)
+	}
+}

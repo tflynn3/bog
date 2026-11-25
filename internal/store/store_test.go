@@ -218,3 +218,66 @@ func TestSeededRunPaginationParity(t *testing.T) {
 		}
 	}
 }
+
+func TestBlockFilterQueryParity(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	rows := make([]Row, 33024)
+	for i := range rows {
+		rows[i] = Row{epoch.Add(time.Duration(i%3) * time.Second), "ordinary"}
+	}
+	rows[0].Line = "abc"
+	rows[1].Line = "def"
+	rows[129].Line = strings.Repeat("x", blockBudget) + " needle界"
+	rows[512].Line = "needle界"
+	rows[513].Line = "needle界"
+	rows[len(rows)-1].Line = "needle界"
+	var s Store
+	s.Publish(rows[:len(rows)-1])
+	_, count, cursor, ok := s.QueryPage(epoch, epoch.Add(time.Minute), "needle界", 1, nil, nil)
+	if !ok || cursor == nil {
+		t.Fatal("missing cursor")
+	}
+	s.Publish(rows[len(rows)-1:]) // seals a block containing part of the old snapshot
+	for _, literal := range []string{"needle界", "abcdef", "ordinary", "界", "absent"} {
+		var want []Row
+		for _, row := range rows {
+			if strings.Contains(row.Line, literal) {
+				want = append(want, row)
+			}
+		}
+		sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+		if got := s.Query(epoch, epoch.Add(time.Minute), literal, 13); !slices.Equal(got, want[:min(13, len(want))]) {
+			t.Fatalf("plain mismatch for %q", literal)
+		}
+		var got []Row
+		var snap *int
+		var pos *Position
+		for {
+			page, c, next, valid := s.QueryPage(epoch, epoch.Add(time.Minute), literal, 17, snap, pos)
+			if !valid {
+				t.Fatal("invalid page")
+			}
+			got = append(got, page...)
+			snap = &c
+			pos = next
+			if next == nil {
+				break
+			}
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("page mismatch for %q: %d != %d", literal, len(got), len(want))
+		}
+	}
+	var got []Row
+	for cursor != nil {
+		page, _, next, valid := s.QueryPage(epoch, epoch.Add(time.Minute), "needle界", 1, &count, cursor)
+		if !valid {
+			t.Fatal("invalid continuation")
+		}
+		got = append(got, page...)
+		cursor = next
+	}
+	if len(got) != 2 {
+		t.Fatalf("old snapshot continuation has %d rows", len(got))
+	}
+}

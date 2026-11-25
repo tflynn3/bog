@@ -120,7 +120,8 @@ type Store struct {
 	publishMu sync.Mutex
 	mu        sync.RWMutex
 	rows      []Row
-	runs      [][]int // immutable sorted ordinal runs, one per occupied level
+	runs      [][]int        // immutable sorted ordinal runs, one per occupied level
+	blocks    []*blockFilter // immutable summaries of sealed append-ordinal blocks
 }
 
 // Publish serializes writers, but leaves readers free to use the previous snapshot
@@ -134,9 +135,15 @@ func (s *Store) Publish(batch []Row) {
 	s.mu.RLock()
 	rows := s.rows
 	runs := append([][]int(nil), s.runs...)
+	blocks := append([]*blockFilter(nil), s.blocks...)
 	s.mu.RUnlock()
 	base := len(rows)
 	rows = append(rows, batch...)
+	for len(blocks)*blockSize+blockSize <= len(rows) {
+		start := len(blocks) * blockSize
+		block := buildBlock(rows[start : start+blockSize])
+		blocks = append(blocks, &block)
+	}
 	run := make([]int, len(batch))
 	for i := range run {
 		run[i] = base + i
@@ -175,7 +182,7 @@ func (s *Store) Publish(batch []Row) {
 		run = merged
 	}
 	s.mu.Lock()
-	s.rows, s.runs = rows, runs
+	s.rows, s.runs, s.blocks = rows, runs, blocks
 	s.mu.Unlock()
 }
 
@@ -216,7 +223,7 @@ func (s *Store) QueryPage(start, end time.Time, contains string, limit int, snap
 
 func (s *Store) query(start, end time.Time, contains string, limit int, snapshot *int, after *Position, lookahead bool) ([]Row, int, *Position, bool) {
 	s.mu.RLock()
-	rows, runs := s.rows, s.runs
+	rows, runs, blocks := s.rows, s.runs, s.blocks
 	count := len(rows)
 	if snapshot != nil {
 		count = *snapshot
@@ -233,6 +240,37 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	s.mu.RUnlock()
 	if !start.Before(end) || limit <= 0 {
 		return []Row{}, count, nil, true
+	}
+	// Count all timestamp-range candidates, including post-snapshot rows. This is
+	// an upper bound and makes calculating it independent of ordinal ordering.
+	bound := 0
+	for _, run := range runs {
+		lo := sort.Search(len(run), func(i int) bool { return !rows[run[i]].TS.Before(start) })
+		hi := sort.Search(len(run), func(i int) bool { return !rows[run[i]].TS.Before(end) })
+		bound += hi - lo
+	}
+	if len(contains) >= 4 && bound >= 32768 {
+		possible := make([]int, 0)
+		possibleRows := 0
+		for first := 0; first < count; first += blockSize {
+			block := first / blockSize
+			if block < len(blocks) && !blocks[block].mayContain(contains) {
+				continue
+			}
+			n := blockSize
+			if count-first < n {
+				n = count - first
+			}
+			possibleRows += n
+			if possibleRows > bound/4 {
+				break
+			}
+			possible = append(possible, first)
+		}
+		if possibleRows <= bound/4 {
+			result, next := queryBlocks(rows, possible, count, start, end, contains, limit, after, lookahead)
+			return result, count, next, true
+		}
 	}
 	h := &candidates{rows: rows}
 	// Each run is sorted, so skip nonmatches before placing its next row in the heap.

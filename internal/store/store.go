@@ -162,6 +162,93 @@ func (m matches) Less(i, j int) bool {
 func (m matches) Swap(i, j int) { m[i], m[j] = m[j], m[i] }
 func (m *matches) Push(x any)   { *m = append(*m, x.(match)) }
 func (m *matches) Pop() any     { old := *m; x := old[len(old)-1]; *m = old[:len(old)-1]; return x }
+
+// Position identifies a row by timestamp and zero-based append ordinal.
+type Position struct {
+	Time    time.Time `json:"time"`
+	Ordinal int       `json:"ordinal"`
+}
+
+// QueryPage captures the published row count when snapshot is nil. A continuation
+// is valid only when its position still identifies a matching row in that snapshot.
+func (s *Store) QueryPage(start, end time.Time, contains string, limit int, snapshot *int, after *Position) ([]Row, int, *Position, bool) {
+	s.mu.RLock()
+	count := len(s.rows)
+	if snapshot != nil {
+		count = *snapshot
+		if count < 1 || count > len(s.rows) || after == nil || after.Ordinal < 0 || after.Ordinal >= count {
+			s.mu.RUnlock()
+			return nil, 0, nil, false
+		}
+		row := s.rows[after.Ordinal]
+		if !row.TS.Equal(after.Time) || row.TS.Before(start) || !row.TS.Before(end) || !strings.Contains(row.Line, contains) {
+			s.mu.RUnlock()
+			return nil, 0, nil, false
+		}
+	}
+	rowsSnapshot := s.rows[:count:count]
+	var bucketSnapshots [][]int
+	if start.Before(end) {
+		first, last := minute(start), minute(end.Add(-time.Nanosecond))
+		if last >= first && last-first < 32 {
+			bucketSnapshots = make([][]int, 0, last-first+1)
+			for m := first; m <= last; m++ {
+				bucket := s.buckets[m]
+				bucketSnapshots = append(bucketSnapshots, bucket[:len(bucket):len(bucket)])
+			}
+		}
+	}
+	s.mu.RUnlock()
+	result := make(matches, 0, limit+1)
+	consider := func(i int) {
+		if i >= count {
+			return
+		}
+		row := rowsSnapshot[i]
+		if row.TS.Before(start) || !row.TS.Before(end) || !strings.Contains(row.Line, contains) || (after != nil && (row.TS.Before(after.Time) || (row.TS.Equal(after.Time) && i <= after.Ordinal))) {
+			return
+		}
+		candidate := match{row, i}
+		if len(result) < limit+1 {
+			heap.Push(&result, candidate)
+		} else if candidate.row.TS.Before(result[0].row.TS) || (candidate.row.TS.Equal(result[0].row.TS) && candidate.order < result[0].order) {
+			result[0] = candidate
+			heap.Fix(&result, 0)
+		}
+	}
+	if bucketSnapshots != nil {
+		for _, bucket := range bucketSnapshots {
+			for _, i := range bucket {
+				consider(i)
+			}
+		}
+	} else {
+		for i := range rowsSnapshot {
+			consider(i)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].row.TS.Equal(result[j].row.TS) {
+			return result[i].order < result[j].order
+		}
+		return result[i].row.TS.Before(result[j].row.TS)
+	})
+	more := len(result) > limit
+	if more {
+		result = result[:limit]
+	}
+	rows := make([]Row, len(result))
+	for i, m := range result {
+		rows[i] = m.row
+	}
+	var next *Position
+	if more {
+		last := result[len(result)-1]
+		next = &Position{last.row.TS, last.order}
+	}
+	return rows, count, next, true
+}
+
 func (s *Store) Query(start, end time.Time, contains string, limit int) []Row {
 	if !start.Before(end) {
 		return []Row{}

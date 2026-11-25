@@ -112,3 +112,42 @@ func TestMinuteIndexParity(t *testing.T) {
 		}
 	}
 }
+
+func TestPageSnapshotConcurrentBackfill(t *testing.T) {
+	s := &Store{}
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	initial := make([]Row, 200)
+	for i := range initial {
+		initial[i] = Row{TS: start.Add(time.Second), Line: "original"}
+	}
+	s.Publish(initial)
+	rows, count, next, ok := s.QueryPage(start, start.Add(time.Minute), "", 1, nil, nil)
+	if !ok || len(rows) != 1 || next == nil {
+		t.Fatal("first page")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			s.Publish([]Row{{TS: start, Line: "backfill"}, {TS: start.Add(time.Second), Line: "late"}})
+		}
+	}()
+	seen := len(rows)
+	for next != nil {
+		var page []Row
+		page, _, next, ok = s.QueryPage(start, start.Add(time.Minute), "", 7, &count, next)
+		if !ok {
+			t.Fatal("invalid snapshot")
+		}
+		for _, row := range page {
+			if row.Line != "original" {
+				t.Fatalf("late row: %q", row.Line)
+			}
+		}
+		seen += len(page)
+	}
+	<-done
+	if seen != len(initial) {
+		t.Fatalf("got %d rows", seen)
+	}
+}

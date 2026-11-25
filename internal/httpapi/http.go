@@ -1,6 +1,10 @@
 package httpapi
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"time"
 
 	"bog/internal/store"
 	"bog/internal/wal"
@@ -81,6 +86,55 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+var cursorKey = func() []byte {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		panic(err)
+	}
+	return key
+}()
+
+type cursorData struct {
+	Version  int               `json:"v"`
+	Start    time.Time         `json:"start"`
+	End      time.Time         `json:"end"`
+	Contains [sha256.Size]byte `json:"contains"`
+	Count    int               `json:"count"`
+	After    store.Position    `json:"after"`
+}
+
+func containsDigest(value string) [sha256.Size]byte {
+	mac := hmac.New(sha256.New, cursorKey)
+	mac.Write([]byte("bog-filter-v1\x00"))
+	mac.Write([]byte(value))
+	var digest [sha256.Size]byte
+	copy(digest[:], mac.Sum(nil))
+	return digest
+}
+
+func encodeCursor(c cursorData) string {
+	b, _ := json.Marshal(c)
+	mac := hmac.New(sha256.New, cursorKey)
+	mac.Write([]byte("bog-cursor-v1\x00"))
+	mac.Write(b)
+	return base64.RawURLEncoding.EncodeToString(append(b, mac.Sum(nil)...))
+}
+func decodeCursor(token string) (cursorData, error) {
+	var c cursorData
+	b, err := base64.RawURLEncoding.Strict().DecodeString(token)
+	if err != nil || len(b) <= sha256.Size || len(b) > 2048 {
+		return c, errors.New("invalid cursor")
+	}
+	payload, sig := b[:len(b)-sha256.Size], b[len(b)-sha256.Size:]
+	mac := hmac.New(sha256.New, cursorKey)
+	mac.Write([]byte("bog-cursor-v1\x00"))
+	mac.Write(payload)
+	if !hmac.Equal(sig, mac.Sum(nil)) || json.Unmarshal(payload, &c) != nil || c.Version != 1 {
+		return c, errors.New("invalid cursor")
+	}
+	return c, nil
+}
+
 var decimal = regexp.MustCompile(`^[0-9]+$`)
 
 func (a *API) query(w http.ResponseWriter, r *http.Request) {
@@ -94,7 +148,7 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for k, v := range q {
-		if (k != "start" && k != "end" && k != "contains" && k != "limit") || len(v) != 1 {
+		if (k != "start" && k != "end" && k != "contains" && k != "limit" && k != "page" && k != "cursor") || len(v) != 1 {
 			http.Error(w, "invalid parameter", 400)
 			return
 		}
@@ -114,7 +168,47 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid query", 400)
 		return
 	}
-	rows := a.store.Query(start, end, q.Get("contains"), limit)
+	_, page := q["page"]
+	cursor, continuation := q["cursor"]
+	if (page && (q.Get("page") != "1" || continuation)) || (continuation && cursor[0] == "") {
+		http.Error(w, "invalid pagination", 400)
+		return
+	}
+	// Reserve space for a fixed-size cursor and ordinary HTTP headers within
+	// the server's 1 MiB header limit. Preserve the request target as received:
+	// re-encoding already valid query characters can inflate its size.
+	if page {
+		if len(r.RequestURI)+2048+4096 > 1<<20 {
+			http.Error(w, "query too large for continuation", 400)
+			return
+		}
+	}
+	var rows []store.Row
+	if page || continuation {
+		var count *int
+		var after *store.Position
+		if continuation {
+			c, err := decodeCursor(cursor[0])
+			if err != nil || !c.Start.Equal(start) || !c.End.Equal(end) || c.Contains != containsDigest(q.Get("contains")) {
+				http.Error(w, "invalid cursor", 400)
+				return
+			}
+			count, after = &c.Count, &c.After
+		}
+		var captured int
+		var next *store.Position
+		var ok bool
+		rows, captured, next, ok = a.store.QueryPage(start, end, q.Get("contains"), limit, count, after)
+		if !ok {
+			http.Error(w, "invalid cursor", 400)
+			return
+		}
+		if next != nil {
+			w.Header().Set("Bog-Next-Cursor", encodeCursor(cursorData{1, start, end, containsDigest(q.Get("contains")), captured, *next}))
+		}
+	} else {
+		rows = a.store.Query(start, end, q.Get("contains"), limit)
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	enc := json.NewEncoder(w)
 	for _, row := range rows {

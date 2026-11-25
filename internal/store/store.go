@@ -242,90 +242,88 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	if !start.Before(end) || limit <= 0 {
 		return []Row{}, count, nil, true
 	}
-	// Count all timestamp-range candidates, including post-snapshot rows. This is
-	// an upper bound and makes calculating it independent of ordinal ordering.
+	// Retain the full timestamp range for Bloom selectivity, while using the
+	// cursor-relative offset for scans. Both share the initial lower seek.
+	offsets := make([]int, len(runs))
 	bound := 0
-	for _, run := range runs {
-		lo := sort.Search(len(run), func(i int) bool { return !rows[run[i]].TS.Before(start) })
-		hi := sort.Search(len(run), func(i int) bool { return !rows[run[i]].TS.Before(end) })
-		bound += hi - lo
+	for i, run := range runs {
+		lo := sort.Search(len(run), func(j int) bool { return !rows[run[j]].TS.Before(start) })
+		if len(contains) >= 4 {
+			hi := lo + sort.Search(len(run)-lo, func(j int) bool { return !rows[run[lo+j]].TS.Before(end) })
+			bound += hi - lo
+		}
+		if after != nil {
+			lo += sort.Search(len(run)-lo, func(j int) bool {
+				ordinal := run[lo+j]
+				t := rows[ordinal].TS
+				return t.After(after.Time) || (t.Equal(after.Time) && ordinal > after.Ordinal)
+			})
+		}
+		offsets[i] = lo
 	}
 	wide := len(contains) >= 4 && bound >= 32768
-	// Seek once per run; both the bounded attempt and its fallback use these
-	// offsets and the same immutable snapshot.
-	offsets := make([]int, len(runs))
-	for i, run := range runs {
-		offsets[i] = sort.Search(len(run), func(j int) bool {
-			ordinal := run[j]
-			t := rows[ordinal].TS
-			if t.Before(start) {
-				return false
-			}
-			return after == nil || t.After(after.Time) || (t.Equal(after.Time) && ordinal > after.Ordinal)
-		})
-	}
 	ordered := func(budget int) ([]Row, *Position, bool) {
-		h := &candidates{rows: rows}
-		examined := 0
-		exhausted := false
-		advance := func(runIndex, offset int) {
-			run := runs[runIndex]
-			for offset < len(run) {
-				if budget > 0 && examined >= budget {
-					exhausted = true
-					return
-				}
-				examined++
-				ordinal := run[offset]
-				row := rows[ordinal]
-				if !row.TS.Before(end) {
-					return
-				}
-				if ordinal < count && strings.Contains(row.Line, contains) {
-					heap.Push(h, candidate{ordinal, runIndex, offset})
-					return
-				}
-				offset++
+		h := &candidates{rows: rows, items: make([]candidate, 0, len(runs))}
+		for i, offset := range offsets {
+			if offset < len(runs[i]) && rows[runs[i][offset]].TS.Before(end) {
+				h.items = append(h.items, candidate{runs[i][offset], i, offset})
 			}
 		}
-		for i, offset := range offsets {
-			advance(i, offset)
-			if exhausted {
+		heap.Init(h)
+		var result []Row
+		var last candidate
+		examined := 0
+		for h.Len() > 0 {
+			if budget > 0 && examined >= budget {
 				return nil, nil, false
 			}
-		}
-		result := make([]Row, 0, min(limit, count))
-		var last candidate
-		for h.Len() > 0 && len(result) < limit {
-			last = heap.Pop(h).(candidate)
-			result = append(result, rows[last.ordinal])
-			if lookahead || len(result) < limit {
-				advance(last.run, last.offset+1)
-				if exhausted {
-					return nil, nil, false
+			current := h.items[0]
+			examined++
+			row := rows[current.ordinal]
+			if current.ordinal < count && strings.Contains(row.Line, contains) {
+				if len(result) == limit {
+					return result, &Position{rows[last.ordinal].TS, last.ordinal}, true
+				}
+				if result == nil {
+					result = make([]Row, 0, min(limit, count))
+				}
+				result = append(result, row)
+				last = current
+				if !lookahead && len(result) == limit {
+					return result, nil, true
 				}
 			}
+			next := current.offset + 1
+			run := runs[current.run]
+			if next < len(run) && rows[run[next]].TS.Before(end) {
+				h.items[0] = candidate{run[next], current.run, next}
+				heap.Fix(h, 0)
+			} else {
+				heap.Pop(h)
+			}
 		}
-		var next *Position
-		if h.Len() > 0 {
-			next = &Position{rows[last.ordinal].TS, last.ordinal}
+		if result == nil {
+			result = []Row{}
 		}
-		return result, next, true
+		return result, nil, true
 	}
 	if wide {
 		// Bound work even for absent literals and runs containing newer rows.
-		budget := 512
-		if limit > budget/2 {
-			budget = min(limit, 2048) * 2
+		budget := max(512, limit)
+		if limit <= int(^uint(0)>>1)/2 {
+			budget = max(512, 2*limit)
+		} else {
+			budget = int(^uint(0) >> 1)
 		}
 		if result, next, complete := ordered(budget); complete {
 			return result, count, next, true
 		}
+		probes := literalProbes(contains)
 		possible := make([]int, 0)
 		possibleRows := 0
 		for first := 0; first < count; first += blockSize {
 			block := first / blockSize
-			if block < len(blocks) && !blocks[block].mayContain(contains) {
+			if block < len(blocks) && !blocks[block].mayContainProbes(probes) {
 				continue
 			}
 			n := blockSize
@@ -343,7 +341,43 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			return result, count, next, true
 		}
 	}
-	result, next, _ := ordered(0)
+	// The unbounded merge skips non-matches within each run before touching the
+	// heap, avoiding heap maintenance for every rejected row.
+	h := &candidates{rows: rows, items: make([]candidate, 0, len(runs))}
+	advance := func(runIndex, offset int) {
+		run := runs[runIndex]
+		for offset < len(run) {
+			ordinal := run[offset]
+			row := rows[ordinal]
+			if !row.TS.Before(end) {
+				return
+			}
+			if ordinal < count && strings.Contains(row.Line, contains) {
+				heap.Push(h, candidate{ordinal, runIndex, offset})
+				return
+			}
+			offset++
+		}
+	}
+	for i, offset := range offsets {
+		advance(i, offset)
+	}
+	result := []Row{}
+	var last candidate
+	for h.Len() > 0 && len(result) < limit {
+		last = heap.Pop(h).(candidate)
+		if len(result) == 0 {
+			result = make([]Row, 0, min(limit, count))
+		}
+		result = append(result, rows[last.ordinal])
+		if lookahead || len(result) < limit {
+			advance(last.run, last.offset+1)
+		}
+	}
+	var next *Position
+	if h.Len() > 0 {
+		next = &Position{rows[last.ordinal].TS, last.ordinal}
+	}
 	return result, count, next, true
 }
 

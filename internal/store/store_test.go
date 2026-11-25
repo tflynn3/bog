@@ -391,3 +391,54 @@ func TestBlockPublicationGrowth(t *testing.T) {
 		t.Fatal("published block prefix changed")
 	}
 }
+
+func TestWideSkewedPaginationOracle(t *testing.T) {
+	epoch := time.Unix(1700000000, 0)
+	for _, matches := range []int{1000, 1001} {
+		for _, limit := range []int{1, 1000} {
+			t.Run(fmt.Sprintf("matches=%d/limit=%d", matches, limit), func(t *testing.T) {
+				var s Store
+				var all []Row
+				for batch := 0; batch < 7; batch++ {
+					rows := make([]Row, 5000)
+					for i := range rows {
+						line := fmt.Sprintf("ordinary-%d-%d", batch, i)
+						if batch == 0 && i < matches {
+							line += " needle"
+						}
+						rows[i] = Row{epoch.Add(time.Duration((i*7+6-batch)/3) * time.Second), line}
+					}
+					all = append(all, rows...)
+					s.Publish(rows)
+				}
+				var want []Row
+				for _, row := range all {
+					if strings.Contains(row.Line, "needle") {
+						want = append(want, row)
+					}
+				}
+				sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+				end := epoch.Add(24 * time.Hour)
+				page, count, cursor, ok := s.QueryPage(epoch, end, "needle", limit, nil, nil)
+				if !ok {
+					t.Fatal("invalid first page")
+				}
+				if (cursor != nil) != (matches > limit) {
+					t.Fatalf("first cursor = %v for %d matches and limit %d", cursor, matches, limit)
+				}
+				got := append([]Row(nil), page...)
+				s.Publish([]Row{{epoch, "needle backfill"}})
+				for cursor != nil {
+					page, _, cursor, ok = s.QueryPage(epoch, end, "needle", limit, &count, cursor)
+					if !ok {
+						t.Fatal("invalid continuation")
+					}
+					got = append(got, page...)
+				}
+				if !slices.Equal(got, want) {
+					t.Fatalf("got %d rows, want %d", len(got), len(want))
+				}
+			})
+		}
+	}
+}

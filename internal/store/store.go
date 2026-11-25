@@ -60,6 +60,14 @@ func Decode(data []byte) ([]Row, error) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
+		if ts, text, ok := plainRow(line); ok {
+			t, err := checkedTime(ts)
+			if err != nil {
+				return nil, err
+			}
+			rows = append(rows, Row{t, text})
+			continue
+		}
 		d := json.NewDecoder(bytes.NewReader(line))
 		tok, err := d.Token()
 		if err != nil || tok != json.Delim('{') {
@@ -101,12 +109,9 @@ func Decode(data []byte) ([]Row, error) {
 		if !seen["ts"] || !seen["line"] {
 			return nil, errors.New("missing field")
 		}
-		t, err := ParseTime(ts)
+		t, err := checkedTime(ts)
 		if err != nil {
-			return nil, fmt.Errorf("timestamp: %w", err)
-		}
-		if t.Equal(time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)) {
-			return nil, errors.New("timestamp reserved for exclusive query end")
+			return nil, err
 		}
 		rows = append(rows, Row{t, text})
 	}
@@ -114,6 +119,94 @@ func Decode(data []byte) ([]Row, error) {
 		return nil, errors.New("empty batch")
 	}
 	return rows, nil
+}
+
+// plainRow accepts only the unescaped, two-field form. All other forms go
+// through the JSON decoder, including malformed input and escaped keys.
+func plainRow(b []byte) (ts, line string, ok bool) {
+	i := 0
+	space := func() {
+		for i < len(b) && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n') {
+			i++
+		}
+	}
+	take := func(c byte) bool {
+		space()
+		if i >= len(b) || b[i] != c {
+			return false
+		}
+		i++
+		return true
+	}
+	str := func() (string, bool) {
+		space()
+		if i >= len(b) || b[i] != '"' {
+			return "", false
+		}
+		i++
+		start := i
+		for i < len(b) && b[i] != '"' {
+			if b[i] < 0x20 || b[i] == '\\' {
+				return "", false
+			}
+			i++
+		}
+		if i == len(b) {
+			return "", false
+		}
+		v := string(b[start:i])
+		i++
+		return v, true
+	}
+	if !take('{') {
+		return "", "", false
+	}
+	var seen uint8
+	for n := 0; n < 2; n++ {
+		if n > 0 && !take(',') {
+			return "", "", false
+		}
+		key, valid := str()
+		if !valid || !take(':') {
+			return "", "", false
+		}
+		value, valid := str()
+		if !valid {
+			return "", "", false
+		}
+		switch key {
+		case "ts":
+			if seen&1 != 0 {
+				return "", "", false
+			}
+			seen |= 1
+			ts = value
+		case "line":
+			if seen&2 != 0 {
+				return "", "", false
+			}
+			seen |= 2
+			line = value
+		default:
+			return "", "", false
+		}
+	}
+	if seen != 3 || !take('}') {
+		return "", "", false
+	}
+	space()
+	return ts, line, i == len(b)
+}
+
+func checkedTime(ts string) (time.Time, error) {
+	t, err := ParseTime(ts)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("timestamp: %w", err)
+	}
+	if t.Equal(time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)) {
+		return time.Time{}, errors.New("timestamp reserved for exclusive query end")
+	}
+	return t, nil
 }
 
 type Store struct {

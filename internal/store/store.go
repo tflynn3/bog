@@ -117,11 +117,34 @@ func Decode(data []byte) ([]Row, error) {
 }
 
 type Store struct {
-	mu   sync.RWMutex
-	rows []Row
+	mu      sync.RWMutex
+	rows    []Row
+	buckets map[int64][]int
 }
 
-func (s *Store) Publish(rows []Row) { s.mu.Lock(); s.rows = append(s.rows, rows...); s.mu.Unlock() }
+// minute returns the UTC epoch minute, rounding toward negative infinity.
+func minute(t time.Time) int64 {
+	seconds := t.Unix()
+	m := seconds / 60
+	if seconds < 0 && seconds%60 != 0 {
+		m--
+	}
+	return m
+}
+
+func (s *Store) Publish(rows []Row) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.buckets == nil {
+		s.buckets = make(map[int64][]int)
+	}
+	base := len(s.rows)
+	s.rows = append(s.rows, rows...)
+	for i, row := range rows {
+		m := minute(row.TS)
+		s.buckets[m] = append(s.buckets[m], base+i)
+	}
+}
 
 type match struct {
 	row   Row
@@ -140,11 +163,24 @@ func (m matches) Swap(i, j int) { m[i], m[j] = m[j], m[i] }
 func (m *matches) Push(x any)   { *m = append(*m, x.(match)) }
 func (m *matches) Pop() any     { old := *m; x := old[len(old)-1]; *m = old[:len(old)-1]; return x }
 func (s *Store) Query(start, end time.Time, contains string, limit int) []Row {
+	if !start.Before(end) {
+		return []Row{}
+	}
+	first, last := minute(start), minute(end.Add(-time.Nanosecond))
+	narrow := last >= first && last-first < 32
 	s.mu.RLock()
 	rowsSnapshot := s.rows
+	var bucketSnapshots [][]int
+	if narrow {
+		bucketSnapshots = make([][]int, 0, last-first+1)
+		for m := first; m <= last; m++ {
+			bucketSnapshots = append(bucketSnapshots, s.buckets[m])
+		}
+	}
 	s.mu.RUnlock()
 	result := make(matches, 0, limit)
-	for i, r := range rowsSnapshot {
+	consider := func(i int) {
+		r := rowsSnapshot[i]
 		if !r.TS.Before(start) && r.TS.Before(end) && strings.Contains(r.Line, contains) {
 			candidate := match{r, i}
 			if len(result) < limit {
@@ -153,6 +189,17 @@ func (s *Store) Query(start, end time.Time, contains string, limit int) []Row {
 				result[0] = candidate
 				heap.Fix(&result, 0)
 			}
+		}
+	}
+	if narrow {
+		for _, bucket := range bucketSnapshots {
+			for _, i := range bucket {
+				consider(i)
+			}
+		}
+	} else {
+		for i := range rowsSnapshot {
+			consider(i)
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {

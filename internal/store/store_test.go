@@ -1,6 +1,9 @@
 package store
 
 import (
+	"slices"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -50,4 +53,62 @@ func TestQuerySnapshotAndTies(t *testing.T) {
 		}
 	}
 	wg.Wait()
+}
+
+func TestMinuteIndexParity(t *testing.T) {
+	var s Store
+	parse := func(v string) time.Time {
+		t.Helper()
+		x, err := ParseTime(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return x
+	}
+	epoch := parse("1970-01-01T00:00:00Z")
+	min := parse("0001-01-01T00:00:00Z")
+	max := parse("9999-12-31T23:59:59.999999998Z")
+	if minute(epoch.Add(-time.Nanosecond)) != -1 || minute(epoch.Add(-time.Minute)) != -1 || minute(epoch.Add(-time.Minute-time.Nanosecond)) != -2 {
+		t.Fatal("negative minutes must floor")
+	}
+	batches := [][]Row{
+		{{epoch.Add(-time.Minute), "edge"}, {epoch, "tie first"}, {max, "max"}, {min, "min"}},
+		{{epoch.Add(-time.Nanosecond), "late"}, {epoch, "tie second"}, {epoch.Add(32 * time.Minute), "far"}},
+	}
+	var all []Row
+	for _, batch := range batches {
+		s.Publish(batch)
+		all = append(all, batch...)
+	}
+	cases := []struct {
+		start, end time.Time
+		contains   string
+		limit      int
+	}{
+		{epoch.Add(-time.Minute), epoch, "", 10},
+		{epoch.Add(-time.Nanosecond), epoch.Add(time.Nanosecond), "", 10},
+		{epoch, epoch.Add(32 * time.Minute), "", 1},
+		{epoch, epoch.Add(32*time.Minute + time.Nanosecond), "", 10},
+		{min, max.Add(time.Nanosecond), "", 10},
+		{min, min.Add(time.Minute), "min", 10},
+		{max.Add(-time.Second), max.Add(time.Nanosecond), "max", 10},
+		{epoch, epoch, "", 10},
+		{epoch.Add(-time.Minute), epoch.Add(time.Minute), "tie", 1},
+	}
+	for _, tc := range cases {
+		var want []Row
+		for _, row := range all {
+			if !row.TS.Before(tc.start) && row.TS.Before(tc.end) && strings.Contains(row.Line, tc.contains) {
+				want = append(want, row)
+			}
+		}
+		sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+		if len(want) > tc.limit {
+			want = want[:tc.limit]
+		}
+		got := s.Query(tc.start, tc.end, tc.contains, tc.limit)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s to %s: got %v, want %v", tc.start, tc.end, got, want)
+		}
+	}
 }

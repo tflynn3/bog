@@ -1,6 +1,8 @@
 package store
 
 import (
+	"fmt"
+	"math/rand"
 	"slices"
 	"sort"
 	"strings"
@@ -55,7 +57,7 @@ func TestQuerySnapshotAndTies(t *testing.T) {
 	wg.Wait()
 }
 
-func TestMinuteIndexParity(t *testing.T) {
+func TestRunIndexParity(t *testing.T) {
 	var s Store
 	parse := func(v string) time.Time {
 		t.Helper()
@@ -68,9 +70,7 @@ func TestMinuteIndexParity(t *testing.T) {
 	epoch := parse("1970-01-01T00:00:00Z")
 	min := parse("0001-01-01T00:00:00Z")
 	max := parse("9999-12-31T23:59:59.999999998Z")
-	if minute(epoch.Add(-time.Nanosecond)) != -1 || minute(epoch.Add(-time.Minute)) != -1 || minute(epoch.Add(-time.Minute-time.Nanosecond)) != -2 {
-		t.Fatal("negative minutes must floor")
-	}
+
 	batches := [][]Row{
 		{{epoch.Add(-time.Minute), "edge"}, {epoch, "tie first"}, {max, "max"}, {min, "min"}},
 		{{epoch.Add(-time.Nanosecond), "late"}, {epoch, "tie second"}, {epoch.Add(32 * time.Minute), "far"}},
@@ -149,5 +149,72 @@ func TestPageSnapshotConcurrentBackfill(t *testing.T) {
 	<-done
 	if seen != len(initial) {
 		t.Fatalf("got %d rows", seen)
+	}
+}
+
+func TestSeededRunPaginationParity(t *testing.T) {
+	rng := rand.New(rand.NewSource(9817))
+	epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	min := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+	max := time.Date(9999, 12, 31, 23, 59, 59, 999999998, time.UTC)
+	var s Store
+	var all []Row
+	for b := 0; b < 93; b++ {
+		batch := make([]Row, 1+rng.Intn(13))
+		for i := range batch {
+			stamp := epoch.Add(time.Duration(rng.Intn(4000)-2000)*time.Second + time.Duration(rng.Intn(3))*time.Nanosecond)
+			if b == 0 && i == 0 {
+				stamp = min
+			}
+			if b == 1 && i == 0 {
+				stamp = max
+			}
+			text := fmt.Sprintf("row-%d-%d", b, i)
+			if rng.Intn(20) == 0 {
+				text += " needle"
+			}
+			batch[i] = Row{stamp, text}
+		}
+		s.Publish(batch)
+		all = append(all, batch...)
+	}
+	for _, bounds := range [][2]time.Time{{min, max.Add(time.Nanosecond)}, {epoch.Add(-16 * time.Minute), epoch.Add(16 * time.Minute)}, {epoch.Add(-16 * time.Minute), epoch.Add(16*time.Minute + time.Nanosecond)}, {max.Add(-time.Second), max.Add(time.Nanosecond)}} {
+		for _, filter := range []string{"", "needle", "absent"} {
+			var want []Row
+			for _, r := range all {
+				if !r.TS.Before(bounds[0]) && r.TS.Before(bounds[1]) && strings.Contains(r.Line, filter) {
+					want = append(want, r)
+				}
+			}
+			sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+			got := s.Query(bounds[0], bounds[1], filter, 17)
+			n := len(want)
+			if n > 17 {
+				n = 17
+			}
+			if !slices.Equal(got, want[:n]) {
+				t.Fatal("plain query mismatch")
+			}
+			var pages []Row
+			var count int
+			var cursor *Position
+			var snap *int
+			for {
+				page, c, next, ok := s.QueryPage(bounds[0], bounds[1], filter, 7, snap, cursor)
+				if !ok {
+					t.Fatal("invalid page")
+				}
+				pages = append(pages, page...)
+				count = c
+				snap = &count
+				cursor = next
+				if cursor == nil {
+					break
+				}
+			}
+			if !slices.Equal(pages, want) {
+				t.Fatalf("paged mismatch for %q: got %d want %d", filter, len(pages), len(want))
+			}
+		}
 	}
 }

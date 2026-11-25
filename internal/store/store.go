@@ -117,51 +117,90 @@ func Decode(data []byte) ([]Row, error) {
 }
 
 type Store struct {
-	mu      sync.RWMutex
-	rows    []Row
-	buckets map[int64][]int
+	publishMu sync.Mutex
+	mu        sync.RWMutex
+	rows      []Row
+	runs      [][]int // immutable sorted ordinal runs, one per occupied level
 }
 
-// minute returns the UTC epoch minute, rounding toward negative infinity.
-func minute(t time.Time) int64 {
-	seconds := t.Unix()
-	m := seconds / 60
-	if seconds < 0 && seconds%60 != 0 {
-		m--
+// Publish serializes writers, but leaves readers free to use the previous snapshot
+// while the new run is sorted and merged.
+func (s *Store) Publish(batch []Row) {
+	if len(batch) == 0 {
+		return
 	}
-	return m
-}
-
-func (s *Store) Publish(rows []Row) {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	s.mu.RLock()
+	rows := s.rows
+	runs := append([][]int(nil), s.runs...)
+	s.mu.RUnlock()
+	base := len(rows)
+	rows = append(rows, batch...)
+	run := make([]int, len(batch))
+	for i := range run {
+		run[i] = base + i
+	}
+	less := func(a, b int) bool {
+		if rows[a].TS.Equal(rows[b].TS) {
+			return a < b
+		}
+		return rows[a].TS.Before(rows[b].TS)
+	}
+	sort.Slice(run, func(i, j int) bool { return less(run[i], run[j]) })
+	for level := 0; ; level++ {
+		if level == len(runs) {
+			runs = append(runs, run)
+			break
+		}
+		if runs[level] == nil {
+			runs[level] = run
+			break
+		}
+		old := runs[level]
+		merged := make([]int, 0, len(old)+len(run))
+		i, j := 0, 0
+		for i < len(old) && j < len(run) {
+			if less(old[i], run[j]) {
+				merged = append(merged, old[i])
+				i++
+			} else {
+				merged = append(merged, run[j])
+				j++
+			}
+		}
+		merged = append(merged, old[i:]...)
+		merged = append(merged, run[j:]...)
+		runs[level] = nil
+		run = merged
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.buckets == nil {
-		s.buckets = make(map[int64][]int)
-	}
-	base := len(s.rows)
-	s.rows = append(s.rows, rows...)
-	for i, row := range rows {
-		m := minute(row.TS)
-		s.buckets[m] = append(s.buckets[m], base+i)
-	}
+	s.rows, s.runs = rows, runs
+	s.mu.Unlock()
 }
 
-type match struct {
-	row   Row
-	order int
+type candidate struct{ ordinal, run, offset int }
+type candidates struct {
+	rows  []Row
+	items []candidate
 }
-type matches []match
 
-func (m matches) Len() int { return len(m) }
-func (m matches) Less(i, j int) bool {
-	if m[i].row.TS.Equal(m[j].row.TS) {
-		return m[i].order > m[j].order
+func (h candidates) Len() int { return len(h.items) }
+func (h candidates) Less(i, j int) bool {
+	a, b := h.items[i].ordinal, h.items[j].ordinal
+	if h.rows[a].TS.Equal(h.rows[b].TS) {
+		return a < b
 	}
-	return m[j].row.TS.Before(m[i].row.TS)
+	return h.rows[a].TS.Before(h.rows[b].TS)
 }
-func (m matches) Swap(i, j int) { m[i], m[j] = m[j], m[i] }
-func (m *matches) Push(x any)   { *m = append(*m, x.(match)) }
-func (m *matches) Pop() any     { old := *m; x := old[len(old)-1]; *m = old[:len(old)-1]; return x }
+func (h candidates) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *candidates) Push(x any)   { h.items = append(h.items, x.(candidate)) }
+func (h *candidates) Pop() any {
+	n := len(h.items) - 1
+	x := h.items[n]
+	h.items = h.items[:n]
+	return x
+}
 
 // Position identifies a row by timestamp and zero-based append ordinal.
 type Position struct {
@@ -172,132 +211,74 @@ type Position struct {
 // QueryPage captures the published row count when snapshot is nil. A continuation
 // is valid only when its position still identifies a matching row in that snapshot.
 func (s *Store) QueryPage(start, end time.Time, contains string, limit int, snapshot *int, after *Position) ([]Row, int, *Position, bool) {
+	return s.query(start, end, contains, limit, snapshot, after, true)
+}
+
+func (s *Store) query(start, end time.Time, contains string, limit int, snapshot *int, after *Position, lookahead bool) ([]Row, int, *Position, bool) {
 	s.mu.RLock()
-	count := len(s.rows)
+	rows, runs := s.rows, s.runs
+	count := len(rows)
 	if snapshot != nil {
 		count = *snapshot
-		if count < 1 || count > len(s.rows) || after == nil || after.Ordinal < 0 || after.Ordinal >= count {
+		if count < 1 || count > len(rows) || after == nil || after.Ordinal < 0 || after.Ordinal >= count {
 			s.mu.RUnlock()
 			return nil, 0, nil, false
 		}
-		row := s.rows[after.Ordinal]
+		row := rows[after.Ordinal]
 		if !row.TS.Equal(after.Time) || row.TS.Before(start) || !row.TS.Before(end) || !strings.Contains(row.Line, contains) {
 			s.mu.RUnlock()
 			return nil, 0, nil, false
 		}
 	}
-	rowsSnapshot := s.rows[:count:count]
-	var bucketSnapshots [][]int
-	if start.Before(end) {
-		first, last := minute(start), minute(end.Add(-time.Nanosecond))
-		if last >= first && last-first < 32 {
-			bucketSnapshots = make([][]int, 0, last-first+1)
-			for m := first; m <= last; m++ {
-				bucket := s.buckets[m]
-				bucketSnapshots = append(bucketSnapshots, bucket[:len(bucket):len(bucket)])
-			}
-		}
-	}
 	s.mu.RUnlock()
-	result := make(matches, 0, limit+1)
-	consider := func(i int) {
-		if i >= count {
-			return
-		}
-		row := rowsSnapshot[i]
-		if row.TS.Before(start) || !row.TS.Before(end) || !strings.Contains(row.Line, contains) || (after != nil && (row.TS.Before(after.Time) || (row.TS.Equal(after.Time) && i <= after.Ordinal))) {
-			return
-		}
-		candidate := match{row, i}
-		if len(result) < limit+1 {
-			heap.Push(&result, candidate)
-		} else if candidate.row.TS.Before(result[0].row.TS) || (candidate.row.TS.Equal(result[0].row.TS) && candidate.order < result[0].order) {
-			result[0] = candidate
-			heap.Fix(&result, 0)
-		}
+	if !start.Before(end) || limit <= 0 {
+		return []Row{}, count, nil, true
 	}
-	if bucketSnapshots != nil {
-		for _, bucket := range bucketSnapshots {
-			for _, i := range bucket {
-				consider(i)
+	h := &candidates{rows: rows}
+	// Each run is sorted, so skip nonmatches before placing its next row in the heap.
+	advance := func(runIndex, offset int) {
+		run := runs[runIndex]
+		for offset < len(run) {
+			ordinal := run[offset]
+			row := rows[ordinal]
+			if !row.TS.Before(end) {
+				return
 			}
-		}
-	} else {
-		for i := range rowsSnapshot {
-			consider(i)
+			if ordinal < count && strings.Contains(row.Line, contains) {
+				heap.Push(h, candidate{ordinal, runIndex, offset})
+				return
+			}
+			offset++
 		}
 	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].row.TS.Equal(result[j].row.TS) {
-			return result[i].order < result[j].order
-		}
-		return result[i].row.TS.Before(result[j].row.TS)
-	})
-	more := len(result) > limit
-	if more {
-		result = result[:limit]
+	for i, run := range runs {
+		offset := sort.Search(len(run), func(j int) bool {
+			ordinal := run[j]
+			t := rows[ordinal].TS
+			if t.Before(start) {
+				return false
+			}
+			return after == nil || t.After(after.Time) || (t.Equal(after.Time) && ordinal > after.Ordinal)
+		})
+		advance(i, offset)
 	}
-	rows := make([]Row, len(result))
-	for i, m := range result {
-		rows[i] = m.row
+	result := make([]Row, 0, limit)
+	var last candidate
+	for h.Len() > 0 && len(result) < limit {
+		last = heap.Pop(h).(candidate)
+		result = append(result, rows[last.ordinal])
+		if lookahead || len(result) < limit {
+			advance(last.run, last.offset+1)
+		}
 	}
 	var next *Position
-	if more {
-		last := result[len(result)-1]
-		next = &Position{last.row.TS, last.order}
+	if h.Len() > 0 {
+		next = &Position{rows[last.ordinal].TS, last.ordinal}
 	}
-	return rows, count, next, true
+	return result, count, next, true
 }
 
 func (s *Store) Query(start, end time.Time, contains string, limit int) []Row {
-	if !start.Before(end) {
-		return []Row{}
-	}
-	first, last := minute(start), minute(end.Add(-time.Nanosecond))
-	narrow := last >= first && last-first < 32
-	s.mu.RLock()
-	rowsSnapshot := s.rows
-	var bucketSnapshots [][]int
-	if narrow {
-		bucketSnapshots = make([][]int, 0, last-first+1)
-		for m := first; m <= last; m++ {
-			bucketSnapshots = append(bucketSnapshots, s.buckets[m])
-		}
-	}
-	s.mu.RUnlock()
-	result := make(matches, 0, limit)
-	consider := func(i int) {
-		r := rowsSnapshot[i]
-		if !r.TS.Before(start) && r.TS.Before(end) && strings.Contains(r.Line, contains) {
-			candidate := match{r, i}
-			if len(result) < limit {
-				heap.Push(&result, candidate)
-			} else if candidate.row.TS.Before(result[0].row.TS) || (candidate.row.TS.Equal(result[0].row.TS) && candidate.order < result[0].order) {
-				result[0] = candidate
-				heap.Fix(&result, 0)
-			}
-		}
-	}
-	if narrow {
-		for _, bucket := range bucketSnapshots {
-			for _, i := range bucket {
-				consider(i)
-			}
-		}
-	} else {
-		for i := range rowsSnapshot {
-			consider(i)
-		}
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].row.TS.Equal(result[j].row.TS) {
-			return result[i].order < result[j].order
-		}
-		return result[i].row.TS.Before(result[j].row.TS)
-	})
-	rows := make([]Row, len(result))
-	for i, m := range result {
-		rows[i] = m.row
-	}
+	rows, _, _, _ := s.query(start, end, contains, limit, nil, nil, false)
 	return rows
 }

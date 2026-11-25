@@ -135,14 +135,15 @@ func (s *Store) Publish(batch []Row) {
 	s.mu.RLock()
 	rows := s.rows
 	runs := append([][]int(nil), s.runs...)
-	blocks := append([]*blockFilter(nil), s.blocks...)
+	// The captured length is the immutable published prefix. Only the serialized
+	// writer appends beyond it, so readers may retain this slice without copying.
+	blocks := s.blocks
 	s.mu.RUnlock()
 	base := len(rows)
 	rows = append(rows, batch...)
 	for len(blocks)*blockSize+blockSize <= len(rows) {
 		start := len(blocks) * blockSize
-		block := buildBlock(rows[start : start+blockSize])
-		blocks = append(blocks, &block)
+		blocks = append(blocks, buildBlock(rows[start:start+blockSize]))
 	}
 	run := make([]int, len(batch))
 	for i := range run {

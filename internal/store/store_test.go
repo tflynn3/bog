@@ -341,3 +341,53 @@ func TestWideOrderedAttemptParity(t *testing.T) {
 		t.Fatalf("snapshot continuation: got %v, want %v", got, want)
 	}
 }
+
+func TestBlockPublicationGrowth(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	initial := make([]Row, 33023)
+	for i := range initial {
+		initial[i] = Row{epoch, "ordinary"}
+	}
+	initial[0].Line = "rare needle"
+	initial[len(initial)-1].Line = "rare needle"
+	// The over-budget block must remain a candidate without a bitmap.
+	initial[blockSize].Line = strings.Repeat("x", blockBudget) + " rare needle"
+	var s Store
+	s.Publish(initial)
+	if s.blocks[1] != nil || s.blocks[0] == nil {
+		t.Fatal("incorrect block budget handling")
+	}
+	oldBlocks := s.blocks
+	first, count, cursor, ok := s.QueryPage(epoch, epoch.Add(time.Second), "rare needle", 1, nil, nil)
+	if !ok || cursor == nil || len(first) != 1 {
+		t.Fatal("missing initial cursor")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		batch := make([]Row, 37)
+		for i := range batch {
+			batch[i] = Row{epoch, "later needle"}
+		}
+		for i := 0; i < 100; i++ {
+			s.Publish(batch)
+		}
+	}()
+	got := append([]Row(nil), first...)
+	for cursor != nil {
+		page, _, next, valid := s.QueryPage(epoch, epoch.Add(time.Second), "rare needle", 1, &count, cursor)
+		if !valid {
+			t.Fatal("invalid snapshot")
+		}
+		got = append(got, page...)
+		cursor = next
+	}
+	<-done
+	want := []Row{initial[0], initial[blockSize], initial[len(initial)-1]}
+	if !slices.Equal(got, want) {
+		t.Fatalf("snapshot mismatch: got %d rows, want %d", len(got), len(want))
+	}
+	if len(oldBlocks) != len(initial)/blockSize || oldBlocks[1] != nil || oldBlocks[0] != s.blocks[0] {
+		t.Fatal("published block prefix changed")
+	}
+}

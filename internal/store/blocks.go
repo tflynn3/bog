@@ -12,8 +12,7 @@ const blockBudget = 64 << 10
 const bitmapWords = 512 // 4 KiB
 
 type blockFilter struct {
-	bits      [bitmapWords]uint64
-	unindexed bool
+	bits [bitmapWords]uint64
 }
 
 // Gram hashes are calculated within each decoded string, never across rows.
@@ -31,16 +30,15 @@ func (b *blockFilter) add(hash uint64) {
 		b.bits[bit/64] |= uint64(1) << (bit % 64)
 	}
 }
-func buildBlock(rows []Row) blockFilter {
-	var b blockFilter
+func buildBlock(rows []Row) *blockFilter {
 	size := 0
 	for _, row := range rows {
 		if len(row.Line) > blockBudget-size {
-			b.unindexed = true
-			return b
+			return nil
 		}
 		size += len(row.Line)
 	}
+	b := new(blockFilter)
 	for _, row := range rows {
 		for i := 0; i+4 <= len(row.Line); i++ {
 			b.add(gramHash(row.Line[i : i+4]))
@@ -49,7 +47,7 @@ func buildBlock(rows []Row) blockFilter {
 	return b
 }
 func (b *blockFilter) mayContain(literal string) bool {
-	if b.unindexed {
+	if b == nil {
 		return true
 	}
 	// Any subset of required grams is safe. Cap probe work for long literals.

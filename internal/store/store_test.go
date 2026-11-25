@@ -281,3 +281,63 @@ func TestBlockFilterQueryParity(t *testing.T) {
 		t.Fatalf("old snapshot continuation has %d rows", len(got))
 	}
 }
+
+func TestWideOrderedAttemptParity(t *testing.T) {
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	rows := make([]Row, 33023)
+	for i := range rows {
+		line := fmt.Sprintf("dense-%05d", i)
+		if i == 100 || i == 18000 || i == 32000 {
+			line += " sparse"
+		}
+		// Ties and reverse insertion exercise the ordinal tie-breaker and merge.
+		rows[i] = Row{epoch.Add(time.Duration((len(rows)-i)/3) * time.Second), line}
+	}
+	var s Store
+	for _, bounds := range [][2]int{{0, 10000}, {10000, 20000}, {20000, len(rows)}} {
+		s.Publish(rows[bounds[0]:bounds[1]])
+	}
+	end := epoch.Add(24 * time.Hour)
+	for _, literal := range []string{"dense", "sparse", "missing"} {
+		var want []Row
+		for _, row := range rows {
+			if strings.Contains(row.Line, literal) {
+				want = append(want, row)
+			}
+		}
+		sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+		got, _, next, ok := s.QueryPage(epoch, end, literal, 2, nil, nil)
+		if !ok || !slices.Equal(got, want[:min(2, len(want))]) || (next != nil) != (len(want) > 2) {
+			t.Fatalf("first page %q: got %v, cursor %v", literal, got, next)
+		}
+	}
+	first, count, cursor, ok := s.QueryPage(epoch, end, "sparse", 1, nil, nil)
+	if !ok || cursor == nil {
+		t.Fatal("missing sparse cursor")
+	}
+	done := make(chan struct{})
+	go func() {
+		s.Publish([]Row{{epoch, "sparse backfill"}}) // seals the partial block
+		close(done)
+	}()
+	var got = append([]Row(nil), first...)
+	for cursor != nil {
+		page, _, next, valid := s.QueryPage(epoch, end, "sparse", 1, &count, cursor)
+		if !valid {
+			t.Fatal("invalid continuation")
+		}
+		got = append(got, page...)
+		cursor = next
+	}
+	<-done
+	var want []Row
+	for _, row := range rows {
+		if strings.Contains(row.Line, "sparse") {
+			want = append(want, row)
+		}
+	}
+	sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+	if !slices.Equal(got, want) {
+		t.Fatalf("snapshot continuation: got %v, want %v", got, want)
+	}
+}

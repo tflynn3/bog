@@ -249,7 +249,77 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		hi := sort.Search(len(run), func(i int) bool { return !rows[run[i]].TS.Before(end) })
 		bound += hi - lo
 	}
-	if len(contains) >= 4 && bound >= 32768 {
+	wide := len(contains) >= 4 && bound >= 32768
+	// Seek once per run; both the bounded attempt and its fallback use these
+	// offsets and the same immutable snapshot.
+	offsets := make([]int, len(runs))
+	for i, run := range runs {
+		offsets[i] = sort.Search(len(run), func(j int) bool {
+			ordinal := run[j]
+			t := rows[ordinal].TS
+			if t.Before(start) {
+				return false
+			}
+			return after == nil || t.After(after.Time) || (t.Equal(after.Time) && ordinal > after.Ordinal)
+		})
+	}
+	ordered := func(budget int) ([]Row, *Position, bool) {
+		h := &candidates{rows: rows}
+		examined := 0
+		exhausted := false
+		advance := func(runIndex, offset int) {
+			run := runs[runIndex]
+			for offset < len(run) {
+				if budget > 0 && examined >= budget {
+					exhausted = true
+					return
+				}
+				examined++
+				ordinal := run[offset]
+				row := rows[ordinal]
+				if !row.TS.Before(end) {
+					return
+				}
+				if ordinal < count && strings.Contains(row.Line, contains) {
+					heap.Push(h, candidate{ordinal, runIndex, offset})
+					return
+				}
+				offset++
+			}
+		}
+		for i, offset := range offsets {
+			advance(i, offset)
+			if exhausted {
+				return nil, nil, false
+			}
+		}
+		result := make([]Row, 0, min(limit, count))
+		var last candidate
+		for h.Len() > 0 && len(result) < limit {
+			last = heap.Pop(h).(candidate)
+			result = append(result, rows[last.ordinal])
+			if lookahead || len(result) < limit {
+				advance(last.run, last.offset+1)
+				if exhausted {
+					return nil, nil, false
+				}
+			}
+		}
+		var next *Position
+		if h.Len() > 0 {
+			next = &Position{rows[last.ordinal].TS, last.ordinal}
+		}
+		return result, next, true
+	}
+	if wide {
+		// Bound work even for absent literals and runs containing newer rows.
+		budget := 512
+		if limit > budget/2 {
+			budget = min(limit, 2048) * 2
+		}
+		if result, next, complete := ordered(budget); complete {
+			return result, count, next, true
+		}
 		possible := make([]int, 0)
 		possibleRows := 0
 		for first := 0; first < count; first += blockSize {
@@ -272,47 +342,7 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			return result, count, next, true
 		}
 	}
-	h := &candidates{rows: rows}
-	// Each run is sorted, so skip nonmatches before placing its next row in the heap.
-	advance := func(runIndex, offset int) {
-		run := runs[runIndex]
-		for offset < len(run) {
-			ordinal := run[offset]
-			row := rows[ordinal]
-			if !row.TS.Before(end) {
-				return
-			}
-			if ordinal < count && strings.Contains(row.Line, contains) {
-				heap.Push(h, candidate{ordinal, runIndex, offset})
-				return
-			}
-			offset++
-		}
-	}
-	for i, run := range runs {
-		offset := sort.Search(len(run), func(j int) bool {
-			ordinal := run[j]
-			t := rows[ordinal].TS
-			if t.Before(start) {
-				return false
-			}
-			return after == nil || t.After(after.Time) || (t.Equal(after.Time) && ordinal > after.Ordinal)
-		})
-		advance(i, offset)
-	}
-	result := make([]Row, 0, limit)
-	var last candidate
-	for h.Len() > 0 && len(result) < limit {
-		last = heap.Pop(h).(candidate)
-		result = append(result, rows[last.ordinal])
-		if lookahead || len(result) < limit {
-			advance(last.run, last.offset+1)
-		}
-	}
-	var next *Position
-	if h.Len() > 0 {
-		next = &Position{rows[last.ordinal].TS, last.ordinal}
-	}
+	result, next, _ := ordered(0)
 	return result, count, next, true
 }
 

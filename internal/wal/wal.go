@@ -30,15 +30,28 @@ type file interface {
 }
 type Log struct {
 	mu        sync.Mutex
+	cond      *sync.Cond
+	queue     []*appendRequest
+	running   bool
 	f         file
 	s         *store.Store
 	offset    int64
 	poisoned  bool
 	closed    bool
+	closeDone bool
+	closeErr  error
 	committed bool
 	root      *os.Root
 	dir       *os.File
 	syncDir   func() error
+}
+
+const maxGroup = 16
+
+type appendRequest struct {
+	payload []byte
+	rows    []store.Row
+	done    chan error
 }
 
 func openRegular(dir *os.File, name string, flags int) (*os.File, error) {
@@ -322,58 +335,112 @@ func writeAll(w io.Writer, p []byte) error {
 	}
 	return nil
 }
+func (l *Log) initCond() {
+	if l.cond == nil {
+		l.cond = sync.NewCond(&l.mu)
+	}
+}
+
+// Append waits for admission and for its entire batch to become durable and visible.
 func (l *Log) Append(payload []byte, rows []store.Row) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.initCond()
+	for len(l.queue) >= maxGroup && !l.closed && !l.poisoned {
+		l.cond.Wait()
+	}
 	if l.poisoned {
+		l.mu.Unlock()
 		return ErrUncertain
 	}
 	if l.closed {
+		l.mu.Unlock()
 		return os.ErrClosed
 	}
-	h := make([]byte, 16)
-	n := uint32(len(payload))
-	binary.LittleEndian.PutUint32(h, n)
-	binary.LittleEndian.PutUint32(h[4:], ^n)
-	binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(payload, table))
-	binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
-	err := writeAll(l.f, h)
-	if err == nil {
-		err = writeAll(l.f, payload)
+	req := &appendRequest{payload: payload, rows: rows, done: make(chan error, 1)}
+	l.queue = append(l.queue, req)
+	if !l.running {
+		l.running = true
+		go l.run()
 	}
-	if err == nil {
-		err = l.f.Sync()
+	l.mu.Unlock()
+	return <-req.done
+}
+
+func (l *Log) run() {
+	for {
+		l.mu.Lock()
+		if len(l.queue) == 0 {
+			l.running = false
+			l.cond.Broadcast()
+			l.mu.Unlock()
+			return
+		}
+		group := l.queue
+		l.queue = nil
+		l.cond.Broadcast()
+		l.mu.Unlock()
+
+		err := l.appendGroup(group)
+		l.mu.Lock()
+		if errors.Is(err, ErrUncertain) {
+			l.poisoned = true
+			for _, req := range l.queue {
+				req.done <- ErrUncertain
+			}
+			l.queue = nil
+			l.cond.Broadcast()
+		}
+		for _, req := range group {
+			req.done <- err
+		}
+		l.mu.Unlock()
 	}
-	if err != nil {
+}
+
+func (l *Log) appendGroup(group []*appendRequest) error {
+	next := l.offset
+	for _, req := range group {
+		var h [16]byte
+		n := uint32(len(req.payload))
+		binary.LittleEndian.PutUint32(h[:], n)
+		binary.LittleEndian.PutUint32(h[4:], ^n)
+		binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(req.payload, table))
+		binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
+		if err := writeAll(l.f, h[:]); err != nil {
+			return l.rollback(err)
+		}
+		if err := writeAll(l.f, req.payload); err != nil {
+			return l.rollback(err)
+		}
+		next += int64(len(h) + len(req.payload))
+	}
+	if err := l.f.Sync(); err != nil {
 		return l.rollback(err)
 	}
-	next := l.offset + int64(len(h)+len(payload))
 	if l.root != nil {
 		replaced, err := l.commit(next)
 		if err != nil {
 			if !replaced {
 				return l.rollback(err)
 			}
-			l.poisoned = true
 			return ErrUncertain
 		}
 	}
 	l.offset = next
-	l.s.Publish(rows)
+	for _, req := range group {
+		l.s.Publish(req.rows)
+	}
 	return nil
 }
 
 func (l *Log) rollback(err error) error {
 	if e := l.f.Truncate(l.offset); e != nil {
-		l.poisoned = true
 		return ErrUncertain
 	}
 	if e := l.f.Sync(); e != nil {
-		l.poisoned = true
 		return ErrUncertain
 	}
 	if _, e := l.f.Seek(l.offset, io.SeekStart); e != nil {
-		l.poisoned = true
 		return ErrUncertain
 	}
 	return err
@@ -415,10 +482,18 @@ func (l *Log) commit(offset int64) (bool, error) {
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.initCond()
 	if l.closed {
-		return nil
+		for !l.closeDone {
+			l.cond.Wait()
+		}
+		return l.closeErr
 	}
 	l.closed = true
+	l.cond.Broadcast()
+	for l.running {
+		l.cond.Wait()
+	}
 	err := l.f.Close()
 	if l.dir != nil {
 		if e := l.dir.Close(); err == nil {
@@ -430,5 +505,8 @@ func (l *Log) Close() error {
 			err = e
 		}
 	}
+	l.closeErr = err
+	l.closeDone = true
+	l.cond.Broadcast()
 	return err
 }

@@ -4,10 +4,12 @@ import (
 	"bog/internal/store"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -605,5 +607,186 @@ func TestRejectUnsafePermissions(t *testing.T) {
 				t.Fatal("accepted unsafe permissions")
 			}
 		})
+	}
+}
+
+type groupFile struct {
+	*os.File
+	writes, syncs    int
+	failWrite        int
+	entered, release chan struct{}
+}
+
+func (f *groupFile) Write(p []byte) (int, error) {
+	f.writes++
+	if f.writes == f.failWrite {
+		return 0, errors.New("injected later frame failure")
+	}
+	return f.File.Write(p)
+}
+func (f *groupFile) Sync() error {
+	f.syncs++
+	if f.entered != nil && f.syncs == 1 {
+		close(f.entered)
+		<-f.release
+	}
+	return f.File.Sync()
+}
+
+func TestGroupFramesAndRollback(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "wal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			gf := &groupFile{File: f}
+			if fail {
+				gf.failWrite = 4
+			}
+			l := &Log{f: gf, s: &store.Store{}}
+			a := []byte(`{"ts":"2025-01-01T00:00:00Z","line":"first"}`)
+			b := []byte(`{"ts":"2025-01-01T00:00:00Z","line":"second"}`)
+			ar, _ := store.Decode(a)
+			br, _ := store.Decode(b)
+			err = l.appendGroup([]*appendRequest{{payload: a, rows: ar}, {payload: b, rows: br}})
+			if fail {
+				if err == nil || errors.Is(err, ErrUncertain) {
+					t.Fatalf("failure: %v", err)
+				}
+				if end, _ := f.Seek(0, io.SeekEnd); end != 0 {
+					t.Fatalf("rollback size %d", end)
+				}
+				if err = l.Append(a, ar); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err != nil || gf.syncs != 1 {
+				t.Fatalf("err=%v syncs=%d", err, gf.syncs)
+			}
+			data, err := os.ReadFile(f.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data[16:16+len(a)]) != string(a) || string(data[32+len(a):]) != string(b) {
+				t.Fatal("frame order")
+			}
+			rows := l.s.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10)
+			if len(rows) != 2 || rows[0].Line != "first" || rows[1].Line != "second" {
+				t.Fatalf("publication order: %+v", rows)
+			}
+		})
+	}
+}
+
+func TestQueuedGroupAndClose(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gf := &groupFile{File: f, entered: make(chan struct{}), release: make(chan struct{})}
+	l := &Log{f: gf, s: &store.Store{}}
+	rows, _ := store.Decode(batch)
+	results := make(chan error, 4)
+	go func() { results <- l.Append(batch, rows) }()
+	<-gf.entered
+	// Admit the remaining requests in a known order while the first sync is blocked.
+	for i := 0; i < 3; i++ {
+		go func() { results <- l.Append(batch, rows) }()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			l.mu.Lock()
+			n := len(l.queue)
+			l.mu.Unlock()
+			if n == i+1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("request was not queued")
+			}
+			runtime.Gosched()
+		}
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- l.Close() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		l.mu.Lock()
+		c := l.closed
+		l.mu.Unlock()
+		if c {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("close did not start")
+		}
+		runtime.Gosched()
+	}
+	if err := l.Append(batch, rows); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("append during close: %v", err)
+	}
+	close(gf.release)
+	for i := 0; i < 4; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if gf.syncs != 2 {
+		t.Fatalf("got %d WAL syncs for two groups", gf.syncs)
+	}
+}
+
+type blockingCloseFile struct {
+	*groupFile
+	closeEntered chan struct{}
+	closeRelease chan struct{}
+}
+
+func (f *blockingCloseFile) Close() error {
+	close(f.closeEntered)
+	<-f.closeRelease
+	return f.File.Close()
+}
+
+func TestConcurrentCloseWaitsForDescriptors(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bf := &blockingCloseFile{
+		groupFile:    &groupFile{File: f, entered: make(chan struct{}), release: make(chan struct{})},
+		closeEntered: make(chan struct{}), closeRelease: make(chan struct{}),
+	}
+	l := &Log{f: bf, s: &store.Store{}}
+	rows, _ := store.Decode(batch)
+	appended := make(chan error, 1)
+	go func() { appended <- l.Append(batch, rows) }()
+	<-bf.entered
+	closed := make(chan error, 2)
+	go func() { closed <- l.Close() }()
+	go func() { closed <- l.Close() }()
+	close(bf.release)
+	<-bf.closeEntered
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before the file was closed: %v", err)
+	default:
+	}
+	close(bf.closeRelease)
+	if err := <-appended; err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-closed; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("file still open: %v", err)
 	}
 }

@@ -46,24 +46,29 @@ func buildBlock(rows []Row) *blockFilter {
 	}
 	return b
 }
-func (b *blockFilter) mayContain(literal string) bool {
-	if b == nil {
-		return true
-	}
-	// Any subset of required grams is safe. Cap probe work for long literals.
+
+// literalProbes computes bit positions once for all blocks in a query.
+func literalProbes(literal string) []uint64 {
 	grams := len(literal) - 3
-	probes := grams
-	if probes > 32 {
-		probes = 32
-	}
+	probes := min(grams, 32)
+	bits := make([]uint64, 0, probes*3)
 	for i := 0; i < probes; i++ {
 		pos := i * (grams - 1) / max(1, probes-1)
 		hash := gramHash(literal[pos : pos+4])
 		for j := uint64(0); j < 3; j++ {
-			bit := (hash + j*(hash>>32|1)) % (bitmapWords * 64)
-			if b.bits[bit/64]&(uint64(1)<<(bit%64)) == 0 {
-				return false
-			}
+			bits = append(bits, (hash+j*(hash>>32|1))%(bitmapWords*64))
+		}
+	}
+	return bits
+}
+
+func (b *blockFilter) mayContainProbes(bits []uint64) bool {
+	if b == nil {
+		return true
+	}
+	for _, bit := range bits {
+		if b.bits[bit/64]&(uint64(1)<<(bit%64)) == 0 {
+			return false
 		}
 	}
 	return true

@@ -20,6 +20,17 @@ func requireIntegrity(t testing.TB, op string, err, integrity error) {
 	}
 }
 
+func assertRestoreParent(t testing.TB, parent string, want ...string) {
+	t.Helper()
+	guard := filepath.Join(parent, backupGuard)
+	info, err := os.Lstat(guard)
+	must(t, err)
+	if info.Mode() != 0600 || info.Size() != 0 {
+		t.Fatalf("restore guard %s has mode %s and size %d, want an empty regular file with mode 0600", guard, info.Mode(), info.Size())
+	}
+	assertChildren(t, parent, append([]string{backupGuard}, want...)...)
+}
+
 func rejectBackup(t testing.TB, source, parent string) {
 	t.Helper()
 	dest := filepath.Join(parent, "absent")
@@ -30,10 +41,9 @@ func rejectBackup(t testing.TB, source, parent string) {
 	}
 	for _, path := range []string{dest, placeholder} {
 		requireIntegrity(t, "restore", backup.Restore(t.Context(), source, path), backup.ErrIntegrity)
+		assertRestoreParent(t, parent, "placeholder")
+		assertChildren(t, placeholder)
 	}
-	// Check the absent path, the empty placeholder, and the staging namespace.
-	assertChildren(t, parent, "placeholder")
-	assertChildren(t, placeholder)
 }
 
 func runBackupCorpus(t *testing.T, f fixture) {
@@ -55,7 +65,7 @@ func runBackupCorpus(t *testing.T, f fixture) {
 			if err := backup.Restore(t.Context(), source, existing); err == nil || errors.Is(err, backup.ErrPublicationUncertain) {
 				t.Fatalf("restore over an existing image returned %v", err)
 			}
-			assertChildren(t, root, "destinations", "existing", "malformed")
+			assertRestoreParent(t, root, "destinations", "existing", "malformed")
 			assertFiles(t, source, image)
 			assertFiles(t, existing, f.image)
 			assertRestored(t, existing, f.point, f.rows)
@@ -145,12 +155,12 @@ func FuzzBackup(f *testing.F) {
 				t.Fatalf("failed verification returned point %+v", point)
 			}
 			requireIntegrity(t, "restore", backup.Restore(t.Context(), source, dest), backup.ErrIntegrity)
-			assertChildren(t, root, "bundle")
+			assertRestoreParent(t, root, "bundle")
 			return
 		}
 		must(t, backup.Restore(t.Context(), source, dest))
 		assertRestored(t, dest, point, nil)
-		assertChildren(t, root, "bundle", "restore")
+		assertRestoreParent(t, root, "bundle", "restore")
 	})
 }
 

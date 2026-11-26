@@ -1,8 +1,9 @@
 # ADR 0007 — Runtime storage composition
 
-**Status** — Cycle 51 decision for the #53 wiring merge. At base
-`5782ab3a08341cfb159a39bbf982f61482f4177c`, the command serves the ordinary
-WAL and an in-memory query view. Checkpoint, history, and backup are staged.
+**Status** — Accepted composition decision. The Linux production inventory
+at `9bf89aa4c5a173833bd8fb70d088ac0a257e20a8` shows the command serving the
+ordinary WAL and an in-memory query view. Checkpoint, history, and backup
+remain staged until #53 wiring lands.
 
 This decision specifies the command composition for the
 [retained-history cutover](0004-retained-history-cutover.md),
@@ -21,6 +22,16 @@ request, result, and cursor types at the consumer boundary and avoids adding
 a production adapter package. The command supplies the storage libraries
 with readers, bounds, and pins. Checkpoint, history, and backup must have no
 direct or transitive production dependency on `internal/wal`.
+
+The reviewed #59 candidate (`9352f5b2997dd2cf386c13ea42c897c9ce91abe1`)
+passes a `store.QueryWork` budget to `Page`, replays each certified source
+anchor and limit, owns release of successful acquisitions, and exposes
+`API.Close(ctx)` for capture drain. The base components expose
+`wal.Log.Capture` and `history.Catalog.AcquireCurrent` as separate
+operations. #53 must coordinate them with commit publication and generation
+activation. History's current matching-row visitor omits seek, filter, and
+exhaustion costs. The retained source must meter that work where it occurs
+and reproduce it on replay.
 
 | Directory state under the owner lock | Recovery input |
 | --- | --- |
@@ -103,24 +114,37 @@ and pinned directory. Surface cleanup failures. If the drain deadline passes,
 leave the owner locked until process exit so active users cannot overlap a
 second writer.
 
+## Backup destination retry
+
+`bog-storage` owns the destination publication protocol for export and restore.
+The reviewed coordinator candidate keys a lock and stage by destination name
+within a pinned parent. A retry must establish stage ownership under that
+lock before reclaiming interrupted output. Preserve an existing published
+destination and unrelated entries. Exercise a process interruption before
+rename and a retry after a rename or sync reports an uncertain result.
+Verify the resulting image and confirm that the retry cannot replace a
+published destination or delete staging owned by another writer. This
+evidence belongs to storage publication and is pending integration with
+the backup entry points.
+
 ## Ownership and release gate
 
-The bog architecture maintainer owns this decision and reviews the command
-seam with `bog-storage` and the #59 owner before composition. `bog-storage`
-owns #53 recovery, capture, and live compaction. `bog-query` owns #59 and
-the HTTP paging contract.
+`bog` owns this decision, the fitness registry, and #59 HTTP paging.
+`bog-storage` owns #53 recovery, capture, live compaction, and backup
+publication. ADR 0006 names the durable query specialty. The active owner
+for #59 is `bog`.
 
-After #61 releases its read lease on `internal/archtest/architecture_test.go`,
-acquire the registry write lease for the #53 wiring merge. Derive actual
-Linux production roles and direct edges from the tree with #53 and #59
-composed. Update the observed diagram and registry together, promoting only
-reachable packages and removing retired edges. Run
+Compose the #53, #59, and #61 domain commits before measuring the cutover
+tree. Update the observed diagram and registry together, promoting each
+staged package the server reaches and removing retired edges. Run
 `go test -count=1 ./internal/archtest` and
 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` before merge.
 [System architecture](../architecture/SYSTEM.md#fitness-and-registry-ownership)
 
-#53 remains the release gate. Qualify one binary from the full composed
-commit SHA. Require exact fixed-budget walks, a held cursor across live
+#53 gates retained-history cutover, and #60 follows the #53 command lease.
+Full release qualification stays pending through #60. Qualify one Linux
+binary from the full composed candidate SHA. Require exact fixed-budget
+walks, a held cursor across live
 generation replacement with acknowledged backfill, and fresh walks after
 restart. Start that binary on a verified restore, append through HTTP, and
 verify the exact augmented history after restart. Require the remaining

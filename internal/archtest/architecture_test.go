@@ -108,9 +108,17 @@ func TestLinuxArchitecture(t *testing.T) {
 		}
 		packages[pkg.ImportPath] = pkg
 	}
-	for _, problem := range architectureProblems(packages, registry) {
+	for _, problem := range linuxGraphProblems(packages, registry) {
 		t.Error(problem)
 	}
+}
+
+func linuxGraphProblems(packages map[string]listedPackage, rules map[string]rule) []string {
+	problems := architectureProblems(packages, rules)
+	problems = append(problems, pagingBoundaryProblems(packages)...)
+	problems = append(problems, storageAuthorityProblems(packages)...)
+	problems = append(problems, queryOracleProblems(packages, rules)...)
+	return problems
 }
 
 func architectureProblems(packages map[string]listedPackage, rules map[string]rule) []string {
@@ -131,6 +139,14 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 
 	for _, path := range slices.Sorted(maps.Keys(rules)) {
 		r := rules[path]
+		switch r.role {
+		case runtimeLibrary, serverCommand, staged, standalone, testOnly, verifier, verifierModel:
+			if (path == server) != (r.role == serverCommand) {
+				problems = append(problems, fmt.Sprintf("invalid server command registration: %s has role %q, only %s may be the server command", path, r.role, server))
+			}
+		default:
+			problems = append(problems, fmt.Sprintf("%s has unknown architecture role %q", path, r.role))
+		}
 		pkg, exists := local[path]
 		switch {
 		case !exists:
@@ -178,7 +194,11 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 				problems = append(problems, fmt.Sprintf("forbidden production import: %s -> %s", path, imported))
 			}
 		}
-		for _, imported := range r.imports {
+		for i, imported := range r.imports {
+			if slices.Contains(r.imports[:i], imported) {
+				problems = append(problems, fmt.Sprintf("duplicate production import registration: %s -> %s", path, imported))
+				continue
+			}
 			if _, isLocal := production[imported]; !isLocal || !slices.Contains(imports, imported) {
 				problems = append(problems, fmt.Sprintf("stale production import registration: %s -> %s", path, imported))
 			}
@@ -229,11 +249,6 @@ func storageDirectionProblems(packages map[string]listedPackage, production map[
 			if reached[to] {
 				problems = append(problems, fmt.Sprintf("forbidden storage dependency: %s -> %s", from, to))
 			}
-		}
-	}
-	for _, to := range []string{"bog/internal/backup", "bog/internal/checkpoint", "bog/internal/history"} {
-		if slices.Contains(production[httpapi], to) {
-			problems = append(problems, fmt.Sprintf("HTTP must use the page source seam: %s -> %s", httpapi, to))
 		}
 	}
 	return problems

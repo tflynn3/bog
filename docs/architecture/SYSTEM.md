@@ -15,15 +15,16 @@ trusted network or behind an authenticated access layer.
 
 ## Observed Linux production imports
 
-These are the direct imports between root-module production packages at
-`d67892082f0ea3e9a951e55076d5eb80127bf031`, listed for Linux amd64 with
-cgo disabled. Arrows point from importer to dependency. Test-only packages
-are listed in the registry below. Nodes with no outgoing arrows have zero
-direct root-module production imports.
+These are the direct imports between root-module production packages measured
+at integration base `9bf89aa4c5a173833bd8fb70d088ac0a257e20a8` with
+`GOOS=linux GOARCH=amd64 GOAMD64=v1 CGO_ENABLED=0`. Arrows point from
+importer to dependency. The package registry includes the Linux test-only
+packages. Nodes with no outgoing arrows have zero direct root-module
+production imports.
 
 ```mermaid
 flowchart TD
-    subgraph Runtime["Server and reachable libraries"]
+    subgraph Runtime["Wired Linux server (legacy WAL recovery)"]
         Cmd["cmd/bog"]
         HTTP["internal/httpapi"]
         Ready["internal/readiness"]
@@ -49,7 +50,7 @@ flowchart TD
     Checkpoint --> Store
     History --> Store
     Backup --> Store
-    subgraph Evidence["Release evidence commands"]
+    subgraph Evidence["Linux release evidence commands"]
         Admission["verify/release"]
         Durability["verify/linux"]
         Capacity["bench/retained-history"]
@@ -82,13 +83,13 @@ flowchart TD
   [ADR 0003](../adr/0003-wal-capture-and-restored-image-startup.md) records
   the startup guard and capture design.
 
-## Pending imports and role changes
+## Integration status
 
-| Wiring | Expected graph or role change |
+| Domain change | Review and next integration boundary |
 | --- | --- |
-| #53 with #59 | `cmd/bog` wires the retained adapter to the WAL owner and retained libraries. Promote checkpoint, history, and backup from staged to wired when the Linux server reaches them. Record the command's actual direct imports and any edges retired by the wiring. |
-| Release client integration | Expect `verify/release` to import `internal/client` for paging. Register a separate `verify/release` import of `verify/query-model` if the semantic comparison uses it from production verifier code. Restored-parity test imports are outside the production graph. The client remains standalone and the oracle remains verifier support. |
-| Crash-safe backup staging | Storage owns the publication lifecycle for staging and cleanup. Apply any graph changes with the production imports that introduce them. Runtime reachability determines backup's role. |
+| #53 with #59 | The pinned tree still opens the legacy WAL and serves the in-memory query view. The reviewed #59 candidate supplies the consumer-owned `PageSource`. The #53 command composition must supply the retained implementation, synchronized capture, and recovery activation. Remeasure the production graph when both domain changes land and promote each library the server reaches. |
+| #61 verifier composition | The reviewed candidate adds the production edge `verify/release → internal/client` for budget walks. Register it when the candidate lands. Restored-parity test imports of the oracle remain outside the production graph. |
+| Crash-safe backup staging | The base's export and restore share a publisher that creates a stage per attempt. The storage candidate supplies a destination publication coordinator. Wire it into those entry points and prove that retries reclaim interrupted stages while preserving durable destinations and unrelated files. |
 
 ## Retained-history handoff
 
@@ -119,10 +120,12 @@ Writable restore establishes checkpoint and tail recovery authority before
 listening, and restart selects that writable authority. The opt-in loopback
 capacity control drives replacement through the same owner.
 
-ADRs 0006 and 0007 are the interface contract for core engineering and
-`bog-storage`. At their review, confirm deterministic replay, captured-view
-expiry, reference ownership, and commit and capture ordering. ADR 0005
-governs the lifecycle handoff. The owner keeps the directory pinned through
+ADRs 0006 and 0007 are the interface contract for `bog` and `bog-storage`.
+The #59 candidate meters source work on each call and replays the original
+source anchor and limit. The current history scanner exposes a matching-row
+visitor, so the retained implementation needs a metering seam for seeks,
+nonmatching rows, and exhaustion. ADR 0005 governs the lifecycle handoff.
+The owner keeps the directory pinned through
 activation, publication, and storage drain. `cmd/bog` owns the separate
 readiness probe handle in #60, while readiness borrows it to sample disk
 headroom and observes WAL outcomes. Capture, paging, and export references
@@ -172,19 +175,20 @@ process restart. [Ingest retry contract](../ingest-retries.md)
 
 | Rank | Property | Trade-off |
 | --- | --- | --- |
-| 1 | Durability | Wait for durable whole-batch commit before acknowledging. Sync staged data and directory publication before activating new authority. Stop on uncertain writes or committed corruption, even when availability suffers. |
-| 2 | Exact queries | Preserve ordered membership through restart and, at cutover, through compaction and verified restore. Spend work before issuing a cursor to certify the full walk. Client-based qualification adds a separate comparison of ordered rows against fixture history. |
-| 3 | Bounded resources | Limit captures, concurrent scans, request work, and response bytes. At cutover, bound the writable tail and retain pinned generations through cursor expiry and operation drain. Pins delay disk reclamation, and v1 format compatibility costs disk space for a readable WAL prefix. Staged backup files also consume space until publication or safe cleanup. |
-| 4 | Recovery time | The base replays the committed WAL before opening the listener. Cutover trades checkpoint validation before startup for bounded tail replay. |
+| 1 | Durability | Acknowledge whole batches after durable commit and query publication. At cutover, validate and sync new recovery authority before use. Retried backup publication must preserve complete destinations and reclaim only proven protocol-owned staging. |
+| 2 | Exact queries | Preserve append-ordered ties, duplicates, and captured membership through restart and, at cutover, through compaction and writable restore. Certify fixed-budget walks before issuing a cursor. Use fixture-derived expectations for parity. |
+| 3 | Bounded resources | Limit concurrent scans, request work, and response bytes. At cutover, also bound retained captures and the writable tail. Pins defer reclamation through expiry and operation drain. V1 compatibility retains a readable WAL prefix. |
+| 4 | Recovery time | The pinned base replays the committed WAL before listening. Cutover trades checkpoint validation before startup for bounded tail replay. |
 | 5 | Throughput | Share syncs across admitted writes and prune provably irrelevant scan work. Hashing the v1 prefix for publication and export consumes disk bandwidth. |
 
 ## Release evidence
 
-#53 remains the retained-history release gate and qualifies the composed
-#53 and #59 runtime. The workflow builds one clean Go 1.27.0 candidate on
-Ubuntu 24.04 amd64 from the supplied full SHA and supplies the same binary
-to four evidence sources. Every report must match the revision, binary
-SHA-256, and `linux-release-v1` fixture.
+#53 gates retained-history cutover. Full qualification uses the #53 and
+#59 runtime, #61 paging probes, and #60 readiness handoff. The workflow
+builds one clean Go 1.27.0 candidate on Ubuntu 24.04 amd64 from the supplied
+full SHA and supplies the same binary to four evidence sources. Every
+report must match the revision, binary SHA-256, and `linux-release-v1`
+fixture.
 [Linux release workflow](../../.github/workflows/linux-release.yml)
 
 | Source | Report | Required evidence |
@@ -201,64 +205,57 @@ step also runs the bounded backup and history corruption corpus in
 run records a baseline.
 [Release verifier contract](../../verify/release/README.md)
 
-The release client integration will use `internal/client` to qualify
-complete NDJSON pages and opaque continuation handling. The verifier derives
+The #61 candidate uses `internal/client` for complete NDJSON pages and opaque
+continuation handling in the fixed-budget probes. The verifier derives
 expected membership, order, and snapshot cutoffs from the fixture and its
 acknowledged appends. Low-level transport probes still supply evidence for
 TCP backpressure and wire-level rejection. [ADR 0008](../adr/0008-release-verifier-composition.md)
 
 ## Fitness and registry ownership
 
-Core engineering owns the architecture record and fitness registry, #59's
-HTTP paging contract, and production-client release integration.
-`bog-storage` owns #53, composes the retained adapter in `cmd/bog`, and
-owns recovery and publication, including crash-safe backup staging. #60
-follows the command lease handoff, and #63 follows cutover.
+`bog` owns the architecture record, fitness registry, #59 HTTP paging, and
+#61 production-client verification. `bog-storage` owns #53 runtime wiring,
+recovery, and backup publication. #60 follows the #53 command lease, #63
+follows cutover, and #18 remains queued.
 
-The #61 read lease on `internal/archtest/architecture_test.go` has cleared.
-For the #53 wiring PR, core engineering and `bog-storage` coordinate the
-graph and registry update under the wiring PR's write leases. Review both
-sides of the current merge base, then measure the Linux production graph
-with #53 and #59 composed. Update the measured revision, diagram, direct
-edges, promotions, and retired entries together with their production
-wiring. Apply the same rule to the production-client edge in the PR that
-adds it.
+The integration PR takes the domain implementation commits for #53, #59,
+and #61 and measures their combined Linux tree. Update the measured
+revision, diagram, registry role changes, and each added or retired edge
+with the domain wiring. The available #59 and #61 candidates change paths
+owned by their domain PRs. The pinned architecture tree has neither change,
+and no #53 runtime implementation was available for this measurement.
 [Fitness registry](../../internal/archtest/architecture_test.go)
 
 The Architecture workflow runs `go test -count=1 ./internal/archtest`.
 The suite lists packages with `GOOS=linux GOARCH=amd64 GOAMD64=v1
 CGO_ENABLED=0` and `GOENV=off GOFLAGS= GO111MODULE=on GOWORK=off`. It checks
-production imports within the root module and follows all listed dependencies
-for server reachability. Host-only files, test imports, and nested modules
-are outside the production import registry. Package loading errors, cycles,
-unregistered packages, incorrect roles, forbidden imports, and stale
-registered imports fail the suite. The registry requires `verify/fuzz` to
-have Linux test files only. A storage dependency on HTTP, readiness, or the
-Go HTTP client fails even when it is transitive or all direct edges are
-registered. The companion paging check rejects any root-module production
-path from HTTP to checkpoint, history, or backup, including a fully
-registered path through an intermediate package. Its fixtures exercise
-both command-owned adapter wiring and HTTP bypasses.
+production imports within the root module and follows all listed production
+dependencies for reachability and boundary checks. Host-only files, test
+imports, and nested modules are outside the production import registry.
+Package loading errors, cycles, unregistered packages, incorrect roles,
+and forbidden, duplicate, or stale registered imports fail the suite.
+`verify/fuzz` must contain Linux test files only. Storage cannot reach HTTP,
+readiness, or the Go HTTP client. The paging check rejects any production
+path from HTTP to checkpoint, history, or backup. Its fixtures exercise
+command-owned adapter wiring and bypasses through local and external packages.
 [Paging boundary check](../../internal/archtest/cutover_boundaries_test.go)
 
-The storage authority check rejects direct and transitive root-module
-production paths from checkpoint, history, or backup to `internal/wal`,
-including paths whose edges are all registered. Its fixtures cover valid
-command-local composition and bypasses through a registered intermediary.
+The storage authority check rejects direct and transitive production paths
+from checkpoint, history, or backup to `internal/wal`, even through a
+registered or external intermediary.
 [Storage authority check](../../internal/archtest/storage_authority_test.go)
 
-The oracle independence check follows registered root-module production
-edges from `verify/query-model` and rejects reachability to the production
-client or a server command, wired library, or staged runtime library.
+The oracle independence check follows production edges from
+`verify/query-model` and rejects reachability to the production client,
+the server command, or a wired or staged library.
 Fixtures run the existing registry checks on the allowed verifier-to-client
 and verifier-to-oracle edges and on fully registered paths that violate
 oracle independence.
 [Oracle independence check](../../internal/archtest/verifier_boundaries_test.go)
 
-Run
-`go test -count=1 ./internal/archtest` and
-`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on this PR. Repeat both
-on the composed tree before dispatching the #53 release gate with its full commit
-SHA. Qualification requires the same Linux binary to pass verified restore,
-fixed-budget pagination, readiness on the active WAL filesystem, and the other
-checks in the existing gate.
+Run `go test -count=1 ./internal/archtest` and
+`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on the composed tree.
+Slipway runs the Linux integration verifier. Full release qualification stays
+pending through #60, when the gate can exercise readiness on the active WAL
+filesystem along with live compaction, writable restore, and fixed-budget
+query parity on one SHA-pinned binary.

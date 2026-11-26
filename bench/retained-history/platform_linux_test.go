@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -25,14 +26,15 @@ func TestChildCapacityControlEnvironment(t *testing.T) {
 				"#!/bin/sh\nprintf '%s/%s' \"${BOG_CAPACITY_CONTROL-unset}\" \"$BOG_CAPACITY_TEST_SENTINEL\" > observed\n"), 0700); err != nil {
 				t.Fatal(err)
 			}
+			if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
 			p, _, err := startChild(candidate, dir, dir, tc.mode)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() {
-				if err := p.stop(); err != nil {
-					t.Error(err)
-				}
+				testReap(t, p)
 			})
 			select {
 			case <-p.done:
@@ -53,8 +55,14 @@ func TestChildReapedOnFailedCgroupPlacement(t *testing.T) {
 	if err := os.WriteFile(candidate, []byte("#!/bin/sh\nexit 17\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if p, _, err := startChild(candidate, dir, filepath.Join(dir, "missing"), "legacy"); p != nil || !errors.Is(err, os.ErrNotExist) {
+	p, _, err := startChild(candidate, dir, filepath.Join(dir, "missing"), "legacy")
+	if p == nil || !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed cgroup placement: child %v, error %v", p, err)
+	}
+	t.Cleanup(func() { testReap(t, p) })
+	proof, _, err := emptyTeardown().run(p, 20*time.Millisecond, time.Second, nil)
+	if err != nil || !proof.CandidateReaped {
+		t.Fatalf("placement failure cleanup = %+v, %v", proof, err)
 	}
 }
 
@@ -81,13 +89,7 @@ func TestChildExitAndForcedCleanup(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() {
-				select {
-				case <-p.done:
-				default:
-					t.Errorf("child not reaped: %v", p.stop())
-				}
-			})
+			t.Cleanup(func() { testReap(t, p) })
 			if tc.exitCode == -1 {
 				deadline := time.Now().Add(2 * time.Second)
 				for {
@@ -108,7 +110,11 @@ func TestChildExitAndForcedCleanup(t *testing.T) {
 				}
 			}
 			var exit *exec.ExitError
-			if err := p.stop(); !errors.As(err, &exit) || exit.ExitCode() != tc.exitCode ||
+			proof, err, cleanupErr := emptyTeardown().run(p, 20*time.Millisecond, time.Second, func() {})
+			if cleanupErr != nil || proof.Status != "pass" || !proof.CandidateReaped || !proof.SubtreeEmpty || !proof.SubtreeRemoved {
+				t.Fatalf("cleanup = %+v, %v", proof, cleanupErr)
+			}
+			if !errors.As(err, &exit) || exit.ExitCode() != tc.exitCode ||
 				(tc.exitCode == -1 && !strings.Contains(err.Error(), "grace period")) {
 				t.Fatalf("unexpected child exit: %v", err)
 			}
@@ -129,5 +135,25 @@ func TestDeviceIOParsing(t *testing.T) {
 	got, err := deviceIO("253:0 rbytes=0 wbytes=10\n7:1 rbytes=3 wbytes=2\n")
 	if err != nil || len(got) != 2 || got["253:0"]["wbytes"] != 10 || got["7:1"]["rbytes"] != 3 {
 		t.Fatalf("device counters: %v %v", got, err)
+	}
+}
+
+func emptyTeardown() cgroupTeardown {
+	return cgroupTeardown{
+		populated: func() (bool, error) { return false, nil },
+		kill:      func() error { return errors.New("unexpected kill on empty subtree") },
+		remove:    func(context.Context) error { return nil },
+	}
+}
+
+func testReap(t *testing.T, p *child) {
+	t.Helper()
+	if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Error(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !waitChild(ctx, p.done) {
+		t.Error("child was not reaped")
 	}
 }

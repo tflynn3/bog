@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "revision": "efb5f059f5ad7ab04e3321f33c4c7a4b2f7ea605",
+  "binary_sha256": "8b8bb15fb05f9e97f36c2e428c61f01b1c9de0cf42e149e27d62cfd17598c3ff",
+  "fixture": "linux-release-v1",
+  "mode": "live",
+  "cases": {
+    "retained_history_capacity": {
+      "status": "fail",
+      "detail": "196608 seed rows, live_capability: live compaction status HTTP 404: 404 page not found\n\n393216 seed rows, live_capability: live compaction status HTTP 404: 404 page not found\n",
+      "evidence": [
+        {
+          "fixture": {
+            "seed_rows": 196608,
+            "tail_rows": 2048,
+            "line_bytes": 1024,
+            "batch_rows": 64,
+            "memory_limit_bytes": 134217728
+          },
+          "phase": "live_capability",
+          "status": "fail",
+          "workload_status": "fail",
+          "detail": "live compaction status HTTP 404: 404 page not found\n",
+          "timed_out": false,
+          "start_to_ready_ns": 377704722,
+          "restart_to_ready_ns": null,
+          "ingest_p99_ns": null,
+          "backfill_query_p99_ns": null,
+          "ingest_samples": 0,
+          "backfill_query_samples": 0,
+          "recovered_rows": 0,
+          "cleanup": {
+            "status": "pass",
+            "candidate_reaped": true,
+            "subtree_empty": true,
+            "subtree_removed": true
+          },
+          "cgroup_peak_memory_bytes": 2220032,
+          "peak_rss_bytes": 7471104,
+          "peak_descriptors": 11,
+          "device_io": {
+            "253:0": {
+              "dbytes": 0,
+              "dios": 0,
+              "rbytes": 0,
+              "rios": 0,
+              "wbytes": 8192,
+              "wios": 2
+            }
+          },
+          "initial_disk_free_bytes": 6487986176,
+          "minimum_disk_headroom_bytes": 6487977984,
+          "unavailable": {
+            "backfill_query_p99": "no sample collected",
+            "ingest_p99": "no sample collected",
+            "restart_to_ready": "no sample collected"
+          }
+        },
+        {
+          "fixture": {
+            "seed_rows": 393216,
+            "tail_rows": 2048,
+            "line_bytes": 1024,
+            "batch_rows": 64,
+            "memory_limit_bytes": 134217728
+          },
+          "phase": "live_capability",
+          "status": "fail",
+          "workload_status": "fail",
+          "detail": "live compaction status HTTP 404: 404 page not found\n",
+          "timed_out": false,
+          "start_to_ready_ns": 215411865,
+          "restart_to_ready_ns": null,
+          "ingest_p99_ns": null,
+          "backfill_query_p99_ns": null,
+          "ingest_samples": 0,
+          "backfill_query_samples": 0,
+          "recovered_rows": 0,
+          "cleanup": {
+            "status": "pass",
+            "candidate_reaped": true,
+            "subtree_empty": true,
+            "subtree_removed": true
+          },
+          "cgroup_peak_memory_bytes": 2195456,
+          "peak_rss_bytes": 7995392,
+          "peak_descriptors": 11,
+          "device_io": {
+            "253:0": {
+              "dbytes": 0,
+              "dios": 0,
+              "rbytes": 0,
+              "rios": 0,
+              "wbytes": 8192,
+              "wios": 2
+            }
+          },
+          "initial_disk_free_bytes": 6487986176,
+          "minimum_disk_headroom_bytes": 6487977984,
+          "unavailable": {
+            "backfill_query_p99": "no sample collected",
+            "ingest_p99": "no sample collected",
+            "restart_to_ready": "no sample collected"
+          }
+        }
+      ]
+    }
+  }
+}

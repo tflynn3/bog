@@ -42,6 +42,32 @@ The durability report's `enospc` case requires the following `evidence` object.
 }
 ```
 
+## Live capacity evidence
+
+The capacity case requires `mode: "live"` and exactly one passing record
+each for 196,608 and 393,216 seed rows. Each fixture uses 1,024-byte
+lines, 64-row batches, 2,048 tail rows, and a 128 MiB cgroup memory cap
+with swap disabled. The compaction record must report a completed
+generation covering the seed plus the first tail batch. The committed
+and recovered row counts must both equal seed plus tail. The validator
+also checks startup and restart timings, mixed-load p99s and sample
+counts, memory peak, RSS, descriptor count, disk headroom, and per-device
+I/O counters.
+
+Each record carries `workload_status` and a separate `cleanup` object. An
+overall pass requires both to pass. Cleanup records `candidate_reaped`,
+`subtree_empty`, and `subtree_removed`. The runner gives the candidate
+time to stop, reads hierarchical `cgroup.events`, and uses
+`cgroup.kill` when processes remain. It waits for `populated 0` before
+removing cgroups bottom-up. The cleanup deadline is independent of the
+workload deadline. A workload failure can carry successful cleanup
+evidence, which still fails the capacity case.
+
+Set `BOG_TEST_CGROUP_PARENT` to a delegated cgroup v2 parent with memory
+and I/O enabled for its children to run the kernel regression tests.
+Run the test process from a separate child of that delegation, as the
+release workflow does for the benchmark.
+
 ## Admission fixture
 
 The probe ingests 320 timestamped rows one second apart from

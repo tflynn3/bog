@@ -14,6 +14,19 @@ import (
 )
 
 func run(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "qualify" {
+		flags := flag.NewFlagSet("release qualify", flag.ContinueOnError)
+		root := flags.String("evidence", "", "directory containing both architecture evidence bundles")
+		revision := flags.String("revision", "", "full candidate commit SHA")
+		fixture := flags.String("fixture", "", "release fixture ID")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return errors.New("unexpected positional arguments")
+		}
+		return qualifyRelease(*root, *revision, *fixture)
+	}
 	validate := len(args) > 0 && args[0] == "validate"
 	if validate {
 		args = args[1:]
@@ -22,12 +35,14 @@ func run(ctx context.Context, args []string) error {
 	binary := flags.String("binary", "", "absolute path to the candidate binary")
 	revision := flags.String("revision", "", "full candidate commit SHA")
 	fixture := flags.String("fixture", "", "release fixture ID")
-	var output, admission, durability, capacity, parity string
+	var output, arch string
+	var reports releaseReports
 	if validate {
-		flags.StringVar(&admission, "admission", "", "admission report")
-		flags.StringVar(&durability, "durability", "", "durability report")
-		flags.StringVar(&capacity, "capacity", "", "capacity report")
-		flags.StringVar(&parity, "parity", "", "restored parity report")
+		flags.StringVar(&reports.admission, "admission", "", "admission report")
+		flags.StringVar(&reports.durability, "durability", "", "durability report")
+		flags.StringVar(&reports.capacity, "capacity", "", "capacity report")
+		flags.StringVar(&reports.parity, "parity", "", "restored parity report")
+		flags.StringVar(&arch, "arch", "", "require native Linux release evidence for amd64 or arm64")
 	} else {
 		flags.StringVar(&output, "report", "", "admission report output path")
 	}
@@ -40,29 +55,20 @@ func run(ctx context.Context, args []string) error {
 	if !validate && output == "" {
 		return errors.New("-report is required")
 	}
-	id, err := readIdentity(*binary, *revision, *fixture)
+	if arch != "" {
+		if *fixture != releaseFixture {
+			return fmt.Errorf("native validation requires fixture %s", releaseFixture)
+		}
+		if err := verifyNativeHost(arch); err != nil {
+			return err
+		}
+	}
+	id, err := readCandidateIdentity(*binary, *revision, *fixture, arch)
 	if err != nil {
 		return err
 	}
 	if validate {
-		for _, check := range []struct {
-			name, path string
-			cases      []string
-		}{
-			{"admission", admission, admissionCases},
-			{"durability", durability, durabilityCases},
-			{"capacity", capacity, capacityCases},
-		} {
-			if checkErr := validateFile(check.path, id, check.cases); checkErr != nil {
-				err = errors.Join(err, fmt.Errorf("%s report: %w", check.name, checkErr))
-			}
-		}
-		if parity != "" {
-			if checkErr := validateFile(parity, id, []string{"restored_parity"}); checkErr != nil {
-				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
-			}
-		}
-		return err
+		return reports.validate(id, arch != "")
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)

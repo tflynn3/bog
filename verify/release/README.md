@@ -1,11 +1,20 @@
 # Linux release verification
 
-Dispatch the **Linux release verification** workflow with the full commit SHA.
-The workflow builds the candidate once with Go 1.27.0 on Ubuntu 24.04 amd64 and
-uses the resulting absolute binary path for every verifier. Download the
-`linux-release-evidence` artifact for the revision, SHA-256, build metadata,
-fixture, runner and filesystem configuration, reports, producer exit statuses,
-and logs.
+After #53, #70, #68, and the #60 readiness handoff land, dispatch the
+**Linux release verification** workflow with the full composed commit SHA.
+Use a workflow revision that includes this gate. The workflow
+builds the same clean revision once on native Ubuntu 24.04 amd64 and once on
+native Ubuntu 24.04 arm64 with Go 1.27.0. Each runner checks its runner
+identity, kernel architecture, and Go host and target before building. All four
+producers use that runner's pinned binary.
+
+Download `linux-release-evidence-amd64` and `linux-release-evidence-arm64`
+for the binaries, SHA-256 checksums, build metadata, fixture and runner
+configuration, reports, producer exit statuses, and logs. The final
+**Qualify both Linux architectures** job requires both native jobs to succeed.
+It independently checks each uploaded binary's ELF machine and Go build
+metadata, recomputes its digest, and validates all four reports and producer
+exits against that architecture's binary and the requested revision.
 
 The admission, durability, and capacity producers take
 `-binary PATH -revision SHA -fixture ID -report PATH`.
@@ -46,11 +55,13 @@ The durability report validator requires these fields in the `enospc` case's
 }
 ```
 
-The durability producer also requires both retarget checks to pass before
-marking `enospc` as passing. In `healthy_to_full`, readiness stays `ready`
-and ingest returns HTTP 204. In `full_to_healthy`, readiness stays
-`low_disk_headroom` and ingest returns HTTP 503. The latter also records
+Native qualification requires explicit evidence in both retarget directions.
+In `healthy_to_full`, readiness stays `ready`, ingest returns HTTP 204, and
+the batch replays on the original healthy directory. In `full_to_healthy`,
+readiness stays `low_disk_headroom` and ingest returns HTTP 503, followed by
 `post_ingest_reason: "wal_rollback"` and `post_ingest_category: "enospc"`.
+The durability producer propagates failures to stop its candidates, unmount
+the disposable filesystem, or remove its fixture through its exit status.
 
 ## Live capacity evidence
 
@@ -143,18 +154,31 @@ order, with the budget, page, requested limit, and HTTP status where available.
 The Linux test `TestReleaseRestoredParity` publishes a checkpoint and appends
 a WAL tail with overlapping times, ties, duplicates, and backfill. It exports,
 verifies, and restores that capture before starting the pinned candidate.
-Fresh walks use `FetchPage` and must reproduce the exact append-order model
-across page sizes and literal filters with a 256-byte response cap. After the candidate
-acknowledges an ingest on the restored image, a fresh walk must return the
-augmented model before shutdown, and another must return it after restart.
-On restart, a raw request using a cursor from the old process must receive
-a framed HTTP 400 with the exact `invalid cursor\n` body and no continuation
-header or trailer.
-The `restored_parity` evidence records their row counts in `post_append_rows`
-and `restart_rows`. The report is bound to the same candidate identity.
+Fresh walks use `FetchPage` and the independent append-log oracle across page
+sizes and literal filters with a 256-byte response cap. The test holds a cursor
+from before the append, requires a 204 for the new row, and checks the
+augmented view. It starts opt-in loopback compaction and requires publication
+of a newer generation at the requested cutoff. The held walk must exhaust at
+its original cutoff. Fresh walks after publication and after restart must
+exhaust at the augmented cutoff.
 
-The workflow passes `-parity parity.json` when validating the collected reports
-and runs the verifier tests with the race detector on Linux.
+On restart, a wire probe using a cursor from the old process must receive a
+framed HTTP 400 with the exact `invalid cursor\n` body and no continuation
+header or trailer. The proof records each verified row count, generation
+replacement, stale cursor rejection, and fixture removal. Walk failures retain
+the first failing stage, filter, page, limit, verified offset, and HTTP status
+when available. The producer writes the report after process and fixture
+cleanup and exits nonzero on failure.
+
+The native jobs pass `-arch` to `go run ./verify/release validate` and require
+all four reports. The original `validate` invocation without `-arch` and the
+producer CLI continue to accept schema v1. To revalidate downloaded bundles,
+keep their artifact names as subdirectories of one evidence directory.
+
+```sh
+go run ./verify/release qualify -evidence /path/to/bundles \
+  -revision "$REVISION" -fixture linux-release-v1
+```
 
 ## Architecture handoff for #61
 

@@ -15,14 +15,32 @@ env:
   GOTOOLCHAIN: local
   GOWORK: 'off'
   GOAMD64: v1
+  GOARM64: v8.0
   CGO_ENABLED: '0'
   FIXTURE: linux-release-v1
   REVISION: ${{ inputs.revision }}
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    name: Verify Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            runner_arch: X64
+            machine: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            runner_arch: ARM64
+            machine: aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      EXPECTED_ARCH: ${{ matrix.arch }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+      EXPECTED_MACHINE: ${{ matrix.machine }}
+    timeout-minutes: 75
     defaults:
       run:
         shell: bash
@@ -31,9 +49,9 @@ jobs:
         run: |
           EVIDENCE="$RUNNER_TEMP/bog-release-evidence"
           mkdir -p "$EVIDENCE"
-          printf 'EVIDENCE=%s\nBINARY=%s\n' "$EVIDENCE" "$RUNNER_TEMP/bog-release-candidate" >> "$GITHUB_ENV"
+          printf 'EVIDENCE=%s\nBINARY=%s\n' "$EVIDENCE" "$EVIDENCE/candidate" >> "$GITHUB_ENV"
           {
-            printf 'revision=%q\nfixture=%s\n' "$REVISION" "$FIXTURE"
+            printf 'revision=%q\nfixture=%s\nexpected_arch=%s\n' "$REVISION" "$FIXTURE" "$EXPECTED_ARCH"
             uname -a
             printf 'runner_os=%s\nrunner_arch=%s\nimage_os=%s\nimage_version=%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
             cat /etc/os-release
@@ -42,7 +60,8 @@ jobs:
             findmnt --target /sys/fs/cgroup
           } | tee "$EVIDENCE/run.txt"
           [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "Expected a full lowercase commit SHA" | tee -a "$EVIDENCE/run.txt"; exit 1; }
-          [[ "$RUNNER_ARCH" == X64 && "$(uname -m)" == x86_64 ]]
+          [[ "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == "$EXPECTED_RUNNER_ARCH" ]]
+          [[ "$(uname -s)" == Linux && "$(uname -m)" == "$EXPECTED_MACHINE" ]]
 
       - uses: actions/checkout@v4
         with:
@@ -77,12 +96,24 @@ jobs:
             [[ "$head" == "$REVISION" ]]
             [[ -z "$(git status --porcelain)" ]]
             go version
-            [[ "$(go env GOVERSION GOOS GOARCH GOTOOLCHAIN GOAMD64 CGO_ENABLED)" == $'go1.27.0\nlinux\namd64\nlocal\nv1\n0' ]]
+            expected=$(printf 'go1.27.0\nlinux\n%s\nlinux\n%s\nlocal\n0' "$EXPECTED_ARCH" "$EXPECTED_ARCH")
+            actual=$(go env GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOTOOLCHAIN CGO_ENABLED)
+            if [[ "$actual" != "$expected" ]]; then
+              printf 'Unexpected Go version, host, target, toolchain selector, or cgo setting:\n%s\n' "$actual"
+              exit 1
+            fi
+            case "$EXPECTED_ARCH" in
+              amd64) [[ "$(go env GOAMD64)" == v1 ]] ;;
+              arm64) [[ "$(go env GOARM64)" == v8.0 ]] ;;
+              *) exit 1 ;;
+            esac
             go build -trimpath -buildvcs=true -o "$BINARY" ./cmd/bog
             go version -m "$BINARY" | tee "$EVIDENCE/build-info.txt"
             grep -Eq "^[[:space:]]+build[[:space:]]+vcs.revision=$REVISION$" "$EVIDENCE/build-info.txt"
             grep -Eq '^[[:space:]]+build[[:space:]]+vcs.modified=false$' "$EVIDENCE/build-info.txt"
-            sha256sum "$BINARY" | tee "$EVIDENCE/binary.sha256"
+            grep -Eq "^[[:space:]]+build[[:space:]]+GOARCH=$EXPECTED_ARCH$" "$EVIDENCE/build-info.txt"
+            grep -Eq '^[[:space:]]+build[[:space:]]+GOOS=linux$' "$EVIDENCE/build-info.txt"
+            (cd "$EVIDENCE" && sha256sum candidate) | tee "$EVIDENCE/binary.sha256"
           } 2>&1 | tee "$EVIDENCE/build.log"
 
       - name: Run release evidence producers
@@ -137,7 +168,7 @@ jobs:
             cd gate || exit
             export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
             export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
-            timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
+            timeout --kill-after=5s 3m go test -json -timeout=2m -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
           )
           failed=0
           for name in admission durability capacity parity; do
@@ -155,8 +186,8 @@ jobs:
         run: |
           {
             failed=0
-            sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
-            go run ./verify/release validate -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
+            (cd "$EVIDENCE" && sha256sum --strict --check binary.sha256) || failed=1
+            go run ./verify/release validate -arch "$EXPECTED_ARCH" -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
             exit "$failed"
@@ -164,18 +195,60 @@ jobs:
 
       - name: Race-test release verifier lifecycle
         if: always() && steps.build.outcome == 'success'
-        working-directory: candidate
-        timeout-minutes: 5
+        timeout-minutes: 8
         env:
           CGO_ENABLED: '1'
         run: |
-          go test -race -count=1 ./internal/archtest ./verify/linux ./verify/release ./bench/retained-history ./verify/fuzz \
-            2>&1 | tee "$EVIDENCE/verifier-race.log"
+          {
+            failed=0
+            (cd gate && go test -race -timeout=3m -count=1 ./verify/release) || failed=1
+            (cd candidate && go test -race -timeout=4m -count=1 ./internal/archtest ./verify/linux ./bench/retained-history ./verify/fuzz) || failed=1
+            exit "$failed"
+          } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 
       - name: Publish release evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-release-evidence
+          name: linux-release-evidence-${{ matrix.arch }}
           path: ${{ runner.temp }}/bog-release-evidence
           if-no-files-found: error
+          overwrite: true
+
+  qualify:
+    name: Qualify both Linux architectures
+    if: always()
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-release-evidence-*
+          path: ${{ runner.temp }}/release-evidence
+
+      - name: Require both native jobs and validate the evidence together
+        if: always()
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          failed=0
+          if [[ "$VERIFY_RESULT" != success ]]; then
+            echo "Native verification matrix ended with $VERIFY_RESULT"
+            failed=1
+          fi
+          go run ./verify/release qualify -evidence "$RUNNER_TEMP/release-evidence" \
+            -revision "$REVISION" -fixture "$FIXTURE" || failed=1
+          exit "$failed"

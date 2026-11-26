@@ -4,4 +4,33 @@
 
 Queries return the longest ordered prefix of complete records that fits, subject also to `limit`. If the first matching record cannot fit, the server returns HTTP 422 with an error body and no continuation cursor. Increase the limit if that record must be retrieved.
 
-For snapshot pagination (`page=1`), a byte-limited page includes `Bog-Next-Cursor` whenever more records remain in the captured snapshot. Supply it as `cursor` with the same time bounds and filter to continue; a terminal page has no cursor. Records appended after snapshot capture, including backfilled records, do not appear in subsequent pages. Ordinary queries have no continuation cursor; use snapshot pagination to retrieve all matching records across byte-limited responses.
+For snapshot pagination (`page=1`), a successful page includes `Bog-Next-Cursor` whenever more records remain in the captured snapshot. Supply it as `cursor` with the same time bounds and filter to continue. A terminal page has no cursor. Records appended after snapshot capture, including backfilled records, do not appear in subsequent pages. Ordinary queries have no continuation cursor. Use snapshot pagination to retrieve all matching records across byte-limited responses.
+
+## Query work and cursor lifetime
+
+`-query-work-budget` caps work for each query. With a retained-history page
+source, the server reserves work for the immediate continuation using the same
+capture, filters, row limit, and response byte cap. This reservation counts
+toward the current request's budget. It covers token validation, seeks and
+scans (including lookahead), NDJSON encoding, and delivery of the bytes that
+fit. It starts after the last emitted row, including on byte-trimmed pages.
+Each subsequent request applies the same check before issuing its own cursor.
+
+The in-memory implementation budgets each page independently. A page can
+succeed even if a later continuation runs out of work.
+
+If the work budget runs out during page preparation or reservation, the server
+returns HTTP 503 with the plain-text body `query work budget exhausted` and
+no NDJSON rows or next cursor. HTTP 503 with `query capacity exhausted` means
+the concurrent query or capture slots are occupied. Retry a failed continuation
+using its original cursor. A smaller `limit` may help with dense matches.
+Sparse matches can require a higher work budget to reach the next match or
+prove the end of the walk.
+
+Route continuations to the running handler that issued the cursor. Captures
+expire at a fixed deadline set when the walk starts. A cursor lasts at most
+15 minutes, and a retained-history source can expire its capture sooner.
+HTTP 410 with `query capture expired` means the signed cursor's capture is
+unavailable. A restart changes the signing key and returns HTTP 400 with
+`invalid cursor` for an old token. In either case, start a fresh walk with
+`page=1`, which takes a new capture.

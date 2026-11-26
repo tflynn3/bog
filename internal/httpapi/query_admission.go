@@ -18,7 +18,7 @@ func queryAdmission(limit int, next http.Handler) http.Handler {
 		case slots <- struct{}{}:
 			defer func() { <-slots }()
 		default:
-			http.Error(w, "query capacity exhausted", http.StatusServiceUnavailable)
+			writeQueryError(w, ErrQueryCapacityExhausted)
 			return
 		}
 		// Cancellation may have happened while acquiring the slot.

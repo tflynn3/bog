@@ -95,7 +95,7 @@ func rowLess(rows []Row, a, b int) bool {
 	}
 	return rows[a].TS.Before(rows[b].TS)
 }
-func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, literal string, limit int, after *Position, lookahead bool, work *QueryWork) ([]Row, *Position, error) {
+func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, literal string, limit int, after *Position, lookahead bool, positions *pagePositions, work *QueryWork) ([]Row, *Position, error) {
 	capacity := limit
 	if lookahead && capacity < count {
 		capacity++
@@ -134,6 +134,7 @@ func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, lite
 	result := make([]Row, 0, len(h.ordinals))
 	for _, ordinal := range h.ordinals {
 		result = append(result, rows[ordinal])
+		positions.append(ordinal, cap(result))
 	}
 	return result, next, nil
 }

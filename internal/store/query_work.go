@@ -19,7 +19,9 @@ var (
 // and one unit per block considered for Bloom pruning (at most 96 bit tests).
 // It charges one unit per candidate visited plus
 // one per decoded line byte for candidates eligible for matching. Cursor anchor
-// checks and lookahead candidates use the same row and byte rate. Revisited work
+// checks and lookahead candidates use the same row and byte rate when inspecting
+// a line. An unfiltered positioned page can validate an anchor or prove
+// lookahead by examining position alone, at one unit each. Revisited work
 // is charged again, including after an optimization falls back to another scan.
 type QueryWork struct {
 	ctx       context.Context

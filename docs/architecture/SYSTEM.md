@@ -16,7 +16,7 @@ trusted network or behind an authenticated access layer.
 ## Observed Linux production imports
 
 These are the direct imports between root-module production packages at
-`ae0716c6adc383dbd6e23cce544391eff1815eff`, listed for Linux amd64 with
+`dd2b61184a115f72f77a89ae995dbfec67d46cb7`, listed for Linux amd64 with
 cgo disabled. Arrows point from importer to dependency. Test-only packages
 are listed in the registry below. An isolated node has zero direct
 root-module production imports.
@@ -97,12 +97,20 @@ retry library, stay independent of HTTP, readiness, and the Go HTTP client.
 
 The coordinated capture binds the validated generation and exact durable,
 query-visible tail under the same owner. A cursor reads the same view across
-generation replacement. A fresh walk sees later committed appends. Writable
-restore establishes checkpoint and tail recovery authority before listening,
-and restart selects that writable authority. The opt-in loopback capacity
-control drives replacement through the same owner.
+generation replacement. A fresh walk sees later committed appends. Before
+issuing its first cursor, HTTP certifies that the pinned walk can reach
+exhaustion at the same per-request work budget and response byte cap,
+including when a continuation lowers its row limit. The cursor uses the
+earlier of HTTP's maximum lifetime and any source expiry. An authenticated
+cursor whose capture has expired receives 410, and admitted operations
+retain their references through completion.
+
+Writable restore establishes checkpoint and tail recovery authority before
+listening, and restart selects that writable authority. The opt-in loopback
+capacity control drives replacement through the same owner.
 [ADR 0004](../adr/0004-retained-history-cutover.md)
 [ADR 0005](../adr/0005-pinned-writable-recovery-authority.md)
+[ADR 0006](../adr/0006-fixed-budget-query-continuations.md)
 
 ## Package registry
 
@@ -163,22 +171,31 @@ must match the revision, binary SHA-256, and `linux-release-v1` fixture.
 | `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Start the shipped binary on a verified restore, compare fresh HTTP walks, observe 204 for a new append, and recover the exact augmented history after restart. |
 
 The `linux-release-evidence` artifact contains build identity, fixture and
-runner details, reports, exit statuses, and logs. The legacy capacity run
-records a baseline. See the [release verifier contract](../../verify/release/README.md).
+runner details, reports, exit statuses, and logs. The Linux verifier race
+step also runs the bounded backup and history corruption corpus in
+`verify/fuzz` and records it in `verifier-race.log`. The legacy capacity
+run records a baseline.
+[Release verifier contract](../../verify/release/README.md)
 
 ## Fitness and registry ownership
 
-The architecture track owns the fitness registry. It requires `verify/fuzz`
-in the Linux inventory with test files only. Its disappearance or conversion
-to production fails the suite. Checkpoint, history, and backup are staged on
-the current tree.
+The bog architecture specialty owns the system graph, ADR 0006, and the
+fitness registry. The bog query specialty (`bog-query`) owns #59 and the
+HTTP paging contract. `bog-storage` owns #53 and composes the retained
+adapter in `cmd/bog`. The query and storage owners coordinate replay and
+expiry behavior at the consumer seam. #61, #62, and the Linux corruption
+gate continue under their current owners. #60 follows the command lease
+handoff, and #63 follows cutover.
 
-At integration, review both sides of the current merge base and inspect the
-actual Linux production graph with #53 and #59 composed. In the wiring merge,
-the architecture owner promotes the packages newly reachable from `cmd/bog`,
-registers any extracted adapter and its direct imports, and removes retired
-entries and edges. The composed-cutover fixture exercises these rules with a
-representative graph. [Fitness registry](../../internal/archtest/architecture_test.go)
+#61 holds a read lease on `internal/archtest/architecture_test.go`. After
+that lease clears, the architecture owner and `bog-storage` coordinate the
+registry update under the corresponding write lease in the #53 wiring merge.
+Review both sides of the current merge base and derive role promotions,
+direct edges, and retired packages or edges from the actual Linux production
+graph with #53 and #59 composed. Update the graph and registry together,
+including any adapter package the command reaches. Checkpoint, history, and
+backup are staged at this PR's base.
+[Fitness registry](../../internal/archtest/architecture_test.go)
 
 The Architecture workflow runs `go test -count=1 ./internal/archtest` on the
 host. The suite lists packages with `GOOS=linux GOARCH=amd64 GOAMD64=v1
@@ -187,10 +204,16 @@ production imports within the root module and follows all listed dependencies
 for server reachability. Host-only files, test imports, and nested modules
 are outside the production import registry. Package loading errors, cycles,
 unregistered packages, incorrect roles, forbidden imports, and stale
-registered imports fail the suite. A storage dependency on HTTP, readiness,
-or the Go HTTP client fails even when it is transitive or all direct edges
-are registered. Direct HTTP imports of checkpoint, history, or backup also
-fail, keeping retained paging behind the consumer seam. Run
+registered imports fail the suite. The registry requires `verify/fuzz` to
+have Linux test files only. A storage dependency on HTTP, readiness, or the
+Go HTTP client fails even when it is transitive or all direct edges are
+registered. The companion paging check rejects any root-module production
+path from HTTP to checkpoint, history, or backup, including a fully
+registered path through an intermediate package. Its fixtures exercise
+both command-owned adapter wiring and HTTP bypasses.
+[Paging boundary check](../../internal/archtest/cutover_boundaries_test.go)
+
+Run
 `go test -count=1 ./internal/archtest` and
 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on this PR. Repeat both
 on the composed tree before dispatching the release gate with its full commit

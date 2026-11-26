@@ -1,0 +1,5 @@
+# HA operator status
+
+No HA operator or replication proxy is implemented yet. Do not deploy multiple independent Bog instances as replicas: a 204 from an individual instance is only a local durable commit and cannot establish a quorum, fence a stale leader, or recover a consistent global order after failover.
+
+A correct implementation needs a durable consensus log with stable member identities, quorum-backed commit and ordered application to each Bog instance, fencing across leadership changes, recovery and catch-up, and a deduplication/application protocol that survives a crash between local application and recording progress. The current Bog HTTP API exposes neither idempotent application nor a replication position. Any future implementation must resolve that boundary before reporting replicated writes as successful. Membership and rollout state must survive controller restarts, and storage must retain each member's `bog.wal` and `bog.commit` together on Linux storage meeting the root README's durability contract.

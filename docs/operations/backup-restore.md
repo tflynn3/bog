@@ -1,0 +1,7 @@
+# Backup and restore
+
+Bog's source of truth is the pair `bog.wal` and `bog.commit`. A backup must contain both files from the same stopped instance. Stop ingest and shut down Bog cleanly before copying them; copying either file while it is being replaced or appended can produce an inconsistent backup. Keep the pair together and retain its ownership and restrictive permissions. Protect backups as sensitive log data.
+
+To restore, stop Bog, create an existing empty data directory on supported Linux storage, and restore both files into it. The directory and files must be owned by the service user and not group- or world-writable. Start Bog with that directory and wait for `/healthz`; replay can take time. Test recovery and compare the expected data before resuming traffic. Do not merge WAL files or restore just the marker or WAL. See the repository README for the complete filesystem durability requirements.
+
+`bogctl -addr http://HOST:8080 ingest < logs.ndjson` sends bounded atomic batches. A stream may be partially committed if an error occurs. An unknown write outcome must be reconciled by the application; blindly rerunning can duplicate rows. `bogctl -addr http://HOST:8080 -start 2025-01-01T00:00:00Z -end 2025-01-02T00:00:00Z query` streams a stable paginated snapshot. Use an address pinned to one process throughout the query; cursors become invalid on restart or routing to a different process.

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"bog/internal/store"
 )
@@ -56,6 +57,9 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("lock data directory: %w", err)
 	}
+	if err := rejectRestoreImage(root); err != nil {
+		return nil, err
+	}
 	l := &Log{s: s, root: root, dir: d, syncDir: d.Sync}
 	f, err := l.openWAL()
 	if err != nil {
@@ -70,11 +74,33 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("lock WAL: %w", err)
 	}
+	l.captures, err = openCaptureFile(d, f)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, l.captures.release())
+		}
+	}()
 	l.f = f
 	if err := l.recover(); err != nil {
 		return nil, err
 	}
 	return l, nil
+}
+
+func rejectRestoreImage(root *os.Root) error {
+	// These names are reserved by the v1 backup format. A checkpoint alone
+	// can coexist with a complete legacy WAL and is not a restore indicator.
+	for _, name := range []string{"bog.backup", "bog.wal.tail"} {
+		if _, err := root.Lstat(name); err == nil {
+			return fmt.Errorf("found %s: backup/restore image requires checkpoint-aware recovery; use a restore-capable Bog reader", name)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect restore entry %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 func (l *Log) openWAL() (*os.File, error) {
@@ -160,6 +186,10 @@ func (l *Log) recover() error {
 		return fmt.Errorf("sync recovered data directory: %w", err)
 	}
 	builder.Install(l.s)
+	// QueryPage with a zero row limit captures the installed row count
+	// without scanning or decoding the recovered prefix again.
+	_, count, _, _ := l.s.QueryPage(time.Time{}, time.Time{}, "", 0, nil, nil)
+	l.committed = captureBoundary{end: end, nextOrdinal: uint64(count)}
 	return nil
 }
 

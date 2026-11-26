@@ -4,11 +4,11 @@ Bog is a durable raw-log service for Linux. Build with Go 1.27:
 
 ```sh
 go build ./cmd/bog
-mkdir ./data
+mkdir -m 700 ./data
 ./bog -data-dir ./data -addr 127.0.0.1:8080
 ```
 
-`-data-dir` must be an existing directory; `-addr` defaults to `127.0.0.1:8080`. A process holds an exclusive lock on the directory until exit. `GET /healthz` returns 200 once the WAL has been replayed and the server is listening.
+`-data-dir` must be an existing directory. `-addr` defaults to `127.0.0.1:8080`. The standalone server has no authentication or per-stream isolation. Anyone who can reach it can ingest and query all data. When binding to a non-loopback address, restrict access to a trusted network or use an authenticated access layer. A process holds an exclusive lock on the directory until exit. `GET /healthz` returns 200 once the WAL has been replayed and the server is listening.
 
 ```sh
 printf '%s\n' '{"ts":"2025-01-01T00:00:00.123456789Z","line":"hello"}' | curl -X POST localhost:8080/ingest --data-binary @-

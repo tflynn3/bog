@@ -45,6 +45,7 @@ type result struct {
 	Fixture       fixture        `json:"fixture"`
 	Phase         string         `json:"phase"`
 	Status        string         `json:"status"`
+	Workload      string         `json:"workload_status"`
 	Detail        string         `json:"detail,omitempty"`
 	TimedOut      bool           `json:"timed_out"`
 	StartReady    *time.Duration `json:"start_to_ready_ns"`
@@ -55,7 +56,18 @@ type result struct {
 	QuerySamples  int            `json:"backfill_query_samples"`
 	RecoveredRows int            `json:"recovered_rows"`
 	Compaction    *compaction    `json:"compaction,omitempty"`
+	Cleanup       cleanupProof   `json:"cleanup"`
 	resources
+}
+
+// A capacity pass requires all three independently observed cleanup facts.
+// "not_started" records a fixture that never acquired a subtree.
+type cleanupProof struct {
+	Status          string `json:"status"`
+	CandidateReaped bool   `json:"candidate_reaped"`
+	SubtreeEmpty    bool   `json:"subtree_empty"`
+	SubtreeRemoved  bool   `json:"subtree_removed"`
+	Detail          string `json:"detail,omitempty"`
 }
 
 type resources struct {
@@ -200,7 +212,12 @@ func run(ctx context.Context, args []string) (err error) {
 		run := measure(ctx, o, binary, filepath.Join(dir, fmt.Sprintf("store-%d", i)), size)
 		runs = append(runs, run)
 		if run.Status != "pass" {
-			failures = errors.Join(failures, fmt.Errorf("%d seed rows, %s: %s", size.SeedRows, run.Phase, run.Detail))
+			if run.Detail != "" {
+				failures = errors.Join(failures, fmt.Errorf("%d seed rows, %s: %s", size.SeedRows, run.Phase, run.Detail))
+			}
+			if run.Cleanup.Detail != "" {
+				failures = errors.Join(failures, fmt.Errorf("%d seed rows, cleanup: %s", size.SeedRows, run.Cleanup.Detail))
+			}
 		}
 	}
 	return failures

@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "revision": "efb5f059f5ad7ab04e3321f33c4c7a4b2f7ea605",
+  "binary_sha256": "8b8bb15fb05f9e97f36c2e428c61f01b1c9de0cf42e149e27d62cfd17598c3ff",
+  "fixture": "linux-release-v1",
+  "mode": "legacy",
+  "cases": {
+    "legacy_baseline": {
+      "status": "pass",
+      "evidence": [
+        {
+          "fixture": {
+            "seed_rows": 8192,
+            "tail_rows": 2048,
+            "line_bytes": 1024,
+            "batch_rows": 64,
+            "memory_limit_bytes": 134217728
+          },
+          "phase": "complete",
+          "status": "pass",
+          "workload_status": "pass",
+          "timed_out": false,
+          "start_to_ready_ns": 302064877,
+          "restart_to_ready_ns": 776558520,
+          "ingest_p99_ns": 79260220,
+          "backfill_query_p99_ns": 130877061,
+          "ingest_samples": 32,
+          "backfill_query_samples": 20,
+          "recovered_rows": 10240,
+          "cleanup": {
+            "status": "pass",
+            "candidate_reaped": true,
+            "subtree_empty": true,
+            "subtree_removed": true
+          },
+          "cgroup_peak_memory_bytes": 36016128,
+          "peak_rss_bytes": 30015488,
+          "peak_descriptors": 13,
+          "device_io": {
+            "253:0": {
+              "dbytes": 0,
+              "dios": 0,
+              "rbytes": 0,
+              "rios": 0,
+              "wbytes": 12255232,
+              "wios": 489
+            }
+          },
+          "initial_disk_free_bytes": 6487977984,
+          "minimum_disk_headroom_bytes": 6477025280
+        },
+        {
+          "fixture": {
+            "seed_rows": 32768,
+            "tail_rows": 2048,
+            "line_bytes": 1024,
+            "batch_rows": 64,
+            "memory_limit_bytes": 134217728
+          },
+          "phase": "complete",
+          "status": "pass",
+          "workload_status": "pass",
+          "timed_out": false,
+          "start_to_ready_ns": 143597212,
+          "restart_to_ready_ns": 2885907302,
+          "ingest_p99_ns": 79098496,
+          "backfill_query_p99_ns": 101923351,
+          "ingest_samples": 32,
+          "backfill_query_samples": 79,
+          "recovered_rows": 34816,
+          "cleanup": {
+            "status": "pass",
+            "candidate_reaped": true,
+            "subtree_empty": true,
+            "subtree_removed": true
+          },
+          "cgroup_peak_memory_bytes": 111067136,
+          "peak_rss_bytes": 77987840,
+          "peak_descriptors": 13,
+          "device_io": {
+            "253:0": {
+              "dbytes": 0,
+              "dios": 0,
+              "rbytes": 0,
+              "rios": 0,
+              "wbytes": 41668608,
+              "wios": 1653
+            }
+          },
+          "initial_disk_free_bytes": 6487977984,
+          "minimum_disk_headroom_bytes": 6435655680
+        }
+      ]
+    },
+    "retained_history_capacity": {
+      "status": "skip",
+      "detail": "legacy baseline cannot qualify live retained history"
+    }
+  }
+}

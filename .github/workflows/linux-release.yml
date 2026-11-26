@@ -169,7 +169,7 @@ jobs:
         env:
           CGO_ENABLED: '1'
         run: |
-          go test -race -count=1 ./internal/archtest ./verify/linux ./verify/release ./bench/retained-history \
+          go test -race -count=1 ./internal/archtest ./verify/linux ./verify/release ./bench/retained-history ./verify/fuzz \
             2>&1 | tee "$EVIDENCE/verifier-race.log"
 
       - name: Publish release evidence

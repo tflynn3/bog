@@ -48,17 +48,28 @@ be opened with `OpenRestored`. This is an engine image whose tail requires
 checkpoint-aware replay. Starting the legacy WAL writer on the image is not
 supported.
 
-The parent directory must exist on the local filesystem. The caller owns
-the destination pathname during publication. Export and restore sync the
-staged files, sync and close the private sibling directory, install it by
-renaming it, and sync the parent. An existing empty placeholder is removed
-just before rename, since `os.Root.Rename` requires an absent directory
-target. An interruption before rename leaves an empty or absent destination
-ready for retry. An abruptly terminated process may leave an unpublished
-sibling staging directory. A parent sync failure after rename returns
-`ErrPublicationUncertain`; reopen and verify the destination before making
-another publication decision. Restore verifies its staged copy before
-installing it.
+The destination parent must exist on a trusted local filesystem that supports
+advisory locks, atomic rename, and directory sync. Export and Restore share an
+exclusive publication protocol scoped to the opened parent and exact
+destination basename. The caller controls the pathname against other
+filesystem writers. A waiting retry honors context cancellation.
+
+New staging entries are private siblings in the reserved `.bog-backup-v1-`
+namespace. A retry reclaims an abandoned copy only after validating its claim
+and directory identity and acquiring the directory's lock. Prefix-only
+entries from older releases and entries for other destinations are preserved.
+Staging metadata is stored outside the image and the v1 file layout is
+unchanged.
+
+Export and Restore sync the staged files and directory before publication.
+Restore also verifies the staged copy. On Linux one directory-relative rename
+installs the image over an absent destination or an empty placeholder, and
+the publisher syncs the parent before returning success. A populated
+destination is preserved. An uncertain rename or a sync failure after rename
+returns `ErrPublicationUncertain`. Reopen and verify the destination before
+retrying. A later attempt can clean up abandoned staging metadata beside a
+completed image without modifying the image.
+[ADR 0009](../../docs/adr/0009-backup-staging-recovery.md)
 
 ## Working memory
 

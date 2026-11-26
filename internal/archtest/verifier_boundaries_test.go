@@ -12,26 +12,19 @@ const (
 	goClient   = "bog/internal/client"
 )
 
-func TestQueryOracleIndependence(t *testing.T) {
-	t.Parallel()
-	for _, problem := range queryOracleProblems(registry) {
-		t.Error(problem)
-	}
-}
-
-// TestLinuxArchitecture checks that the registry matches the root-module
-// production graph. Enforce oracle independence even for registered paths.
-func queryOracleProblems(rules map[string]rule) []string {
-	packages := make(map[string]listedPackage, len(rules))
-	for path, entry := range rules {
-		packages[path] = listedPackage{Imports: entry.imports}
-	}
+// Check the observed graph, including paths through dependencies of the module.
+func queryOracleProblems(packages map[string]listedPackage, rules map[string]rule) []string {
 	reached := reachableImports(packages, queryModel)
+	runtime := reachableImports(packages, server)
 
 	var problems []string
 	for _, path := range slices.Sorted(maps.Keys(reached)) {
-		role := rules[path].role
-		if path == goClient || role == serverCommand || role == runtimeLibrary || role == staged {
+		if path == queryModel {
+			continue
+		}
+		pkg := packages[path]
+		if path == goClient || (pkg.Module != nil && pkg.Module.Main && (runtime[path] ||
+			rules[path].role == runtimeLibrary || rules[path].role == staged)) {
 			problems = append(problems, fmt.Sprintf("forbidden query oracle dependency: %s reaches %s", queryModel, path))
 		}
 	}
@@ -41,19 +34,24 @@ func queryOracleProblems(rules map[string]rule) []string {
 func TestQueryOracleIndependenceFixtures(t *testing.T) {
 	t.Parallel()
 	const (
-		release = "bog/verify/release"
-		helper  = "bog/verify/helper"
-		httpapi = "bog/internal/httpapi"
-		store   = "bog/internal/store"
-		history = "bog/internal/history"
+		release  = "bog/verify/release"
+		helper   = "bog/verify/helper"
+		external = "example.com/oracle-bridge"
+		httpapi  = "bog/internal/httpapi"
+		store    = "bog/internal/store"
+		history  = "bog/internal/history"
 	)
 	tests := []struct {
-		name          string
-		oracleImports []string
-		helperImports []string
-		want          []string
+		name           string
+		oracleImports  []string
+		helperImports  []string
+		externalImport string
+		unregistered   bool
+		releaseOracle  bool
+		want           []string
 	}{
-		{name: "release verifier imports the client and oracle", oracleImports: []string{helper}},
+		{name: "release verifier imports the client as in #61"},
+		{name: "release verifier imports the client and oracle", oracleImports: []string{helper}, releaseOracle: true},
 		{
 			name:          "oracle imports client directly",
 			oracleImports: []string{goClient},
@@ -88,17 +86,38 @@ func TestQueryOracleIndependenceFixtures(t *testing.T) {
 				"forbidden query oracle dependency: " + queryModel + " reaches " + store,
 			},
 		},
+		{
+			name:           "oracle reaches runtime through an external package",
+			externalImport: httpapi,
+			want: []string{
+				"forbidden query oracle dependency: " + queryModel + " reaches " + httpapi,
+				"forbidden query oracle dependency: " + queryModel + " reaches " + store,
+			},
+		},
+		{
+			name:         "an unregistered oracle import still violates independence",
+			unregistered: true,
+			want: []string{
+				"forbidden production import: " + queryModel + " -> " + goClient,
+				"forbidden query oracle dependency: " + queryModel + " reaches " + goClient,
+				"forbidden query oracle dependency: " + queryModel + " reaches " + store,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			releaseImports := []string{goClient}
+			if tt.releaseOracle {
+				releaseImports = append(releaseImports, queryModel)
+			}
 			rules := map[string]rule{
 				server:     {serverCommand, []string{httpapi}},
 				httpapi:    {runtimeLibrary, []string{store}},
 				store:      {runtimeLibrary, nil},
 				history:    {staged, []string{store}},
 				goClient:   {standalone, []string{store}},
-				release:    {verifier, []string{goClient, queryModel}},
+				release:    {verifier, releaseImports},
 				queryModel: {verifierModel, tt.oracleImports},
 				helper:     {verifierModel, tt.helperImports},
 			}
@@ -110,11 +129,15 @@ func TestQueryOracleIndependenceFixtures(t *testing.T) {
 				}
 				packages[path] = productionPackage(name, entry.imports...)
 			}
-			if problems := architectureProblems(packages, rules); len(problems) != 0 {
-				t.Fatalf("fixture violates the existing architecture rules: %v", problems)
+			if tt.externalImport != "" {
+				packages[queryModel] = productionPackage("querymodel", external)
+				packages[external] = listedPackage{Imports: []string{tt.externalImport}}
 			}
-			if got := queryOracleProblems(rules); !slices.Equal(got, tt.want) {
-				t.Errorf("queryOracleProblems() = %q, want %q", got, tt.want)
+			if tt.unregistered {
+				packages[queryModel] = productionPackage("querymodel", goClient)
+			}
+			if got := linuxGraphProblems(packages, rules); !slices.Equal(got, tt.want) {
+				t.Errorf("linuxGraphProblems() = %q, want %q", got, tt.want)
 			}
 		})
 	}

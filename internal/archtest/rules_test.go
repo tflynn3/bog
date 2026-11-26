@@ -131,6 +131,30 @@ func TestArchitectureRules(t *testing.T) {
 			want: []string{release + " has package name \"release\" incompatible with its verifier command role"},
 		},
 		{
+			name: "detached library has an unknown role",
+			change: func(_ map[string]listedPackage, rules map[string]rule) {
+				rules[backup] = rule{"typo", []string{store}}
+			},
+			want: []string{backup + " has unknown architecture role \"typo\""},
+		},
+		{
+			name: "server mislabeled as verifier",
+			change: func(_ map[string]listedPackage, rules map[string]rule) {
+				rules[server] = rule{verifier, []string{store, wal}}
+			},
+			want: []string{
+				"invalid server command registration: " + server + " has role \"verifier command\", only " + server + " may be the server command",
+				server + " is registered as verifier command but reachability from " + server + " is true",
+			},
+		},
+		{
+			name: "duplicate declared edge",
+			change: func(_ map[string]listedPackage, rules map[string]rule) {
+				rules[history] = rule{staged, []string{checkpoint, store, store}}
+			},
+			want: []string{"duplicate production import registration: " + history + " -> " + store},
+		},
+		{
 			name: "cycle outside runtime even if imports are allowed",
 			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
 				pkgs[checkpoint] = productionPackage("checkpoint", history)
@@ -217,6 +241,8 @@ func TestComposedCutoverRules(t *testing.T) {
 			want: []string{
 				"forbidden storage dependency: " + checkpoint + " -> " + httpapi,
 				"forbidden storage dependency: " + history + " -> " + httpapi,
+				"forbidden storage authority dependency: " + checkpoint + " reaches " + wal,
+				"forbidden storage authority dependency: " + history + " reaches " + wal,
 			},
 		},
 		{
@@ -225,7 +251,10 @@ func TestComposedCutoverRules(t *testing.T) {
 				pkgs[history] = productionPackage("history", checkpoint, store, readiness)
 				rules[history] = rule{runtimeLibrary, []string{checkpoint, store, readiness}}
 			},
-			want: []string{"forbidden storage dependency: " + history + " -> " + readiness},
+			want: []string{
+				"forbidden storage dependency: " + history + " -> " + readiness,
+				"forbidden storage authority dependency: " + history + " reaches " + wal,
+			},
 		},
 		{
 			name: "backup cannot reach HTTP through a registered adapter",
@@ -235,16 +264,20 @@ func TestComposedCutoverRules(t *testing.T) {
 				rules[backup] = rule{runtimeLibrary, []string{store, adapter}}
 				rules[adapter] = rule{runtimeLibrary, []string{httpapi}}
 			},
-			want: []string{"forbidden storage dependency: " + backup + " -> " + httpapi},
+			want: []string{
+				"forbidden storage dependency: " + backup + " -> " + httpapi,
+				"forbidden storage authority dependency: " + backup + " reaches " + wal,
+			},
 		},
 		{
-			name: "unregistered backup import violates both rules",
+			name: "unregistered backup import also crosses runtime boundaries",
 			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
 				pkgs[backup] = productionPackage("backup", store, httpapi)
 			},
 			want: []string{
 				"forbidden production import: " + backup + " -> " + httpapi,
 				"forbidden storage dependency: " + backup + " -> " + httpapi,
+				"forbidden storage authority dependency: " + backup + " reaches " + wal,
 			},
 		},
 		{
@@ -253,7 +286,10 @@ func TestComposedCutoverRules(t *testing.T) {
 				pkgs[httpapi] = productionPackage("httpapi", store, wal, history)
 				rules[httpapi] = rule{runtimeLibrary, []string{store, wal, history}}
 			},
-			want: []string{"HTTP must use the page source seam: " + httpapi + " -> " + history},
+			want: []string{
+				"HTTP must use the page source seam: " + httpapi + " reaches " + checkpoint,
+				"HTTP must use the page source seam: " + httpapi + " reaches " + history,
+			},
 		},
 		{
 			name: "extracted runtime adapter requires registration",
@@ -305,8 +341,8 @@ func TestComposedCutoverRules(t *testing.T) {
 			if tt.change != nil {
 				tt.change(pkgs, rules)
 			}
-			if got := architectureProblems(pkgs, rules); !slices.Equal(got, tt.want) {
-				t.Errorf("architectureProblems() = [%s], want [%s]", strings.Join(got, "\n"), strings.Join(tt.want, "\n"))
+			if got := linuxGraphProblems(pkgs, rules); !slices.Equal(got, tt.want) {
+				t.Errorf("linuxGraphProblems() = [%s], want [%s]", strings.Join(got, "\n"), strings.Join(tt.want, "\n"))
 			}
 		})
 	}

@@ -6,21 +6,9 @@ import (
 	"testing"
 )
 
-func TestStorageAuthorityBoundary(t *testing.T) {
-	t.Parallel()
-	for _, problem := range storageAuthorityProblems(registry) {
-		t.Error(problem)
-	}
-}
-
-// The Linux architecture test checks the registry against the production graph.
-// Enforce ownership independently so registering a bypass cannot permit it.
-func storageAuthorityProblems(rules map[string]rule) []string {
+// Validate ownership even for dependencies declared in the registry.
+func storageAuthorityProblems(packages map[string]listedPackage) []string {
 	const wal = "bog/internal/wal"
-	packages := make(map[string]listedPackage, len(rules))
-	for path, entry := range rules {
-		packages[path] = listedPackage{Imports: entry.imports}
-	}
 
 	var problems []string
 	for _, from := range []string{"bog/internal/backup", "bog/internal/checkpoint", "bog/internal/history"} {
@@ -36,6 +24,7 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 	const (
 		backup     = "bog/internal/backup"
 		checkpoint = "bog/internal/checkpoint"
+		external   = "example.com/authority-bridge"
 		history    = "bog/internal/history"
 		httpapi    = "bog/internal/httpapi"
 		relay      = "bog/internal/relay"
@@ -71,6 +60,11 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 			from: history, through: relay,
 			want: []string{"forbidden storage authority dependency: " + history + " reaches " + wal},
 		},
+		{
+			name: "backup reaches the owner through an external package",
+			from: backup, through: external,
+			want: []string{"forbidden storage authority dependency: " + backup + " reaches " + wal},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -87,7 +81,7 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 			if tt.through == relay {
 				rules[relay] = rule{runtimeLibrary, []string{wal}}
 			}
-			if tt.from != "" {
+			if tt.from != "" && tt.through != external {
 				entry := rules[tt.from]
 				entry.imports = append(entry.imports, tt.through)
 				rules[tt.from] = entry
@@ -100,11 +94,15 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 				}
 				packages[path] = productionPackage(name, entry.imports...)
 			}
+			if tt.through == external {
+				packages[tt.from] = productionPackage("backup", store, external)
+				packages[external] = listedPackage{Imports: []string{wal}}
+			}
 			if problems := architectureProblems(packages, rules); len(problems) != 0 {
 				t.Fatalf("fixture violates the existing architecture rules: %v", problems)
 			}
-			if got := storageAuthorityProblems(rules); !slices.Equal(got, tt.want) {
-				t.Errorf("storageAuthorityProblems() = %q, want %q", got, tt.want)
+			if got := linuxGraphProblems(packages, rules); !slices.Equal(got, tt.want) {
+				t.Errorf("linuxGraphProblems() = %q, want %q", got, tt.want)
 			}
 		})
 	}

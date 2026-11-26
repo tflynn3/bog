@@ -2,8 +2,9 @@ package httpapi
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -40,23 +41,26 @@ func readHTTPTestBody(t *testing.T, body io.ReadCloser) []byte {
 	return data
 }
 
+func newAPI(s *store.Store, w appender, maxBytes int, workBudget uint64) *API {
+	return newAPIForSource(&legacyPageSource{store: s}, w, maxBytes, workBudget)
+}
+
 func TestCursorAuthenticationDomainSeparation(t *testing.T) {
 	a := newAPI(nil, nil, DefaultQueryMaxResponseBytes, DefaultQueryWorkBudget)
-	payload, err := json.Marshal(cursorData{Version: 1})
+	token := a.encodeCursor(cursorData{Capture: 7})
+	data, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := a.containsDigest(string(payload))
-	forged := base64.RawURLEncoding.EncodeToString(append(payload, digest[:]...))
+	mac := hmac.New(sha256.New, a.cursorKey[:])
+	mac.Write([]byte("bog-filter-v1\x00"))
+	mac.Write(data[:cursorPayloadSize])
+	forged := base64.RawURLEncoding.EncodeToString(mac.Sum(data[:cursorPayloadSize]))
 	if _, err := a.decodeCursor(forged); err == nil {
-		t.Fatal("filter digest authenticated a cursor payload")
+		t.Fatal("filter MAC authenticated a cursor payload")
 	}
-	token, err := a.encodeCursor(cursorData{Version: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.decodeCursor(token); err != nil {
-		t.Fatal(err)
+	if cursor, err := a.decodeCursor(token); err != nil || cursor.Capture != 7 {
+		t.Fatalf("authentic cursor = %+v, %v", cursor, err)
 	}
 }
 
@@ -318,7 +322,7 @@ func TestSnapshotByteCutPreservesOrdinal(t *testing.T) {
 	oneOut := httptest.NewRecorder()
 	one.ServeHTTP(oneOut, httptest.NewRequest("GET", "/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&page=1&limit=5", nil))
 	oneCursor, err := oneAPI.decodeCursor(oneOut.Header().Get("Bog-Next-Cursor"))
-	if oneOut.Code != 200 || oneOut.Body.Len() != size || err != nil || oneCursor.After.Ordinal != 0 {
+	if oneOut.Code != 200 || oneOut.Body.Len() != size || err != nil || oneCursor.After != positionDigest(legacyPosition(store.TailPosition{Time: stamp, Ordinal: 0})) {
 		t.Fatalf("one-row cut: %d cursor=%+v error=%v", oneOut.Code, oneCursor, err)
 	}
 	a := newAPI(s, nil, size*2, DefaultQueryWorkBudget)
@@ -335,7 +339,7 @@ func TestSnapshotByteCutPreservesOrdinal(t *testing.T) {
 		t.Fatalf("first: %d %q", first.Code, first.Body.String())
 	}
 	c, err := a.decodeCursor(token)
-	if err != nil || c.After.Ordinal != 1 || c.Count != 5 {
+	if err != nil || c.After != positionDigest(legacyPosition(store.TailPosition{Time: stamp, Ordinal: 1})) {
 		t.Fatalf("cursor: %+v %v", c, err)
 	}
 	s.Publish([]store.Row{{TS: stamp.Add(-1), Line: "backfill"}, row})
@@ -345,7 +349,7 @@ func TestSnapshotByteCutPreservesOrdinal(t *testing.T) {
 		t.Fatalf("second: %d %q", second.Code, second.Body.String())
 	}
 	c, err = a.decodeCursor(token)
-	if err != nil || c.After.Ordinal != 3 || c.Count != 5 {
+	if err != nil || c.After != positionDigest(legacyPosition(store.TailPosition{Time: stamp, Ordinal: 3})) {
 		t.Fatalf("cursor: %+v %v", c, err)
 	}
 	last := query("&cursor=" + token + "&limit=5")

@@ -259,6 +259,9 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 		Cleanup: cleanupProof{Status: "not_started"}, Diagnostics: &capacityDiagnostics{
 			Queries: make(map[string]*queryPhase), Unavailable: make(map[string]string),
 		}, resources: resources{Unavailable: make(map[string]string)}}
+	if o.mode == "live" {
+		r.Diagnostics.Backfills = newBackfillTimelines(f)
+	}
 	err := func() (err error) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -357,7 +360,7 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 	return r
 }
 
-func (r *result) exercise(ctx context.Context, o options, binary, dir, group string, f fixture, candidate *candidateEvidence) (*child, error) {
+func (r *result) exercise(ctx context.Context, o options, binary, dir, group string, f fixture, candidate *candidateEvidence) (_ *child, err error) {
 	r.Phase = candidate.Lifetime
 	if err := ctx.Err(); err != nil {
 		candidate.StartupError = diagnosticError(err)
@@ -382,16 +385,34 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 		candidate.StartupError = diagnosticError(err)
 		return p, err
 	}
+	// Abort in-flight HTTP calls and join the watcher before teardown.
+	work, cancelWork := context.WithCancel(ctx)
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		select {
+		case <-work.Done():
+		case <-p.done:
+			cancelWork()
+		}
+	}()
+	defer func() {
+		cancelWork()
+		<-watched
+		if p.exited() {
+			err = errors.Join(err, errors.New("candidate exited during workload"))
+		}
+	}()
 	elapsed := time.Since(start)
 	candidate.Ready = &elapsed
 	if candidate.Lifetime == "restart" {
 		r.RestartReady = &elapsed
 		r.Phase = "recovery_walk"
-		r.RecoveredRows, err = f.recover(ctx, probe)
+		r.RecoveredRows, err = f.recover(work, probe)
 		return p, err
 	}
 	r.StartReady = &elapsed
-	return p, f.load(ctx, probe, o, r)
+	return p, f.load(work, probe, o, r, dir)
 }
 
 func (r *result) collectRSS(p *child) {

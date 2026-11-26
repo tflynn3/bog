@@ -90,7 +90,10 @@ func TestArchitectureRules(t *testing.T) {
 			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
 				pkgs[server] = productionPackage("main", wal)
 			},
-			want: []string{store + " is registered as runtime library but reachability from " + server + " is false"},
+			want: []string{
+				store + " is registered as runtime library but reachability from " + server + " is false",
+				"stale production import registration: " + server + " -> " + store,
+			},
 		},
 		{
 			name: "test harness gains production files",
@@ -153,6 +156,123 @@ func TestArchitectureRules(t *testing.T) {
 			}
 			got := architectureProblems(pkgs, rules)
 			if !slices.Equal(got, tt.want) {
+				t.Errorf("architectureProblems() = [%s], want [%s]", strings.Join(got, "\n"), strings.Join(tt.want, "\n"))
+			}
+		})
+	}
+}
+
+func TestComposedCutoverRules(t *testing.T) {
+	const (
+		httpapi    = "bog/internal/httpapi"
+		readiness  = "bog/internal/readiness"
+		wal        = "bog/internal/wal"
+		store      = "bog/internal/store"
+		checkpoint = "bog/internal/checkpoint"
+		history    = "bog/internal/history"
+		backup     = "bog/internal/backup"
+		adapter    = "bog/internal/retained"
+	)
+	tests := []struct {
+		name   string
+		change func(map[string]listedPackage, map[string]rule)
+		want   []string
+	}{
+		{name: "composition root reaches all retained storage"},
+		{
+			name: "wiring without role promotions",
+			change: func(_ map[string]listedPackage, rules map[string]rule) {
+				for _, path := range []string{backup, checkpoint, history} {
+					r := rules[path]
+					r.role = staged
+					rules[path] = r
+				}
+			},
+			want: []string{
+				backup + " is registered as staged but reachability from " + server + " is true",
+				checkpoint + " is registered as staged but reachability from " + server + " is true",
+				history + " is registered as staged but reachability from " + server + " is true",
+			},
+		},
+		{
+			name: "checkpoint cannot depend on HTTP",
+			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+				pkgs[checkpoint] = productionPackage("checkpoint", store, httpapi)
+			},
+			want: []string{"forbidden production import: " + checkpoint + " -> " + httpapi},
+		},
+		{
+			name: "history cannot depend on readiness",
+			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+				pkgs[history] = productionPackage("history", checkpoint, store, readiness)
+			},
+			want: []string{"forbidden production import: " + history + " -> " + readiness},
+		},
+		{
+			name: "backup cannot depend on HTTP",
+			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+				pkgs[backup] = productionPackage("backup", store, httpapi)
+			},
+			want: []string{"forbidden production import: " + backup + " -> " + httpapi},
+		},
+		{
+			name: "HTTP cannot bypass the consumer seam",
+			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+				pkgs[httpapi] = productionPackage("httpapi", store, wal, history)
+			},
+			want: []string{"forbidden production import: " + httpapi + " -> " + history},
+		},
+		{
+			name: "extracted runtime adapter requires registration",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[server] = productionPackage("main", httpapi, readiness, store, wal, adapter)
+				pkgs[adapter] = productionPackage("retained", backup, history, wal)
+				rules[server] = rule{serverCommand, []string{httpapi, readiness, store, wal, adapter}}
+			},
+			want: []string{
+				"unregistered reachable production package " + adapter,
+				"forbidden production import: " + adapter + " -> " + backup,
+				"forbidden production import: " + adapter + " -> " + history,
+				"forbidden production import: " + adapter + " -> " + wal,
+			},
+		},
+		{
+			name: "retired direct edge remains in the registry",
+			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+				pkgs[httpapi] = productionPackage("httpapi", store)
+			},
+			want: []string{"stale production import registration: " + httpapi + " -> " + wal},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			// Model an adapter in cmd/bog. History brings checkpoint in
+			// transitively, so no speculative direct command edge is needed.
+			pkgs := map[string]listedPackage{
+				server:     productionPackage("main", backup, history, httpapi, readiness, store, wal),
+				backup:     productionPackage("backup", store),
+				checkpoint: productionPackage("checkpoint", store),
+				history:    productionPackage("history", checkpoint, store),
+				httpapi:    productionPackage("httpapi", store, wal),
+				readiness:  productionPackage("readiness", store, wal),
+				store:      productionPackage("store"),
+				wal:        productionPackage("wal", store),
+			}
+			rules := map[string]rule{
+				server:     {serverCommand, []string{backup, history, httpapi, readiness, store, wal}},
+				backup:     {runtimeLibrary, []string{store}},
+				checkpoint: {runtimeLibrary, []string{store}},
+				history:    {runtimeLibrary, []string{checkpoint, store}},
+				httpapi:    {runtimeLibrary, []string{store, wal}},
+				readiness:  {runtimeLibrary, []string{store, wal}},
+				store:      {runtimeLibrary, nil},
+				wal:        {runtimeLibrary, []string{store}},
+			}
+			if tt.change != nil {
+				tt.change(pkgs, rules)
+			}
+			if got := architectureProblems(pkgs, rules); !slices.Equal(got, tt.want) {
 				t.Errorf("architectureProblems() = [%s], want [%s]", strings.Join(got, "\n"), strings.Join(tt.want, "\n"))
 			}
 		})

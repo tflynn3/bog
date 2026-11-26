@@ -37,8 +37,9 @@ The cursor captures published rows at the first request; later appends do not ap
 ## Retained-history cutover
 
 The [cutover decision](docs/adr/0004-retained-history-cutover.md) specifies
-the behavior planned for the integrated release. The legacy binary rejects
-restored images before opening the legacy WAL.
+the operating contract for the integrated release. Use a qualified
+cutover binary for the steps below. The legacy binary rejects restored
+images before opening the legacy WAL.
 
 ### Activate a verified restore
 
@@ -65,30 +66,33 @@ appends survive restart alongside the restored rows.
 
 A first page pins one generation and its committed tail. Its cursor keeps
 reading that view through generation replacement while the capture is live.
-After expiry or restart, start a fresh walk. A byte-limited page resumes
-just after its last emitted row. If the work
-budget prevents the server from establishing and preparing a page, it
-returns 503 with no rows or next cursor. Retry a continuation with the
-cursor from the original request while its capture is live. Lowering
+An expired capture returns 410. After expiry or restart, start a fresh walk
+with `page=1` on the serving process. A byte-limited page resumes just after
+its last emitted row. If the work budget prevents the server from preparing a
+page, it returns 503 with no rows or next cursor. Retry a continuation with
+the cursor from the original request while its capture is live. Lowering
 `limit` can help when a page has many matches. A sparse scan may require a
 larger server work budget.
 
 ### Opt in to capacity verification
 
-The proposed `-enable-capacity-control` switch enables
-`/_capacity/compaction` on an explicitly loopback-bound server. It defaults
-to off. Use it with a disposable data directory for the live Linux capacity
-fixture.
+Set `BOG_CAPACITY_CONTROL=1` on a cutover binary to enable
+`/_capacity/compaction` on a loopback-bound listener. The control defaults
+to off. Use a disposable local data directory for the Linux capacity fixture.
 
 ```sh
-./bog -data-dir /path/to/disposable-data -addr 127.0.0.1:8080 -enable-capacity-control
+BOG_CAPACITY_CONTROL=1 ./bog -data-dir /path/to/disposable-data -addr 127.0.0.1:8080
 ```
 
-The fixture drives asynchronous checkpoint replacement while
-ingesting and resuming a pinned cursor. It checks the observed generation,
-checkpoint coverage, and committed row count. The legacy baseline runs
-with the control off. See the [capacity runner](bench/retained-history/README.md)
-and [Linux release gate](verify/release/README.md).
+The capacity runner sets the opt-in for both live starts and removes any
+inherited opt-in in legacy mode. Live qualification checks asynchronous
+checkpoint replacement during ingest and cursor resume, then checks
+complete query walks after restart at both fixture sizes. It requires
+delegated cgroup v2 and cleanup of candidate processes and disposable
+cgroups. The Linux release gate collects capacity, admission, durability,
+and restored-parity reports from the same pinned binary. See the
+[capacity runner](bench/retained-history/README.md) and
+[Linux release gate](verify/release/README.md).
 
 ## Legacy performance measurements
 

@@ -35,8 +35,8 @@ type rule struct {
 	imports []string
 }
 
-// These are permitted direct imports within the root module. Promote a staged
-// package and update its consumers here in the same change that wires it in.
+// Record the observed direct production imports within the root module.
+// Update roles and edges in the same change as the wiring that requires them.
 var registry = map[string]rule{
 	server:                       {serverCommand, []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
 	"bog/internal/httpapi":       {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
@@ -171,9 +171,15 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 			}
 			problems = append(problems, fmt.Sprintf("unregistered %s production package %s", reach, path))
 		}
-		for _, imported := range production[path] {
+		imports := production[path]
+		for _, imported := range imports {
 			if _, isLocal := production[imported]; isLocal && !slices.Contains(r.imports, imported) {
 				problems = append(problems, fmt.Sprintf("forbidden production import: %s -> %s", path, imported))
+			}
+		}
+		for _, imported := range r.imports {
+			if _, isLocal := production[imported]; !isLocal || !slices.Contains(imports, imported) {
+				problems = append(problems, fmt.Sprintf("stale production import registration: %s -> %s", path, imported))
 			}
 		}
 	}

@@ -64,12 +64,12 @@ func TestComparePayloadReads(t *testing.T) {
 		bytesAvoided  int64
 		wantErr       bool
 	}{
-		{"same reads", payloadReads{4, 200}, "sparse", 0, 0, false},
-		{"pruned", payloadReads{1, 50}, "sparse", 3, 150, false},
+		{"same reads", payloadReads{Blocks: 4, Bytes: 200}, "sparse", 0, 0, false},
+		{"pruned", payloadReads{Blocks: 1, Bytes: 50}, "sparse", 3, 150, false},
 		{"no reads", payloadReads{}, "sparse", 4, 200, false},
-		{"increased reads", payloadReads{5, 50}, "sparse", 0, 0, true},
-		{"increased bytes", payloadReads{4, 201}, "sparse", 0, 0, true},
-		{"different query", payloadReads{1, 50}, "medium", 0, 0, true},
+		{"increased reads", payloadReads{Blocks: 5, Bytes: 50}, "sparse", 0, 0, true},
+		{"increased bytes", payloadReads{Blocks: 4, Bytes: 201}, "sparse", 0, 0, true},
+		{"different query", payloadReads{Blocks: 1, Bytes: 50}, "medium", 0, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := measurement{Name: tc.baselineName, Literal: "literal", payloadReads: tc.reads}
@@ -80,6 +80,27 @@ func TestComparePayloadReads(t *testing.T) {
 			if err == nil && (m.BlocksAvoided != tc.blocksAvoided || m.BytesAvoided != tc.bytesAvoided ||
 				m.BaselineBlocksRead != base.Blocks || m.BaselineBytesRead != base.Bytes) {
 				t.Errorf("wrong baseline accounting: %+v", m)
+			}
+		})
+	}
+}
+
+func TestParsePeakRSS(t *testing.T) {
+	for _, tc := range []struct {
+		name, status string
+		bytes        int64
+	}{
+		{"high water", "Name:\tsegment-layout\nVmHWM:\t2048 kB\nVmRSS:\t1024 kB\n", 2 << 20},
+		{"absent", "VmRSS:\t1024 kB\n", 0},
+		{"overflow", "VmHWM: 9007199254740992 kB\n", 0},
+		{"negative", "VmHWM: -1 kB\n", 0},
+		{"zero", "VmHWM: 0 kB\n", 0},
+		{"bad unit", "VmHWM: 1 MB\n", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parsePeakRSS([]byte(tc.status))
+			if got != tc.bytes || (err != nil) != (tc.bytes == 0) {
+				t.Fatalf("parsePeakRSS = %d, %v", got, err)
 			}
 		})
 	}

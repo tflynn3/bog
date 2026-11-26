@@ -141,6 +141,9 @@ func queries() []query {
 		{"dense", denseLiteral, firstTime, endTime},
 		{"case-mismatch", "COHORT-DENSE", firstTime, endTime},
 		{"bounded-sparse", sparseLiteral, epoch, epoch.Add(37 * time.Second)},
+		// Sparse rows always include cohort-medium between these terms.
+		// Their four-byte windows still admit blocks containing sparse rows.
+		{"bloom-false-positive", sparseLiteral + " " + denseLiteral, firstTime, endTime},
 	}
 }
 

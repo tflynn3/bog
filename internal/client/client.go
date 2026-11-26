@@ -69,7 +69,10 @@ func (e *HTTPError) Error() string {
 	}
 	return fmt.Sprintf("Bog HTTP %d: %s", e.StatusCode, e.Body)
 }
-func (e *HTTPError) Unwrap() error   { return e.Cause }
+func (e *HTTPError) Unwrap() error { return e.Cause }
+
+// Retryable reports a query HTTP 503. A capacity rejection may clear on retry;
+// a work-budget rejection may require a smaller limit or a larger server budget.
 func (e *HTTPError) Retryable() bool { return e.QueryRetryable }
 
 // Query specifies the immutable bounds and filter of a snapshot walk.
@@ -88,8 +91,12 @@ type Page struct {
 
 func (c *Client) endpoint(path string) string {
 	u := *c.base
-	u.Path = strings.TrimRight(u.Path, "/") + path
-	u.RawPath = ""
+	escaped := u.EscapedPath()
+	prefix := strings.TrimRight(escaped, "/")
+	// Remove only literal trailing separators. An escaped slash belongs
+	// to the base path segment, even when its decoded value ends in '/'.
+	u.Path = u.Path[:len(u.Path)-(len(escaped)-len(prefix))] + path
+	u.RawPath = prefix + path
 	return u.String()
 }
 func (c *Client) request(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
@@ -102,6 +109,27 @@ func (c *Client) request(ctx context.Context, method, path string, body io.Reade
 }
 func framed(r *http.Response) bool {
 	return r.ProtoMajor >= 2 || r.ContentLength >= 0 || (len(r.TransferEncoding) == 1 && r.TransferEncoding[0] == "chunked")
+}
+
+func readQueryBody(r *http.Response, limit int64) ([]byte, error) {
+	if !framed(r) {
+		return nil, errors.New("query response has unverifiable framing")
+	}
+	encodings := r.Header.Values("Content-Encoding")
+	if r.Uncompressed || len(encodings) > 1 || (len(encodings) == 1 && !strings.EqualFold(encodings[0], "identity")) {
+		return nil, errors.New("unsupported query content encoding")
+	}
+	if r.ContentLength >= 0 && r.ContentLength > limit && limit >= 0 {
+		return nil, errors.New("response exceeds size limit")
+	}
+	body, err := readBounded(r.Body, limit)
+	if err != nil {
+		return nil, err
+	}
+	if r.ContentLength >= 0 && int64(len(body)) != r.ContentLength {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return body, nil
 }
 func readBounded(r io.Reader, n int64) ([]byte, error) {
 	if n < 0 || n == math.MaxInt64 {
@@ -163,22 +191,16 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (page Pa
 		e.CursorRejected = cursor != "" && resp.StatusCode == http.StatusBadRequest && framed(resp) && e.Cause == nil && e.Body == "invalid cursor\n"
 		return Page{}, e
 	}
-	if !framed(resp) {
-		return Page{}, errors.New("query response has unverifiable framing")
-	}
-	if resp.Uncompressed || (resp.Header.Get("Content-Encoding") != "" && resp.Header.Get("Content-Encoding") != "identity") {
-		return Page{}, errors.New("unsupported query content encoding")
-	}
 	limit := c.MaxPageBytes
 	if limit == 0 {
 		limit = DefaultMaxPage
 	}
-	if limit < 0 {
-		return Page{}, errors.New("invalid page size limit")
-	}
-	b, err := readBounded(resp.Body, limit)
+	b, err := readQueryBody(resp, limit)
 	if err != nil {
 		return Page{}, fmt.Errorf("read query page: %w", err)
+	}
+	if _, present := resp.Trailer["Bog-Next-Cursor"]; present {
+		return Page{}, errors.New("unexpected next cursor trailer")
 	}
 	var rows []Row
 	for len(b) > 0 {

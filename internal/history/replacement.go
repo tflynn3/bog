@@ -102,7 +102,7 @@ func (r *Replacement) install(ctx context.Context, open directoryOpener) (_ Gene
 	c.current = next
 	c.mu.Unlock()
 	if prev != nil {
-		c.trackRetired(prev)
+		c.trackSuperseded(prev, next)
 		err = prev.release()
 	}
 	return next.info, err

@@ -16,6 +16,7 @@ import (
 )
 
 const schemaVersion = 1
+const capacityCase = "retained_history_capacity"
 
 var fullRevision = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -46,7 +47,7 @@ type report struct {
 
 var admissionCases = []string{"one_slot_saturation", "ingest_during_saturation", "cursor_resume", "work_budget"}
 var durabilityCases = []string{"sigkill", "recovery", "enospc"}
-var capacityCases = []string{"retained_history_capacity"}
+var capacityCases = []string{capacityCase}
 
 func readIdentity(binary, revision, fixture string) (id identity, err error) {
 	if !filepath.IsAbs(binary) || !fullRevision.MatchString(revision) || fixture == "" {
@@ -92,7 +93,7 @@ func decodeFields(data []byte, fields map[string]any) (map[string]jsontext.Value
 func validateReport(data []byte, expected identity, required []string) error {
 	var got identity
 	var cases map[string]jsontext.Value
-	_, err := decodeFields(data, map[string]any{
+	fields, err := decodeFields(data, map[string]any{
 		"schema_version": &got.SchemaVersion, "revision": &got.Revision,
 		"binary_sha256": &got.BinarySHA256, "fixture": &got.Fixture, "cases": &cases,
 	})
@@ -112,6 +113,9 @@ func validateReport(data []byte, expected identity, required []string) error {
 		if err := validateOutcome(raw, mandatory, mandatory && name == "enospc"); err != nil {
 			return fmt.Errorf("case %q: %w", name, err)
 		}
+	}
+	if slices.Contains(required, capacityCase) {
+		return validateCapacity(fields["mode"], cases[capacityCase], got.Fixture)
 	}
 	return nil
 }

@@ -16,8 +16,11 @@ candidate checkout. The sibling commands need to provision their Linux fixtures
 and use the supplied binary. The gate fails if any command or report is missing,
 including on revisions where only earlier harness entry points exist. The
 capacity producer runs as the runner user in a systemd service with delegated
-cgroup v2 memory and I/O controllers. Its live launcher supplies
-`BOG_CAPACITY_CONTROL=1` to both candidate starts.
+cgroup v2 memory and I/O controllers. The launcher clears any inherited
+`BOG_CAPACITY_CONTROL` and sets `BOG_CAPACITY_CONTROL=1` for both loopback
+candidate starts in live mode. Legacy mode leaves it unset.
+[ADR 0004](../../docs/adr/0004-retained-history-cutover.md#writable-activation-and-capacity-control)
+specifies the server opt-in.
 
 Reports have integer `schema_version` 1, string `revision`, lowercase hexadecimal
 `binary_sha256`, string `fixture`, and a `cases` object. Each case has a string
@@ -41,6 +44,32 @@ The durability report's `enospc` case requires the following `evidence` object.
   "recovered_after_space_freed": true
 }
 ```
+
+## Live capacity evidence
+
+The capacity case requires `mode: "live"` and exactly one passing record
+each for 196,608 and 393,216 seed rows. Each fixture uses 1,024-byte
+lines, 64-row batches, 2,048 tail rows, and a 128 MiB cgroup memory cap
+with swap disabled. The compaction record must report a completed
+generation covering the seed plus the first tail batch. The committed
+and recovered row counts must both equal seed plus tail. The validator
+also checks startup and restart timings, mixed-load p99s and sample
+counts, memory peak, RSS, descriptor count, disk headroom, and per-device
+I/O counters.
+
+Each record carries `workload_status` and a separate `cleanup` object. An
+overall pass requires both to pass. Cleanup records `candidate_reaped`,
+`subtree_empty`, and `subtree_removed`. The runner gives the candidate
+time to stop, reads hierarchical `cgroup.events`, and uses
+`cgroup.kill` when processes remain. It waits for `populated 0` before
+removing cgroups bottom-up. The cleanup deadline is independent of the
+workload deadline. A workload failure can carry successful cleanup
+evidence, which still fails the capacity case.
+
+Set `BOG_TEST_CGROUP_PARENT` to a delegated cgroup v2 parent with memory
+and I/O enabled for its children to run the kernel regression tests.
+Run the test process from a separate child of that delegation, as the
+release workflow does for the benchmark.
 
 ## Admission fixture
 

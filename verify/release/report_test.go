@@ -85,7 +85,7 @@ func TestValidateCommand(t *testing.T) {
 	binary := filepath.Join(dir, "candidate")
 	data := []byte("prebuilt candidate")
 	writeFixture(t, binary, data)
-	id := identity{1, testRevision, fmt.Sprintf("%x", sha256.Sum256(data)), "release-fixture"}
+	id := identity{1, testRevision, fmt.Sprintf("%x", sha256.Sum256(data)), capacityFixtureID}
 	args := []string{"validate", "-binary", binary, "-revision", id.Revision, "-fixture", id.Fixture}
 	for _, fixture := range []struct {
 		name  string
@@ -106,6 +106,9 @@ func TestValidateCommand(t *testing.T) {
 		raw, err := json.Marshal(report{id, cases})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if fixture.name == "capacity" {
+			raw = capacityReport(id)
 		}
 		writeFixture(t, path, raw)
 		args = append(args, "-"+fixture.name, path)

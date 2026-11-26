@@ -48,53 +48,32 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	gate, err := cmd.StdinPipe()
+	readGate, gate, err := os.Pipe()
 	if err != nil {
 		return nil, "", err
 	}
+	cmd.Stdin = readGate
 	if err := cmd.Start(); err != nil {
-		return nil, "", errors.Join(err, gate.Close())
+		return nil, "", errors.Join(err, readGate.Close(), gate.Close())
 	}
 	p := &child{cmd: cmd, done: make(chan struct{})}
-	go func() {
-		p.waitErr = cmd.Wait()
-		close(p.done)
+	defer func() {
+		// Keep the PID reserved until placement finishes, even if the
+		// shell exits before we release the gate.
+		go func() {
+			p.waitErr = cmd.Wait()
+			close(p.done)
+		}()
 	}()
-	err = os.WriteFile(filepath.Join(group, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0)
+	if err := readGate.Close(); err != nil {
+		return p, "", errors.Join(err, gate.Close())
+	}
+	err = writeCgroupFile(group, "cgroup.procs", strconv.Itoa(cmd.Process.Pid))
 	if err == nil {
 		_, err = gate.Write([]byte("start\n"))
 	}
-	if err := errors.Join(err, gate.Close()); err != nil {
-		return nil, "", errors.Join(err, p.stop())
-	}
-	return p, "http://" + addr, nil
-}
-
-func (p *child) stop() error {
-	select {
-	case <-p.done:
-		return p.waitErr
-	default:
-	}
-	err := p.cmd.Process.Signal(syscall.SIGTERM)
-	if errors.Is(err, os.ErrProcessDone) {
-		err = nil
-	}
-	select {
-	case <-p.done:
-		return errors.Join(err, p.waitErr)
-	case <-time.After(2 * time.Second):
-	}
-	killErr := p.cmd.Process.Kill()
-	if errors.Is(killErr, os.ErrProcessDone) {
-		killErr = nil
-	}
-	select {
-	case <-p.done:
-		return errors.Join(err, killErr, p.waitErr, errors.New("child shutdown exceeded grace period"))
-	case <-time.After(2 * time.Second):
-		return errors.Join(err, killErr, errors.New("timed out reaping child"))
-	}
+	// The caller owns p even when placement or release of the startup gate fails.
+	return p, "http://" + addr, errors.Join(err, gate.Close())
 }
 
 func openGroup(parent string, limit uint64) (string, error) {
@@ -109,18 +88,45 @@ func openGroup(parent string, limit uint64) (string, error) {
 		}
 		parent = filepath.Join("/sys/fs/cgroup", path)
 	}
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(parent, &fs); err != nil {
+		return "", err
+	}
+	const cgroup2Magic = 0x63677270
+	if fs.Type != cgroup2Magic {
+		return "", fmt.Errorf("%s is not on cgroup v2", parent)
+	}
 	group, err := os.MkdirTemp(parent, "bog-capacity-")
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(group, "memory.max"), []byte(strconv.FormatUint(limit, 10)), 0); err != nil {
-		return "", errors.Join(err, os.Remove(group))
-	}
-	// Disable swap so memory.max is the working-set limit.
-	if err := os.WriteFile(filepath.Join(group, "memory.swap.max"), []byte("0"), 0); err != nil {
-		return "", errors.Join(err, os.Remove(group))
+	// Return the owned directory even if configuration fails so it goes
+	// through the same teardown as a fully provisioned fixture.
+	for _, limit := range []struct{ name, value string }{
+		{"memory.max", strconv.FormatUint(limit, 10)},
+		{"memory.swap.max", "0"},
+	} {
+		if err := writeCgroupFile(group, limit.name, limit.value); err != nil {
+			return group, err
+		}
+		data, err := os.ReadFile(filepath.Join(group, limit.name))
+		if err != nil {
+			return group, err
+		}
+		if strings.TrimSpace(string(data)) != limit.value {
+			return group, fmt.Errorf("%s did not retain limit %s: %q", limit.name, limit.value, data)
+		}
 	}
 	return group, nil
+}
+
+func writeCgroupFile(group, name, value string) error {
+	file, err := os.OpenFile(filepath.Join(group, name), os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, err = file.WriteString(value)
+	return errors.Join(err, file.Close())
 }
 
 func deviceIO(data string) (map[string]map[string]uint64, error) {
@@ -176,6 +182,11 @@ func (r *resources) sample(ctx context.Context, p *child, dir string) <-chan str
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
 		for {
+			select {
+			case <-p.done:
+				return
+			default:
+			}
 			files, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", p.cmd.Process.Pid))
 			if err == nil {
 				n := uint64(len(files))
@@ -188,6 +199,8 @@ func (r *resources) sample(ctx context.Context, p *child, dir string) <-chan str
 			r.disk(dir)
 			select {
 			case <-ctx.Done():
+				return
+			case <-p.done:
 				return
 			case <-ticker.C:
 			}
@@ -217,85 +230,58 @@ func (r *resources) collect(group string) {
 	}
 }
 
-func closeGroup(group string) error {
-	populated, err := os.ReadFile(filepath.Join(group, "cgroup.procs"))
-	if err == nil && len(strings.Fields(string(populated))) != 0 {
-		err = errors.Join(errors.New("processes left in capacity cgroup"),
-			os.WriteFile(filepath.Join(group, "cgroup.kill"), []byte("1"), 0))
-	}
-	return errors.Join(err, os.Remove(group))
-}
-
 func measure(ctx context.Context, o options, binary, dir string, f fixture) (r result) {
-	r = result{Fixture: f, Phase: "provision", Status: "fail", resources: resources{Unavailable: make(map[string]string)}}
+	r = result{Fixture: f, Phase: "provision", Status: "fail", Workload: "fail",
+		Cleanup: cleanupProof{Status: "not_started"}, resources: resources{Unavailable: make(map[string]string)}}
 	err := func() (err error) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := os.Mkdir(dir, 0700); err != nil {
 			return err
 		}
 		defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
 		r.disk(dir)
 		group, err := openGroup(o.cgroupParent, f.MemoryBytes)
-		if err != nil {
-			return fmt.Errorf("create delegated cgroup v2 leaf: %w", err)
-		}
-		defer func() { r.collect(group); err = errors.Join(err, closeGroup(group)) }()
-		for _, restart := range []bool{false, true} {
-			err := func() (err error) {
-				r.Phase = "startup"
-				if restart {
-					r.Phase = "restart"
+		var p *child
+		var earlyCleanupErr error
+		if group != "" {
+			defer func() {
+				var shutdownErr, cleanupErr error
+				r.Cleanup, shutdownErr, cleanupErr = teardownGroup(group, p, func() { r.collect(group) })
+				cleanupErr = errors.Join(earlyCleanupErr, cleanupErr)
+				if cleanupErr != nil {
+					r.Cleanup.Status, r.Cleanup.Detail = "fail", cleanupErr.Error()
 				}
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				start := time.Now()
-				p, base, err := startChild(binary, dir, group, o.mode)
-				if err != nil {
-					return err
-				}
-				sampling, stopSampling := context.WithCancel(ctx)
-				sampled := r.sample(sampling, p, dir)
-				defer func() {
-					stopSampling()
-					<-sampled
-					err = errors.Join(err, p.stop())
-					select {
-					case <-p.done:
-						usage, ok := p.cmd.ProcessState.SysUsage().(*syscall.Rusage)
-						if ok && usage.Maxrss > 0 {
-							rss := uint64(usage.Maxrss) * 1024
-							if r.PeakRSS == nil || rss > *r.PeakRSS {
-								r.PeakRSS = &rss
-							}
-						}
-					default:
-					}
-				}()
-				probe := newService(base)
-				defer probe.client.CloseIdleConnections()
-				if err := probe.ready(ctx, p.done); err != nil {
-					return err
-				}
-				elapsed := time.Since(start)
-				if restart {
-					r.RestartReady = &elapsed
-					r.Phase = "recovery_walk"
-					n, err := f.recover(ctx, probe)
-					r.RecoveredRows = n
-					return err
-				}
-				r.StartReady = &elapsed
-				return f.load(ctx, probe, o, &r)
+				r.collectRSS(p)
+				err = errors.Join(err, shutdownErr)
 			}()
-			if err != nil {
-				return err
-			}
 		}
-		return nil
+		if err != nil {
+			return fmt.Errorf("create delegated cgroup v2 subtree: %w", err)
+		}
+
+		p, err = r.exercise(ctx, o, binary, dir, group, f, false)
+		if err != nil {
+			return err
+		}
+		// Drain the first lifetime before restarting with the same data and
+		// measurement cgroup. Final teardown also removes the subtree.
+		var stopped cleanupProof
+		stopped, err, earlyCleanupErr = teardownGroup(group, p, nil)
+		r.collectRSS(p)
+		if stopped.CandidateReaped {
+			p = nil
+		}
+		if err != nil || earlyCleanupErr != nil {
+			return err
+		}
+		p, err = r.exercise(ctx, o, binary, dir, group, f, true)
+		return err
 	}()
 	for key, missing := range map[string]bool{
 		"cgroup_peak_memory": r.CgroupPeak == nil, "peak_rss": r.PeakRSS == nil, "peak_descriptors": r.PeakFDs == nil,
-		"device_io": len(r.DeviceIO) == 0, "disk_headroom": r.MinFree == nil,
+		"device_io": len(r.DeviceIO) == 0, "disk_headroom": r.InitialFree == nil || r.MinFree == nil,
 		"ingest_p99": r.IngestP99 == nil, "backfill_query_p99": r.QueryP99 == nil,
 		"start_to_ready": r.StartReady == nil, "restart_to_ready": r.RestartReady == nil,
 	} {
@@ -303,13 +289,73 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 			r.Unavailable[key] = "no sample collected"
 		}
 	}
-	if err != nil {
+	switch {
+	case err != nil:
 		r.Detail = err.Error()
 		r.TimedOut = errors.Is(err, context.DeadlineExceeded)
-	} else if len(r.Unavailable) > 0 {
+	case r.RestartReady == nil && r.Cleanup.Status == "fail":
+		r.Workload, r.Detail = "skip", "restart blocked by first-lifetime cleanup"
+	case len(r.Unavailable) > 0:
 		r.Phase, r.Detail = "measurement", "required measurements unavailable"
-	} else {
-		r.Phase, r.Status = "complete", "pass"
+	case *r.CgroupPeak == 0 || *r.CgroupPeak > f.MemoryBytes || *r.PeakFDs == 0 || *r.MinFree == 0:
+		r.Phase, r.Detail = "measurement", "required resource measurements outside fixture bounds"
+	default:
+		r.Phase, r.Workload = "complete", "pass"
+		if r.Cleanup.Status == "pass" {
+			r.Status = "pass"
+		}
 	}
 	return r
+}
+
+func (r *result) exercise(ctx context.Context, o options, binary, dir, group string, f fixture, restart bool) (*child, error) {
+	r.Phase = "startup"
+	if restart {
+		r.Phase = "restart"
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	p, base, err := startChild(binary, dir, group, o.mode)
+	if err != nil {
+		return p, err
+	}
+	sampling, stopSampling := context.WithCancel(ctx)
+	sampled := r.sample(sampling, p, dir)
+	defer func() {
+		stopSampling()
+		<-sampled
+	}()
+	probe := newService(base)
+	defer probe.client.CloseIdleConnections()
+	if err := probe.ready(ctx, p.done); err != nil {
+		return p, err
+	}
+	elapsed := time.Since(start)
+	if restart {
+		r.RestartReady = &elapsed
+		r.Phase = "recovery_walk"
+		r.RecoveredRows, err = f.recover(ctx, probe)
+		return p, err
+	}
+	r.StartReady = &elapsed
+	return p, f.load(ctx, probe, o, r)
+}
+
+func (r *result) collectRSS(p *child) {
+	if p == nil {
+		return
+	}
+	select {
+	case <-p.done:
+		usage, ok := p.cmd.ProcessState.SysUsage().(*syscall.Rusage)
+		if ok && usage.Maxrss > 0 {
+			rss := uint64(usage.Maxrss) * 1024
+			if r.PeakRSS == nil || rss > *r.PeakRSS {
+				r.PeakRSS = &rss
+			}
+		}
+	default:
+	}
 }

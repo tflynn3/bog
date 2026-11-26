@@ -3,14 +3,12 @@ package backup
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"syscall"
 )
 
@@ -33,28 +31,33 @@ type Snapshot interface {
 }
 
 // Export creates a verified bundle in an absent or empty destination directory.
-// The caller must control the destination pathname through publication.
+// Concurrent publishers coordinate within the destination parent. The caller
+// must control the pathname against other filesystem writers.
 func Export(ctx context.Context, snapshot Snapshot, destination string) error {
+	return exportBackup(ctx, snapshot, destination, publish)
+}
+
+func exportBackup(ctx context.Context, snapshot Snapshot, destination string, publish publisher) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if snapshot == nil {
 		return errors.New("backup snapshot is required")
 	}
-	p := snapshot.Point()
-	r, err := snapshot.OpenManifest()
-	if err != nil {
-		return fmt.Errorf("open captured manifest: %w", err)
-	}
-	b, err := readLimited(r, manifestLimit)
-	if err != nil {
-		return fmt.Errorf("read captured manifest: %w", err)
-	}
-	m, err := readManifest(b, p)
-	if err != nil {
-		return err
-	}
 	return publish(ctx, destination, func(stage *os.Root) error {
+		p := snapshot.Point()
+		r, err := snapshot.OpenManifest()
+		if err != nil {
+			return fmt.Errorf("open captured manifest: %w", err)
+		}
+		b, err := readLimited(r, manifestLimit)
+		if err != nil {
+			return fmt.Errorf("read captured manifest: %w", err)
+		}
+		m, err := readManifest(b, p)
+		if err != nil {
+			return err
+		}
 		if err := writeBytes(stage, manifestName, b); err != nil {
 			return err
 		}
@@ -181,8 +184,12 @@ func Verify(ctx context.Context, bundle string) (_ Point, err error) {
 // Restore verifies a private staged copy before installing it. A destination
 // that was absent or empty remains usable after any pre-publication failure.
 // The bundle must remain immutable throughout the call. The caller must
-// control the destination pathname through publication.
+// control the destination pathname against other filesystem writers.
 func Restore(ctx context.Context, bundle, destination string) error {
+	return restoreBackup(ctx, bundle, destination, publish)
+}
+
+func restoreBackup(ctx context.Context, bundle, destination string, publish publisher) error {
 	return publish(ctx, destination, func(stage *os.Root) (err error) {
 		src, err := os.OpenRoot(bundle)
 		if err != nil {
@@ -397,114 +404,4 @@ func writeFile(root *os.Root, name string, write func(io.Writer) error) (err err
 		return fmt.Errorf("write %s: %w", name, err)
 	}
 	return f.Sync()
-}
-
-func publish(ctx context.Context, destination string, fill func(*os.Root) error) (err error) {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	path := filepath.Clean(destination)
-	name := filepath.Base(path)
-	if name == "." || name == ".." || !filepath.IsLocal(name) || name == string(filepath.Separator) {
-		return errors.New("invalid backup destination")
-	}
-	parent, err := os.OpenRoot(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	published := false
-	defer func() {
-		closeErr := parent.Close()
-		if published && closeErr != nil {
-			closeErr = fmt.Errorf("%w: %w", ErrPublicationUncertain, closeErr)
-		}
-		err = errors.Join(err, closeErr)
-	}()
-	if _, err := emptyDestination(parent, name); err != nil {
-		return err
-	}
-	var random [16]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return err
-	}
-	temp := ".bog-backup-" + hex.EncodeToString(random[:])
-	if err := parent.Mkdir(temp, 0700); err != nil {
-		return err
-	}
-	defer func() {
-		if !published {
-			err = errors.Join(err, parent.RemoveAll(temp))
-		}
-	}()
-	if err := parent.Chmod(temp, 0700); err != nil {
-		return err
-	}
-	stage, err := parent.OpenRoot(temp)
-	if err != nil {
-		return err
-	}
-	err = fill(stage)
-	if err == nil {
-		err = syncDirectory(stage)
-	}
-	if err := errors.Join(err, stage.Close()); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	// os.Root.Rename requires an absent directory target. Remove an empty
-	// placeholder only after staging is durable and ready for installation.
-	exists, err := emptyDestination(parent, name)
-	if err != nil {
-		return err
-	}
-	if exists {
-		if err := parent.Remove(name); err != nil {
-			return err
-		}
-	}
-	if err := parent.Rename(temp, name); err != nil {
-		if errors.Is(err, syscall.EIO) {
-			return fmt.Errorf("%w: %w", ErrPublicationUncertain, err)
-		}
-		return err
-	}
-	published = true
-	if err := syncDirectory(parent); err != nil {
-		return fmt.Errorf("%w: %w", ErrPublicationUncertain, err)
-	}
-	return nil
-}
-
-func emptyDestination(parent *os.Root, name string) (bool, error) {
-	st, err := parent.Lstat(name)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if !st.IsDir() {
-		return false, errors.New("backup destination must be a directory")
-	}
-	f, err := parent.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return false, err
-	}
-	names, readErr := f.Readdirnames(1)
-	if len(names) != 0 {
-		readErr = errors.New("backup destination is not empty")
-	} else {
-		readErr = unexpectedDirRead(readErr)
-	}
-	return true, errors.Join(readErr, f.Close())
-}
-
-func syncDirectory(root *os.Root) error {
-	d, err := root.Open(".")
-	if err != nil {
-		return err
-	}
-	return errors.Join(d.Sync(), d.Close())
 }

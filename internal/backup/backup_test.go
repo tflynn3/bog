@@ -376,11 +376,7 @@ func TestBadBundlesAndRestoreRetry(t *testing.T) {
 			if len(entries) != 0 {
 				t.Fatal("failed restore modified its destination")
 			}
-			entries, err = os.ReadDir(root)
-			must(t, err)
-			if len(entries) != 2 {
-				t.Fatal("failed restore left staging files")
-			}
+			backupChildren(t, root, stagingGuard, "bad", "restore")
 			must(t, Restore(ctx, good, target))
 			p, err := Verify(ctx, target)
 			must(t, err)
@@ -544,11 +540,7 @@ func TestFailedExportLeavesDestinationRetryable(t *testing.T) {
 			if err := Export(context.Background(), s, bundle); !errors.Is(err, tt.want) {
 				t.Fatalf("export error = %v, want %v", err, tt.want)
 			}
-			entries, err := os.ReadDir(root)
-			must(t, err)
-			if len(entries) != 0 {
-				t.Fatalf("failed export left files: %v", entries)
-			}
+			backupChildren(t, root, stagingGuard)
 			must(t, Export(context.Background(), f, bundle))
 		})
 	}
@@ -693,9 +685,5 @@ func TestPublicationPreservesLateDestinationContents(t *testing.T) {
 	if string(got) != "keep" {
 		t.Fatal("publication changed destination contents")
 	}
-	entries, err := os.ReadDir(root)
-	must(t, err)
-	if len(entries) != 1 {
-		t.Fatalf("rejected publication left staging entries: %v", entries)
-	}
+	backupChildren(t, root, stagingGuard, "restore")
 }

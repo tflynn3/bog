@@ -54,7 +54,7 @@ var registry = map[string]rule{
 	"bog/internal/ingest":        {testOnly, nil},
 	"bog/internal/archtest":      {testOnly, nil},
 	fuzzVerifier:                 {testOnly, nil},
-	"bog/verify/release":         {verifier, nil},
+	"bog/verify/release":         {verifier, []string{goClient}},
 	"bog/verify/linux":           {verifier, nil},
 	"bog/bench/retained-history": {verifier, nil},
 	"bog/verify/query-model":     {verifierModel, nil},
@@ -76,13 +76,23 @@ func (p listedPackage) production() bool {
 }
 
 func TestLinuxArchitecture(t *testing.T) {
+	for _, arch := range []string{"amd64", "arm64"} {
+		t.Run(arch, func(t *testing.T) {
+			t.Parallel()
+			checkLinuxArchitecture(t, arch)
+		})
+	}
+}
+
+func checkLinuxArchitecture(t *testing.T, arch string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "list", "-deps",
 		"-json=ImportPath,Name,Module,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports", "./...")
 	cmd.Dir = "../.."
 	cmd.Env = append(cmd.Environ(),
-		"GOOS=linux", "GOARCH=amd64", "GOAMD64=v1", "CGO_ENABLED=0",
+		"GOOS=linux", "GOARCH="+arch, "GOAMD64=v1", "GOARM64=v8.0", "CGO_ENABLED=0",
 		"GOENV=off", "GOFLAGS=", "GO111MODULE=on", "GOWORK=off")
 	cmd.WaitDelay = 2 * time.Second
 
@@ -211,7 +221,10 @@ func reachableImports(packages map[string]listedPackage, root string) map[string
 
 // Direction is an architectural invariant independent of the observed registry.
 func storageDirectionProblems(packages map[string]listedPackage, production map[string][]string) []string {
-	const httpapi = "bog/internal/httpapi"
+	const (
+		httpapi   = "bog/internal/httpapi"
+		readiness = "bog/internal/readiness"
+	)
 	var problems []string
 	for _, from := range []string{
 		"bog/internal/backup",
@@ -225,15 +238,21 @@ func storageDirectionProblems(packages map[string]listedPackage, production map[
 			continue
 		}
 		reached := reachableImports(packages, from)
-		for _, to := range []string{httpapi, "bog/internal/readiness", "bog/internal/client"} {
+		for _, to := range []string{httpapi, readiness, goClient} {
 			if reached[to] {
 				problems = append(problems, fmt.Sprintf("forbidden storage dependency: %s -> %s", from, to))
 			}
 		}
 	}
+	// Readiness observes the active owner and its filesystem. The command
+	// supplies the probe handle and owns retained storage composition.
+	readyReachable := reachableImports(packages, readiness)
 	for _, to := range []string{"bog/internal/backup", "bog/internal/checkpoint", "bog/internal/history"} {
 		if slices.Contains(production[httpapi], to) {
 			problems = append(problems, fmt.Sprintf("HTTP must use the page source seam: %s -> %s", httpapi, to))
+		}
+		if readyReachable[to] {
+			problems = append(problems, fmt.Sprintf("forbidden readiness dependency: %s reaches %s", readiness, to))
 		}
 	}
 	return problems

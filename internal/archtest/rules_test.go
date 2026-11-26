@@ -192,7 +192,7 @@ func TestComposedCutoverRules(t *testing.T) {
 		change func(map[string]listedPackage, map[string]rule)
 		want   []string
 	}{
-		{name: "composition root reaches all retained storage"},
+		{name: "command composes retained storage and readiness independently"},
 		{
 			name: "wiring without role promotions",
 			change: func(_ map[string]listedPackage, rules map[string]rule) {
@@ -254,6 +254,27 @@ func TestComposedCutoverRules(t *testing.T) {
 				rules[httpapi] = rule{runtimeLibrary, []string{store, wal, history}}
 			},
 			want: []string{"HTTP must use the page source seam: " + httpapi + " -> " + history},
+		},
+		{
+			name: "registered readiness import still cannot reach backup",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[readiness] = productionPackage("readiness", store, wal, backup)
+				rules[readiness] = rule{runtimeLibrary, []string{store, wal, backup}}
+			},
+			want: []string{"forbidden readiness dependency: " + readiness + " reaches " + backup},
+		},
+		{
+			name: "readiness cannot reach retained history through the observed WAL",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[httpapi] = productionPackage("httpapi", store)
+				rules[httpapi] = rule{runtimeLibrary, []string{store}}
+				pkgs[wal] = productionPackage("wal", store, history)
+				rules[wal] = rule{runtimeLibrary, []string{store, history}}
+			},
+			want: []string{
+				"forbidden readiness dependency: " + readiness + " reaches " + checkpoint,
+				"forbidden readiness dependency: " + readiness + " reaches " + history,
+			},
 		},
 		{
 			name: "extracted runtime adapter requires registration",

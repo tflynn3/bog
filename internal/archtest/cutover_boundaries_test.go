@@ -36,11 +36,11 @@ func pagingBoundaryProblems(rules map[string]rule) []string {
 func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 	t.Parallel()
 	const (
-		adapter    = "bog/internal/retainedpages"
 		backup     = "bog/internal/backup"
 		checkpoint = "bog/internal/checkpoint"
 		history    = "bog/internal/history"
 		httpapi    = "bog/internal/httpapi"
+		relay      = "bog/internal/relay"
 		store      = "bog/internal/store"
 		wal        = "bog/internal/wal"
 	)
@@ -54,16 +54,15 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 		bypassFrom string
 		want       []string
 	}{
-		{name: "command injects adapter"},
-		{name: "HTTP imports adapter", bypassFrom: httpapi, want: wantBypass},
-		{name: "HTTP reaches adapter through WAL", bypassFrom: wal, want: wantBypass},
+		{name: "command injects its own page source"},
+		{name: "HTTP reaches retained storage through a relay", bypassFrom: httpapi, want: wantBypass},
+		{name: "HTTP reaches retained storage through WAL", bypassFrom: wal, want: wantBypass},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			rules := map[string]rule{
-				server:     {serverCommand, []string{adapter, httpapi, wal}},
-				adapter:    {runtimeLibrary, []string{backup, history}},
+				server:     {serverCommand, []string{backup, history, httpapi, wal}},
 				backup:     {runtimeLibrary, []string{store}},
 				checkpoint: {runtimeLibrary, []string{store}},
 				history:    {runtimeLibrary, []string{checkpoint, store}},
@@ -72,8 +71,9 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 				wal:        {runtimeLibrary, []string{store}},
 			}
 			if tt.bypassFrom != "" {
+				rules[relay] = rule{runtimeLibrary, []string{backup, history}}
 				entry := rules[tt.bypassFrom]
-				entry.imports = append(entry.imports, adapter)
+				entry.imports = append(entry.imports, relay)
 				rules[tt.bypassFrom] = entry
 			}
 			packages := make(map[string]listedPackage, len(rules))

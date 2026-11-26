@@ -31,10 +31,17 @@ type publicationIntent struct {
 	Segments    []ownedSegment
 }
 
+func (a *publicationAttempt) writeNew(name string, b []byte) error {
+	if err := a.pub.stage.reserve(a.ctx, len(b)); err != nil {
+		return err
+	}
+	return a.pub.writeNew(name, b)
+}
+
 func (a *publicationAttempt) stageSegment(name string, b []byte, sum string) error {
 	p := a.pub
 	path := stageDir + "/" + name
-	if err := p.writeNew(path, b); err != nil {
+	if err := a.writeNew(path, b); err != nil {
 		return err
 	}
 	info, err := p.root.Lstat(path)
@@ -67,7 +74,7 @@ func (a *publicationAttempt) recordIntent() error {
 	if len(b) > maxManifestSize {
 		return errors.New("checkpoint intent too large")
 	}
-	if err := p.writeNew(stagedIntent, b); err != nil {
+	if err := a.writeNew(stagedIntent, b); err != nil {
 		return err
 	}
 	if err := p.root.Rename(stagedIntent, intentName); err != nil {
@@ -110,7 +117,11 @@ func (a *publicationAttempt) install() error {
 // the WAL directory lock. Authoritative runs under the publication lock. It
 // must validate the manifest, every referenced segment, and the owner's WAL
 // boundary, or return os.ErrNotExist if the manifest itself is absent.
-func RecoverCaptured(root *os.Root, dir *os.File, authoritative func() (*Manifest, error)) (err error) {
+func RecoverCaptured(root *os.Root, dir *os.File, authoritative func() (*Manifest, error)) error {
+	return recoverCapturedWithBudget(root, dir, authoritative, nil)
+}
+
+func recoverCapturedWithBudget(root *os.Root, dir *os.File, authoritative func() (*Manifest, error), stage *stagingAccount) (err error) {
 	if authoritative == nil {
 		return errors.New("missing authoritative checkpoint validator")
 	}
@@ -119,7 +130,11 @@ func RecoverCaptured(root *os.Root, dir *os.File, authoritative func() (*Manifes
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	return p.resolve(authoritative)
+	err = p.resolve(authoritative)
+	if err == nil || err == os.ErrNotExist {
+		stage.settle()
+	}
+	return err
 }
 
 // resolvePublication retains the offline reader's additional WAL checks.
@@ -211,7 +226,7 @@ func (p *publication) recoverStaging(info os.FileInfo, m *Manifest) error {
 }
 
 func openPublicationFile(dir *os.File, name string) (*os.File, error) {
-	fd, err := syscall.Openat(int(dir.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	fd, err := openat(int(dir.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +318,7 @@ func (p *publication) matchesOwnedSegment(file ownedSegment) (_ bool, err error)
 		info.Size() != file.Size || info.Mode().Perm()&0022 != 0 {
 		return false, nil
 	}
-	fd, err := syscall.Openat(int(p.dir.Fd()), file.Name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	fd, err := openat(int(p.dir.Fd()), file.Name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return false, err
 	}

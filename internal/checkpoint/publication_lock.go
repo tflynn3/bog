@@ -16,13 +16,13 @@ const publicationLockName = "bog.checkpoint.lock"
 func LockPublication(dir *os.File, exclusive bool) (_ *os.File, err error) {
 	const flags = syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | syscall.O_CLOEXEC
 	dirFD := int(dir.Fd())
-	fd, err := syscall.Openat(dirFD, publicationLockName, flags, 0)
+	fd, err := openat(dirFD, publicationLockName, flags, 0)
 	created := false
 	if errors.Is(err, os.ErrNotExist) {
-		fd, err = syscall.Openat(dirFD, publicationLockName, flags|syscall.O_CREAT|syscall.O_EXCL, 0600)
+		fd, err = openat(dirFD, publicationLockName, flags|syscall.O_CREAT|syscall.O_EXCL, 0600)
 		created = err == nil
 		if errors.Is(err, os.ErrExist) {
-			fd, err = syscall.Openat(dirFD, publicationLockName, flags, 0)
+			fd, err = openat(dirFD, publicationLockName, flags, 0)
 		}
 	}
 	if err != nil {

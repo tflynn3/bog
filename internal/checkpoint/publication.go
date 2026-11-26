@@ -4,12 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"slices"
@@ -54,13 +52,15 @@ func (p *publication) writeNew(name string, data []byte) (err error) {
 
 type publicationAttempt struct {
 	pub        *publication
+	ctx        context.Context
 	files      []ownedSegment
 	installing bool
 }
 
 type publication struct {
-	root *os.Root
-	dir  *os.File
+	root  *os.Root
+	dir   *os.File
+	stage *stagingAccount
 
 	segmentDirSync  func() error
 	manifestRename  func(string, string) error
@@ -72,7 +72,11 @@ type publication struct {
 // the call, and serializes generation activation. The supplied digest binds
 // the exact v1 prefix through end. Previous is nil for a first publication.
 // Publication takes its own lock and requires recovery of any pending attempt.
-func PublishCaptured(ctx context.Context, root *os.Root, dir *os.File, input io.ReaderAt, end int64, previous *Manifest, next uint64, source string) (published *Manifest, err error) {
+func PublishCaptured(ctx context.Context, root *os.Root, dir *os.File, input io.ReaderAt, end int64, previous *Manifest, next uint64, source string) (*Manifest, error) {
+	return publishCaptured(ctx, root, dir, input, end, previous, next, source, nil)
+}
+
+func publishCaptured(ctx context.Context, root *os.Root, dir *os.File, input io.ReaderAt, end int64, previous *Manifest, next uint64, source string, stage *stagingAccount) (published *Manifest, err error) {
 	if input == nil || !validPublicationBoundary(end, next, source) {
 		return nil, fmt.Errorf("%w: invalid checkpoint prefix", ErrIntegrity)
 	}
@@ -101,8 +105,11 @@ func PublishCaptured(ctx context.Context, root *os.Root, dir *os.File, input io.
 		m.NextOrdinal = previous.NextOrdinal
 		m.Segments = append(m.Segments, previous.Segments...)
 	}
+	p.stage = stage
 	return p.publish(ctx, m, &next, func(visit func(uint64, []store.Row) error) error {
-		return scanPublicationFrames(ctx, input, start, end, m.NextOrdinal, visit)
+		return scanCapturedFrames(ctx, input, start, end, m.NextOrdinal, func(_, _ int64, first uint64, rows []store.Row) error {
+			return visit(first, rows)
+		})
 	})
 }
 
@@ -245,8 +252,11 @@ func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, sc
 	if err := p.root.Mkdir(stageDir, 0700); err != nil {
 		return nil, err
 	}
-	a := publicationAttempt{pub: p}
+	a := publicationAttempt{pub: p, ctx: ctx}
 	manifestPending := false
+	if p.stage != nil {
+		p.stage.pending = true
+	}
 	defer func() {
 		if manifestPending {
 			return
@@ -254,11 +264,15 @@ func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, sc
 		if published == nil && a.installing {
 			// Leave the durable intent available if cleanup fails.
 			if cleanupErr := p.removeOwned(a.files, nil); cleanupErr != nil {
-				err = errors.Join(err, cleanupErr)
+				err = errors.Join(err, ErrPublicationUncertain, cleanupErr)
 				return
 			}
 		}
-		err = errors.Join(err, p.clearStaging())
+		if cleanupErr := p.clearStaging(); cleanupErr != nil {
+			err = errors.Join(err, ErrPublicationUncertain, cleanupErr)
+			return
+		}
+		p.stage.settle()
 	}()
 	if err := p.root.Chmod(stageDir, 0700); err != nil {
 		return nil, err
@@ -333,10 +347,13 @@ func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, sc
 	if len(b) > maxManifestSize {
 		return nil, errors.New("manifest too large")
 	}
-	if err := p.writeNew(stagedManifest, b); err != nil {
+	if err := a.writeNew(stagedManifest, b); err != nil {
 		return nil, err
 	}
 	if err := a.install(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	rename := p.root.Rename
@@ -359,54 +376,4 @@ func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, sc
 	}
 	manifestPending = false
 	return m, nil
-}
-
-// scanPublicationFrames reads an owner-pinned suffix at absolute WAL offsets.
-// It never reads the omitted prefix of a restored WAL.
-func scanPublicationFrames(ctx context.Context, input io.ReaderAt, pos, end int64, ordinal uint64, visit func(uint64, []store.Row) error) error {
-	var header [16]byte
-	var payload []byte
-	for pos < end {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if end-pos < int64(len(header)) {
-			return fmt.Errorf("%w: incomplete committed frame at %d", ErrIntegrity, pos)
-		}
-		frame := io.NewSectionReader(input, pos, end-pos)
-		if _, err := io.ReadFull(frame, header[:]); err != nil {
-			return fmt.Errorf("read committed frame header at %d: %w", pos, err)
-		}
-		n := binary.LittleEndian.Uint32(header[:4])
-		if n == 0 || n > store.MaxBatch || binary.LittleEndian.Uint32(header[4:8]) != ^n ||
-			crc32.Checksum(header[:12], castagnoli) != binary.LittleEndian.Uint32(header[12:]) {
-			return fmt.Errorf("%w: invalid committed frame header at %d", ErrIntegrity, pos)
-		}
-		if int64(n) > end-pos-int64(len(header)) {
-			return fmt.Errorf("%w: incomplete committed frame at %d", ErrIntegrity, pos)
-		}
-		if cap(payload) < int(n) {
-			payload = make([]byte, n)
-		}
-		payload = payload[:n]
-		if _, err := io.ReadFull(frame, payload); err != nil {
-			return fmt.Errorf("read committed frame at %d: %w", pos, err)
-		}
-		if crc32.Checksum(payload, castagnoli) != binary.LittleEndian.Uint32(header[8:12]) {
-			return fmt.Errorf("%w: invalid committed frame checksum at %d", ErrIntegrity, pos)
-		}
-		rows, err := store.Decode(payload)
-		if err != nil {
-			return fmt.Errorf("%w: invalid committed frame at %d: %w", ErrIntegrity, pos, err)
-		}
-		if uint64(len(rows)) > ^uint64(0)-ordinal {
-			return fmt.Errorf("%w: append ordinal overflow", ErrIntegrity)
-		}
-		if err := visit(ordinal, rows); err != nil {
-			return err
-		}
-		ordinal += uint64(len(rows))
-		pos += int64(len(header)) + int64(n)
-	}
-	return ctx.Err()
 }

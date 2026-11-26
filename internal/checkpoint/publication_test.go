@@ -77,7 +77,7 @@ func TestRecoveryPreservesCollisionAndRemovesInstalledName(t *testing.T) {
 	_, err = l.Publish()
 	requirePublicationOK(t, err)
 	requirePublicationOK(t, l.root.Mkdir(stageDir, 0700))
-	a := publicationAttempt{pub: l.publication()}
+	a := publicationAttempt{pub: l.publication(), ctx: t.Context()}
 	first := segmentPrefix + "22222222222222222222222222222222"
 	collision := segmentPrefix + "33333333333333333333333333333333"
 	_, blocks := blockSeeds(t)
@@ -155,7 +155,7 @@ func TestRecoverBeforeManifestAttempt(t *testing.T) {
 			name := segmentPrefix + "44444444444444444444444444444444"
 			staged := stageDir + "/" + name
 			requirePublicationOK(t, l.root.Mkdir(stageDir, 0700))
-			a := publicationAttempt{pub: l.publication()}
+			a := publicationAttempt{pub: l.publication(), ctx: t.Context()}
 			_, blocks := blockSeeds(t)
 			requirePublicationOK(t, a.stageSegment(name, blocks[0], digest(blocks[0])))
 			if phase != "staged only" {

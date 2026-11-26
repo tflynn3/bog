@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"bog/internal/checkpoint"
 )
@@ -56,6 +57,7 @@ type Catalog struct {
 	current *generation
 	closed  bool
 	retired []retiredDirectory
+	budget  *checkpoint.Budget
 }
 
 type generation struct {
@@ -65,6 +67,7 @@ type generation struct {
 	dir      *os.File
 	dirInfo  os.FileInfo
 	pin      *os.File
+	charge   *checkpoint.Reservation
 	segments []segment
 }
 
@@ -73,83 +76,84 @@ func (g *generation) release() error {
 		return nil
 	}
 	err := errors.Join(g.releasePin(), g.dir.Close())
+	if g.charge != nil {
+		g.charge.Release()
+	}
 	close(g.drained)
 	return err
 }
 
-// Replace validates the authoritative bog.checkpoint in dir and installs it
-// atomically for new readers. A shared publication lock keeps the manifest
-// stable until the new generation is pinned. Pinning requires permission to
-// create a coordination file in the directory. A validation or cancellation
-// failure leaves the current generation available. If closing the retired
-// directory fails, Replace returns the installed generation and that error.
-func (c *Catalog) Replace(ctx context.Context, path string) (_ Generation, err error) {
-	c.replace.Lock()
-	defer c.replace.Unlock()
-	// Close and Replace are serialized, so closed is stable here.
-	if c.closed {
-		return Generation{}, os.ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return Generation{}, err
-	}
-	dir, info, err := openDirectory(path)
+// NewCatalog bounds generation and capture admission using budget. The legacy
+// zero-value Catalog retains its original unbudgeted behavior.
+func NewCatalog(budget *checkpoint.Budget) *Catalog {
+	return &Catalog{budget: budget}
+}
+
+// Replace validates and installs the manifest in path for new captures.
+func (c *Catalog) Replace(ctx context.Context, path string) (Generation, error) {
+	return c.replaceWith(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
+}
+
+// ReplacePinned is Replace using the caller's pinned directory. The catalog
+// opens and owns an independent handle to the same directory.
+func (c *Catalog) ReplacePinned(ctx context.Context, dir *os.File) (Generation, error) {
+	return c.replaceWith(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+}
+
+func (c *Catalog) replaceWith(ctx context.Context, open directoryOpener) (Generation, error) {
+	ticket, err := c.ReserveReplacement(ctx)
 	if err != nil {
 		return Generation{}, err
 	}
-	lock, err := checkpoint.LockPublication(dir, false)
-	if err != nil {
-		return Generation{}, errors.Join(err, dir.Close())
-	}
-	defer func() { err = errors.Join(err, lock.Close()) }()
-	next, err := loadAt(ctx, dir)
-	if err != nil {
-		return Generation{}, errors.Join(err, dir.Close())
-	}
-	next.dirInfo = info
-	if err := next.registerPin(ctx); err != nil {
-		return Generation{}, errors.Join(err, dir.Close())
-	}
-	next.refs.Store(1)
-	c.mu.Lock()
-	if err := ctx.Err(); err != nil {
-		c.mu.Unlock()
-		return Generation{}, errors.Join(err, next.release())
-	}
-	prev := c.current
-	c.current = next
-	c.mu.Unlock()
-	if prev != nil {
-		c.trackRetired(prev)
-		err = prev.release()
-	}
-	return next.info, err
+	defer ticket.Close()
+	return ticket.install(ctx, open)
 }
 
 // Acquire pins id if it is current. Already acquired readers keep their
 // snapshots after replacement, and a different current ID expires id.
 func (c *Catalog) Acquire(id GenerationID) (*Reader, error) {
-	return c.acquire(&id)
+	return c.acquire(context.Background(), &id, time.Time{})
 }
 
 // AcquireCurrent pins the current generation.
 func (c *Catalog) AcquireCurrent() (*Reader, error) {
-	return c.acquire(nil)
+	return c.AcquireCurrentUntil(context.Background(), time.Time{})
 }
 
-func (c *Catalog) acquire(id *GenerationID) (*Reader, error) {
+// AcquireCurrentUntil pins the current generation and admits scans until the
+// optional deadline or explicit Close. The caller closes expired readers to
+// retire idle captures. Cancellation of ctx does not retire a returned reader.
+func (c *Catalog) AcquireCurrentUntil(ctx context.Context, deadline time.Time) (*Reader, error) {
+	return c.acquire(ctx, nil, deadline)
+}
+
+func (c *Catalog) acquire(ctx context.Context, id *GenerationID, deadline time.Time) (*Reader, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	g := c.current
-	if g != nil && (id == nil || *id == g.info.ID) {
-		g.refs.Add(1)
-		return &Reader{gen: g, info: g.info}, nil
+	if g == nil || (id != nil && *id != g.info.ID) {
+		err := &ExpiredError{}
+		if id != nil {
+			err.ID = *id
+		}
+		return nil, err
 	}
-	err := &ExpiredError{}
-	if id != nil {
-		err.ID = *id
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return nil, &ExpiredError{ID: g.info.ID}
 	}
-	return nil, err
+	var charge *checkpoint.Reservation
+	if c.budget != nil {
+		var err error
+		charge, err = c.budget.Reserve(ctx, checkpoint.LiveCaptures, 1)
+		if err != nil {
+			return nil, err
+		}
+	}
+	g.refs.Add(1)
+	return &Reader{gen: g, info: g.info, deadline: deadline, charge: charge}, nil
 }
 
 // Close retires the current generation and prevents further replacement. It
@@ -172,9 +176,11 @@ func (c *Catalog) Close() error {
 // Reader pins one generation until Close. It supports concurrent scans and
 // must not be copied. Closing a Reader does not interrupt scans already started.
 type Reader struct {
-	mu   sync.Mutex
-	gen  *generation
-	info Generation
+	mu       sync.Mutex
+	gen      *generation
+	info     Generation
+	deadline time.Time
+	charge   *checkpoint.Reservation
 }
 
 // Generation returns information about the pinned snapshot.
@@ -183,9 +189,12 @@ func (r *Reader) Generation() Generation { return r.info }
 // Close releases the reader's reference. It is safe to call more than once.
 func (r *Reader) Close() error {
 	r.mu.Lock()
-	g := r.gen
-	r.gen = nil
+	g, charge := r.gen, r.charge
+	r.gen, r.charge = nil, nil
 	r.mu.Unlock()
+	if charge != nil {
+		defer charge.Release()
+	}
 	if g != nil {
 		return g.release()
 	}

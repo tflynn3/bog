@@ -28,7 +28,8 @@ func validSegmentName(name string) bool {
 		strings.Trim(name[len(segmentPrefix):], "0123456789abcdef") == ""
 }
 
-type segmentMeta struct {
+// Segment describes an immutable block referenced by a Manifest.
+type Segment struct {
 	Name   string `json:"name"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"`
@@ -37,12 +38,14 @@ type segmentMeta struct {
 // Manifest identifies an immutable collection of sorted blocks and the WAL prefix
 // they represent. SourceSHA256 is the identity of that exact prefix, including magic.
 type Manifest struct {
-	Version       int           `json:"version"`
-	SourceSHA256  string        `json:"source_sha256"`
-	CoveredOffset int64         `json:"covered_offset"`
-	NextOrdinal   uint64        `json:"next_ordinal"`
-	Segments      []segmentMeta `json:"segments"`
+	Version       int       `json:"version"`
+	SourceSHA256  string    `json:"source_sha256"`
+	CoveredOffset int64     `json:"covered_offset"`
+	NextOrdinal   uint64    `json:"next_ordinal"`
+	Segments      []Segment `json:"segments"`
 }
+type segmentMeta = Segment
+
 type manifestEnvelope struct {
 	Payload json.RawMessage `json:"payload"`
 	SHA256  string          `json:"sha256"`

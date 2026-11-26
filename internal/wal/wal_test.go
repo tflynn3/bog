@@ -316,12 +316,26 @@ func TestUncommittedSuffixDiscarded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l.Close()
 	after, err := os.ReadFile(path)
 	if err != nil || string(after) != string(before) {
 		t.Fatalf("suffix not discarded: %v", err)
 	}
-	if len(s.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10)) != 1 {
+	if err := l.Append(batch, rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restored := &store.Store{}
+	l, err = Open(dir, restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if got := restored.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10); len(got) != 2 {
+		t.Fatalf("reopened rows: %d", len(got))
+	}
+	if len(s.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10)) != 2 {
 		t.Fatal("committed row lost")
 	}
 }
@@ -992,5 +1006,171 @@ func TestReplayMalformedCommittedFrameDoesNotPublish(t *testing.T) {
 	got := target.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10)
 	if !slices.Equal(got, rows) {
 		t.Fatalf("failed replay published rows: %v", got)
+	}
+}
+
+type countedReplayFile struct {
+	*os.File
+	reads int
+	bytes int
+}
+
+func (f *countedReplayFile) Read(p []byte) (int, error) {
+	n, err := f.File.Read(p)
+	f.reads++
+	f.bytes += n
+	return n, err
+}
+
+func replayTestFrame(payload []byte) []byte {
+	frame := make([]byte, 16+len(payload))
+	binary.LittleEndian.PutUint32(frame, uint32(len(payload)))
+	binary.LittleEndian.PutUint32(frame[4:], ^uint32(len(payload)))
+	binary.LittleEndian.PutUint32(frame[8:], crc32.Checksum(payload, table))
+	binary.LittleEndian.PutUint32(frame[12:], crc32.Checksum(frame[:12], table))
+	copy(frame[16:], payload)
+	return frame
+}
+
+func TestReplayBufferedBoundaries(t *testing.T) {
+	// Place a header across 64 KiB, then a payload across the next boundary,
+	// followed by a frame larger than the buffer.
+	payloadOfSize := func(n int) []byte {
+		prefix := `{"ts":"2025-01-01T00:00:00Z","line":"`
+		suffix := `"}`
+		return []byte(prefix + strings.Repeat("x", n-len(prefix)-len(suffix)) + suffix)
+	}
+	first := payloadOfSize(64*1024 - len(magic) - 16 - 8)
+	second := payloadOfSize(64 * 1024)
+	large := payloadOfSize(70 * 1024)
+	data := append([]byte(magic), replayTestFrame(first)...)
+	data = append(data, replayTestFrame(second)...)
+	data = append(data, replayTestFrame(large)...)
+	path := filepath.Join(t.TempDir(), "wal")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	l := &Log{f: f, committed: true}
+	builder := store.NewRecoveryBuilder()
+	if err := l.replay(int64(len(data)), builder); err != nil {
+		t.Fatal(err)
+	}
+	s := &store.Store{}
+	builder.Install(s)
+	got := s.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10)
+	if len(got) != 3 || len(got[0].Line) != len(first)-len(`{"ts":"2025-01-01T00:00:00Z","line":"`)-2 || len(got[2].Line) != len(large)-len(`{"ts":"2025-01-01T00:00:00Z","line":"`)-2 {
+		t.Fatalf("unexpected recovered rows: %d", len(got))
+	}
+}
+
+func TestReplayBufferedReadAheadBound(t *testing.T) {
+	data := []byte(magic)
+	const frames = 2000
+	for i := 0; i < frames; i++ {
+		data = append(data, replayTestFrame(batch)...)
+	}
+	end := len(data)
+	data = append(data, []byte("uncommitted suffix")...)
+	path := filepath.Join(t.TempDir(), "wal")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	counted := &countedReplayFile{File: f}
+	l := &Log{f: counted, committed: true}
+	if err := l.replay(int64(end), store.NewRecoveryBuilder()); err != nil {
+		t.Fatal(err)
+	}
+	if counted.bytes != end || counted.reads >= frames {
+		t.Fatalf("read %d bytes in %d reads; committed %d bytes across %d frames", counted.bytes, counted.reads, end, frames)
+	}
+	pos, err := f.Seek(0, io.SeekCurrent)
+	if err != nil || pos != int64(end) {
+		t.Fatalf("position = %d, err = %v", pos, err)
+	}
+}
+
+func TestMarkerInsidePayloadDoesNotMutate(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, &store.Store{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.Decode(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(batch, rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "bog.wal")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	end := uint64(len(before) - 1)
+	marker := make([]byte, 24)
+	copy(marker, "BOGCMT01")
+	binary.LittleEndian.PutUint64(marker[8:], end)
+	binary.LittleEndian.PutUint64(marker[16:], ^end)
+	if err := os.WriteFile(filepath.Join(dir, "bog.commit"), marker, 0600); err != nil {
+		t.Fatal(err)
+	}
+	target := &store.Store{}
+	target.Publish(rows)
+	if reopened, err := Open(dir, target); err == nil {
+		reopened.Close()
+		t.Fatal("accepted marker inside payload")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !slices.Equal(before, after) {
+		t.Fatalf("WAL changed after failed replay: %v", err)
+	}
+	got := target.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10)
+	if !slices.Equal(got, rows) {
+		t.Fatal("failed replay changed store")
+	}
+}
+
+func BenchmarkReplayManySmallFrames(b *testing.B) {
+	dir := b.TempDir()
+	l, err := Open(dir, &store.Store{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	rows, err := store.Decode(batch)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 10000; i++ {
+		if err := l.Append(batch, rows); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		l, err := Open(dir, &store.Store{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := l.Close(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

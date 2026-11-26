@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -258,8 +259,9 @@ func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
 	if _, err = l.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
+	reader := bufio.NewReaderSize(io.LimitReader(l.f, info), 64*1024)
 	header := make([]byte, len(magic))
-	if _, err = io.ReadFull(l.f, header); err != nil || string(header) != magic {
+	if _, err = io.ReadFull(reader, header); err != nil || string(header) != magic {
 		return errors.New("invalid WAL magic")
 	}
 	pos := int64(len(magic))
@@ -269,7 +271,7 @@ func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
 		if info-pos < 16 {
 			return l.recoverTail(pos)
 		}
-		_, err = io.ReadFull(l.f, h[:])
+		_, err = io.ReadFull(reader, h[:])
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return l.recoverTail(pos)
 		}
@@ -291,7 +293,7 @@ func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
 		} else {
 			payload = payload[:n]
 		}
-		_, err = io.ReadFull(l.f, payload)
+		_, err = io.ReadFull(reader, payload)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return l.recoverTail(pos)
 		}

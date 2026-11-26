@@ -85,9 +85,16 @@ an otherwise authorized cursor, which then returns 400 as today.
 
 Version the cursor format and MAC domain for shared deployments. Authenticate
 the canonical stream tuple and stable principal ID alongside the existing
-normalized bounds, keyed filter digest, snapshot count and position. Derive
-scope from authenticated server context, not from fields asserted by the token.
-Verify MAC and compare scope before using the snapshot or scanning. A valid
+normalized bounds, keyed filter digest, snapshot count and position, and the
+effective output-masking revision. This revision is server-derived and never
+reused for a stream, including when a policy is restored to earlier rules or
+masking is disabled. The no-masking state has an explicit revision too; every
+effective policy change assigns a new revision. Derive scope and revision from
+trusted server context, not from fields asserted by the token. Authenticate and
+authorize the requested stream first, then validate the MAC, scope, query, and
+revision before accessing rows or using the snapshot. A revision mismatch
+returns the standard 400 invalid-cursor response with zero rows and no next
+cursor; the caller must start a fresh walk. A valid
 cursor presented by a different principal or for a different stream returns
 the same 400 invalid-cursor response as any other scope mismatch, provided the
 caller is authorized for the requested stream. The cursor is not transferable,
@@ -167,9 +174,16 @@ can infer hidden values by probing `contains`, observing page lengths, and
 checking `Bog-Next-Cursor`. Shared mode must apply output masking before matching,
 byte limits, lookahead, and cursor generation if those inferences are to be
 prevented; otherwise the policy must explicitly disclose those channels and
-must not claim storage exclusion. Export authorization does not bypass storage
-exclusion, and any additional output masking promised for exports must be
-applied before the artifact is made available.
+must not claim storage exclusion. For each page, capture one effective masking
+policy and revision after authorization and use that same policy and revision
+for cursor validation, anchor validation, matching, lookahead, byte limits,
+encoding, and the next cursor. Coordinate policy updates with this capture so
+an admitted page cannot mix revisions; a later page captures the then-current
+revision and rejects a cursor bound to an earlier one. Resolve and compile the
+policy once per page where possible, outside per-row hot loops. Export
+authorization does not bypass storage exclusion, and any additional output
+masking promised for exports must be applied before the artifact is made
+available.
 
 ## Storage, export, restore, and rollout
 
@@ -232,6 +246,13 @@ guarantee without the migration and redaction process above.
   Her continuation returns 403 with no data or cursor; a token alone cannot
   restore access. An already admitted response may finish. After regrant, the
   original cursor works only if still valid; after restart it returns 400.
+- Alice receives page one under masking revision R1. The effective policy
+  changes to R2 before her next request. While still authorized, her page-two
+  continuation returns the standard 400 invalid-cursor response with zero
+  rows and no next cursor. She starts a fresh walk under R2. This also applies
+  when enabling or disabling masking, or restoring earlier rules. If her query
+  grant is revoked before the continuation, it returns 403 with no rows or next
+  cursor instead, regardless of the revision mismatch.
 - Ingest a sentinel secret with a policy replacing it, then inspect committed
   WAL bytes and queries: only the replacement appears. Restart and query again,
   export A, inspect the artifact, restore to an authorized target, restart, and

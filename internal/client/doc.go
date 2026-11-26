@@ -3,8 +3,8 @@
 // pages, and call Walk to consume a stable snapshot. WalkFrom resumes at the
 // cursor returned when a request or page consumer fails; use the same Query.
 // FetchPage exposes a fully validated page and continuation token together.
-// A short body, incomplete chunked response, invalid NDJSON, or next cursor
-// that repeats the request cursor yields no page. Walk and WalkFrom also
+// A short body, incomplete chunked response, invalid NDJSON, empty page with
+// a next cursor, or repeated request cursor yields no page. Walk and WalkFrom also
 // withhold any page whose next cursor repeats an earlier cursor in that call,
 // including the starting cursor. They return the input cursor for the failed
 // page. Query HTTP 503 errors are retryable with the cursor from the failed walk.

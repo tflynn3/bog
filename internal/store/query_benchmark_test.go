@@ -92,6 +92,9 @@ func BenchmarkRestoredSingleRun(b *testing.B) {
 		}
 		rows[i] = Row{epoch.Add(time.Duration(i) * time.Second), line}
 	}
+	for i := 600; i < 700; i++ {
+		rows[i].Line += " clustertoken"
+	}
 	count := len(rows)
 	// A dense prefix followed by a sparse tail exercises the bounded attempt and fallback.
 	for i := 1000; i < len(rows)-1; i++ {
@@ -107,14 +110,20 @@ func BenchmarkRestoredSingleRun(b *testing.B) {
 		name, literal string
 		snapshot      *int
 		after         *Position
+		ordinary      bool
 	}{
-		{"dense", "ordinary", nil, nil}, {"rare", "raretoken", nil, nil},
-		{"absent", "absenttoken", nil, nil}, {"dense_to_sparse", "dense", &count, &after},
+		{"dense", "ordinary", nil, nil, false}, {"ordinary_dense", "ordinary", nil, nil, true},
+		{"clustered", "clustertoken", nil, nil, false}, {"rare", "raretoken", nil, nil, false},
+		{"absent", "absenttoken", nil, nil, false}, {"dense_to_sparse", "dense", &count, &after, false},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				s.QueryPage(epoch, epoch.Add(48*time.Hour), tc.literal, 100, tc.snapshot, tc.after)
+				if tc.ordinary {
+					s.Query(epoch, epoch.Add(48*time.Hour), tc.literal, 100)
+				} else {
+					s.QueryPage(epoch, epoch.Add(48*time.Hour), tc.literal, 100, tc.snapshot, tc.after)
+				}
 			}
 		})
 	}

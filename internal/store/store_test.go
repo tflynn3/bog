@@ -618,3 +618,50 @@ func TestOrderedRecoveryBoundaryOracle(t *testing.T) {
 		}
 	}
 }
+
+func TestOrderedRecoveryStreamingOracle(t *testing.T) {
+	epoch := time.Unix(1700000000, 0)
+	for _, matches := range []int{3, 4} {
+		t.Run(fmt.Sprintf("matches=%d", matches), func(t *testing.T) {
+			rows := make([]Row, 3*blockSize+512+37)
+			for i := range rows {
+				rows[i] = Row{epoch.Add(time.Duration(i/3) * time.Second), "ordinary"}
+			}
+			for _, i := range []int{100, 510, 520, len(rows) - 1}[:matches] {
+				rows[i].Line = "needle"
+			}
+			// Exercise an unfilterable sealed block and identical rows at tied times.
+			rows[520].Line = "needle" + strings.Repeat("x", blockBudget)
+			builder := NewRecoveryBuilder()
+			builder.Add(rows)
+			var s Store
+			builder.Install(&s)
+			start, end := epoch, rows[len(rows)-1].TS.Add(time.Second)
+			var want []Row
+			for _, row := range rows {
+				if !row.TS.Before(start) && row.TS.Before(end) && strings.Contains(row.Line, "needle") {
+					want = append(want, row)
+				}
+			}
+			if got := s.Query(start, end, "needle", 3); !slices.Equal(got, want[:3]) {
+				t.Fatal("ordinary query differs from scan")
+			}
+			page, count, cursor, ok := s.QueryPage(start, end, "needle", 3, nil, nil)
+			if !ok || (cursor != nil) != (matches > 3) {
+				t.Fatalf("first page: ok=%v cursor=%v", ok, cursor)
+			}
+			got := append([]Row(nil), page...)
+			s.Publish([]Row{{rows[100].TS, "needle backfill"}})
+			for cursor != nil {
+				page, _, cursor, ok = s.QueryPage(start, end, "needle", 3, &count, cursor)
+				if !ok {
+					t.Fatal("invalid continuation")
+				}
+				got = append(got, page...)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("got %d rows, want %d", len(got), len(want))
+			}
+		})
+	}
+}

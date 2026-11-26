@@ -544,18 +544,50 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 				return result, count, next, true
 			}
 		}
+		if implicit {
+			// The recovered run is already in append order. Resume the bounded
+			// scan and inspect only blocks that may contain the literal.
+			run := runs[active]
+			hi := sort.Search(run.length, func(i int) bool { return !rows[i].TS.Before(end) })
+			hi = min(hi, count)
+			probes := literalProbes(contains)
+			for directOffset < hi {
+				block := directOffset / blockSize
+				blockEnd := min((block+1)*blockSize, hi)
+				if block < len(blocks) && !blocks[block].mayContainProbes(probes) {
+					directOffset = blockEnd
+					continue
+				}
+				for directOffset < blockEnd {
+					ordinal := directOffset
+					directOffset++
+					row := rows[ordinal]
+					if !strings.Contains(row.Line, contains) {
+						continue
+					}
+					if len(directResult) == limit {
+						return directResult, count, &Position{rows[directLast].TS, directLast}, true
+					}
+					if directResult == nil {
+						directResult = make([]Row, 0, min(limit, count))
+					}
+					directResult = append(directResult, row)
+					directLast = ordinal
+					if !lookahead && len(directResult) == limit {
+						return directResult, count, nil, true
+					}
+				}
+			}
+			if directResult == nil {
+				directResult = []Row{}
+			}
+			return directResult, count, nil, true
+		}
 		for i, run := range runs {
 			hi := lower[i] + sort.Search(run.length-lower[i], func(j int) bool { return !rows[run.ordinal(lower[i]+j)].TS.Before(end) })
 			bound += hi - lower[i]
-			if implicit && i == active {
-				intervalStart = min(offsets[i], count)
-				intervalEnd = min(hi, count)
-			}
 		}
-		if implicit {
-			bound = max(0, intervalEnd-intervalStart)
-		}
-		if bound >= 32768 || (implicit && bound > 0) {
+		if bound >= 32768 {
 			if active == -2 {
 				if result, next, complete := ordered(budget); complete {
 					return result, count, next, true

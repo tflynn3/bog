@@ -16,7 +16,17 @@ import (
 	"time"
 )
 
-const server = "bog/cmd/bog"
+const (
+	server     = "bog/cmd/bog"
+	httpapi    = "bog/internal/httpapi"
+	readiness  = "bog/internal/readiness"
+	store      = "bog/internal/store"
+	wal        = "bog/internal/wal"
+	checkpoint = "bog/internal/checkpoint"
+	history    = "bog/internal/history"
+	backup     = "bog/internal/backup"
+	retained   = "bog/internal/retained"
+)
 
 type role string
 
@@ -35,17 +45,18 @@ type rule struct {
 	imports []string
 }
 
-// Record the observed direct production imports within the root module.
-// Update roles and edges in the same change as the wiring that requires them.
+// Record observed Linux production imports within the root module. The
+// retained composition fixture covers the cutover contract until the command
+// wiring lands. Promote roles and update edges in the wiring change.
 var registry = map[string]rule{
-	server:                       {serverCommand, []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
-	"bog/internal/httpapi":       {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
-	"bog/internal/readiness":     {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
-	"bog/internal/wal":           {runtimeLibrary, []string{"bog/internal/store"}},
-	"bog/internal/store":         {runtimeLibrary, nil},
-	"bog/internal/checkpoint":    {staged, []string{"bog/internal/store"}},
-	"bog/internal/history":       {staged, []string{"bog/internal/checkpoint", "bog/internal/store"}},
-	"bog/internal/backup":        {staged, []string{"bog/internal/store"}},
+	server:                       {serverCommand, []string{httpapi, readiness, store, wal}},
+	httpapi:                      {runtimeLibrary, []string{store, wal}},
+	readiness:                    {runtimeLibrary, []string{store, wal}},
+	wal:                          {runtimeLibrary, []string{store}},
+	store:                        {runtimeLibrary, nil},
+	checkpoint:                   {staged, []string{store}},
+	history:                      {staged, []string{checkpoint, store}},
+	backup:                       {staged, []string{store}},
 	"bog/internal/idempotency":   {staged, nil},
 	"bog/internal/client":        {standalone, []string{"bog/internal/store"}},
 	"bog/internal/ingest":        {testOnly, nil},
@@ -173,7 +184,10 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 		}
 		imports := production[path]
 		for _, imported := range imports {
-			if _, isLocal := production[imported]; isLocal && !slices.Contains(r.imports, imported) {
+			if _, isLocal := production[imported]; !isLocal {
+				continue
+			}
+			if forbiddenDirection(path, imported) || !slices.Contains(r.imports, imported) {
 				problems = append(problems, fmt.Sprintf("forbidden production import: %s -> %s", path, imported))
 			}
 		}
@@ -188,6 +202,22 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 		problems = append(problems, "production import cycle: "+strings.Join(cycle, " -> "))
 	}
 	return problems
+}
+
+// These boundaries survive registry updates. cmd/bog bridges the HTTP
+// consumer interface to retained storage. The storage modules stay usable
+// independently of the transport and the retained coordinator.
+func forbiddenDirection(from, to string) bool {
+	switch from {
+	case httpapi, readiness:
+		return to == retained || to == history || to == checkpoint || to == backup
+	case store, wal, history, checkpoint, backup:
+		return to == httpapi || to == readiness || to == retained
+	case retained:
+		return to == httpapi || to == readiness
+	default:
+		return false
+	}
 }
 
 // go list also rejects cycles during loading. Keep the invariant explicit so it

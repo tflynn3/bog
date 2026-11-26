@@ -19,9 +19,9 @@ Ingest accepts at most 4 MiB of UTF-8 NDJSON. Each nonblank line must be an obje
 
 Query requires `start` and `end` timestamps and accepts a literal case-sensitive `contains` and decimal `limit` (default 500, range 1–1000). The interval is `[start,end)`; equal bounds return no rows. Output is UTF-8 `application/x-ndjson`, in UTC, ordered by timestamp then commit and row order. Duplicate records remain distinct. Queries see complete batches.
 
-A single append-only `bog.wal` and its `bog.commit` marker are the source of truth; keep them together. Create the data directory on a local filesystem before starting the service, and ensure its parent directory is itself durably established (including any newly created ancestors). After the eight-byte `BOGWAL01` magic, each batch has a 16-byte little-endian header: payload length, its bitwise complement, payload CRC32C, and CRC32C of the first 12 header bytes, followed by the original NDJSON payload. The 24-byte marker contains `BOGCMT01`, the little-endian committed offset, and its bitwise complement. Concurrent admitted batches can share a WAL sync and one atomically replaced and directory-synced commit marker; each retains its own frame and is published as a whole in admission order. Successful responses follow the durable marker and in-memory publication. Recovery discards any bytes beyond the committed offset; corruption within the committed prefix prevents startup. Startup rebuilds memory from the committed WAL. A missing or invalid marker on a populated WAL, or a marker without a WAL, prevents startup; only a new store or a magic-only WAL may bootstrap without a marker.
+On the legacy layout, keep the append-only `bog.wal` and its `bog.commit` marker together. They are the recovery authority for that layout. Create the data directory on a local filesystem before starting the service, and ensure its parent directory is itself durably established (including any newly created ancestors). After the eight-byte `BOGWAL01` magic, each batch has a 16-byte little-endian header: payload length, its bitwise complement, payload CRC32C, and CRC32C of the first 12 header bytes, followed by the original NDJSON payload. The 24-byte marker contains `BOGCMT01`, the little-endian committed offset, and its bitwise complement. Concurrent admitted batches can share a WAL sync and one atomically replaced and directory-synced commit marker; each retains its own frame and is published as a whole in admission order. Successful responses follow the durable marker and in-memory publication. Recovery discards any bytes beyond the committed offset; corruption within the committed prefix prevents startup. Startup rebuilds memory from the committed WAL. A missing or invalid marker on a populated WAL, or a marker without a WAL, prevents startup; only a new store or a magic-only WAL may bootstrap without a marker.
 
-Decoded rows and a derived index of immutable sorted ordinal runs remain in memory, so retained data is bounded by available RAM. Each published batch is sorted by UTC timestamp and append order, then merged into runs by batch count. Queries seek within each run and merge matching rows in order, including across wide time ranges. On startup, recovery represents a timestamp-ordered WAL prefix as an implicit run without an ordinal array; otherwise it builds one explicitly sorted ordinal run; live batches remain in separate merge levels. The index does not change the on-disk format. Up to 16 ingest requests can be processed concurrently, and additional requests receive 503. A failed append returns 503 only after rollback is synced and publishes no rows. If a commit or rollback cannot be confirmed, the process terminates and the request outcome is unknown. Once admitted, an append completes even if its client disconnects. A lost response leaves the outcome unknown and retrying can produce duplicates. The data directory must be owned by the service user and must not be group- or world-writable; existing WAL and marker files must also be owned by that user, not group- or world-writable, and have exactly one link. All parent directories must be trusted against replacement or renaming by other principals. The local filesystem and storage stack must support exclusive advisory locks, atomic rename, file sync, directory sync, and powersafe overwrite: a write interrupted by power loss must not damage bytes outside the written range, even within the same sector. Consecutive WAL frames may share a sector, so this guarantee is required to preserve previously acknowledged batches.
+On the legacy layout, decoded rows and a derived index of immutable sorted ordinal runs remain in memory, so retained data is bounded by available RAM. Each published batch is sorted by UTC timestamp and append order, then merged into runs by batch count. Queries seek within each run and merge matching rows in order, including across wide time ranges. On startup, recovery represents a timestamp-ordered WAL prefix as an implicit run without an ordinal array; otherwise it builds one explicitly sorted ordinal run; live batches remain in separate merge levels. The index does not change the on-disk format. Up to 16 ingest requests can be processed concurrently, and additional requests receive 503. A failed append returns 503 only after rollback is synced and publishes no rows. If a commit or rollback cannot be confirmed, the process terminates and the request outcome is unknown. Once admitted, an append completes even if its client disconnects. A lost response leaves the outcome unknown and retrying can produce duplicates. The data directory must be owned by the service user and must not be group- or world-writable; existing WAL and marker files must also be owned by that user, not group- or world-writable, and have exactly one link. All parent directories must be trusted against replacement or renaming by other principals. The local filesystem and storage stack must support exclusive advisory locks, atomic rename, file sync, directory sync, and powersafe overwrite: a write interrupted by power loss must not damage bytes outside the written range, even within the same sector. Consecutive WAL frames may share a sector, so this guarantee is required to preserve previously acknowledged batches.
 
 Sealed groups of 128 append ordinals also have derived Bloom filters over overlapping four-byte grams of each decoded line. Each bitmap uses 4 KiB (about 32 bytes per row, plus small metadata); blocks with more than 64 KiB of decoded text and the unsealed tail remain unfiltered. Wide literal searches may use these filters to skip blocks, but always check candidate lines exactly. Filters are rebuilt on replay and do not alter durable files or snapshot pagination.
 
@@ -36,10 +36,11 @@ The cursor captures published rows at the first request; later appends do not ap
 
 ## Retained-history cutover
 
-The [cutover decision](docs/adr/0004-retained-history-cutover.md) specifies
-the operating contract for the integrated release. Use a qualified
-cutover binary for the steps below. The legacy binary rejects restored
-images before opening the legacy WAL.
+The Cycle 42 cutover serves immutable checkpoints and a bounded committed
+tail under one writer. The pinned base still serves the legacy layout and
+rejects restored images during startup. The steps below require a
+cutover binary qualified by the pinned Linux release gate. See the
+[cutover decision](docs/adr/0004-retained-history-cutover.md).
 
 ### Activate a verified restore
 
@@ -55,19 +56,29 @@ usual startup command. See the [backup format](internal/backup/FORMAT.md).
 ```
 
 The server locks the directory, validates the restored checkpoint and
-committed suffix, and durably activates writable recovery before opening
-the listener. An incomplete, corrupt, or ambiguous layout fails startup.
-Keep legacy WAL and commit files out of the unactivated image. After
-activation, start the server on the same directory on restart and use a
-fresh `page=1` request to walk the recovered view. New acknowledged
-appends survive restart alongside the restored rows.
+committed suffix, and durably publishes writable recovery authority
+before opening the listener. Keep legacy `bog.wal` and `bog.commit` files
+out of the unactivated image. With a valid active authority, restart on
+the same service directory to recover the checkpoint, restored suffix,
+and subsequent acknowledged appends. Keep that whole directory together.
+Use a fresh `page=1` walk after restart.
+
+If activation is interrupted, restart on that directory with the same
+cutover binary so it can validate and recover the publication state.
+On a startup error for an incomplete, corrupt, or ambiguous layout,
+preserve the service directory and diagnose the reported error. Restore
+the original bundle into a separate destination if a fresh copy is
+needed. The original bundle represents its captured cutoff, so replacing
+an active directory with it can lose subsequent acknowledged appends. See
+the [writable-restore decision](docs/adr/0005-writable-restore-authority.md).
 
 ### Page through retained history
 
 A first page pins one generation and its committed tail. Its cursor keeps
 reading that view through generation replacement while the capture is live.
-An expired capture returns 410. After expiry or restart, start a fresh walk
-with `page=1` on the serving process. A byte-limited page resumes just after
+An expired capture on its issuing process returns 410. A cursor from
+before restart returns 400 because the signing key changes. Start a fresh
+walk with `page=1` in either case. A byte-limited page resumes just after
 its last emitted row. If the work budget prevents the server from preparing a
 page, it returns 503 with no rows or next cursor. Retry a continuation with
 the cursor from the original request while its capture is live. Lowering

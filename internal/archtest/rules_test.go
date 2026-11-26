@@ -8,15 +8,10 @@ import (
 
 func TestArchitectureRules(t *testing.T) {
 	const (
-		store      = "bog/internal/store"
-		checkpoint = "bog/internal/checkpoint"
-		history    = "bog/internal/history"
-		backup     = "bog/internal/backup"
-		wal        = "bog/internal/wal"
-		ingest     = "bog/internal/ingest"
-		release    = "bog/verify/release"
-		extra      = "bog/internal/extra"
-		external   = "example.com/dependency"
+		ingest   = "bog/internal/ingest"
+		release  = "bog/verify/release"
+		extra    = "bog/internal/extra"
+		external = "example.com/dependency"
 	)
 	tests := []struct {
 		name   string
@@ -162,23 +157,15 @@ func TestArchitectureRules(t *testing.T) {
 	}
 }
 
+// This fixture exercises the retained boundaries independently of whether
+// the command wiring is present in the checkout.
 func TestComposedCutoverRules(t *testing.T) {
-	const (
-		httpapi    = "bog/internal/httpapi"
-		readiness  = "bog/internal/readiness"
-		wal        = "bog/internal/wal"
-		store      = "bog/internal/store"
-		checkpoint = "bog/internal/checkpoint"
-		history    = "bog/internal/history"
-		backup     = "bog/internal/backup"
-		adapter    = "bog/internal/retained"
-	)
 	tests := []struct {
 		name   string
 		change func(map[string]listedPackage, map[string]rule)
 		want   []string
 	}{
-		{name: "composition root reaches all retained storage"},
+		{name: "retained wiring with promoted storage modules"},
 		{
 			name: "wiring without role promotions",
 			change: func(_ map[string]listedPackage, rules map[string]rule) {
@@ -195,80 +182,39 @@ func TestComposedCutoverRules(t *testing.T) {
 			},
 		},
 		{
-			name: "checkpoint cannot depend on HTTP",
-			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
-				pkgs[checkpoint] = productionPackage("checkpoint", store, httpapi)
-			},
-			want: []string{"forbidden production import: " + checkpoint + " -> " + httpapi},
-		},
-		{
-			name: "history cannot depend on readiness",
-			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
-				pkgs[history] = productionPackage("history", checkpoint, store, readiness)
-			},
-			want: []string{"forbidden production import: " + history + " -> " + readiness},
-		},
-		{
-			name: "backup cannot depend on HTTP",
-			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
-				pkgs[backup] = productionPackage("backup", store, httpapi)
-			},
-			want: []string{"forbidden production import: " + backup + " -> " + httpapi},
-		},
-		{
-			name: "HTTP cannot bypass the consumer seam",
-			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
-				pkgs[httpapi] = productionPackage("httpapi", store, wal, history)
-			},
-			want: []string{"forbidden production import: " + httpapi + " -> " + history},
-		},
-		{
-			name: "extracted runtime adapter requires registration",
-			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
-				pkgs[server] = productionPackage("main", httpapi, readiness, store, wal, adapter)
-				pkgs[adapter] = productionPackage("retained", backup, history, wal)
-				rules[server] = rule{serverCommand, []string{httpapi, readiness, store, wal, adapter}}
+			name: "retained wiring without an adapter registration",
+			change: func(_ map[string]listedPackage, rules map[string]rule) {
+				delete(rules, retained)
 			},
 			want: []string{
-				"unregistered reachable production package " + adapter,
-				"forbidden production import: " + adapter + " -> " + backup,
-				"forbidden production import: " + adapter + " -> " + history,
-				"forbidden production import: " + adapter + " -> " + wal,
+				"unregistered reachable production package " + retained,
+				"forbidden production import: " + retained + " -> " + backup,
+				"forbidden production import: " + retained + " -> " + history,
+				"forbidden production import: " + retained + " -> " + wal,
 			},
 		},
 		{
-			name: "retired direct edge remains in the registry",
-			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
-				pkgs[httpapi] = productionPackage("httpapi", store)
+			name: "retired direct command edge remains registered",
+			change: func(_ map[string]listedPackage, rules map[string]rule) {
+				r := rules[server]
+				r.imports = append(r.imports, backup)
+				rules[server] = r
 			},
-			want: []string{"stale production import registration: " + httpapi + " -> " + wal},
+			want: []string{"stale production import registration: " + server + " -> " + backup},
+		},
+		{
+			name: "registered storage cycle still fails",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[checkpoint] = productionPackage("checkpoint", store, history)
+				rules[checkpoint] = rule{runtimeLibrary, []string{store, history}}
+			},
+			want: []string{"production import cycle: " + history + " -> " + checkpoint + " -> " + history},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			// Model an adapter in cmd/bog. History brings checkpoint in
-			// transitively, so no speculative direct command edge is needed.
-			pkgs := map[string]listedPackage{
-				server:     productionPackage("main", backup, history, httpapi, readiness, store, wal),
-				backup:     productionPackage("backup", store),
-				checkpoint: productionPackage("checkpoint", store),
-				history:    productionPackage("history", checkpoint, store),
-				httpapi:    productionPackage("httpapi", store, wal),
-				readiness:  productionPackage("readiness", store, wal),
-				store:      productionPackage("store"),
-				wal:        productionPackage("wal", store),
-			}
-			rules := map[string]rule{
-				server:     {serverCommand, []string{backup, history, httpapi, readiness, store, wal}},
-				backup:     {runtimeLibrary, []string{store}},
-				checkpoint: {runtimeLibrary, []string{store}},
-				history:    {runtimeLibrary, []string{checkpoint, store}},
-				httpapi:    {runtimeLibrary, []string{store, wal}},
-				readiness:  {runtimeLibrary, []string{store, wal}},
-				store:      {runtimeLibrary, nil},
-				wal:        {runtimeLibrary, []string{store}},
-			}
+			pkgs, rules := composedCutoverFixture()
 			if tt.change != nil {
 				tt.change(pkgs, rules)
 			}
@@ -277,6 +223,62 @@ func TestComposedCutoverRules(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCutoverForbiddenDirections(t *testing.T) {
+	tests := []struct {
+		from, to string
+	}{
+		{httpapi, retained},
+		{httpapi, history},
+		{readiness, backup},
+		{checkpoint, httpapi},
+		{history, readiness},
+		{backup, httpapi},
+		{retained, httpapi},
+		{wal, retained},
+	}
+	for _, tt := range tests {
+		t.Run(tt.from+" to "+tt.to, func(t *testing.T) {
+			t.Parallel()
+			pkgs, rules := composedCutoverFixture()
+			pkg, r := pkgs[tt.from], rules[tt.from]
+			pkg.Imports = append(pkg.Imports, tt.to)
+			r.imports = append(r.imports, tt.to)
+			pkgs[tt.from], rules[tt.from] = pkg, r
+
+			want := "forbidden production import: " + tt.from + " -> " + tt.to
+			if got := architectureProblems(pkgs, rules); !slices.Contains(got, want) {
+				t.Errorf("architectureProblems() = %q, missing %q", got, want)
+			}
+		})
+	}
+}
+
+func composedCutoverFixture() (map[string]listedPackage, map[string]rule) {
+	pkgs := map[string]listedPackage{
+		server:     productionPackage("main", httpapi, readiness, retained, store, wal),
+		backup:     productionPackage("backup", store),
+		checkpoint: productionPackage("checkpoint", store),
+		history:    productionPackage("history", checkpoint, store),
+		httpapi:    productionPackage("httpapi", store, wal),
+		readiness:  productionPackage("readiness", store, wal),
+		retained:   productionPackage("retained", backup, history, wal),
+		store:      productionPackage("store"),
+		wal:        productionPackage("wal", store),
+	}
+	rules := map[string]rule{
+		server:     {serverCommand, []string{httpapi, readiness, retained, store, wal}},
+		backup:     {runtimeLibrary, []string{store}},
+		checkpoint: {runtimeLibrary, []string{store}},
+		history:    {runtimeLibrary, []string{checkpoint, store}},
+		httpapi:    {runtimeLibrary, []string{store, wal}},
+		readiness:  {runtimeLibrary, []string{store, wal}},
+		retained:   {runtimeLibrary, []string{backup, history, wal}},
+		store:      {runtimeLibrary, nil},
+		wal:        {runtimeLibrary, []string{store}},
+	}
+	return pkgs, rules
 }
 
 func productionPackage(name string, imports ...string) listedPackage {

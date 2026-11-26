@@ -14,9 +14,14 @@ on a trusted network or behind an authenticated access layer.
 
 ## Observed Linux production imports
 
-These are the direct imports between root-module production packages at
-`efb5f059f5ad7ab04e3321f33c4c7a4b2f7ea605`, listed for Linux amd64 with
-cgo disabled. An isolated node has zero direct root-module production imports.
+These are the direct imports between root-module production packages on
+the Cycle 42 base `d06f31a`, listed for Linux amd64 with cgo disabled.
+That commit is the merge base with target `origin/main` at `64ed0cc`.
+The target splits Store internals and adds positioned tail paging within
+the same package. #13 candidate `dd46a1e` adds the consumer paging
+interface. Its Linux ingest error adapter still imports WAL for uncertain
+outcomes. Neither change alters the direct edges below. An isolated node
+has zero direct root-module production imports.
 
 ```mermaid
 flowchart TD
@@ -77,20 +82,35 @@ flowchart TD
 
 ## Retained-history integration
 
-At cutover, the composition root wires HTTP's consumer-owned paging seam to
-the WAL owner and history catalog. That is a runtime interface call from HTTP
-to the supplied implementation. Checkpoint validates and durably publishes
-immutable generations. History owns generation pins, segment scans, and
-reclamation. Store owns decoded tail rows and their order. Backup consumes a
-pinned storage view. Keep these storage packages independent of HTTP and
-readiness.
+At cutover, `cmd/bog` wires HTTP's consumer-owned paging seam to
+`internal/retained`. The adapter coordinates the WAL owner and history
+catalog. Checkpoint validates and durably publishes immutable generations.
+History owns generation pins, segment scans, and reclamation. Store owns
+decoded tail rows and their order. Backup consumes a pinned storage view.
+The command translates between HTTP and storage types at the seam.
 
-The coordinated capture binds the validated generation and exact durable,
-query-visible tail under the same owner. A cursor reads the same view across
-generation replacement. Writable restore establishes checkpoint and tail
-recovery authority before listening. The loopback capacity control drives
-generation replacement through the same owner. See the interface, activation,
-and launch contracts in [ADR 0004](../adr/0004-retained-history-cutover.md).
+The diagram below shows runtime calls and ownership at cutover. The direct
+import registry above describes the available source.
+
+```mermaid
+flowchart LR
+    Cmd["cmd/bog"] --> HTTP["HTTP handler"]
+    Cmd --> Retained["Retained adapter"]
+    HTTP -. "PageSource calls via command bridge" .-> Retained
+    Retained --> Owner["WAL owner and commit authority"]
+    Retained --> History["History catalog and generation pins"]
+    History --> Checkpoint["Immutable checkpoint segments"]
+    Owner --> Tail["Committed tail"]
+    Retained -. "Pinned view" .-> Backup["Backup engine"]
+```
+
+Capture binds the validated generation and exact durable, query-visible
+tail under the same owner. A cursor reads the same view across generation
+replacement until expiry. Restarts require a fresh walk. A writable
+restore publishes active recovery authority before listening. The loopback
+capacity control drives generation replacement through that same owner.
+See the [cutover contract](../adr/0004-retained-history-cutover.md) and
+[writable-restore decision](../adr/0005-writable-restore-authority.md).
 
 ## Package registry
 
@@ -99,16 +119,17 @@ graph. Staged libraries await runtime wiring. Standalone libraries have
 independent consumers. Test-only packages contain test files. Verifier
 commands and support live outside the server dependency tree.
 
-| Package or entry point | Role at the pinned revision | Responsibility |
+| Package or entry point | Role at the pinned revision | Responsibility and cutover role |
 | --- | --- | --- |
 | `cmd/bog` | Server command | Recovery, listener, and lifecycle |
 | `internal/httpapi` | Runtime | HTTP validation, admission, cursors, and response framing |
 | `internal/readiness` | Runtime | Disk headroom and write outcome observation |
 | `internal/wal` | Runtime | Directory locking, commit, replay, and WAL capture |
 | `internal/store` | Runtime | Row decoding, publication, and ordered queries |
-| `internal/checkpoint` | Staged | Legacy WAL scans, checkpoint format, and publication |
-| `internal/history` | Staged | Generation validation, scans, pins, and reclamation |
-| `internal/backup` | Staged | Pinned export, verification, restore, and offline reads |
+| `internal/checkpoint` | Staged | Legacy WAL scans, checkpoint format, and publication. Promote when reached by the command. |
+| `internal/history` | Staged | Generation validation, scans, pins, and reclamation. Promote when reached by the command. |
+| `internal/backup` | Staged | Pinned export, verification, restore, and offline reads. Promote when reached by the command. |
+| `internal/retained` | Planned in #53 | Register as runtime with the command wiring. Coordinates active recovery, generation replacement, and capture of checkpoint and tail. |
 | `internal/idempotency` | Staged | Backend-mediated keyed ingest retries |
 | `internal/client` | Standalone | HTTP client, page validation, and ingest outcomes |
 | `internal/ingest` | Test-only | Reference decoder and fuzz tests |
@@ -131,7 +152,7 @@ pinned Linux run.
 | --- | --- | --- |
 | 1 | Durability | Wait for durable whole-batch commit before acknowledging. Stop on uncertain writes or committed corruption, even when availability suffers. |
 | 2 | Exact queries | Preserve ordered membership through compaction, restart, and verified restore. Fail incompletely prepared pages before advancing their cursors. |
-| 3 | Bounded resources | Bound captures, concurrent scans, work, response bytes, and tail size. Use per-row positions for byte-trimmed pages and reclaim only after pins drain. |
+| 3 | Bounded resources | Bound captures, concurrent scans, work, response bytes, and tail size. Expiry limits how long walks can pin storage. Reclamation waits for admitted readers to drain. |
 | 4 | Recovery time | Validate the authority and replay its committed suffix before opening the listener. Bound the tail to reduce recovery work. |
 | 5 | Throughput | Share syncs across admitted writes and prune provably irrelevant scan work within the guarantees above. |
 
@@ -159,10 +180,14 @@ The architecture PR is the sole writer of the [fitness registry](../../internal/
 At integration, use `git merge-base HEAD origin/main` with the current target
 ref and review package changes on both sides. Inspect the composed Linux
 production graph with #53 and #13 together. Promote checkpoint, history,
-and backup when the command first reaches them, register any extracted
-adapter with its observed role and imports, and remove retired entries
-and edges in that same change. The composed-cutover fixture exercises
-these rules ahead of wiring.
+and backup when the command first reaches them, register
+`internal/retained` with its observed role and imports, and remove retired
+entries and edges in that same change. The retained fixture checks
+transitive promotions, adapter registration, stale edges, and cycles. The
+direction rules reject a direct dependency from HTTP or readiness to
+retained storage, and dependencies from storage back to HTTP or readiness,
+even if a registry edit lists the edge. Keep the command's bridge at the
+composition root.
 
 The Architecture workflow runs `go test -count=1 ./internal/archtest` on the
 host. The suite lists packages with `GOOS=linux GOARCH=amd64 GOAMD64=v1

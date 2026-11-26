@@ -1,9 +1,10 @@
 # ADR 0004 — Retained-history runtime cutover
 
-**Status** — Cycle 39 integration contract. The pinned base serves the
-legacy WAL layout. The HTTP handoff below is recorded from #13's candidate
-`2e7426f`. #53 supplies the retained adapter and startup wiring on the
-composed revision. Pinned Linux qualification remains pending.
+**Status** — Cycle 42 integration contract. The pinned base serves the
+legacy WAL layout. The HTTP handoff below is recorded from #13 candidate
+`dd46a1e`. The target adds positioned tail pages in `64ed0cc`. #53 owns
+the retained adapter and startup wiring. Composed Linux qualification is
+pending.
 
 The legacy server replays and retains the full committed WAL in memory. The
 cutover serves immutable checkpoint history with a bounded committed tail,
@@ -24,9 +25,12 @@ Linux import graph and the registry update required at integration.
 
 ## Storage and HTTP seam
 
-HTTP owns admission, filter canonicalization, cursor authentication, and
-NDJSON framing. `cmd/bog` injects the adapter via
-`httpapi.NewWithPageSource`. The #13 handoff exposes this consumer interface.
+#13 owns admission, filter canonicalization, cursor authentication, NDJSON
+framing, and the consumer interface in `internal/httpapi`. At cutover,
+`cmd/bog` bridges the consumer types to the storage adapter in
+`internal/retained` and injects that bridge via `httpapi.NewWithPageSource`.
+The Linux HTTP import of WAL in #13 still classifies uncertain ingest
+outcomes. The query path uses the consumer seam.
 
 ```go
 type PageSource interface {
@@ -57,7 +61,9 @@ reads can drain. #53 must coordinate this WAL boundary with the history
 pin under the same commit and activation synchronization.
 
 Page positions follow the total order of UTC timestamp and global append
-ordinal. Merge the checkpoint and captured tail in that order, preserving
+ordinal. The target's `Store.QueryPositionedPage` exposes ordered tail rows
+with global ordinals using the captured tail count and first ordinal.
+Merge the checkpoint and captured tail in that order, preserving
 duplicates, equal timestamps, and backfill. The captured view includes whole
 durable groups through its fixed end. Later commits and generation
 replacement leave membership and positions fixed. Reclaim retired files only
@@ -108,8 +114,9 @@ bytes. #53 owns any export adaptation for an active tail-only layout.
   generates a signing key at startup, so a prior issuer's token fails
   authentication after restart. Start a fresh walk with `page=1`.
 - Read the requested page using the shared work budget. When #13 prepares a
-  next cursor, it also meters a bounded immediate continuation at the same
-  limit, measuring its response without allocating a second body. Finish
+  next cursor, it also meters an immediate continuation with a separate
+  request-sized budget at the same limit, measuring its response without
+  allocating a second body. Finish
   preparation before committing the exact `Content-Length` and any
   `Bog-Next-Cursor`. Hold the query admission slot through body delivery.
   Ingest has independent admission.
@@ -143,24 +150,10 @@ bytes. #53 owns any export adaptation for an active tail-only layout.
 ## Writable activation and capacity control
 
 Classify the layout under the directory lock before legacy bootstrap or any
-recovery mutation. Recognize a restore if either `bog.backup` or
-`bog.wal.tail` is present. Validate the complete v1 image, including
-manifest and segment integrity, ordinal coverage, and suffix size, digest,
-and whole-frame coverage. Reject unsafe, damaged, incomplete, or ambiguous
-layouts. An unactivated image mixed with legacy authority files is ambiguous.
-Recognize an interrupted activation only through the activation protocol's
-own durable state and validate it before resuming.
-
-The v1 image omits the covered WAL prefix. Activate a recoverable append
-state for the verified checkpoint and suffix under the existing owner.
-Publish the durable authority for that state before listening or accepting
-writes. Recovery resumes at the next global append ordinal after the
-verified suffix. A restart after activation recovers the checkpoint, its
-committed suffix, and every subsequently acknowledged batch through the
-same writable path. Failure before activation completes leaves a recoverable
-image or a validated, resumable activation state. Keep the source bundle
-separate from the service directory. Replay and serving must not depend on
-the source bundle after activation.
+recovery mutation. A restored image becomes writable only when the
+checkpoint identity, WAL epoch, and initial commit point form durable
+recovery authority. [ADR 0005](0005-writable-restore-authority.md) defines the
+validation, publication order, interrupted activation, and restart rules.
 
 The capacity launcher clears inherited `BOG_CAPACITY_CONTROL`, then sets
 `BOG_CAPACITY_CONTROL=1` for both candidate starts in live mode. Legacy mode
@@ -190,9 +183,10 @@ storage owner as production ingest and query.
 
 | Track | Write ownership and handoff |
 | --- | --- |
-| Architecture | Owns this ADR, the operator README, system graph, and sole fitness-registry edits. Lands role and edge changes with the wiring that requires them. |
+| Architecture | Owns this ADR, ADR 0005, the operator README, system graph, and sole fitness-registry edits. Lands role and edge changes with the wiring that requires them. |
 | #53 storage and bootstrap | Sole writer of runtime storage and `cmd/bog` composition. Records the adapter's concrete types, imports, capture and export lifetime, activation failures, and capacity handler behavior for the composed tree. |
 | #13 HTTP | Owns `internal/httpapi`. Supplies the consumer types and HTTP failure mapping above. |
+| #55 checkpoint recovery | Owns recovery of an inaccessible empty checkpoint staging directory under the publication lock. Resolve interrupted checkpoint publication before using that generation. |
 | #57 capacity and release evidence | Owns capacity teardown and release evidence. Uses the production launch contract to qualify the same composed binary at both sizes. |
 
 #54 landed the verifier registrations and release lifecycle hardening in
@@ -219,8 +213,9 @@ queued.
 3. Review both sides of the merge base with the current target ref.
    Derive Linux production imports from the composed #53 and #13 sources.
    Promote checkpoint, history, and backup when reachable from `cmd/bog`,
-   register any new adapter, and remove retired edges and entries in the
-   same integration change. Run `go test -count=1 ./internal/archtest` and
+   register `internal/retained`, and remove retired edges and entries in the
+   same integration change. Keep dependencies directed from the composition
+   root toward HTTP and storage. Run `go test -count=1 ./internal/archtest` and
    `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on that tree.
 4. Dispatch the [Linux release gate](../../verify/release/README.md) using
    the full composed commit SHA. Qualify one clean candidate built with Go

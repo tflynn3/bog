@@ -1,0 +1,118 @@
+name: Linux release verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full lowercase commit SHA to qualify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOWORK: 'off'
+  FIXTURE: linux-release-v1
+  REVISION: ${{ inputs.revision }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Record fixture and check revision input
+        run: |
+          EVIDENCE="$RUNNER_TEMP/bog-release-evidence"
+          mkdir -p "$EVIDENCE"
+          printf 'EVIDENCE=%s\nBINARY=%s\n' "$EVIDENCE" "$RUNNER_TEMP/bog-release-candidate" >> "$GITHUB_ENV"
+          {
+            printf 'revision=%q\nfixture=%s\n' "$REVISION" "$FIXTURE"
+            uname -a
+          } | tee "$EVIDENCE/run.txt"
+          [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "Expected a full lowercase commit SHA" | tee -a "$EVIDENCE/run.txt"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          path: gate
+          persist-credentials: false
+
+      - name: Record fixture configuration
+        run: cp gate/verify/release/README.md "$EVIDENCE/fixture.md"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision }}
+          path: candidate
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - name: Build pinned candidate
+        id: build
+        working-directory: candidate
+        timeout-minutes: 6
+        run: |
+          {
+            head=$(git rev-parse HEAD)
+            printf 'HEAD=%s\n' "$head"
+            [[ "$head" == "$REVISION" ]]
+            [[ -z "$(git status --porcelain)" ]]
+            go version
+            [[ "$(go env GOVERSION GOOS GOARCH GOTOOLCHAIN)" == $'go1.27.0\nlinux\namd64\nlocal' ]]
+            go build -trimpath -buildvcs=true -o "$BINARY" ./cmd/bog
+            go version -m "$BINARY" | tee "$EVIDENCE/build-info.txt"
+            grep -Eq "^[[:space:]]+build[[:space:]]+vcs.revision=$REVISION$" "$EVIDENCE/build-info.txt"
+            grep -Eq '^[[:space:]]+build[[:space:]]+vcs.modified=false$' "$EVIDENCE/build-info.txt"
+            sha256sum "$BINARY" | tee "$EVIDENCE/binary.sha256"
+          } 2>&1 | tee "$EVIDENCE/build.log"
+
+      - name: Run release evidence producers
+        if: steps.build.outcome == 'success'
+        timeout-minutes: 43
+        run: |
+          failed=0
+          producer() {
+            local name=$1 directory=$2 command=$3 duration=$4
+            if (cd "$directory" && timeout --kill-after=5s "$duration" go run "$command" \
+              -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
+              -report "$EVIDENCE/$name.json") 2>&1 | tee "$EVIDENCE/$name.log"; then
+              printf '%s exit=0\n' "$name" | tee -a "$EVIDENCE/producers.txt"
+            else
+              printf '%s exit=%d\n' "$name" "$?" | tee -a "$EVIDENCE/producers.txt"
+              failed=1
+            fi
+          }
+          producer admission gate ./verify/release 2m
+          producer durability candidate ./verify/linux 15m
+          producer capacity candidate ./bench/retained-history 24m
+          exit "$failed"
+
+      - name: Validate reports and candidate identity
+        if: always() && steps.build.outcome == 'success'
+        working-directory: gate
+        timeout-minutes: 3
+        run: |
+          {
+            failed=0
+            sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
+            go run ./verify/release validate -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
+              -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
+              -capacity "$EVIDENCE/capacity.json" || failed=1
+            exit "$failed"
+          } 2>&1 | tee "$EVIDENCE/validation.log"
+
+      - name: Publish release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-evidence
+          path: ${{ runner.temp }}/bog-release-evidence
+          if-no-files-found: error

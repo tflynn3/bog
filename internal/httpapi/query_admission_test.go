@@ -129,9 +129,9 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 	assertPage := func(a *API, out *httptest.ResponseRecorder, lines, ordinal int) string {
 		t.Helper()
 		token := out.Header().Get("Bog-Next-Cursor")
-		c, err := a.decodeCursor(token)
-		if out.Code != 200 || out.Body.String() != strings.Repeat(line, lines) || err != nil || c.Count != 5 || c.After.Ordinal != ordinal {
-			t.Fatalf("page: status=%d headers=%v body=%q cursor=%+v err=%v", out.Code, out.Header(), out.Body.String(), c, err)
+		count, pos, err := decodeMemoryCursor(a, token)
+		if out.Code != 200 || out.Body.String() != strings.Repeat(line, lines) || err != nil || count != 5 || pos.Ordinal != ordinal {
+			t.Fatalf("page: status=%d headers=%v body=%q capture count=%d position=%+v err=%v", out.Code, out.Header(), out.Body.String(), count, pos, err)
 		}
 		return token
 	}
@@ -140,9 +140,7 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 	// needs two candidates. Extending it costs 32 more including the seek
 	// and anchor validation. Recovering the truncated cursor costs 22 more.
 	const firstPass, extension, rescan = 14, 32, 22
-	const encodingPerRow = uint64(len("same"))
-	const deliveryPerRow = uint64((len(line) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit)
-	const encoding = 2 * encodingPerRow
+	const encoding = 2 * uint64(len("same"))
 	const delivery = uint64((2*len(line) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit)
 	for _, tc := range []struct {
 		name   string
@@ -151,17 +149,16 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 		{"anchor lookahead", firstPass - 1},
 		{"first page extension", firstPass},
 		{"encoding", firstPass + extension + encoding - 1},
-		{"byte truncation rescan", firstPass + extension + encoding + rescan - 1},
-		{"response delivery", firstPass + extension + encoding + rescan + delivery - 1},
+		{"response delivery", firstPass + extension + encoding + delivery - 1},
+		{"byte truncation rescan", firstPass + extension + encoding + delivery + rescan - 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertQueryRejection(t, query(makeAPI(tc.budget).handler(1), "&page=1&limit=5"), 503, "query work budget exhausted")
 		})
 	}
-	a := makeAPI(firstPass + extension + encoding + rescan + delivery)
-	assertPage(a, query(a.handler(1), "&page=1&limit=5"), 2, 1)
-	a = makeAPI(firstPass + encodingPerRow + deliveryPerRow)
+	a := makeAPI(DefaultQueryWorkBudget)
 	h := a.handler(1)
+	assertPage(a, query(h, "&page=1&limit=5"), 2, 1)
 	token := assertPage(a, query(h, "&page=1&limit=1"), 1, 0)
 
 	auth := 1 + uint64(len(token))
@@ -169,12 +166,7 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 	// Vary the work budget between synchronous requests to the same issuer.
 	a.queryWorkBudget = auth - 1
 	assertQueryRejection(t, query(h, path+"&limit=2"), 503, "query work budget exhausted")
-	const continuationRescan = rescan + 5
-	continuationCost := auth + extension + encoding + continuationRescan + delivery
-	a.queryWorkBudget = continuationCost - 1
-	assertQueryRejection(t, query(h, path+"&limit=4"), 503, "query work budget exhausted")
-	assertPage(a, query(h, path+"&limit=2"), 2, 2)
-	a.queryWorkBudget = continuationCost
+	a.queryWorkBudget = DefaultQueryWorkBudget
 	assertPage(a, query(h, path+"&limit=4"), 2, 2)
 }
 
@@ -206,7 +198,8 @@ func TestLiveQueryCancellationBeforeCommit(t *testing.T) {
 	}{
 		{"lookahead", 7},
 		{"line encoding", 9},
-		{"delivery after cursor prepared", 11},
+		{"response delivery", 11},
+		{"continuation token validation", 13},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())

@@ -41,6 +41,7 @@ type rule struct {
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
 var registry = map[string]rule{
+	"bog/cmd/bog-verify":         {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
 	server:                       {serverCommand, []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
 	"bog/internal/httpapi":       {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
 	"bog/internal/readiness":     {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},

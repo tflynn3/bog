@@ -46,6 +46,33 @@ func (s *storeAdapter) query(req model.Request) (model.Page, error) {
 	return page, nil
 }
 
+func (s *storeAdapter) queryPositioned(req model.Request) (model.Page, error) {
+	var anchor *store.PageAnchor
+	if req.Cursor != nil {
+		anchor = &store.PageAnchor{Count: req.Cursor.HighWater, Ordinal: req.Cursor.After.Ordinal}
+	}
+	filter := req.Filter
+	result, err := s.store.QuerySnapshotPage(filter.Start, filter.End, filter.Contains, req.Limit, anchor, nil)
+	if err != nil {
+		return model.Page{}, err
+	}
+	page := model.Page{Rows: make([]model.Row, len(result.Rows)), HighWater: result.Count}
+	if len(result.Rows) != len(result.Ordinals) {
+		return model.Page{}, fmt.Errorf("got %d rows and %d ordinals", len(result.Rows), len(result.Ordinals))
+	}
+	for i, row := range result.Rows {
+		page.Rows[i] = model.Row{Time: row.TS, Line: row.Line}
+	}
+	if result.HasMore {
+		last := len(result.Rows) - 1
+		if last < 0 {
+			return model.Page{}, fmt.Errorf("empty store page reports more rows")
+		}
+		page.Next = &model.Position{Time: result.Rows[last].TS, Ordinal: result.Ordinals[last]}
+	}
+	return page, nil
+}
+
 var epoch = time.Date(2025, 1, 2, 0, 0, 0, 123, time.UTC)
 
 func loadHistory(batches [][]model.Row) (*storeAdapter, *model.Log) {
@@ -167,7 +194,7 @@ func TestStoreSnapshotWalkConcurrentPublish(t *testing.T) {
 	published := 0
 	checkWalk(t, seed, log, filter, []int{1, 11, 17}, func(req model.Request) (model.Page, error) {
 		if req.Cursor == nil || published == len(late) {
-			return s.query(req)
+			return s.queryPositioned(req)
 		}
 		batch := late[published]
 		published++
@@ -182,7 +209,7 @@ func TestStoreSnapshotWalkConcurrentPublish(t *testing.T) {
 		})
 		<-ready
 		close(start)
-		page, err := s.query(req)
+		page, err := s.queryPositioned(req)
 		writer.Wait()
 		log.Append(batch)
 		return page, err
@@ -190,5 +217,5 @@ func TestStoreSnapshotWalkConcurrentPublish(t *testing.T) {
 	if published != len(late) {
 		t.Fatalf("seed=%d: published %d late batches, want %d", seed, published, len(late))
 	}
-	checkWalk(t, seed, log, filter, []int{53}, s.query)
+	checkWalk(t, seed, log, filter, []int{53}, s.queryPositioned)
 }

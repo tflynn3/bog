@@ -52,6 +52,22 @@ func startChild(t *testing.T, binary, dir, addr, cwd string) *child {
 	return p
 }
 
+func (p *child) stop(t *testing.T) {
+	t.Helper()
+	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-p.done:
+		p.reaped = true
+		if err != nil {
+			t.Fatalf("SIGTERM: %v: %s", err, p.logs.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("exit timed out")
+	}
+}
+
 func TestLifecycle(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "bog")
 	buildCtx, cancelBuild := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -81,7 +97,7 @@ func TestLifecycle(t *testing.T) {
 			t.Fatalf("%s modified: %v", dir, entries)
 		}
 	}
-	dir := t.TempDir()
+	dir := privateDataDir(t)
 	other := t.TempDir()
 	if out, err := run("-addr", "127.0.0.1:0", "-data-dir", dir, "-query-max-response-bytes=0"); err == nil || !strings.Contains(out, "query-max-response-bytes must be positive") {
 		t.Fatalf("invalid response limit: %v %s", err, out)
@@ -145,44 +161,10 @@ func TestLifecycle(t *testing.T) {
 	start := func(path, address string) {
 		t.Helper()
 		p := startChild(t, binary, path, address, other)
-		cmd, done, logs := p.cmd, p.done, &p.logs
-		client := &http.Client{Timeout: 300 * time.Millisecond, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}}
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			select {
-			case err := <-done:
-				p.reaped = true
-				t.Fatalf("server exited: %v: %s", err, logs.String())
-			default:
-			}
-			resp, err := client.Get("http://" + address + "/healthz")
-			if err == nil {
-				_, readErr := io.Copy(io.Discard, resp.Body)
-				closeErr := resp.Body.Close()
-				if readErr != nil || closeErr != nil {
-					t.Fatalf("health response: %v %v", readErr, closeErr)
-				}
-				if resp.StatusCode == http.StatusOK {
-					break
-				}
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("startup timed out")
-		}
-		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case err := <-done:
-			p.reaped = true
-			if err != nil {
-				t.Fatalf("SIGTERM: %v: %s", err, logs.String())
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("exit timed out")
-		}
+		client := newServiceClient(address)
+		client.waitReady(t, p)
+		client.expect(t, http.MethodGet, "/healthz", "", http.StatusOK)
+		p.stop(t)
 	}
 	start(dir, addr)
 	if _, err := os.Stat(filepath.Join(dir, "bog.wal")); err != nil {
@@ -192,6 +174,7 @@ func TestLifecycle(t *testing.T) {
 	start(dir, addr)
 	start(unsafe, addr)
 	t.Run("drain", func(t *testing.T) { testShutdownDrainsInFlightIngest(t, binary) })
+	t.Run("ready_enospc", func(t *testing.T) { testReadyWithKernelENOSPC(t, binary, addr) })
 }
 
 func testShutdownDrainsInFlightIngest(t *testing.T, binary string) {
@@ -203,7 +186,7 @@ func testShutdownDrainsInFlightIngest(t *testing.T, binary string) {
 	if err := probe.Close(); err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
+	dir := privateDataDir(t)
 	p := startChild(t, binary, dir, addr, "")
 	cmd, done, logs := p.cmd, p.done, &p.logs
 	var conn net.Conn

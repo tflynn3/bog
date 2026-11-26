@@ -8,6 +8,8 @@ import (
 	"flag"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -16,6 +18,15 @@ import (
 	"bog/internal/store"
 	"bog/internal/wal"
 )
+
+func privateDataDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
 
 func TestParseFlags(t *testing.T) {
 	tests := []struct {
@@ -68,7 +79,7 @@ func TestRunClosesWALOnListenFailure(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	dir := t.TempDir()
+	dir := privateDataDir(t)
 	c, err := parseFlags([]string{"-data-dir", dir, "-addr", listener.Addr().String()}, io.Discard)
 	if err != nil {
 		t.Fatal(err)

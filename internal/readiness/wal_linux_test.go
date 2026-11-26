@@ -51,7 +51,11 @@ func assertReady(t *testing.T, h http.Handler, code int, want status) {
 
 func TestReadyRouteWithAppendResults(t *testing.T) {
 	s := &store.Store{}
-	w, err := wal.Open(t.TempDir(), s)
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	w, err := wal.Open(dir, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,6 +79,10 @@ func TestReadyRouteWithAppendResults(t *testing.T) {
 	failure = privateErr
 	if rec := request(h, http.MethodPost, "/ingest", testBatch); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("failed ingest = %d %s", rec.Code, rec.Body)
+	}
+	assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"})
+	if rec := request(h, http.MethodPost, "/ingest", "invalid batch"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid ingest during rollback = %d %s", rec.Code, rec.Body)
 	}
 	assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"})
 	rec := request(h, http.MethodGet, "/ready", "")
@@ -221,80 +229,4 @@ func TestDiskHeadroom(t *testing.T) {
 	if h := NewHandler(ctx, dir, appendFunc(nil), func(Appender) http.Handler { return http.NotFoundHandler() }); h == nil {
 		t.Fatal("missing handler")
 	}
-}
-
-// Run with BOG_READINESS_TEST_TMPFS pointing to a disposable, capacity-limited
-// tmpfs. The normal unit tests use a deterministic append failure.
-func TestReadyWithKernelENOSPC(t *testing.T) {
-	mount := os.Getenv("BOG_READINESS_TEST_TMPFS")
-	if mount == "" {
-		t.Skip("requires a disposable tiny tmpfs")
-	}
-	var fs syscall.Statfs_t
-	if err := syscall.Statfs(mount, &fs); err != nil {
-		t.Fatal(err)
-	}
-	const tmpfsMagic = 0x01021994
-	if fs.Type != tmpfsMagic || fs.Bsize <= 0 || fs.Blocks < 4 ||
-		fs.Blocks > (8<<20)/uint64(fs.Bsize) || fs.Bavail != fs.Blocks {
-		t.Fatalf("want empty tmpfs of at most 8 MiB; got %+v", fs)
-	}
-	dir, err := os.MkdirTemp(mount, "bog-ready-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Error(err)
-		}
-	})
-	s := &store.Store{}
-	w, err := wal.Open(dir, s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := w.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	h := NewHandler(ctx, dir, w, func(a Appender) http.Handler { return httpapi.New(s, a) })
-	deadline := time.Now().Add(5 * time.Second)
-	for request(h, http.MethodGet, "/ready", "").Code != http.StatusOK {
-		if time.Now().After(deadline) {
-			t.Fatal("initial readiness sample timed out")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if err := syscall.Statfs(dir, &fs); err != nil {
-		t.Fatal(err)
-	}
-	filler := filepath.Join(dir, "fill")
-	file, err := os.OpenFile(filler, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = syscall.Fallocate(int(file.Fd()), 0, 0, int64(fs.Bavail)*int64(fs.Bsize))
-	if err := errors.Join(err, file.Close()); err != nil {
-		t.Fatalf("fill tmpfs: %v", err)
-	}
-	if rec := request(h, http.MethodPost, "/ingest", testBatch); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("ingest on full tmpfs = %d %s", rec.Code, rec.Body)
-	}
-	assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"})
-	if rec := request(h, http.MethodGet, "/healthz", ""); rec.Code != http.StatusOK {
-		t.Fatalf("liveness on full tmpfs = %d", rec.Code)
-	}
-
-	if err := os.Remove(filler); err != nil {
-		t.Fatal(err)
-	}
-	assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"})
-	if rec := request(h, http.MethodPost, "/ingest", testBatch); rec.Code != http.StatusNoContent {
-		t.Fatalf("ingest after freeing space = %d %s", rec.Code, rec.Body)
-	}
-	assertReady(t, h, http.StatusOK, status{Ready: true, Reason: "ready"})
 }

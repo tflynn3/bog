@@ -75,10 +75,19 @@ func run(c config) error {
 		}
 		return fmt.Errorf("listen on %q: %w", addr, err)
 	}
-	server := &http.Server{Handler: httpapi.NewWithQueryLimits(s, w, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
+	probeCtx, stopProbes := context.WithCancel(context.Background())
+	defer stopProbes()
+	server := &http.Server{
+		Handler:           newReadyHandler(probeCtx, c, s, w),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
 	var serveErr error
@@ -86,6 +95,7 @@ func run(c config) error {
 	case <-signals:
 	case serveErr = <-served:
 	}
+	stopProbes()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {

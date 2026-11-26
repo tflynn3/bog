@@ -31,9 +31,12 @@ func TestSnapshot(t *testing.T) {
 		{"rollback with stale headroom", sample{at: expired}, outcome{rolledBack, expired, "eio"}, status{Reason: "wal_rollback", Category: "eio"}},
 		{"uncertain with fresh headroom", fresh, outcome{uncertain, now, "other"}, status{Reason: "recovery_required", Category: "other"}},
 		{"durable after low", low, recentWrite, status{Ready: true, Reason: "ready"}},
+		{"durable after stale sample", sample{at: expired}, recentWrite, status{Ready: true, Reason: "ready"}},
+		{"probe failure after recent durable", sample{at: now, failed: true}, outcome{state: durable, at: fresh.at}, status{Reason: "sample_unavailable"}},
 		{"low after durable", low, outcome{state: durable, at: expired}, status{Reason: "low_disk_headroom"}},
 		{"durable before initial sample", sample{}, recentWrite, status{Ready: true, Reason: "ready"}},
 		{"stale durable and no sample", sample{}, outcome{state: durable, at: expired}, status{Reason: "sampling_pending"}},
+		{"stale durable and stale sample", sample{at: expired.Add(-time.Second), headroom: true}, outcome{state: durable, at: expired}, status{Reason: "sample_stale"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

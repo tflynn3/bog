@@ -1,8 +1,8 @@
 # Bog system architecture
 
-Bog runs as one Linux process per data directory. The binary, its HTTP
-listener, and the local data directory form one deployment and consistency
-unit. `cmd/bog` owns startup and shutdown. It constructs the in-memory store,
+Bog uses one Linux process, one HTTP listener, one WAL owner, and one pinned
+local data directory as its deployment and consistency unit. `cmd/bog` owns
+startup and shutdown. At the Cycle 38 base it constructs the in-memory store,
 opens and replays the WAL before listening, and composes HTTP with readiness.
 On shutdown it stops readiness probes and drains HTTP before closing the WAL.
 The directory remains locked while handlers may still use it.
@@ -14,10 +14,12 @@ powersafe overwrite. The service has no built-in authentication or stream
 isolation. Its HTTP listener belongs on a trusted network or behind an
 authenticated access layer.
 
-## Server, backup, and release entry points
+## Observed imports and entry points at the Cycle 38 base
 
 Solid arrows show direct Go imports. Labeled dotted arrows show ownership,
-file publication, or how the release workflow runs the candidate.
+file publication, or how the release workflow runs the candidate. This is
+the direct root-module production graph at `17530c2`. Isolated nodes have
+no direct imports of other production packages in the root module.
 
 ```mermaid
 flowchart TD
@@ -44,14 +46,25 @@ flowchart TD
         Backup -. publishes and opens .-> Image
     end
     Backup --> Store
+    subgraph Staged["Staged storage and retry components"]
+        Checkpoint["internal/checkpoint"]
+        History["internal/history"]
+        Idempotency["internal/idempotency"]
+    end
+    History --> Checkpoint
+    History --> Store
+    Checkpoint --> Store
+    Client["internal/client<br/>standalone"]
+    Client --> Store
     subgraph Evidence["Linux release workflow"]
         Gate["linux-release.yml<br/>builds one revision-pinned binary"]
         Admission["verify/release<br/>admission probe and report validation"]
-        Durability["verify/linux (#3)<br/>planned durability evidence"]
-        Capacity["bench/retained-history (#32)<br/>planned capacity evidence"]
+        Durability["verify/linux (#3)<br/>durability producer"]
+        Capacity["bench/retained-history (#32)<br/>capacity producer"]
         Gate -. runs .-> Admission
-        Gate -. expects .-> Durability
-        Gate -. expects .-> Capacity
+        Gate -. runs .-> Durability
+        Gate -. runs .-> Capacity
+        Model["verify/query-model<br/>independent test oracle"]
     end
     Gate -. builds .-> Cmd
     Admission -. exercises over HTTP .-> HTTP
@@ -84,19 +97,23 @@ flowchart TD
 - **Offline backup** — The staged engine exports, verifies, and restores a
   checkpoint and its exact committed WAL suffix. The image reader is exercised
   offline through `OpenRestored`. The shipped command currently opens the
-  legacy WAL layout. [ADR 0003](../adr/0003-wal-capture-and-restored-image-startup.md)
-  covers how the cutover will recognize restored images before legacy recovery.
+  legacy WAL layout and rejects directories containing `bog.backup` or
+  `bog.wal.tail` before legacy WAL recovery. [ADR 0003](../adr/0003-wal-capture-and-restored-image-startup.md)
+  records the startup guard and capture design.
 - **Release evidence** — The dispatch workflow builds one Linux candidate at
   the supplied revision and passes that binary to each evidence producer.
   `verify/release` runs the admission probe and validates the reports. #3 and
-  #32 provide the durability and capacity evidence required to qualify a build.
+  #32 provide the durability and capacity producers. The capacity producer can
+  record a legacy baseline and requires the live compaction control to qualify
+  the cutover.
 
 ## Package registry
 
 The registry in [architecture_test.go](../../internal/archtest/architecture_test.go)
-records the current Linux production reachability and permitted direct imports
-within the root Go module. Production reachability always starts at
-`bog/cmd/bog`.
+records Linux production reachability and permitted direct imports within the
+root Go module. Production reachability starts at `bog/cmd/bog`. The table
+records observed base roles. The two observed verifier commands marked for
+#54 registration already exist in the tree.
 
 | Package or entry point | Current role | Responsibility |
 | --- | --- | --- |
@@ -116,31 +133,91 @@ within the root Go module. Production reachability always starts at
 | `verify/query-model` | Verifier support | Independent query oracle and fixtures used by tests |
 | `bench/segment-layout` | Benchmark command in a nested Go module | Linux checkpoint layout experiment, outside the root-module graph |
 | `.github/workflows/linux-release.yml` | Release workflow | Builds and identifies the candidate, runs producers, and publishes evidence |
-| `verify/linux` (#3) | Planned entry point | Linux crash recovery and ENOSPC durability evidence |
-| `bench/retained-history` (#32) | Planned entry point | Revision-pinned Linux capacity evidence, starting with the legacy baseline |
+| `verify/linux` (#3) | Verifier command, registration pending #54 | Linux crash recovery and ENOSPC durability evidence |
+| `bench/retained-history` (#32) | Verifier command, registration pending #54 | Revision-pinned legacy baseline and live capacity evidence |
 
-`cmd/bog` composes the runtime. HTTP and readiness depend on WAL and store.
-WAL depends on store, which imports no Bog packages. Outside the runtime,
-history may depend on checkpoint and store. Checkpoint, backup, and the
-standalone client each depend on store. Idempotency imports no Bog packages. The
-root-module verifier and query oracle import no Bog production packages.
-The nested segment layout benchmark consumes checkpoint and store in its own
-module. The planned evidence producers are absent at this revision. See the
-[release verifier contract](../../verify/release/README.md) for their invocation
+Runtime libraries are reachable from the server. Staged libraries are
+root-module production packages awaiting runtime wiring. Standalone
+libraries have independent consumers. Test-only packages contain only test
+code. Verifier commands and support packages sit outside the runtime
+reachability tree. The nested segment-layout module sits outside the
+root-module import graph. Both pending verifier registrations have zero
+direct root-module imports. See the
+[release verifier contract](../../verify/release/README.md) for invocation
 and report requirements.
 
-## Proposed retained-history design
+## Intended retained-history imports at cutover
 
-[ADR 0001](../adr/0001-single-writer-retained-history.md) specifies the cutover.
-[ADR 0003](../adr/0003-wal-capture-and-restored-image-startup.md) extends it with
-the shared capture and restored-image startup contract.
-A production adapter will capture a pinned checkpoint generation and a fixed
-committed WAL end together. HTTP paging and backup will use that same capture.
-Queries will merge immutable checkpoint segments and the bounded tail in
-timestamp and append order. Publication, activation, and reclamation will
-respect the WAL owner's authority and outstanding pins. This cutover changes
-the HTTP, checkpoint, history, and store paths together. Until then, serving
-and replay use the in-memory store and legacy WAL as shown above.
+[ADR 0004](../adr/0004-retained-history-cutover.md) records the consumer
+interface and ownership before implementation. This graph shows intended
+direct imports. The cutover records the actual edges and roles observed in
+the integrated candidate.
+
+```mermaid
+flowchart TD
+    subgraph Runtime["One Linux process"]
+        Cmd["cmd/bog<br/>composition, storage adapter, lifecycle"]
+        HTTP["internal/httpapi<br/>consumer paging interface"]
+        Ready["internal/readiness"]
+        WAL["internal/wal<br/>recovery, commit, capture boundary"]
+        Store["internal/store<br/>recovered and live tail"]
+        Checkpoint["internal/checkpoint<br/>validation and publication"]
+        History["internal/history<br/>generation scans and pins"]
+        Backup["internal/backup<br/>restore validation and export"]
+        Cmd --> HTTP
+        Cmd --> Ready
+        Cmd --> WAL
+        Cmd --> Store
+        Cmd --> Checkpoint
+        Cmd --> History
+        Cmd --> Backup
+        HTTP --> WAL
+        HTTP --> Store
+        Ready --> WAL
+        Ready --> Store
+        WAL --> Store
+        Checkpoint --> Store
+        History --> Checkpoint
+        History --> Store
+        Backup --> Store
+    end
+    WAL -. owns .-> Data[("Pinned local data directory")]
+    HTTP -. invokes paging interface .-> Cmd
+    Client["internal/client<br/>standalone"] --> Store
+    Client -. queries over HTTP .-> HTTP
+    Idempotency["internal/idempotency<br/>staged"]
+    subgraph Evidence["Linux release gate"]
+        Gate["linux-release.yml"]
+        Admission["verify/release"]
+        Durability["verify/linux"]
+        Capacity["bench/retained-history"]
+        Model["verify/query-model"]
+        Gate -. runs .-> Admission
+        Gate -. runs .-> Durability
+        Gate -. runs .-> Capacity
+    end
+    Gate -. builds .-> Cmd
+    Admission -. exercises over HTTP .-> HTTP
+    Durability -. exercises process and filesystem .-> Cmd
+    Capacity -. exercises over HTTP .-> HTTP
+```
+
+The composition root implements the HTTP consumer interface and wires it to
+the WAL owner and history catalog. HTTP can capture and page through this
+interface. The dotted call in the graph is interface dispatch. WAL,
+checkpoint, history, backup, and store have no imports of HTTP or
+readiness. The retained view combines a pinned checkpoint generation with
+a fixed committed tail. A cursor continues to read that view across
+replacement. Writable restore activation establishes recovery authority for
+that same view before the listener opens. The opt-in capacity control
+exercises generation replacement through the same owner and listener.
+
+At cutover, expect `internal/checkpoint`, `internal/history`, and
+`internal/backup` to become runtime libraries once the command reaches
+them. Register the observed production roles and direct imports in the
+same integration change. The standalone client, staged keyed-ingest
+library, test-only packages, and verification producers retain their
+separate entry points and roles.
 
 ## Ranked trade-offs
 
@@ -149,8 +226,8 @@ Higher-ranked properties govern decisions when goals conflict.
 | Rank | Property | Consequence |
 | --- | --- | --- |
 | 1 | Durability | Acknowledge only durable complete batches. Fail startup on corrupt committed data and stop writes when commit state is uncertain. Verify crash recovery and ENOSPC against the release candidate (#3). |
-| 2 | Exact query correctness | Preserve ordering, duplicates, backfill, and snapshot membership. Fail incomplete scans without advancing the cursor. A verified restored image must reproduce its captured rows through a fresh HTTP walk after the cutover. |
-| 3 | Bounded resource use | Budget query work, output bytes, concurrent scans, and retained pins. Measure the legacy capacity baseline and the retained-history cutover with the same revision-pinned fixture contract (#32). |
+| 2 | Exact query correctness | Preserve ordering, duplicates, backfill, and snapshot membership. Fail incomplete scans without advancing the cursor. A fresh walk after verified restore reproduces its captured rows. Subsequent durable appends survive restart with the same global ordering. |
+| 3 | Bounded resource use | Budget query work, output bytes, concurrent scans, retained pins, and the committed tail. Use per-row positions to avoid rescanning byte-trimmed pages. Measure the legacy capacity baseline and the retained-history cutover with the same revision-pinned fixture contract (#32). |
 | 4 | Recovery time | Validate the checkpoint and replay its bounded committed tail before serving restored history. Measure startup without relaxing durability checks. |
 | 5 | Throughput | Share syncs across admitted writes and prune provably irrelevant query work within the guarantees above. |
 
@@ -168,12 +245,15 @@ direct-import rules. Transitive server reachability still follows listed
 dependencies. Package loading errors, forbidden imports, cycles, unregistered
 production packages, and stale role registrations fail the suite.
 
-One registry owner coordinates producer integration. For each integration,
+#54 is the sole writer of `internal/archtest/**` and coordinates producer
+and runtime integration. For each integration,
 find the PR's current base with
 `git merge-base HEAD origin/main` using an up-to-date target ref. Review package
-and import changes from that merge base on both sides. When each producer
-exists, land its exact role and observed direct root-module imports in the
-registry and this document with its package on the integrated branch. Run
-`go test -count=1 ./internal/archtest` on each integrated tree. Promote a staged
-package in the same change that makes it reachable from the shipped command,
-and remove entries for retired packages.
+and import changes from that merge base on both sides. Register
+`bog/verify/linux` and `bog/bench/retained-history` as verifier commands with
+empty root-module import lists. The base suite currently reports both as
+unregistered production packages. Land each staged-to-runtime promotion with
+the wiring that makes the package reachable. Refresh the observed graph and
+registry together, and remove entries for retired packages. Run
+`go test -count=1 ./internal/archtest` on the composed tree before dispatching
+the pinned Linux release gate.

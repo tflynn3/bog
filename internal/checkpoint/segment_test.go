@@ -5,13 +5,19 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"bog/internal/store"
+	"bog/internal/wal"
 )
 
 func TestPublishAndInterruptedGeneration(t *testing.T) {
@@ -20,6 +26,7 @@ func TestPublishAndInterruptedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeOnCleanup(t, l)
 	if _, err = l.OpenPublished(); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("missing manifest: %v", err)
 	}
@@ -47,8 +54,8 @@ func TestPublishAndInterruptedGeneration(t *testing.T) {
 	if err = l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	after, _ := os.ReadFile(filepath.Join(dir, "bog.wal"))
-	afterMarker, _ := os.ReadFile(filepath.Join(dir, "bog.commit"))
+	after := readFixture(t, dir, "bog.wal")
+	afterMarker := readFixture(t, dir, "bog.commit")
 	if !bytes.Equal(wal, after) || !bytes.Equal(marker, afterMarker) {
 		t.Fatal("legacy inputs changed")
 	}
@@ -56,7 +63,7 @@ func TestPublishAndInterruptedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	closeOnCleanup(t, l)
 	if _, err = l.OpenPublished(); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +81,7 @@ func TestRejectCorruptSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	closeOnCleanup(t, l)
 	m, err := l.Publish()
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +101,7 @@ func TestRejectCorruptSegment(t *testing.T) {
 }
 
 func TestManySmallFrames(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateDir(t)
 	payload := []byte("{\"ts\":\"2024-01-01T00:00:00Z\",\"line\":\"x\"}\n")
 	var h [16]byte
 	binary.LittleEndian.PutUint32(h[:], uint32(len(payload)))
@@ -120,7 +127,7 @@ func TestManySmallFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	closeOnCleanup(t, l)
 	m, err := l.Publish()
 	if err != nil {
 		t.Fatal(err)
@@ -151,10 +158,12 @@ func TestRenameFailureStopsUntilReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeOnCleanup(t, l)
 	if err = os.Mkdir(filepath.Join(dir, manifestName), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = l.Publish(); !errors.Is(err, ErrPublicationUncertain) {
+	var renameErr *os.LinkError
+	if _, err = l.Publish(); !errors.Is(err, ErrPublicationUncertain) || !errors.As(err, &renameErr) {
 		t.Fatalf("publish: %v", err)
 	}
 	if _, err = l.Publish(); !errors.Is(err, ErrPublicationUncertain) {
@@ -163,7 +172,9 @@ func TestRenameFailureStopsUntilReopen(t *testing.T) {
 	if _, err = l.OpenPublished(); !errors.Is(err, ErrPublicationUncertain) {
 		t.Fatalf("open: %v", err)
 	}
-	l.Close()
+	if err = l.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err = os.Remove(filepath.Join(dir, manifestName)); err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +182,7 @@ func TestRenameFailureStopsUntilReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	closeOnCleanup(t, l)
 	if _, err = l.OpenPublished(); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -183,7 +194,7 @@ func TestRejectDuplicateOrdinalWithValidChecksums(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	closeOnCleanup(t, l)
 	m, err := l.Publish()
 	if err != nil {
 		t.Fatal(err)
@@ -231,11 +242,12 @@ func TestInterruptedReplacement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			closeOnCleanup(t, l)
 			old, err := l.Publish()
 			if err != nil {
 				t.Fatal(err)
 			}
-			injected := fmt.Errorf("injected failure")
+			injected := &os.PathError{Op: scenario, Path: manifestName, Err: syscall.EIO}
 			switch scenario {
 			case "before rename":
 				l.manifestRename = func(_, _ string) error { return injected }
@@ -249,10 +261,11 @@ func TestInterruptedReplacement(t *testing.T) {
 			case "final directory sync":
 				l.manifestDirSync = func() error { return injected }
 			}
-			if _, err = l.Publish(); !errors.Is(err, ErrPublicationUncertain) {
+			if _, err = l.Publish(); !errors.Is(err, ErrPublicationUncertain) || !errors.Is(err, syscall.EIO) {
 				t.Fatalf("publish: %v", err)
 			}
-			if _, err = l.OpenPublished(); !errors.Is(err, ErrPublicationUncertain) {
+			var cause *os.PathError
+			if _, err = l.OpenPublished(); !errors.Is(err, ErrPublicationUncertain) || !errors.As(err, &cause) || cause != injected {
 				t.Fatalf("open after uncertainty: %v", err)
 			}
 			if err = l.Close(); err != nil {
@@ -262,7 +275,7 @@ func TestInterruptedReplacement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer l.Close()
+			closeOnCleanup(t, l)
 			p, err := l.OpenPublished()
 			if err != nil {
 				t.Fatal(err)
@@ -294,5 +307,150 @@ func TestInterruptedReplacement(t *testing.T) {
 				t.Fatal("legacy inputs changed")
 			}
 		})
+	}
+}
+
+func TestPublishModeUnderUmask(t *testing.T) {
+	for _, mask := range []int{0002, 0022, 0400, 0777} {
+		t.Run(strconv.FormatInt(int64(mask), 8), func(t *testing.T) {
+			dir, _, _ := fixture(t)
+			l, err := OpenLegacy(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeOnCleanup(t, l)
+			// Umask is process-wide, so this test and its subtests run serially.
+			m, err := func() (*Manifest, error) {
+				old := syscall.Umask(mask)
+				defer syscall.Umask(old)
+				return l.Publish()
+			}()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(m.Segments) == 0 {
+				t.Fatal("published no segments")
+			}
+			names := []string{manifestName}
+			for _, s := range m.Segments {
+				names = append(names, s.Name)
+			}
+			for _, name := range names {
+				st, err := os.Stat(filepath.Join(dir, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode := st.Mode().Perm(); mode != 0600 {
+					t.Errorf("%s mode = %04o, want 0600", name, mode)
+				}
+			}
+			if _, err := l.OpenPublished(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPublishedAndUncoveredMatchWALRecovery(t *testing.T) {
+	dir := privateDir(t)
+	appendBatches := func(payloads ...string) {
+		t.Helper()
+		writer, err := wal.Open(dir, &store.Store{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeOnCleanup(t, writer)
+		for _, payload := range payloads {
+			batch, err := store.Decode([]byte(payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Append([]byte(payload), batch); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const duplicate = "{\"ts\":\"2024-01-01T00:00:00Z\",\"line\":\"literal.*\"}\n"
+	appendBatches(duplicate + duplicate)
+	l, err := OpenLegacy(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeOnCleanup(t, l)
+	prefix, err := l.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const backfill = "{\"ts\":\"2020-01-01T00:00:00Z\",\"line\":\"literal.* backfill\"}\n" +
+		"{\"ts\":\"2024-01-01T00:00:00Z\",\"line\":\"literalX\"}\n" +
+		"{\"ts\":\"2025-01-01T00:00:00Z\",\"line\":\"literal.* outside\"}\n"
+	const largeStart = "{\"ts\":\"2024-01-01T00:00:00Z\",\"line\":\"literal.*"
+	const largeEnd = "\"}\n"
+	largest := largeStart + strings.Repeat("x", store.MaxBatch-len(largeStart)-len(largeEnd)) + largeEnd
+	appendBatches(backfill, largest)
+	var oracle store.Store
+	writer, err := wal.Open(dir, &oracle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err = OpenLegacy(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeOnCleanup(t, l)
+	p, err := l.OpenPublished()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := p.Manifest(); m.CoveredOffset != prefix.CoveredOffset || m.NextOrdinal != 2 {
+		t.Fatalf("unexpected covered boundary: %+v", m)
+	}
+	var all []BlockRow
+	if err := p.Scan(func(row BlockRow) error {
+		all = append(all, row)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	frameSizes := []int{3, 1}
+	frame := 0
+	if err := l.ScanUncovered(p, func(first uint64, rows []store.Row) error {
+		if frame >= len(frameSizes) || len(rows) != frameSizes[frame] || first != uint64(len(all)) {
+			t.Fatalf("uncovered frame %d has first ordinal %d and %d rows", frame, first, len(rows))
+		}
+		for i, row := range rows {
+			all = append(all, BlockRow{row, first + uint64(i)})
+		}
+		frame++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if frame != len(frameSizes) || len(all) != 6 {
+		t.Fatalf("recovered %d uncovered batches and %d total rows", frame, len(all))
+	}
+	sort.SliceStable(all, func(i, j int) bool { return all[i].Row.TS.Before(all[j].Row.TS) })
+	start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	const literal = "literal.*"
+	var got []store.Row
+	for _, row := range all {
+		if !row.Row.TS.Before(start) && row.Row.TS.Before(end) && strings.Contains(row.Row.Line, literal) {
+			got = append(got, row.Row)
+		}
+	}
+	if want := oracle.Query(start, end, literal, 10); !slices.Equal(got, want) || len(want) != 4 {
+		t.Fatalf("recovered query differs from WAL replay, row counts %d and %d", len(got), len(want))
 	}
 }

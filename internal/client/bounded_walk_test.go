@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBoundedWalk(t *testing.T) {
@@ -22,8 +24,10 @@ func TestBoundedWalk(t *testing.T) {
 		pages  int
 		err    error
 		detail string
+		empty  bool
 	}{
-		{name: "empty terminal", tokens: []string{""}, budget: 1, calls: 1, pages: 1, err: io.EOF},
+		{name: "empty terminal", tokens: []string{""}, budget: 1, calls: 1, pages: 1, err: io.EOF, empty: true},
+		{name: "empty continuation", tokens: []string{fixtureCursor, ""}, budget: 2, calls: 2, pages: 2, err: io.EOF, empty: true},
 		{name: "terminal at budget", tokens: []string{fixtureCursor, ""}, budget: 2, calls: 2, pages: 2, err: io.EOF},
 		{name: "budget with continuation", tokens: []string{fixtureCursor, fixtureNext, ""}, budget: 2, calls: 2, pages: 2, err: ErrPageBudget},
 		{name: "same cursor", tokens: []string{fixtureCursor, fixtureCursor}, budget: 3, calls: 2, pages: 1, detail: "does not advance"},
@@ -48,7 +52,7 @@ func TestBoundedWalk(t *testing.T) {
 					t.Errorf("request cursor = %q, want %q", got, tc.tokens[i-1])
 				}
 				body := contractRow("row")
-				if len(tc.tokens) == 1 {
+				if tc.empty {
 					body = ""
 				}
 				writeContractPage(t, w, body, tc.tokens[i])
@@ -88,10 +92,83 @@ func TestBoundedWalk(t *testing.T) {
 	}
 }
 
+func TestConcurrentBoundedWalks(t *testing.T) {
+	var firstRequests atomic.Int32
+	bothStarted := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch q.Get("cursor") {
+		case "":
+			if firstRequests.Add(1) == 2 {
+				close(bothStarted)
+			}
+			select {
+			case <-bothStarted:
+			case <-r.Context().Done():
+				return
+			}
+			writeContractPage(t, w, "", fixtureCursor)
+		case fixtureCursor:
+			writeContractPage(t, w, contractRow(q.Get("contains")), fixtureNext)
+		case fixtureNext:
+			next := ""
+			if q.Get("contains") == "cycle" {
+				next = fixtureCursor
+			}
+			writeContractPage(t, w, contractRow(q.Get("contains")), next)
+		default:
+			t.Errorf("unexpected request %s", r.URL)
+			http.Error(w, "unexpected cursor", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(s.Close)
+	c, err := New(s.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.CloseIdleConnections)
+
+	var walks sync.WaitGroup
+	for _, filter := range []string{"cycle", "terminal"} {
+		walks.Go(func() {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			walk, err := c.NewBoundedWalk(Query{Contains: filter, Limit: 1}, 3)
+			if err != nil {
+				t.Errorf("%s walk: %v", filter, err)
+				return
+			}
+			if p, err := walk.NextPage(ctx); err != nil || len(p.Rows) != 0 || p.NextCursor != fixtureCursor {
+				t.Errorf("%s walk first page %+v, error %v", filter, p, err)
+				return
+			}
+			if p, err := walk.NextPage(ctx); err != nil || len(p.Rows) != 1 || p.Rows[0].Line != filter || p.NextCursor != fixtureNext {
+				t.Errorf("%s walk second page %+v, error %v", filter, p, err)
+				return
+			}
+			p, err := walk.NextPage(ctx)
+			if filter == "cycle" {
+				if !errors.Is(err, errCursorCycle) || len(p.Rows) != 0 || p.NextCursor != "" {
+					t.Errorf("cycled page %+v, error %v", p, err)
+				}
+				return
+			}
+			if err != nil || len(p.Rows) != 1 || p.Rows[0].Line != filter || p.NextCursor != "" {
+				t.Errorf("terminal page %+v, error %v", p, err)
+				return
+			}
+			if _, err := walk.NextPage(ctx); !errors.Is(err, io.EOF) {
+				t.Errorf("after terminal page got %v, want EOF", err)
+			}
+		})
+	}
+	walks.Wait()
+}
+
 func TestBoundedWalkRetryAfterFailure(t *testing.T) {
 	for _, tc := range []struct{ name, body, detail string }{
 		{"malformed NDJSON", contractRow("valid prefix") + "{oops}\n", "decode query record"},
-		{"over row limit", contractRow("one") + contractRow("two"), "returned 2 rows for limit 1"},
+		{"over row limit", contractRow("one") + contractRow("two"), "exceeds requested limit 1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

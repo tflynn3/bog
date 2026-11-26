@@ -56,17 +56,11 @@ func (w *BoundedWalk) NextPage(ctx context.Context) (Page, error) {
 	if err := ctx.Err(); err != nil {
 		return Page{}, err
 	}
-	if w.query.Limit > 0 && len(p.Rows) > w.query.Limit {
-		return Page{}, fmt.Errorf("page %d: %w", w.pages+1, &HTTPError{
-			StatusCode: http.StatusOK,
-			Cause:      fmt.Errorf("returned %d rows for limit %d", len(p.Rows), w.query.Limit),
-		})
-	}
 	if p.NextCursor != "" {
 		if p.NextCursor == w.anchor {
 			return Page{}, fmt.Errorf("page %d: %w", w.pages+1, &HTTPError{
 				StatusCode: http.StatusOK,
-				Cause:      errors.New("next cursor does not advance pagination: cursor cycle"),
+				Cause:      errCursorCycle,
 			})
 		}
 		// Brent's cycle detection uses exponentially spaced anchors. It

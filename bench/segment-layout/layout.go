@@ -9,18 +9,19 @@ import (
 	"io"
 	"time"
 
-	"bog/internal/store"
+	"bog/internal/checkpoint"
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 )
 
 const (
-	magic       = "BOGLAY01"
-	headerSize  = 18 // magic, codec, summary flag, block count, CRC32C
-	entrySize   = 36 // checkpoint time bounds, raw and stored lengths, CRC32C
-	blockHeader = 44
-	maxBlock    = store.MaxBatch + 68
-	zstdWindow  = 1 << 20
+	magic           = "BOGLAY01"
+	headerSize      = 18 // magic, codec, summary flag, block count, CRC32C
+	entrySize       = 36 // checkpoint time bounds, raw and stored lengths, CRC32C
+	blockHeader     = 44
+	maxBlock        = checkpoint.MaxBlockSize
+	zstdWindow      = 1 << 20
+	maxLayoutBlocks = maxBatches*256 + 9 // At most one block per fixture row, including backfill.
 )
 
 type codec byte
@@ -63,8 +64,33 @@ var endTime = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
 
 func seal(b []byte) { le.PutUint32(b[len(b)-4:], crc32.Checksum(b[:len(b)-4], crcTable)) }
 
+func readFullAt(r io.ReaderAt, b []byte, offset int64) error {
+	n, err := r.ReadAt(b, offset)
+	if n == len(b) && err == io.EOF {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if n != len(b) {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+func writeFullAt(w io.WriterAt, b []byte, offset int64) error {
+	n, err := w.WriteAt(b, offset)
+	if err != nil {
+		return err
+	}
+	if n != len(b) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
 func checkedRead(r io.ReaderAt, b []byte, offset int64) error {
-	if _, err := r.ReadAt(b, offset); err != nil {
+	if err := readFullAt(r, b, offset); err != nil {
 		return err
 	}
 	if crc32.Checksum(b[:len(b)-4], crcTable) != le.Uint32(b[len(b)-4:]) {
@@ -74,7 +100,7 @@ func checkedRead(r io.ReaderAt, b []byte, offset int64) error {
 }
 
 func writeLayout(w io.WriterAt, l layout, count int, block func(int) ([]byte, summary, error)) (err error) {
-	if count < 0 || uint64(count) > 1<<32-1 || l.codec > zstdCodec {
+	if count < 0 || count > maxLayoutBlocks || l.codec > zstdCodec {
 		return errLayout
 	}
 	var enc *zstd.Encoder
@@ -95,7 +121,7 @@ func writeLayout(w io.WriterAt, l layout, count int, block func(int) ([]byte, su
 	}
 	le.PutUint32(header[10:], uint32(count))
 	seal(header[:])
-	if _, err := w.WriteAt(header[:], 0); err != nil {
+	if err := writeFullAt(w, header[:], 0); err != nil {
 		return err
 	}
 
@@ -137,10 +163,10 @@ func writeLayout(w io.WriterAt, l layout, count int, block func(int) ([]byte, su
 			copy(entry[32:], filter[:])
 		}
 		seal(entry)
-		if _, err := w.WriteAt(entry, int64(headerSize)+int64(i)*int64(width)); err != nil {
+		if err := writeFullAt(w, entry, int64(headerSize)+int64(i)*int64(width)); err != nil {
 			return err
 		}
-		if _, err := w.WriteAt(stored, offset); err != nil {
+		if err := writeFullAt(w, stored, offset); err != nil {
 			return err
 		}
 		offset += int64(len(stored))
@@ -163,8 +189,9 @@ func indexTime(b []byte) (time.Time, bool) {
 }
 
 type payloadReads struct {
-	Blocks int   `json:"logical_blocks_read"`
-	Bytes  int64 `json:"payload_bytes_read"`
+	Blocks       int   `json:"logical_blocks_read"`
+	Bytes        int64 `json:"payload_bytes_read"`
+	DecodedBytes int64 `json:"decoded_bytes"`
 }
 
 func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, bufferBytes int) error) (read payloadReads, err error) {
@@ -179,7 +206,8 @@ func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, buffe
 	count := int64(le.Uint32(header[10:]))
 	width := int64(l.indexWidth())
 	offset := headerSize + count*width
-	if string(header[:8]) != magic || l.codec > zstdCodec || header[9] > 1 || offset > size {
+	if string(header[:8]) != magic || l.codec > zstdCodec || header[9] > 1 ||
+		count > maxLayoutBlocks || offset > size {
 		return payloadReads{}, errLayout
 	}
 	var dec *zstd.Decoder
@@ -188,24 +216,25 @@ func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, buffe
 		if err := checkedRead(r, entry, headerSize+i*width); err != nil {
 			return payloadReads{}, fmt.Errorf("index entry %d: %w", i, err)
 		}
-		rawSize, storedSize := int(le.Uint32(entry[24:])), int(le.Uint32(entry[28:]))
+		rawLength, storedLength := le.Uint32(entry[24:]), le.Uint32(entry[28:])
 		lo, loOK := indexTime(entry[:12])
 		hi, hiOK := indexTime(entry[12:24])
-		if rawSize < blockHeader || rawSize > maxBlock || storedSize <= 0 || storedSize > rawSize ||
-			int64(storedSize) > size-offset || (l.codec == rawCodec && storedSize != rawSize) ||
+		if rawLength < blockHeader || rawLength > maxBlock || storedLength == 0 || storedLength > rawLength ||
+			int64(storedLength) > size-offset || (l.codec == rawCodec && storedLength != rawLength) ||
 			!loOK || !hiOK || hi.Before(lo) {
 			return payloadReads{}, fmt.Errorf("index entry %d: %w", i, errLayout)
 		}
 		bodyOffset := offset
-		offset += int64(storedSize)
+		offset += int64(storedLength)
 		if hi.Before(q.start) || !lo.Before(q.end) {
 			continue
 		}
 		if l.prune && !(*summary)(entry[32:32+len(summary{})]).mayContain(q.literal) {
 			continue
 		}
+		rawSize, storedSize := int(rawLength), int(storedLength)
 		stored := make([]byte, storedSize)
-		if _, err := r.ReadAt(stored, bodyOffset); err != nil {
+		if err := readFullAt(r, stored, bodyOffset); err != nil {
 			return payloadReads{}, fmt.Errorf("block %d: %w", i, err)
 		}
 		raw, bufferBytes := stored, storedSize
@@ -241,6 +270,7 @@ func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, buffe
 		}
 		read.Blocks++
 		read.Bytes += int64(storedSize)
+		read.DecodedBytes += int64(rawSize)
 	}
 	if offset != size {
 		return payloadReads{}, errLayout

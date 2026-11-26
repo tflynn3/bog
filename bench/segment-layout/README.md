@@ -2,23 +2,46 @@
 
 Run this standalone Go module on Linux. Choose an existing directory on the
 filesystem or device under test. The runner creates and cleans up a private
-subdirectory there.
+subdirectory there. Use `go run . -smoke` from this module for a quick parity
+check.
+
+## Native measurements
+
+On each native Linux amd64 and arm64 runner, use the same clean commit and Go
+version. Build once per runner and use that binary for all six profile and
+scale combinations. Keep the binary and reports outside the checkout. Set
+`output` to an existing external directory and `data_dir` to an existing
+directory on the filesystem under test.
 
 ```sh
+set -eu
 cd bench/segment-layout
-go run . -smoke
+test -z "$(git status --porcelain)"
+revision=$(git rev-parse HEAD)
+arch=$(go env GOHOSTARCH)
+test "$(go env GOHOSTOS)/$(go env GOOS)/$(go env GOARCH)" = "linux/linux/$arch"
+mkdir -p "$output/$arch"
+binary="$output/$arch/segment-layout"
+CGO_ENABLED=0 go build -trimpath -buildvcs=true -o "$binary" .
+sha256sum "$binary" > "$output/$arch/segment-layout.sha256"
+
 for profile in mixed entropy; do
   for scale in small medium large; do
-    go run . -dir /path/to/data -fixture "$profile" -scale "$scale" -runs 21 \
-      -revision "$(git rev-parse HEAD)" > "$profile-$scale.json"
+    "$binary" -dir "$data_dir" -fixture "$profile" -scale "$scale" -runs 21 \
+      -revision "$revision" > "$output/$arch/$profile-$scale.json"
   done
 done
+
+sha256sum -c "$output/$arch/segment-layout.sha256"
 ```
 
-Each invocation emits one schema v2 JSON report. The report records the source
-revision, fixture seed, profile and scale, sample count, Go runtime, kernel,
-filesystem and codec settings. Pass `-revision` when building without Git
-metadata. The default uses Go's embedded revision and dirty status.
+Each invocation emits one schema v3 JSON report. It records the source and
+embedded build revisions, binary SHA-256, fixture seed, profile and scale,
+sample count, Go runtime, kernel machine, filesystem and codec settings.
+Each generation has a SHA-256 of its append input, including timestamp,
+ordinal, and exact line bytes. The default revision uses Go's embedded
+revision and dirty status. An explicit `-revision` can label an exploratory
+build without embedded Git metadata.
 
 | Scale | Ordinary batches | Initial retained rows |
 | --- | ---: | ---: |
@@ -46,7 +69,10 @@ also includes rows outside the window.
 
 Additional probes cover case sensitivity, one-, two- and three-byte UTF-8
 literals (`x`, `é`, `€`), the oversized row's tail, and half-open time
-windows. Every timed sample, across all six layouts and all generations, is
+windows. The earliest row contains `Q7mR` and `7mR2` separately, so its
+block's Bloom filter admits `Q7mR2` even though the literal is absent from
+every row. The probe must decode at least one block and yield zero matches
+on every layout and generation. Every timed sample is
 compared after timing to an independent exact byte-substring scan over the
 append input. A stable timestamp sort of that input preserves append-ordinal
 order for ties. Verification compares timestamps, ordinals and complete
@@ -86,6 +112,10 @@ scenarios. A completed rewrite is removed before the next scenario.
   literal and time window. The report includes both read counts and the
   analogous difference in stored payload bytes. These counters count
   successful logical reads through the container and exclude index reads.
+- **Decoded bytes** sum the original checkpoint block sizes, including
+  their headers, for every payload decoded. Raw blocks and raw fallbacks
+  contribute their full size once. Time- and Bloom-pruned blocks contribute
+  zero. The report includes the same-codec unfiltered count and the difference.
 - **Cold p95** uses nearest rank over the recorded per-query nanosecond
   samples. The runner uses Linux `FADV_RANDOM` on each query's file
   descriptor and requests `FADV_DONTNEED` on the entire file before each
@@ -107,7 +137,37 @@ scenarios. A completed rewrite is removed before the next scenario.
   excludes codec-library internals, allocator overhead, the index and
   accumulated query results. A query with zero payload reads reports zero.
 
+## Aggregate reports and choose a layout
+
+Collect both architecture directories on one Linux runner and use either
+runner's benchmark binary on its matching architecture.
+
+```sh
+"$output/amd64/segment-layout" aggregate "$output"/*/*.json > "$output/summary.json"
+```
+
+The aggregate report keeps cold p95, decoded bytes, peak decode bytes,
+retained bytes, and rewrite bytes grouped by architecture, profile, scale,
+generation, and layout. It checks fixture fingerprints and matching logical
+query work across architectures, recomputes p95 from samples, and checks
+the read, decode, and rewrite accounting against the reported baselines.
+Each architecture must use one binary and identical recorded measurement
+settings throughout its matrix. Run on native hardware. The recorded
+kernel machine and Go target are provenance checks.
+
+The current choice is **raw without Bloom** pending a complete native
+matrix. The selection rule requires at least 21 samples per query in
+each of the 12 architecture, profile and scale combinations for one clean
+commit and separate architecture binaries. In every initial and backfilled
+generation, a candidate must improve both `sparse` and `bounded-sparse`
+p95 by at least 10%, keep the `all` p95 within 10% of raw, and stay within
+raw's retained and whole-file rewrite byte counts. Among qualifying
+candidates, the lowest worst-case sparse p95 ratio wins, with ties resolved
+in report layout order. Incomplete evidence or a matrix without a qualifying
+candidate retains raw. The latency thresholds are decision margins for
+this experiment.
+
 From this module run `go vet ./...`, `go test ./...` and
-`go test -race ./...`. On macOS they cover the portable layout, metrics
-and configuration code. Run them on Linux for the complete fixture,
-sampling and rewrite tests with the production checkpoint codec.
+`go test -race ./...`. On macOS they exercise the portable fixture, layouts,
+measurement and aggregation with the production checkpoint codec. Linux
+also exercises the file cache advice and CLI cleanup.

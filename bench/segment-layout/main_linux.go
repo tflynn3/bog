@@ -32,6 +32,13 @@ func sourceRevision() string {
 
 func main() {
 	log.SetFlags(0)
+	if len(os.Args) > 1 && os.Args[1] == "aggregate" {
+		if err := runAggregate(os.Args[2:], os.Stdout); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfg, err := parseConfig(os.Args[1:], sourceRevision(), os.Stderr)
 	if errors.Is(err, flag.ErrHelp) {
 		return

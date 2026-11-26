@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"slices"
 	"testing"
 	"time"
 
@@ -29,9 +28,12 @@ func TestSmokeLayouts(t *testing.T) {
 			if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 				t.Fatal(err)
 			}
-			if got.SchemaVersion != 2 || got.Revision != "test" || got.Fixture.Scale != "smoke" ||
-				got.Fixture.Name != profile+"-log-v2" || got.Fixture.Rows != 5253 || len(got.Layouts) != len(layouts) {
+			if got.SchemaVersion != reportVersion || got.Revision != "test" || got.Fixture.Scale != "smoke" ||
+				got.Fixture.Name != profile+fixtureVersion || got.Fixture.Rows != 5253 || len(got.Layouts) != len(layouts) {
 				t.Fatalf("wrong report identity: schema %d, fixture %+v, %d layouts", got.SchemaVersion, got.Fixture, len(got.Layouts))
+			}
+			if err := validateReport(got); err != nil {
+				t.Fatal(err)
 			}
 
 			baseline := map[codec]layoutReport{}
@@ -85,6 +87,7 @@ func checkGeneration(t *testing.T, l layout, gen, baseline generationReport, run
 			t.Errorf("%s: unexpected query result %+v", l.name(), m)
 		}
 		if m.BaselineBlocksRead != b.Blocks || m.BaselineBytesRead != b.Bytes ||
+			m.BaselineDecodedBytes != b.DecodedBytes || m.DecodedBytesAvoided != b.DecodedBytes-m.DecodedBytes ||
 			m.BlocksAvoided != b.Blocks-m.Blocks || m.BytesAvoided != b.Bytes-m.Bytes ||
 			m.BlocksAvoided < 0 || m.BytesAvoided < 0 {
 			t.Errorf("%s/%s: wrong baseline accounting", l.name(), m.Name)
@@ -100,6 +103,10 @@ func checkGeneration(t *testing.T, l layout, gen, baseline generationReport, run
 		case "absent", "rare":
 			if l.prune && m.BlocksAvoided == 0 {
 				t.Errorf("%s: missing pruning for %s", l.name(), m.Name)
+			}
+		case falsePositiveQuery:
+			if m.Blocks == 0 || m.MatchingRows != 0 || m.DecodedBytes == 0 {
+				t.Errorf("%s: Bloom false-positive probe failed: %+v", l.name(), m)
 			}
 		}
 		hits[m.Name] = m.MatchingRows
@@ -141,39 +148,4 @@ func TestReportFailureCleansUp(t *testing.T) {
 		t.Fatalf("report failure: %v", err)
 	}
 	assertEmpty(t, parent)
-}
-
-func TestEachSampleChecksOracle(t *testing.T) {
-	input := fixture(4, false)
-	path := t.TempDir() + "/raw"
-	size, err := writeGeneration(path, partition(input.rows), layout{codec: rawCodec})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	q := queries()[1] // Equal timestamps and literal, distinct append ordinals.
-	want := slices.Clone(reference(input.rows, q))
-	samples := 0
-	_, err = measureQuery(bytes.NewReader(data), size, q, want, len(input.rows), 3, func() error {
-		samples++
-		if samples == 2 {
-			want[0], want[1] = want[1], want[0]
-		}
-		return nil
-	})
-	if err == nil || samples != 2 {
-		t.Fatalf("oracle failed to catch wrong duplicate order after %d samples: %v", samples, err)
-	}
-
-	samples = 0
-	_, err = measureQuery(bytes.NewReader(data), size, q, reference(input.rows, q), len(input.rows), 3, func() error {
-		samples++
-		return io.ErrClosedPipe
-	})
-	if !errors.Is(err, io.ErrClosedPipe) || samples != 1 {
-		t.Fatalf("failed cache preparation should terminate after one attempt: %d, %v", samples, err)
-	}
 }

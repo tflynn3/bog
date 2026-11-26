@@ -157,6 +157,19 @@ func writeReport(path string, r report) (err error) {
 	return os.Rename(name, path)
 }
 
+func createFixtureRoot(parent string) (string, error) {
+	if parent == "" {
+		parent = os.TempDir()
+	}
+	// The launcher changes into the store before executing the candidate,
+	// which needs absolute paths for both the executable and -data-dir.
+	absoluteParent, err := filepath.Abs(parent)
+	if err != nil {
+		return "", fmt.Errorf("resolve fixture parent: %w", err)
+	}
+	return os.MkdirTemp(absoluteParent, "bog-capacity-")
+}
+
 func run(ctx context.Context, args []string) (err error) {
 	var o options
 	f := flag.NewFlagSet("retained-history", flag.ContinueOnError)
@@ -197,7 +210,7 @@ func run(ctx context.Context, args []string) (err error) {
 		r.Cases[key] = c
 		err = errors.Join(err, writeReport(o.report, r))
 	}()
-	dir, err := os.MkdirTemp(o.workDir, "bog-capacity-")
+	dir, err := createFixtureRoot(o.workDir)
 	if err != nil {
 		return err
 	}

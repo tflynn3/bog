@@ -24,6 +24,11 @@ architecture. Each size gets a fresh store and cgroup. The same store and cgroup
 are used for the two process lifetimes within a size. The runner reaps the
 processes and removes the stores and measurement cgroups.
 
+`-work-dir` may be relative to the runner's working directory. When omitted, it
+defaults to the system temporary directory. The runner uses absolute paths
+for the private executable and each store so the child can open them after
+changing into the store.
+
 ## Fixture and measurements
 
 | Mode | Retained seed rows | Mixed-load tail rows | Line bytes | Hard memory cap |

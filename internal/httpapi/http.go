@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -23,14 +24,32 @@ type appender interface {
 	Append([]byte, []store.Row) error
 }
 type API struct {
-	store *store.Store
-	wal   appender
-	fatal func()
-	slots chan struct{}
+	store        *store.Store
+	wal          appender
+	fatal        func()
+	slots        chan struct{}
+	querySlots   chan struct{}
+	queryTimeout time.Duration
+	limits       store.QueryLimits
 }
 
+type QueryConfig struct {
+	Concurrency int
+	Timeout     time.Duration
+	Limits      store.QueryLimits
+}
+
+func DefaultQueryConfig() QueryConfig {
+	return QueryConfig{Concurrency: 8, Timeout: 30 * time.Second, Limits: store.QueryLimits{Work: 256 << 20, Rows: 1000000, MatchBytes: 256 << 20, ResultBytes: 16 << 20}}
+}
 func New(s *store.Store, w appender) http.Handler {
-	a := &API{store: s, wal: w, fatal: func() { os.Exit(1) }, slots: make(chan struct{}, 16)}
+	return NewWithQueryConfig(s, w, DefaultQueryConfig())
+}
+func NewWithQueryConfig(s *store.Store, w appender, config QueryConfig) http.Handler {
+	if config.Concurrency < 1 {
+		panic("query concurrency must be positive")
+	}
+	a := &API{store: s, wal: w, fatal: func() { os.Exit(1) }, slots: make(chan struct{}, 16), querySlots: make(chan struct{}, config.Concurrency), queryTimeout: config.Timeout, limits: config.Limits}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.health)
 	mux.HandleFunc("/ingest", a.ingest)
@@ -142,6 +161,24 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	select {
+	case <-r.Context().Done():
+		return
+	default:
+	}
+	select {
+	case a.querySlots <- struct{}{}:
+		defer func() { <-a.querySlots }()
+	default:
+		http.Error(w, "query overloaded", http.StatusServiceUnavailable)
+		return
+	}
+	ctx := r.Context()
+	if a.queryTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, a.queryTimeout)
+		defer cancel()
+	}
 	q, queryErr := url.ParseQuery(r.URL.RawQuery)
 	if queryErr != nil {
 		http.Error(w, "invalid query", 400)
@@ -184,6 +221,7 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var rows []store.Row
+	var nextCursor string
 	if page || continuation {
 		var count *int
 		var after *store.Position
@@ -198,16 +236,37 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		var captured int
 		var next *store.Position
 		var ok bool
-		rows, captured, next, ok = a.store.QueryPage(start, end, q.Get("contains"), limit, count, after)
+		var err error
+		rows, captured, next, ok, err = a.store.QueryPageContext(ctx, start, end, q.Get("contains"), limit, count, after, a.limits)
+		if err != nil {
+			queryError(w, err)
+			return
+		}
 		if !ok {
 			http.Error(w, "invalid cursor", 400)
 			return
 		}
 		if next != nil {
-			w.Header().Set("Bog-Next-Cursor", encodeCursor(cursorData{1, start, end, containsDigest(q.Get("contains")), captured, *next}))
+			nextCursor = encodeCursor(cursorData{1, start, end, containsDigest(q.Get("contains")), captured, *next})
 		}
 	} else {
-		rows = a.store.Query(start, end, q.Get("contains"), limit)
+		var err error
+		rows, err = a.store.QueryContext(ctx, start, end, q.Get("contains"), limit, a.limits)
+		if err != nil {
+			queryError(w, err)
+			return
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		queryError(w, err)
+		return
+	}
+	if nextCursor != "" {
+		w.Header().Set("Bog-Next-Cursor", nextCursor)
+	}
+	// Bound each response by the server deadline even for slow readers.
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = http.NewResponseController(w).SetWriteDeadline(deadline)
 	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	enc := json.NewEncoder(w)
@@ -215,6 +274,19 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		if enc.Encode(row) != nil {
 			return
 		}
+	}
+}
+
+func queryError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrQueryBudget):
+		http.Error(w, "query work budget exhausted", http.StatusUnprocessableEntity)
+	case errors.Is(err, context.DeadlineExceeded):
+		http.Error(w, "query deadline exceeded", http.StatusGatewayTimeout)
+	case errors.Is(err, context.Canceled):
+		http.Error(w, "query canceled", http.StatusRequestTimeout)
+	default:
+		http.Error(w, "query failed", http.StatusInternalServerError)
 	}
 }
 

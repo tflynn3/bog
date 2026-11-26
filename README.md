@@ -50,3 +50,7 @@ Cycle 11 local benchmark record (Linux ARM64, Go 1.27, 3 runs, 1s per run; times
 | RestoredSingleRun/dense_to_sparse | 14,058; 15,897; 17,009 | 13,775; 13,412; 13,775 |
 
 Replay steady allocation fell from about 3,848,260 to 3,553,570 bytes/op; shuffled fell from about 3,848,325 to 3,635,570 bytes/op. These microbenchmarks do not measure the production p95 gate.
+
+Query execution has a separate admission pool; ingest and health do not consume query slots. `-query-concurrency` sets the maximum active requests (default 8); excess requests receive HTTP 503 with `query overloaded`. There is no waiting queue. `-query-timeout` sets the server deadline (default `30s`); deadline expiration returns 504 `query deadline exceeded`, and cancellation returns 408 `query canceled` when a response is still possible.
+
+`-query-work-budget` limits request work units (default 268435456). Each index seek comparison, candidate visit, and Bloom block probe costs one unit, and each byte presented to literal matching costs one unit. `-query-max-rows` (default 1000000) independently limits candidate visits, `-query-max-match-bytes` (default 268435456) limits bytes presented to matching, and `-query-max-result-bytes` (default 16777216) limits a conservative encoded response size estimate. All limits must be positive. Cursor validation and page lookahead use the same request budget as selection. Exhaustion returns HTTP 422 with `query work budget exhausted` and no rows or cursor.

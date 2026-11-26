@@ -239,6 +239,9 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (page Pa
 		if err != nil || len(decoded) <= sha256.Size || len(decoded) > 2048 || base64.RawURLEncoding.EncodeToString(decoded) != next {
 			return Page{}, errors.New("invalid next cursor header")
 		}
+		if next == cursor {
+			return Page{}, errors.New("next cursor does not advance pagination")
+		}
 	}
 	return Page{Rows: rows, NextCursor: next}, nil
 }

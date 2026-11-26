@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,12 @@ import (
 	"sync/atomic"
 	"testing"
 )
+
+func budgetTestCursor(label string) string {
+	// The Go client expects an unpadded URL-safe token large enough to
+	// contain cursor data and a MAC. The fixture server treats it as opaque.
+	return base64.RawURLEncoding.EncodeToString([]byte(label + strings.Repeat("\xff", 32)))
+}
 
 func TestFindSparseBudgetWalk(t *testing.T) {
 	t.Parallel()
@@ -34,7 +41,7 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 	if len(firstBody) > fixture.byteCap || len(firstBody+thirdRow) <= fixture.byteCap {
 		t.Fatalf("fixture does not force a byte trim at %d bytes", fixture.byteCap)
 	}
-	const firstToken, secondToken = "first+/=&", "second+/=&"
+	firstToken, secondToken := budgetTestCursor("first"), budgetTestCursor("second")
 	type page struct {
 		body, cursor string
 	}
@@ -52,13 +59,14 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 		{"first budget", 1, []page{first, middle, last}, []int{4, 2, 1}, ""},
 		{"maximum budget", 8, []page{first, middle, last}, []int{4, 6, 7, 8}, ""},
 		{"no issuing budget", 9, nil, []int{4, 6, 7, 8}, "no first-page cursor"},
-		{"ignored byte cap", 4, []page{{firstBody + thirdRow, firstToken}}, []int{4}, "exceeded response byte cap"},
+		{"ignored byte cap", 4, []page{{firstBody + thirdRow, firstToken}}, []int{4}, "response exceeds size limit"},
+		{"ignored byte cap on resume", 4, []page{first, {strings.Repeat(" ", fixture.byteCap) + thirdRow, secondToken}}, []int{4}, "response exceeds size limit"},
 		{"trimmed too many rows", 4, []page{{record(fixture.want[0]), firstToken}}, []int{4}, "returned 1 rows, want 2"},
 		{"cursor skipped trimmed row", 4, []page{first, {lastRow, ""}}, []int{4}, "unexpected row"},
 		{"leaked nonmatch", 4, []page{first, middle, {record(fixture.seed[8]), ""}}, []int{4}, "unexpected row"},
-		{"continued after last row", 4, []page{first, middle, {lastRow, "extra"}}, []int{4}, "after the final row"},
-		{"budget failure on resume", 4, []page{first, {budgetRejectionBody, ""}}, []int{4}, "page 2: expected NDJSON HTTP 200, got HTTP 503"},
-		{"budget failure proving exhaustion", 4, []page{first, middle, {budgetRejectionBody, ""}}, []int{4}, "page 3: expected NDJSON HTTP 200, got HTTP 503"},
+		{"continued after last row", 4, []page{first, middle, {lastRow, budgetTestCursor("extra")}}, []int{4}, "after the final row"},
+		{"budget failure on resume", 4, []page{first, {budgetRejectionBody, ""}}, []int{4}, "page 2: Bog HTTP 503"},
+		{"budget failure proving exhaustion", 4, []page{first, middle, {budgetRejectionBody, ""}}, []int{4}, "page 3: Bog HTTP 503"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -69,7 +77,7 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 				budgets = append(budgets, budget)
 				pages := tc.pages
 				if budget < tc.threshold {
-					pages = []page{{budgetRejectionBody, ""}}
+					pages = []page{{budgetRejectionBody, ""}, {budgetRejectionBody, ""}}
 				}
 				var calls atomic.Int32
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -92,7 +100,7 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 						q.Get("end") != fixtureEnd || q.Get("contains") != fixture.filter {
 						t.Errorf("unexpected query %s %s", req.Method, req.URL)
 					}
-					if i == 1 {
+					if i == 1 || (i == 2 && budget < tc.threshold) {
 						if q.Get("limit") != strconv.Itoa(fixture.firstLimit) || q.Get("page") != "1" || q.Has("cursor") {
 							t.Errorf("unexpected first-page query %s", req.URL)
 						}
@@ -152,12 +160,12 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 func TestFindBudgetWalk(t *testing.T) {
 	t.Parallel()
 	const (
-		firstToken  = "first+/=&"
-		secondToken = "second+/=&"
-		firstRow    = "{\"ts\":\"" + fixtureStart + "\",\"line\":\"c\"}\n"
-		secondRow   = "{\"ts\":\"" + fixtureStart + "\",\"line\":\"a\"}\n"
-		lastRow     = "{\"ts\":\"" + fixtureStart + "\",\"line\":\"b\"}\n"
+		firstRow  = "{\"ts\":\"" + fixtureStart + "\",\"line\":\"c\"}\n"
+		secondRow = "{\"ts\":\"" + fixtureStart + "\",\"line\":\"a\"}\n"
+		lastRow   = "{\"ts\":\"" + fixtureStart + "\",\"line\":\"b\"}\n"
 	)
+	firstToken, secondToken := budgetTestCursor("first"), budgetTestCursor("second")
+	extraToken := budgetTestCursor("extra")
 	type page struct {
 		status   int
 		body     string
@@ -168,7 +176,7 @@ func TestFindBudgetWalk(t *testing.T) {
 	first := page{status: 200, body: firstRow, cursor: new(firstToken), ndjson: true}
 	second := page{status: 200, body: secondRow, cursor: new(secondToken), ndjson: true}
 	last := page{status: 200, body: lastRow, ndjson: true}
-	rejection := page{status: 503, body: "query work budget exhausted\n"}
+	rejection := page{status: 503, body: budgetRejectionBody}
 
 	for _, tc := range []struct {
 		name       string
@@ -183,22 +191,24 @@ func TestFindBudgetWalk(t *testing.T) {
 		{"inclusive upper bound", 2, 3, []page{first, second, last}, budgetWalkStats{3, 2, 3, 3}, ""},
 		{"no cursor within bound", 3, 3, nil, budgetWalkStats{0, 3, 0, 0}, "no first-page cursor"},
 		{"partial rejection", 1, 3, []page{{status: 503, body: rejection.body + "{\"t"}}, budgetWalkStats{0, 1, 0, 0}, "unclean HTTP 503"},
-		{"rejection with empty cursor header", 0, 3, []page{{status: 503, body: rejection.body, cursor: new("")}}, budgetWalkStats{}, "unclean HTTP 503"},
-		{"rejection with NDJSON content type", 0, 3, []page{{status: 503, body: rejection.body, ndjson: true}}, budgetWalkStats{}, "unclean HTTP 503"},
+		{"rejection with empty cursor header", 0, 3, []page{rejection, {status: 503, body: rejection.body, cursor: new("")}}, budgetWalkStats{}, "unclean HTTP 503"},
+		{"rejection with NDJSON content type", 0, 3, []page{rejection, {status: 503, body: rejection.body, ndjson: true}}, budgetWalkStats{}, "unclean HTTP 503"},
+		{"rejection changed on raw probe", 0, 3, []page{rejection, first}, budgetWalkStats{}, "unclean HTTP 503 budget rejection (got HTTP 200"},
 		{"rejection with unrelated error", 0, 3, []page{{status: 503, body: "busy\n"}}, budgetWalkStats{}, "unclean HTTP 503"},
+		{"truncated rejection", 0, 3, []page{{status: 503, body: rejection.body, truncate: true}}, budgetWalkStats{}, "unexpected EOF"},
 		{"success without first cursor", 1, 3, []page{{status: 200, body: firstRow, ndjson: true}}, budgetWalkStats{0, 1, 0, 0}, "missing continuation cursor"},
-		{"first page exceeds row limit", 0, 3, []page{{status: 200, body: firstRow + secondRow, ndjson: true}}, budgetWalkStats{}, "unexpected row"},
+		{"first page exceeds row limit", 0, 3, []page{{status: 200, body: firstRow + secondRow, ndjson: true}}, budgetWalkStats{}, "returned 2 rows, want 1"},
 		{"out of append order", 0, 3, []page{{status: 200, body: secondRow, cursor: new(firstToken), ndjson: true}}, budgetWalkStats{}, "unexpected row"},
-		{"empty continuation", 0, 3, []page{first, {status: 200, cursor: new(secondToken), ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "returned 0 rows"},
-		{"repeated cursor", 0, 3, []page{first, {status: 200, body: secondRow, cursor: new(firstToken), ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "repeated a continuation cursor"},
+		{"empty continuation", 0, 3, []page{first, {status: 200, cursor: new(secondToken), ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "empty query page with next cursor"},
+		{"repeated cursor", 0, 3, []page{first, {status: 200, body: secondRow, cursor: new(firstToken), ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "next cursor does not advance pagination"},
 		{"early termination", 0, 3, []page{first, {status: 200, body: secondRow, ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "missing continuation cursor"},
-		{"rejected second page", 0, 3, []page{first, rejection}, budgetWalkStats{1, 0, 1, 1}, "page 2: expected NDJSON HTTP 200, got HTTP 503"},
-		{"rejected terminal page", 0, 3, []page{first, second, {status: 410}}, budgetWalkStats{1, 0, 2, 2}, "page 3: expected NDJSON HTTP 200, got HTTP 410"},
-		{"truncated terminal record", 0, 3, []page{first, second, {status: 200, body: lastRow[:len(lastRow)-2], ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "incomplete NDJSON framing"},
-		{"missing terminal newline", 0, 3, []page{first, second, {status: 200, body: strings.TrimSuffix(lastRow, "\n"), ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "incomplete NDJSON framing"},
+		{"rejected second page", 0, 3, []page{first, rejection}, budgetWalkStats{1, 0, 1, 1}, "page 2: Bog HTTP 503"},
+		{"rejected terminal page", 0, 3, []page{first, second, {status: 410}}, budgetWalkStats{1, 0, 2, 2}, "page 3: Bog HTTP 410"},
+		{"truncated terminal record", 0, 3, []page{first, second, {status: 200, body: lastRow[:len(lastRow)-2], ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "invalid query record framing"},
+		{"missing terminal newline", 0, 3, []page{first, second, {status: 200, body: strings.TrimSuffix(lastRow, "\n"), ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "invalid query record framing"},
 		{"truncated HTTP body", 0, 3, []page{first, second, {status: 200, body: lastRow, ndjson: true, truncate: true}}, budgetWalkStats{1, 0, 2, 2}, "unexpected EOF"},
-		{"terminal cursor", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: new("extra"), ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "issued a cursor after the final row"},
-		{"empty terminal cursor header", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: new(""), ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "issued a cursor after the final row"},
+		{"terminal cursor", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: &extraToken, ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "issued a cursor after the final row"},
+		{"empty terminal cursor header", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: new(""), ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "invalid next cursor header"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -212,7 +222,7 @@ func TestFindBudgetWalk(t *testing.T) {
 				}
 				pages := tc.pages
 				if budget <= tc.rejections {
-					pages = []page{rejection}
+					pages = []page{rejection, rejection}
 				}
 				var calls atomic.Int32
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -232,10 +242,10 @@ func TestFindBudgetWalk(t *testing.T) {
 					}
 					q := req.URL.Query()
 					if req.Method != http.MethodGet || req.URL.Path != "/query" || q.Get("start") != fixtureStart ||
-						q.Get("end") != fixtureEnd || q.Get("limit") != "1" || q.Has("contains") {
+						q.Get("end") != fixtureEnd || q.Get("limit") != "1" || !q.Has("contains") || q.Get("contains") != "" {
 						t.Errorf("unexpected query %s %s", req.Method, req.URL)
 					}
-					if i == 1 {
+					if i == 1 || (i == 2 && pages[0].status == http.StatusServiceUnavailable) {
 						if q.Get("page") != "1" || q.Has("cursor") {
 							t.Errorf("invalid first-page query %s", req.URL)
 						}

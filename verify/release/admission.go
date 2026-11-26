@@ -226,7 +226,11 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
 	return serveDirectory(ctx, binary, dir, client, flags, check)
 }
 
-func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(string) error) (err error) {
+func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(string) error) error {
+	return serveDirectoryWithEnv(ctx, binary, dir, client, flags, nil, check)
+}
+
+func serveDirectoryWithEnv(ctx context.Context, binary, dir string, client *http.Client, flags, env []string, check func(string) error) (err error) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -236,6 +240,7 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 		return err
 	}
 	cmd := exec.CommandContext(ctx, binary, append([]string{"-data-dir", dir, "-addr", addr}, flags...)...)
+	cmd.Env = env
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var killOnce sync.Once

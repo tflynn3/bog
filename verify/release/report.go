@@ -17,6 +17,7 @@ import (
 
 const schemaVersion = 1
 const capacityCase = "retained_history_capacity"
+const restoredParityCase = "restored_parity"
 
 var fullRevision = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -49,7 +50,11 @@ var admissionCases = []string{"one_slot_saturation", "ingest_during_saturation",
 var durabilityCases = []string{"sigkill", "recovery", "enospc"}
 var capacityCases = []string{capacityCase}
 
-func readIdentity(binary, revision, fixture string) (id identity, err error) {
+func readIdentity(binary, revision, fixture string) (identity, error) {
+	return readCandidateIdentity(binary, revision, fixture, "")
+}
+
+func readCandidateIdentity(binary, revision, fixture, arch string) (id identity, err error) {
 	if !filepath.IsAbs(binary) || !fullRevision.MatchString(revision) || fixture == "" {
 		return id, errors.New("require an absolute -binary path, a full lowercase SHA in -revision, and a nonempty -fixture")
 	}
@@ -58,6 +63,11 @@ func readIdentity(binary, revision, fixture string) (id identity, err error) {
 		return id, err
 	}
 	defer func() { err = errors.Join(err, file.Close()) }()
+	if arch != "" {
+		if err := verifyCandidate(file, revision, arch); err != nil {
+			return id, err
+		}
+	}
 	hash := sha256.New()
 	copied, err := io.Copy(hash, file)
 	if err != nil {
@@ -91,6 +101,10 @@ func decodeFields(data []byte, fields map[string]any) (map[string]jsontext.Value
 }
 
 func validateReport(data []byte, expected identity, required []string) error {
+	return validateReportMode(data, expected, required, false)
+}
+
+func validateReportMode(data []byte, expected identity, required []string, strict bool) error {
 	var got identity
 	var cases map[string]jsontext.Value
 	fields, err := decodeFields(data, map[string]any{
@@ -110,8 +124,26 @@ func validateReport(data []byte, expected identity, required []string) error {
 	}
 	for name, raw := range cases {
 		mandatory := slices.Contains(required, name)
-		if err := validateOutcome(raw, mandatory, mandatory && name == "enospc"); err != nil {
+		if err := validateOutcome(raw, mandatory, mandatory && name == "enospc", strict); err != nil {
 			return fmt.Errorf("case %q: %w", name, err)
+		}
+		if strict && mandatory {
+			var check func(jsontext.Value) error
+			switch name {
+			case "work_budget":
+				check = validateFixedBudget
+			case restoredParityCase:
+				check = validateParity
+			}
+			if check != nil {
+				var evidence jsontext.Value
+				if _, err := decodeFields(raw, map[string]any{"evidence": &evidence}); err != nil {
+					return fmt.Errorf("case %q: %w", name, err)
+				}
+				if err := check(evidence); err != nil {
+					return fmt.Errorf("case %q: %w", name, err)
+				}
+			}
 		}
 	}
 	if slices.Contains(required, capacityCase) {
@@ -120,15 +152,15 @@ func validateReport(data []byte, expected identity, required []string) error {
 	return nil
 }
 
-func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC bool) error {
+func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC, strict bool) error {
 	var status string
 	fields, err := decodeFields(raw, map[string]any{"status": &status})
 	if err != nil {
 		return err
 	}
-	if detail, ok := fields["detail"]; ok {
-		var text *string
-		if err := json.Unmarshal(detail, &text); err != nil || text == nil {
+	var detail *string
+	if raw, ok := fields["detail"]; ok {
+		if err := json.Unmarshal(raw, &detail); err != nil || detail == nil {
 			return errors.New("detail must be a string")
 		}
 	}
@@ -136,6 +168,9 @@ func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC bool) error {
 	case "pass":
 	case "fail", "skip":
 		if mandatory {
+			if detail != nil && *detail != "" {
+				return fmt.Errorf("expected pass, got %q: %.500s", status, *detail)
+			}
 			return fmt.Errorf("expected pass, got %q", status)
 		}
 	default:
@@ -155,10 +190,13 @@ func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC bool) error {
 	if proof.Errno != "ENOSPC" || !proof.DisposableLocalFilesystem || !proof.ObservedENOSPC || !proof.RecoveredAfterSpaceFreed {
 		return errors.New("require observed kernel ENOSPC on disposable local storage and recovery after freeing space")
 	}
+	if strict {
+		return validateRetargets(fields["evidence"])
+	}
 	return nil
 }
 
-func validateFile(path string, expected identity, required []string) (err error) {
+func validateFileMode(path string, expected identity, required []string, strict bool) (err error) {
 	file, err := openRegular(path)
 	if err != nil {
 		return err
@@ -172,7 +210,7 @@ func validateFile(path string, expected identity, required []string) (err error)
 	if len(data) > maxReport {
 		return errors.New("report exceeds 16 MiB")
 	}
-	return validateReport(data, expected, required)
+	return validateReportMode(data, expected, required, strict)
 }
 
 func openRegular(path string) (*os.File, error) {

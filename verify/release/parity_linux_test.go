@@ -23,8 +23,7 @@ import (
 )
 
 const (
-	restoredParityCase = "restored_parity"
-	restoredPageCap    = 256
+	restoredPageCap = 256
 )
 
 // The release gate supplies the already-built candidate. Ordinary unit runs
@@ -42,7 +41,7 @@ func TestReleaseRestoredParity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	results := report{id, make(map[string]outcome)}
-	proof, probeErr := restoredParity(ctx, binary, t.TempDir())
+	proof, probeErr := runRestoredParity(ctx, binary)
 	probeErr = record(results.Cases, restoredParityCase, proof, probeErr)
 	data, err := json.MarshalIndent(results, "", "  ")
 	if err == nil {
@@ -54,11 +53,26 @@ func TestReleaseRestoredParity(t *testing.T) {
 }
 
 type parityProof struct {
-	Point          backup.Point `json:"verified_point"`
-	CapturedRows   int          `json:"captured_rows"`
-	PostRestore204 bool         `json:"post_restore_204"`
-	PostAppendRows int          `json:"post_append_rows"`
-	RestartRows    int          `json:"restart_rows"`
+	Point backup.Point `json:"verified_point"`
+	parityProgress
+	FirstFailure *parityWalkFailure `json:"first_failure,omitempty"`
+}
+
+func runRestoredParity(ctx context.Context, binary string) (proof parityProof, err error) {
+	root, err := os.MkdirTemp("", "bog-release-parity-")
+	if err != nil {
+		return proof, err
+	}
+	defer func() {
+		cleanupErr := os.RemoveAll(root)
+		proof.FixtureRemoved = cleanupErr == nil
+		if cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove restore fixture: %w", cleanupErr))
+		}
+	}()
+	proof, err = restoredParity(ctx, binary, root)
+	errors.As(err, &proof.FirstFailure)
+	return proof, err
 }
 
 func parityRows() []row {
@@ -88,106 +102,95 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 	}
 	defer client.CloseIdleConnections()
 	flags := []string{fmt.Sprintf("-query-max-response-bytes=%d", restoredPageCap)}
+	model, err := parityModel(rows)
+	if err != nil {
+		return proof, err
+	}
+	captured := model.HighWater()
 	added := row{rows[1].TS, "after restore [match]"}
-	augmented := append(slices.Clone(rows), added)
 	var staleCursor string
-	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(kv, "BOG_CAPACITY_CONTROL=")
+	})
+	enabled := append(slices.Clone(env), "BOG_CAPACITY_CONTROL=1")
+	err = serveDirectoryWithEnv(ctx, binary, dir, client, flags, enabled, func(base string) error {
 		pager, err := newReleasePager(base, client, restoredPageCap)
 		if err != nil {
 			return err
 		}
-		if err := checkRestoredWalks(ctx, pager, rows); err != nil {
+		if err := checkParityWalks(ctx, pager, model, captured, "restore"); err != nil {
 			return err
 		}
-		proof.CapturedRows = len(rows)
+		proof.CapturedRows = captured
+		want, err := parityMatches(pager, model, captured, "")
+		if err != nil {
+			return err
+		}
+		held := parityWalk{stage: "held_across_compaction", want: want}
+		if err := held.page(ctx, pager, 1); err != nil {
+			return err
+		}
+
 		status, err := ingest(ctx, client, base, []row{added})
 		if err != nil {
 			return fmt.Errorf("append to restored image: %w", err)
 		}
 		proof.PostRestore204 = status == http.StatusNoContent
-		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
-			return fmt.Errorf("walk after acknowledged post-restore write: %w", err)
+		if err := appendParityModel(model, []row{added}); err != nil {
+			return err
 		}
-		proof.PostAppendRows = len(augmented)
-		page, _, err := pager.fetch(ctx, "", 1, "")
+		augmented := model.HighWater()
+		if err := checkParityWalks(ctx, pager, model, augmented, "after_append"); err != nil {
+			return err
+		}
+		proof.PostAppendRows = augmented
+		proof.Compaction, err = replaceParityGeneration(ctx, client, base, augmented)
 		if err != nil {
-			return fmt.Errorf("capture cursor before restart: %w", err)
+			return err
 		}
-		if len(page.Rows) != 1 || page.NextCursor == "" {
-			return errors.New("expected one row and a continuation before restart")
+		for held.cursor != "" {
+			if err := held.page(ctx, pager, 1); err != nil {
+				return err
+			}
 		}
-		staleCursor = page.NextCursor
+		proof.HeldRows = held.offset
+		if err := checkParityWalks(ctx, pager, model, augmented, "after_compaction"); err != nil {
+			return err
+		}
+		proof.PostCompactionRows = augmented
+		want, err = parityMatches(pager, model, augmented, "")
+		if err != nil {
+			return err
+		}
+		beforeRestart := parityWalk{stage: "before_restart", want: want}
+		if err := beforeRestart.page(ctx, pager, 1); err != nil {
+			return err
+		}
+		staleCursor = beforeRestart.cursor
 		return nil
 	})
 	if err != nil {
 		return proof, fmt.Errorf("serve restored image: %w", err)
 	}
-	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
+	err = serveDirectoryWithEnv(ctx, binary, dir, client, flags, env, func(base string) error {
 		if err := requireStaleCursorRejection(ctx, client, base, staleCursor); err != nil {
 			return fmt.Errorf("resume cursor from before restart: %w", err)
 		}
+		proof.StaleCursorReject = true
 		pager, err := newReleasePager(base, client, restoredPageCap)
 		if err != nil {
 			return err
 		}
-		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
+		if err := checkParityWalks(ctx, pager, model, model.HighWater(), "restart"); err != nil {
 			return err
 		}
-		proof.RestartRows = len(augmented)
+		proof.RestartRows = model.HighWater()
 		return nil
 	})
 	if err != nil {
 		err = fmt.Errorf("restart with acknowledged post-restore write: %w", err)
 	}
 	return proof, err
-}
-
-func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []row) error {
-	for _, filter := range []string{"", "[match]", "absent"} {
-		var want []row
-		for _, r := range appendOrder {
-			if strings.Contains(r.Line, filter) {
-				want = append(want, r)
-			}
-		}
-		slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
-		for _, limit := range []int{1, 3, 10} {
-			if err := checkRestoredWalk(ctx, pager, filter, limit, want); err != nil {
-				return fmt.Errorf("filter %q, page size %d: %w", filter, limit, err)
-			}
-		}
-	}
-	return nil
-}
-
-func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string, limit int, want []row) error {
-	seen := make(map[string]bool)
-	cursor := ""
-	for number := 1; ; number++ {
-		page, _, err := pager.fetch(ctx, filter, limit, cursor)
-		if err != nil {
-			return fmt.Errorf("page %d: %w", number, err)
-		}
-		n := len(page.Rows)
-		if n > limit {
-			return fmt.Errorf("page %d exceeded row limit", number)
-		}
-		if err := checkPageRows(page.Rows, want); err != nil {
-			return fmt.Errorf("page %d: %w", number, err)
-		}
-		want = want[n:]
-		cursor = page.NextCursor
-		if cursor == "" {
-			if len(want) != 0 {
-				return fmt.Errorf("page %d ended walk with %d rows missing", number, len(want))
-			}
-			return nil
-		}
-		if seen[cursor] || len(want) == 0 {
-			return fmt.Errorf("page %d returned a repeated cursor or continued past the final row", number)
-		}
-		seen[cursor] = true
-	}
 }
 
 // The fixture is private and quiescent throughout export, so the files
@@ -299,5 +302,24 @@ func TestReleaseRestoredFixture(t *testing.T) {
 	got, err := backup.Verify(t.Context(), dir)
 	if err != nil || got != point {
 		t.Fatalf("restored recovery point = %+v, %v; want %+v", got, err, point)
+	}
+}
+
+func TestReleaseParityCleansFixtureAfterStartupFailure(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	binary := filepath.Join(tmp, "invalid-candidate")
+	writeFixture(t, binary, []byte("invalid executable"))
+	proof, err := runRestoredParity(t.Context(), binary)
+	checkProblem(t, err, "serve restored image")
+	if !proof.FixtureRemoved || proof.CapturedRows != 0 {
+		t.Fatalf("unexpected cleanup evidence: %+v", proof)
+	}
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(binary) {
+		t.Fatalf("restore fixture leaked files: %v", entries)
 	}
 }

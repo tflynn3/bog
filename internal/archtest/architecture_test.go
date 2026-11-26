@@ -123,6 +123,68 @@ func checkLinuxArchitecture(t *testing.T, arch string) {
 	for _, problem := range architectureProblems(packages, registry) {
 		t.Error(problem)
 	}
+	for _, problem := range measuredCutoverBoundaryProblems(packages) {
+		t.Error(problem)
+	}
+}
+
+// The registry contains only root-module edges. Apply the cutover boundaries
+// to the measured graph as well so a dependency outside the module cannot
+// hide a paging or storage authority bypass.
+func measuredCutoverBoundaryProblems(packages map[string]listedPackage) []string {
+	measured := make(map[string]rule, len(packages))
+	for path, pkg := range packages {
+		measured[path] = rule{imports: pkg.Imports}
+	}
+	return append(pagingBoundaryProblems(measured), storageAuthorityProblems(measured)...)
+}
+
+func TestMeasuredCutoverBoundaryProblems(t *testing.T) {
+	t.Parallel()
+	const (
+		backup   = "bog/internal/backup"
+		httpapi  = "bog/internal/httpapi"
+		wal      = "bog/internal/wal"
+		external = "example.com/relay"
+	)
+	tests := []struct {
+		name                                     string
+		httpImports, backupImports, relayImports []string
+		want                                     []string
+	}{
+		{
+			name:        "independent external dependency",
+			httpImports: []string{wal, external},
+		},
+		{
+			name:         "external dependency crosses paging seam",
+			httpImports:  []string{wal, external},
+			relayImports: []string{backup},
+			want:         []string{"HTTP must use the page source seam: " + httpapi + " reaches " + backup},
+		},
+		{
+			name:          "external dependency crosses storage authority",
+			httpImports:   []string{wal},
+			backupImports: []string{external},
+			relayImports:  []string{wal},
+			want:          []string{"forbidden storage authority dependency: " + backup + " reaches " + wal},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			packages := map[string]listedPackage{
+				server:   productionPackage("main", httpapi, backup, wal),
+				httpapi:  productionPackage("httpapi", tt.httpImports...),
+				backup:   productionPackage("backup", tt.backupImports...),
+				wal:      productionPackage("wal"),
+				external: {GoFiles: []string{"relay.go"}, Imports: tt.relayImports},
+			}
+			if got := measuredCutoverBoundaryProblems(packages); !slices.Equal(got, tt.want) {
+				t.Errorf("measuredCutoverBoundaryProblems() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 func architectureProblems(packages map[string]listedPackage, rules map[string]rule) []string {

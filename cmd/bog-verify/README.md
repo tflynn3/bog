@@ -25,6 +25,14 @@ the matched row count and confirms both streams reached their terminal pages.
 
 `-limit` defaults to 100 rows per page and accepts 1 through 1000.
 `-max-pages` defaults to 100,000 pages per stream, including the terminal page.
+`-max-page-bytes` defaults to 33,554,432 bytes (32 MiB) per live HTTP page.
+If the server sends larger pages, raise the ceiling to fit the encoded page
+or lower `-limit` to request fewer rows. The comparison holds up to one live
+page and one byte-bounded reference page at a time.
+The reference walk uses private files under the system temporary directory
+to sort matching committed-tail rows, so allow temporary disk space for
+those rows and their merge output. The command removes its scratch files
+when the walk succeeds, fails, or is canceled.
 `-timeout` defaults to five minutes and covers verification and the full walk.
 If a walk fails or exceeds its budget, the command reports the failing side
 and row, and a new invocation starts a fresh snapshot.

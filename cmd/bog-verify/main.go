@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"os/signal"
@@ -20,7 +21,8 @@ import (
 const usage = `Usage:
   bog-verify verify -backup DIR [-timeout 5m]
   bog-verify compare -backup DIR -url URL -start TIME -end TIME
-                     [-contains TEXT] [-limit 100] [-max-pages 100000] [-timeout 5m]
+                     [-contains TEXT] [-limit 100] [-max-pages 100000]
+                     [-max-page-bytes 33554432] [-timeout 5m]
 
 The reference backup must remain immutable throughout the command. Use a
 separate copy as the restored server's data directory. Query times are
@@ -35,11 +37,12 @@ Exit statuses:
 `
 
 type options struct {
-	bundle   string
-	baseURL  string
-	timeout  time.Duration
-	maxPages int
-	query    client.Query
+	bundle       string
+	baseURL      string
+	timeout      time.Duration
+	maxPages     int
+	maxPageBytes int64
+	query        client.Query
 }
 
 func parseOptions(mode string, args []string) (options, error) {
@@ -56,6 +59,7 @@ func parseOptions(mode string, args []string) (options, error) {
 		flags.StringVar(&opts.query.Contains, "contains", "", "case-sensitive substring filter")
 		flags.IntVar(&opts.query.Limit, "limit", 100, "maximum rows per page")
 		flags.IntVar(&opts.maxPages, "max-pages", 100000, "maximum pages per stream, including the terminal page")
+		flags.Int64Var(&opts.maxPageBytes, "max-page-bytes", client.DefaultMaxPage, "maximum encoded bytes per live HTTP page")
 	}
 	if err := flags.Parse(args); err != nil {
 		return options{}, err
@@ -93,6 +97,9 @@ func parseOptions(mode string, args []string) (options, error) {
 	}
 	if opts.maxPages < 1 {
 		return options{}, errors.New("-max-pages must be positive")
+	}
+	if opts.maxPageBytes < 1 || opts.maxPageBytes == math.MaxInt64 {
+		return options{}, fmt.Errorf("-max-page-bytes must be between 1 and %d", int64(math.MaxInt64-1))
 	}
 	return opts, nil
 }

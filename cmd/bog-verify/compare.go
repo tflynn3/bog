@@ -17,7 +17,7 @@ const (
 )
 
 // queryPage represents one validated page. terminal is the source's explicit
-// exhaustion signal and may accompany rows.
+// exhaustion signal and may accompany rows. The stream owns the row slice.
 type queryPage struct {
 	rows     []client.Row
 	terminal bool
@@ -56,6 +56,7 @@ func (s *rowStream) take(ctx context.Context) (client.Row, bool, error) {
 		return client.Row{}, false, nil
 	}
 	row := s.rows[0]
+	s.rows[0] = client.Row{}
 	s.rows = s.rows[1:]
 	if len(s.rows) == 0 {
 		s.rows = nil

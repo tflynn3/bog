@@ -30,6 +30,13 @@ func (p Position) less(q Position) bool {
 	return p.Time.Before(q.Time) || (p.Time.Equal(q.Time) && p.Ordinal < q.Ordinal)
 }
 
+func comparePositions(a, b Position) int {
+	if order := a.Time.Compare(b.Time); order != 0 {
+		return order
+	}
+	return cmp.Compare(a.Ordinal, b.Ordinal)
+}
+
 // Row retains both the decoded row and its append identity.
 type Row struct {
 	store.Row
@@ -60,11 +67,15 @@ type Reader struct {
 
 // OpenRestored validates the entire image before admitting queries or replay.
 func OpenRestored(ctx context.Context, directory string) (*Reader, error) {
+	return openRestored(ctx, directory, verifyImage)
+}
+
+func openRestored(ctx context.Context, directory string, verify func(context.Context, *os.Root) (image, []bounds, error)) (*Reader, error) {
 	root, err := os.OpenRoot(directory)
 	if err != nil {
 		return nil, err
 	}
-	img, bounds, err := verifyImage(ctx, root)
+	img, bounds, err := verify(ctx, root)
 	if err != nil {
 		return nil, errors.Join(err, root.Close())
 	}
@@ -112,22 +123,10 @@ func (r *Reader) QueryPage(ctx context.Context, q Query, limit int) (rows []Row,
 	if err != nil {
 		return nil, nil, err
 	}
-	runs := make(segmentHeap, 0, len(r.image.Segments))
-	for i, s := range r.image.Segments {
-		bounds := r.bounds[i]
-		if bounds.max.Before(q.Start) || !bounds.min.Before(q.End) ||
-			(q.After != nil && bounds.max.Before(q.After.Time)) {
-			continue
-		}
-		cursor := &segmentCursor{segment: s, next: blockHeader}
-		if err := cursor.advance(ctx, r.root, q); err != nil {
-			return nil, nil, err
-		}
-		if cursor.valid {
-			runs = append(runs, cursor)
-		}
+	runs, err := r.segmentRuns(ctx, q)
+	if err != nil {
+		return nil, nil, err
 	}
-	heap.Init(&runs)
 	rows = make([]Row, 0, limit)
 	var decoder walDecoder
 	var frameOffset int64
@@ -168,13 +167,8 @@ func (r *Reader) QueryPage(ctx context.Context, q Query, limit int) (rows []Row,
 			}
 			rows = append(rows, Row{store.Row{TS: cursor.key.Time, Line: line}, cursor.key.Ordinal})
 		}
-		if err := cursor.advance(ctx, r.root, q); err != nil {
+		if err := r.advanceSegment(ctx, q, &runs); err != nil {
 			return nil, nil, err
-		}
-		if cursor.valid {
-			heap.Fix(&runs, 0)
-		} else {
-			heap.Pop(&runs)
 		}
 	}
 	if len(runs) > 0 || len(tail) > 0 {
@@ -182,6 +176,39 @@ func (r *Reader) QueryPage(ctx context.Context, q Query, limit int) (rows []Row,
 		return rows, &position, nil
 	}
 	return rows, nil, nil
+}
+
+func (r *Reader) segmentRuns(ctx context.Context, q Query) (segmentHeap, error) {
+	runs := make(segmentHeap, 0, len(r.image.Segments))
+	for i, s := range r.image.Segments {
+		bounds := r.bounds[i]
+		if bounds.max.Before(q.Start) || !bounds.min.Before(q.End) ||
+			(q.After != nil && bounds.max.Before(q.After.Time)) {
+			continue
+		}
+		cursor := &segmentCursor{segment: s, next: blockHeader}
+		if err := cursor.advance(ctx, r.root, q); err != nil {
+			return nil, err
+		}
+		if cursor.valid {
+			runs = append(runs, cursor)
+		}
+	}
+	heap.Init(&runs)
+	return runs, nil
+}
+
+func (r *Reader) advanceSegment(ctx context.Context, q Query, runs *segmentHeap) error {
+	cursor := (*runs)[0]
+	if err := cursor.advance(ctx, r.root, q); err != nil {
+		return err
+	}
+	if cursor.valid {
+		heap.Fix(runs, 0)
+	} else {
+		heap.Pop(runs)
+	}
+	return nil
 }
 
 type tailRef struct {
@@ -214,10 +241,7 @@ func (r *Reader) tailPage(ctx context.Context, f *os.File, q Query, count int) (
 		return nil, err
 	}
 	slices.SortFunc(rows, func(a, b tailRef) int {
-		if order := a.key.Time.Compare(b.key.Time); order != 0 {
-			return order
-		}
-		return cmp.Compare(a.key.Ordinal, b.key.Ordinal)
+		return comparePositions(a.key, b.key)
 	})
 	return rows, nil
 }

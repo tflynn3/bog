@@ -24,10 +24,25 @@ var (
 type QueryWork struct {
 	ctx       context.Context
 	remaining uint64
+	parent    *QueryWork
 }
 
 func NewQueryWork(ctx context.Context, units uint64) *QueryWork {
 	return &QueryWork{ctx: ctx, remaining: units}
+}
+
+// Remaining returns the units left in this meter.
+func (w *QueryWork) Remaining() uint64 {
+	if w.parent != nil {
+		return min(w.remaining, w.parent.Remaining())
+	}
+	return w.remaining
+}
+
+// WithLimit meters a bounded portion of the same operation. Successful charges
+// debit both meters, including work done before a later charge fails.
+func (w *QueryWork) WithLimit(units uint64) *QueryWork {
+	return &QueryWork{ctx: w.ctx, remaining: min(w.Remaining(), units), parent: w}
 }
 
 // Charge checks cancellation first, then reserves units before doing work.
@@ -39,12 +54,21 @@ func (w *QueryWork) Charge(units ...uint64) error {
 	if err := w.ctx.Err(); err != nil {
 		return err
 	}
+	return w.debit(units)
+}
+
+func (w *QueryWork) debit(units []uint64) error {
 	remaining := w.remaining
 	for _, n := range units {
 		if n > remaining {
 			return ErrQueryWorkExhausted
 		}
 		remaining -= n
+	}
+	if w.parent != nil {
+		if err := w.parent.debit([]uint64{w.remaining - remaining}); err != nil {
+			return err
+		}
 	}
 	w.remaining = remaining
 	return nil

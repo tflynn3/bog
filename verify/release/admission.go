@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -194,6 +195,10 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
 		return err
 	}
 	defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
+	return serveDirectory(ctx, binary, dir, client, flags, check)
+}
+
+func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(string) error) (err error) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -204,30 +209,53 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
 	}
 	cmd := exec.CommandContext(ctx, binary, append([]string{"-data-dir", dir, "-addr", addr}, flags...)...)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var killOnce sync.Once
+	var killErr error
+	cmd.Cancel = func() error {
+		killOnce.Do(func() {
+			killErr = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			if errors.Is(killErr, syscall.ESRCH) {
+				killErr = os.ErrProcessDone
+			}
+		})
+		return killErr
+	}
 	cmd.WaitDelay = 3 * time.Second
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	defer func() {
-		killErr := cmd.Process.Kill()
-		var waitErr error
-		select {
-		case waitErr = <-done:
-		case <-time.After(3 * time.Second):
-			err = errors.Join(err, errors.New("timed out reaping candidate"), killErr)
-			return
+	cleanGroup := func() error {
+		err := cmd.Cancel()
+		if errors.Is(err, os.ErrProcessDone) {
+			return nil
 		}
-		if killErr == nil {
+		return err
+	}
+	done := make(chan struct{})
+	var waitErr, observeErr error
+	go func() {
+		waitErr, observeErr = waitCandidate(cmd, cleanGroup)
+		close(done)
+	}()
+	defer func() {
+		// The leader may have exited while its group is still running.
+		killErr := cleanGroup()
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-done:
 			var exited *exec.ExitError
 			if errors.As(waitErr, &exited) {
 				if status, ok := exited.Sys().(syscall.WaitStatus); ok && status.Signal() == syscall.SIGKILL {
+					err = errors.Join(err, killErr, observeErr)
 					return
 				}
 			}
+			err = errors.Join(err, killErr, observeErr, fmt.Errorf("candidate exited unexpectedly: %v", waitErr))
+		case <-timer.C:
+			err = errors.Join(err, killErr, errors.New("timed out reaping candidate"))
 		}
-		err = errors.Join(err, fmt.Errorf("candidate process cleanup: kill=%v, wait=%v", killErr, waitErr))
 	}()
 
 	base := "http://" + addr
@@ -235,9 +263,8 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
 	defer cancel()
 	for {
 		select {
-		case exitErr := <-done:
-			done <- exitErr
-			return fmt.Errorf("candidate exited before health check: %v", exitErr)
+		case <-done:
+			return fmt.Errorf("candidate exited before health check: %v", waitErr)
 		default:
 		}
 		res, probeErr := request(startup, client, http.MethodGet, base+"/healthz", nil)
@@ -245,7 +272,18 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
 			if res.status != http.StatusOK {
 				return fmt.Errorf("startup health returned HTTP %d", res.status)
 			}
+			select {
+			case <-done:
+				return fmt.Errorf("candidate exited during health check: %v", waitErr)
+			default:
+			}
+			if err := startup.Err(); err != nil {
+				return fmt.Errorf("startup health: %w", err)
+			}
 			return check(base)
+		}
+		if err := startup.Err(); err != nil {
+			return fmt.Errorf("startup health: %w (last probe: %v)", err, probeErr)
 		}
 		var netErr *net.OpError
 		if !errors.As(probeErr, &netErr) || !errors.Is(netErr, syscall.ECONNREFUSED) {
@@ -254,6 +292,8 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
 		select {
 		case <-startup.Done():
 			return fmt.Errorf("startup health: %w (last probe: %v)", startup.Err(), probeErr)
+		case <-done:
+			return fmt.Errorf("candidate exited before health check: %v", waitErr)
 		case <-time.After(20 * time.Millisecond):
 		}
 	}

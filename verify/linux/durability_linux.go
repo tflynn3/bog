@@ -233,10 +233,14 @@ func recoveryCase(ctx context.Context, s *server) (any, error) {
 	return proof, nil
 }
 
-func (s *server) refuseCorruption(ctx context.Context) error {
+func (s *server) refuseCorruption(ctx context.Context) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := s.launch(); err != nil {
 		return err
 	}
+	defer func() { err = errors.Join(err, s.close()) }()
 	ctx, cancel := context.WithTimeout(ctx, processTimeout)
 	defer cancel()
 	ticker := time.NewTicker(5 * time.Millisecond)

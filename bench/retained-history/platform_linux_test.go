@@ -11,13 +11,49 @@ import (
 	"time"
 )
 
+func TestChildCapacityControlEnvironment(t *testing.T) {
+	t.Setenv(capacityControlEnv, "inherited")
+	t.Setenv("BOG_CAPACITY_TEST_SENTINEL", "preserved")
+	for _, tc := range []struct{ mode, want string }{
+		{"live", "1/preserved"},
+		{"legacy", "unset/preserved"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			dir := t.TempDir()
+			candidate := filepath.Join(dir, "bog")
+			if err := os.WriteFile(candidate, []byte(
+				"#!/bin/sh\nprintf '%s/%s' \"${BOG_CAPACITY_CONTROL-unset}\" \"$BOG_CAPACITY_TEST_SENTINEL\" > observed\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			p, _, err := startChild(candidate, dir, dir, tc.mode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := p.stop(); err != nil {
+					t.Error(err)
+				}
+			})
+			select {
+			case <-p.done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("candidate did not exit")
+			}
+			got, err := os.ReadFile(filepath.Join(dir, "observed"))
+			if err != nil || string(got) != tc.want {
+				t.Fatalf("candidate environment: got %q, want %q (%v)", got, tc.want, err)
+			}
+		})
+	}
+}
+
 func TestChildReapedOnFailedCgroupPlacement(t *testing.T) {
 	dir := t.TempDir()
 	candidate := filepath.Join(dir, "bog")
 	if err := os.WriteFile(candidate, []byte("#!/bin/sh\nexit 17\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if p, _, err := startChild(candidate, dir, filepath.Join(dir, "missing")); p != nil || !errors.Is(err, os.ErrNotExist) {
+	if p, _, err := startChild(candidate, dir, filepath.Join(dir, "missing"), "legacy"); p != nil || !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed cgroup placement: child %v, error %v", p, err)
 	}
 }
@@ -41,7 +77,7 @@ func TestChildExitAndForcedCleanup(t *testing.T) {
 			if err := os.WriteFile(candidate, []byte("#!/bin/sh\n"+tc.script+"\n"), 0700); err != nil {
 				t.Fatal(err)
 			}
-			p, _, err := startChild(candidate, dir, dir)
+			p, _, err := startChild(candidate, dir, dir, "legacy")
 			if err != nil {
 				t.Fatal(err)
 			}

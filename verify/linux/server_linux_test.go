@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -48,17 +49,27 @@ func TestProcessCleanup(t *testing.T) {
 	}
 }
 
-func TestStartupFailureAndCancellation(t *testing.T) {
+func TestCandidateDescendantCleanup(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	for _, tc := range []struct{ name, command, want string }{
-		{"failure", "echo 'test startup failure' >&2; exit 7", "test startup failure"},
-		{"timeout", "exec sleep 60", "waiting for /healthz"},
+	for _, tc := range []struct {
+		name, command, want string
+		start               bool
+		contextErr          error
+	}{
+		{name: "normal exit", command: "exit 0"},
+		{name: "failed startup", command: "echo 'test startup failure' >&2; exit 7", want: "test startup failure", start: true},
+		{name: "cancellation", command: "wait", want: "waiting for /healthz", start: true, contextErr: context.Canceled},
+		{name: "startup deadline", command: "wait", want: "waiting for /healthz", start: true, contextErr: context.DeadlineExceeded},
+		{name: "graceful stop", command: "wait"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			file := filepath.Join(dir, tc.name)
-			if err := os.WriteFile(file, []byte("#!/bin/sh\n"+tc.command+"\n"), 0700); err != nil {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "candidate")
+			// The child inherits the candidate output pipes and ignores SIGTERM.
+			script := "#!/bin/sh\ntrap 'exit 0' TERM\nsh -c 'trap \"\" TERM; echo $$ > descendant; exec sleep 60' &\n" +
+				"while [ ! -s descendant ]; do sleep 0.01; done\n" + tc.command + "\n"
+			if err := os.WriteFile(file, []byte(script), 0700); err != nil {
 				t.Fatal(err)
 			}
 			s, err := newServer(file, dir)
@@ -70,12 +81,93 @@ func TestStartupFailureAndCancellation(t *testing.T) {
 					t.Error(err)
 				}
 			})
-			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-			defer cancel()
-			if err := s.start(ctx); err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("start returned %v, expected %q", err, tc.want)
+			timeout := processTimeout
+			if tc.contextErr == context.DeadlineExceeded {
+				timeout = time.Second
 			}
+			ctx, cancel := context.WithTimeout(t.Context(), timeout)
+			defer cancel()
+			started := make(chan error, 1)
+			if tc.start {
+				finished := make(chan struct{})
+				go func() {
+					defer close(finished)
+					started <- s.start(ctx)
+				}()
+				t.Cleanup(func() {
+					cancel()
+					<-finished
+				})
+			} else if err := s.launch(); err != nil {
+				t.Fatal(err)
+			}
+			var pid int
+			testPoll(t, func() (bool, error) {
+				raw, err := os.ReadFile(filepath.Join(dir, "descendant"))
+				if errors.Is(err, os.ErrNotExist) || err == nil && len(raw) == 0 {
+					return false, nil
+				}
+				if err != nil {
+					return false, err
+				}
+				pid, err = strconv.Atoi(strings.TrimSpace(string(raw)))
+				return err == nil, err
+			})
+			if tc.contextErr == context.Canceled {
+				cancel()
+			}
+			if tc.start {
+				select {
+				case err := <-started:
+					if err == nil || !strings.Contains(err.Error(), tc.want) ||
+						tc.contextErr != nil && !errors.Is(err, tc.contextErr) {
+						t.Fatalf("start returned %v, expected %q", err, tc.want)
+					}
+				case <-time.After(processTimeout + time.Second):
+					t.Fatal("startup did not return")
+				}
+			} else if tc.name == "graceful stop" {
+				if err := s.process.stop(syscall.SIGTERM); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				select {
+				case <-s.process.done:
+				case <-time.After(processTimeout):
+					t.Fatal("waiting for candidate exit")
+				}
+			}
+			testPoll(t, func() (bool, error) {
+				raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+				if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+					return true, nil
+				}
+				if err != nil {
+					return false, err
+				}
+				// An orphaned descendant may remain a zombie until PID 1 reaps it.
+				_, status, ok := strings.Cut(string(raw), ") ")
+				return ok && strings.HasPrefix(status, "Z "), nil
+			})
 		})
+	}
+}
+
+func testPoll(t *testing.T, ready func() (bool, error)) {
+	t.Helper()
+	deadline := time.Now().Add(processTimeout)
+	for {
+		ok, err := ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("condition did not become true before deadline")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

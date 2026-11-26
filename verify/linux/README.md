@@ -20,6 +20,11 @@ to return kernel `ENOSPC`. It also requires Bog to reject a valid ingest
 while full, checks replay at capacity, and verifies a new acknowledged batch
 after freeing space and restarting again.
 
+Every candidate runs in its own process group. The verifier terminates the
+group on startup failure or cancellation and before reaping an exited leader.
+Shutdown and output drainage have bounded deadlines, including when a
+descendant inherits the candidate's output pipes.
+
 The fixture records ingest outcomes independently of Bog. A complete cursor
 walk must match its ledger, including append order within timestamp ties.
 The SIGKILL case sends a complete request after HTTP 100 and kills the server

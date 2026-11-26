@@ -38,20 +38,22 @@ type rule struct {
 // These are permitted direct imports within the root module. Promote a staged
 // package and update its consumers here in the same change that wires it in.
 var registry = map[string]rule{
-	server:                     {serverCommand, []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
-	"bog/internal/httpapi":     {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
-	"bog/internal/readiness":   {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
-	"bog/internal/wal":         {runtimeLibrary, []string{"bog/internal/store"}},
-	"bog/internal/store":       {runtimeLibrary, nil},
-	"bog/internal/checkpoint":  {staged, []string{"bog/internal/store"}},
-	"bog/internal/history":     {staged, []string{"bog/internal/checkpoint", "bog/internal/store"}},
-	"bog/internal/backup":      {staged, []string{"bog/internal/store"}},
-	"bog/internal/idempotency": {staged, nil},
-	"bog/internal/client":      {standalone, []string{"bog/internal/store"}},
-	"bog/internal/ingest":      {testOnly, nil},
-	"bog/internal/archtest":    {testOnly, nil},
-	"bog/verify/release":       {verifier, nil},
-	"bog/verify/query-model":   {verifierModel, nil},
+	server:                       {serverCommand, []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
+	"bog/internal/httpapi":       {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
+	"bog/internal/readiness":     {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
+	"bog/internal/wal":           {runtimeLibrary, []string{"bog/internal/store"}},
+	"bog/internal/store":         {runtimeLibrary, nil},
+	"bog/internal/checkpoint":    {staged, []string{"bog/internal/store"}},
+	"bog/internal/history":       {staged, []string{"bog/internal/checkpoint", "bog/internal/store"}},
+	"bog/internal/backup":        {staged, []string{"bog/internal/store"}},
+	"bog/internal/idempotency":   {staged, nil},
+	"bog/internal/client":        {standalone, []string{"bog/internal/store"}},
+	"bog/internal/ingest":        {testOnly, nil},
+	"bog/internal/archtest":      {testOnly, nil},
+	"bog/verify/release":         {verifier, nil},
+	"bog/verify/linux":           {verifier, nil},
+	"bog/bench/retained-history": {verifier, nil},
+	"bog/verify/query-model":     {verifierModel, nil},
 }
 
 type listedPackage struct {

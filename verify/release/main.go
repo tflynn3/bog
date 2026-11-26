@@ -22,11 +22,12 @@ func run(ctx context.Context, args []string) error {
 	binary := flags.String("binary", "", "absolute path to the candidate binary")
 	revision := flags.String("revision", "", "full candidate commit SHA")
 	fixture := flags.String("fixture", "", "release fixture ID")
-	var output, admission, durability, capacity string
+	var output, admission, durability, capacity, parity string
 	if validate {
 		flags.StringVar(&admission, "admission", "", "admission report")
 		flags.StringVar(&durability, "durability", "", "durability report")
 		flags.StringVar(&capacity, "capacity", "", "capacity report")
+		flags.StringVar(&parity, "parity", "", "restored parity report")
 	} else {
 		flags.StringVar(&output, "report", "", "admission report output path")
 	}
@@ -54,6 +55,11 @@ func run(ctx context.Context, args []string) error {
 		} {
 			if checkErr := validateFile(check.path, id, check.cases); checkErr != nil {
 				err = errors.Join(err, fmt.Errorf("%s report: %w", check.name, checkErr))
+			}
+		}
+		if parity != "" {
+			if checkErr := validateFile(parity, id, []string{"restored_parity"}); checkErr != nil {
+				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
 			}
 		}
 		return err

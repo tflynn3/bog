@@ -4,15 +4,20 @@ Dispatch the **Linux release verification** workflow with the full commit SHA.
 The workflow builds the candidate once with Go 1.27.0 on Ubuntu 24.04 amd64 and
 uses the resulting absolute binary path for every verifier. Download the
 `linux-release-evidence` artifact for the revision, SHA-256, build metadata,
-fixture, reports, producer exit statuses, and logs.
+fixture, runner and filesystem configuration, reports, producer exit statuses,
+and logs.
 
-All three producers take `-binary PATH -revision SHA -fixture ID -report PATH`.
+The admission, durability, and capacity producers take
+`-binary PATH -revision SHA -fixture ID -report PATH`.
 The release fixture ID is `linux-release-v1`. The workflow runs
 `go run ./verify/release` from the workflow checkout and
 `go run ./verify/linux` (#3) and `go run ./bench/retained-history` (#32) from the
 candidate checkout. The sibling commands need to provision their Linux fixtures
 and use the supplied binary. The gate fails if any command or report is missing,
-including on revisions where only earlier harness entry points exist.
+including on revisions where only earlier harness entry points exist. The
+capacity producer runs as the runner user in a systemd service with delegated
+cgroup v2 memory and I/O controllers. Its live launcher supplies
+`BOG_CAPACITY_CONTROL=1` to both candidate starts.
 
 Reports have integer `schema_version` 1, string `revision`, lowercase hexadecimal
 `binary_sha256`, string `fixture`, and a `cases` object. Each case has a string
@@ -24,6 +29,7 @@ additional evidence. The following cases must pass.
 | Admission | `one_slot_saturation`, `ingest_during_saturation`, `cursor_resume`, `work_budget` |
 | Durability | `sigkill`, `recovery`, `enospc` |
 | Capacity | `retained_history_capacity` |
+| Restored image | `restored_parity` |
 
 The durability report's `enospc` case requires the following `evidence` object.
 
@@ -55,4 +61,15 @@ inside the original snapshot range, is visible. A separate server with
 `-query-work-budget=1` receives 32 fixture rows and must return a clean HTTP
 503 on a scan for an absent string.
 
-Run the report tests independently with `go test -race ./verify/release`.
+## Restored parity fixture
+
+The Linux test `TestReleaseRestoredParity` publishes a checkpoint and appends
+a WAL tail with overlapping times, ties, duplicates, and backfill. It exports,
+verifies, and restores that capture before starting the pinned candidate.
+Fresh HTTP cursors must reproduce the exact append-order model across page
+sizes and literal filters with a 256-byte response cap. The candidate must
+acknowledge an ingest on the restored image, then return the augmented model
+after restart. The test writes a report bound to the same candidate identity.
+
+The workflow passes `-parity parity.json` when validating the collected reports
+and runs the verifier tests with the race detector on Linux.

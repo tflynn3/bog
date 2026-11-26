@@ -11,22 +11,28 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const processTimeout = 5 * time.Second
 
 type child struct {
-	cmd    *exec.Cmd
-	done   chan struct{}
-	result error
-	logs   limitedLog
+	cmd        *exec.Cmd
+	done       chan struct{}
+	result     error
+	observeErr error
+	logs       limitedLog
+
+	mu       sync.Mutex
+	cleaned  bool
+	groupErr error
 }
 
 type limitedLog struct{ buf bytes.Buffer }
@@ -45,21 +51,62 @@ func spawn(binary, dir string, args ...string) (*child, error) {
 	if err := p.cmd.Start(); err != nil {
 		return nil, err
 	}
-	go func() {
-		p.result = p.cmd.Wait()
-		close(p.done)
-	}()
+	go p.wait()
 	return p, nil
 }
 
-func (p *child) stop(sig syscall.Signal) error {
-	select {
-	case <-p.done:
-		return fmt.Errorf("candidate exited before %s (%v): %s", sig, p.result, p.logs.buf.String())
-	default:
+func (p *child) wait() {
+	// Observe exit without reaping the leader. Its PID still identifies this
+	// group while we kill descendants, even if they inherited output pipes.
+	const pid = 1       // Linux waitid P_PID
+	var info [16]uint64 // aligned, 128-byte Linux siginfo_t
+	for {
+		_, _, errno := syscall.Syscall6(syscall.SYS_WAITID, pid, uintptr(p.cmd.Process.Pid),
+			uintptr(unsafe.Pointer(&info)), syscall.WEXITED|syscall.WNOWAIT, 0, 0)
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			p.observeErr = fmt.Errorf("observe candidate exit: %w", errno)
+		}
+		break
 	}
-	err := p.cmd.Process.Signal(sig)
-	if err != nil && !errors.Is(err, os.ErrProcessDone) {
+	p.cleanGroup() // reap returns the cached group signaling error.
+	p.result = p.cmd.Wait()
+	close(p.done)
+}
+
+func (p *child) signalGroup(sig syscall.Signal) error {
+	err := syscall.Kill(-p.cmd.Process.Pid, sig)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("signal candidate group with %s: %w", sig, err)
+	}
+	return nil
+}
+
+func (p *child) cleanGroup() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.cleaned {
+		p.groupErr = p.signalGroup(syscall.SIGKILL)
+		p.cleaned = true
+	}
+	return p.groupErr
+}
+
+func (p *child) stop(sig syscall.Signal) (err error) {
+	defer func() { err = errors.Join(err, p.reap()) }()
+	p.mu.Lock()
+	if p.cleaned {
+		p.mu.Unlock()
+		return fmt.Errorf("candidate exited before %s", sig)
+	}
+	err = p.signalGroup(sig)
+	p.mu.Unlock()
+	if err != nil {
 		return err
 	}
 	timer := time.NewTimer(processTimeout)
@@ -68,7 +115,7 @@ func (p *child) stop(sig syscall.Signal) error {
 	case <-p.done:
 		var exit *exec.ExitError
 		if sig == syscall.SIGKILL && errors.As(p.result, &exit) &&
-			exit.Sys().(syscall.WaitStatus).Signal() == sig {
+			exit.ProcessState.Sys().(syscall.WaitStatus).Signal() == sig {
 			return nil
 		}
 		if p.result != nil {
@@ -84,22 +131,18 @@ func (p *child) stop(sig syscall.Signal) error {
 }
 
 func (p *child) reap() error {
-	select {
-	case <-p.done:
-		return nil
-	default:
-	}
-	// Kill the process group in cleanup so an inherited output pipe cannot
-	// hold the verifier open. WaitDelay also bounds copy-pipe drainage.
-	err := syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
-	if errors.Is(err, syscall.ESRCH) {
-		err = nil
-	}
+	err := p.cleanGroup()
 	timer := time.NewTimer(processTimeout)
 	defer timer.Stop()
 	select {
 	case <-p.done:
-		return err
+		var exit *exec.ExitError
+		if errors.As(p.result, &exit) {
+			// A signal or nonzero exit is interpreted by the caller of stop
+			// or by the startup probe. Always report other wait failures.
+			return errors.Join(err, p.observeErr)
+		}
+		return errors.Join(err, p.observeErr, p.result)
 	case <-timer.C:
 		return errors.Join(err, errors.New("timed out reaping candidate"))
 	}
@@ -133,6 +176,9 @@ func newServer(binary, dir string) (*server, error) {
 }
 
 func (s *server) launch() error {
+	if err := s.close(); err != nil {
+		return fmt.Errorf("clean up previous candidate: %w", err)
+	}
 	p, err := spawn(s.binary, s.dir, "-addr", s.addr, "-data-dir", s.dir)
 	if err == nil {
 		s.process = p
@@ -147,13 +193,18 @@ func (s *server) close() error {
 	return s.process.reap()
 }
 
-func (s *server) start(ctx context.Context) error {
+func (s *server) start(ctx context.Context) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := s.launch(); err != nil {
 		return err
 	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, s.close())
+		}
+	}()
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	ticker := time.NewTicker(5 * time.Millisecond)
@@ -168,6 +219,9 @@ func (s *server) start(ctx context.Context) error {
 		_, _, err := s.request(probe, http.MethodGet, "/healthz", nil, http.StatusOK)
 		cancel()
 		if err == nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			select {
 			case <-s.process.done:
 				return s.startupExit()

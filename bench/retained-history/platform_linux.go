@@ -20,7 +20,9 @@ type child struct {
 	waitErr error // read after done closes
 }
 
-func startChild(binary, dir, group string) (*child, string, error) {
+const capacityControlEnv = "BOG_CAPACITY_CONTROL"
+
+func startChild(binary, dir, group, mode string) (*child, string, error) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return nil, "", err
@@ -33,6 +35,17 @@ func startChild(binary, dir, group string) (*child, string, error) {
 	// This also works on Linux environments that filter clone3.
 	cmd := exec.Command("/bin/sh", "-c", `read -r gate && [ "$gate" = start ] && exec "$@"`, "capacity",
 		binary, "-addr", addr, "-data-dir", dir)
+	cmd.Dir = dir
+	env := cmd.Environ()
+	cmd.Env = make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, capacityControlEnv+"=") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	if mode == "live" {
+		cmd.Env = append(cmd.Env, capacityControlEnv+"=1")
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	gate, err := cmd.StdinPipe()
@@ -236,7 +249,7 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 					return err
 				}
 				start := time.Now()
-				p, base, err := startChild(binary, dir, group)
+				p, base, err := startChild(binary, dir, group, o.mode)
 				if err != nil {
 					return err
 				}

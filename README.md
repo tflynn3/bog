@@ -8,7 +8,21 @@ mkdir -m 700 ./data
 ./bog -data-dir ./data -addr 127.0.0.1:8080
 ```
 
-`-data-dir` must be an existing directory. `-addr` defaults to `127.0.0.1:8080`. The standalone server has no authentication or per-stream isolation. Anyone who can reach it can ingest and query all data. When binding to a non-loopback address, restrict access to a trusted network or use an authenticated access layer. A process holds an exclusive lock on the directory until exit. `GET /healthz` returns 200 once the WAL has been replayed and the server is listening.
+`-data-dir` must be an existing directory owned by the service user.
+`-addr` defaults to `127.0.0.1:8080`. The standalone server has no authentication
+or per-stream isolation. Anyone who can reach it can ingest and query all data.
+When binding to a non-loopback address, restrict access to a trusted network or
+use an authenticated access layer. Start only one Bog process per data
+directory. The process acquires the exclusive directory lock before recovery
+and opens the listener after recovery succeeds. In a second shell, run
+`curl -fsS --max-time 2 http://127.0.0.1:8080/healthz` to check liveness and
+`curl -fsS --max-time 2 http://127.0.0.1:8080/ready` to check write readiness.
+On startup failure, inspect the server's stderr for the recovery or listen error.
+
+Fresh WAL bootstrap requires Linux `renameat2` with `RENAME_NOREPLACE`
+support on the data filesystem. On every startup the service user must
+be able to open and sync the immediate parent of the pinned data directory.
+If the data path is a symlink, check the parent of the directory it resolves to.
 
 ```sh
 printf '%s\n' '{"ts":"2025-01-01T00:00:00.123456789Z","line":"hello"}' | curl -X POST localhost:8080/ingest --data-binary @-
@@ -34,12 +48,26 @@ curl -i 'localhost:8080/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00
 
 The cursor captures published rows at the first request; later appends do not appear in that walk. Rows with identical timestamps retain append order, including duplicates. Bounds may use equivalent time zones, `contains` must be identical (omission means empty), and `limit` may change between requests. The final page has no cursor header. Cursors are authenticated, expire when the process restarts, and invalid or mismatched cursors return 400. `page` accepts only `1`, and cannot be combined with `cursor`; an empty cursor is invalid. First-page requests must leave room within the 1 MiB request header limit for a continuation cursor and ordinary headers; oversized queries return 400. The encoded NDJSON body is limited to 32 MiB by default; set `-query-max-response-bytes` to change it. The limit includes JSON escaping and each record’s newline. An ordinary query may return a short 200 response without a cursor when the byte limit is reached. If the first matching record cannot fit, the server returns 422; increase the limit to retrieve it. Use `page=1` and follow `Bog-Next-Cursor` as shown above to retrieve the full snapshot. See [query response limits](docs/query-response-limits.md).
 
+On Linux with Go, curl, and lsof installed, run
+`docs/examples/pagination/walkthrough.sh` from the repository root for a
+fresh-store example. It starts a local Bog process, follows a two-page walk,
+and checks that the final page has no cursor.
+[Pagination walkthrough](docs/examples/pagination/README.md)
+
+Encode the plus sign in a positive RFC3339 timezone offset as `%2B`.
+This request starts a walk over January 1, 2025 UTC.
+
+```sh
+curl -i 'http://127.0.0.1:8080/query?start=2025-01-01T05:30:00%2B05:30&end=2025-01-02T05:30:00%2B05:30&page=1&limit=1'
+```
+
 ## Retained-history cutover
 
 The [cutover decision](docs/adr/0004-retained-history-cutover.md) specifies
-the operating contract for the integrated release. Use a qualified
-cutover binary for the steps below. The legacy binary rejects restored
-images before opening the legacy WAL.
+the operating contract for the integrated release. The Linux tree at the
+pinned integration base rejects restored images before opening the legacy
+WAL. The steps below require the composed cutover binary. Release
+qualification remains pending through the #60 readiness handoff.
 
 ### Activate a verified restore
 
@@ -68,11 +96,12 @@ A first page pins one generation and its committed tail. Its cursor keeps
 reading that view through generation replacement while the capture is live.
 An expired capture returns 410. After expiry or restart, start a fresh walk
 with `page=1` on the serving process. A byte-limited page resumes just after
-its last emitted row. If the work budget prevents the server from preparing a
-page, it returns 503 with no rows or next cursor. Retry a continuation with
-the cursor from the original request while its capture is live. Lowering
-`limit` can help when a page has many matches. A sparse scan may require a
-larger server work budget.
+its last emitted row. Before issuing a cursor, the server certifies that
+the walk can finish within the configured per-request budgets, including
+when you lower `limit` on resume. If certification runs out of work, the
+first request returns 503 with no rows or cursor. A sparse scan may require
+a larger server work budget. If a continuation is interrupted, retry with
+the cursor from the original request while its capture is live.
 
 ### Opt in to capacity verification
 

@@ -1,13 +1,15 @@
 # ADR 0008 — Release verifier composition
 
-**Status** — Cycle 52 decision. Production-client verification and
-retained runtime wiring are pending at
-`d67892082f0ea3e9a951e55076d5eb80127bf031`.
+**Status** — Accepted composition decision. #61 landed on main at
+`3a28f26d322a777a423692f241ac962adf757e8d`. The Linux inventory with #59 and
+#61 applied to the pinned base confirms the production verifier edge.
+Full runtime composition awaits #53, and qualification follows #60.
 
 ## Release gate
 
-#53 remains the retained-history release gate. Compose its runtime wiring
-with #59 and qualify the Linux candidate built from the full composed SHA.
+#53 remains the retained-history cutover gate. Compose its runtime wiring
+with #59 and #61. Qualify the Linux candidate built from the full composed
+SHA after the #60 active-filesystem readiness handoff.
 Admission, Linux durability and active-filesystem readiness, live capacity,
 and restored parity all exercise the same binary. The gate binds every
 required report to that revision, the binary SHA-256, and the
@@ -36,6 +38,14 @@ after restart. Keep raw HTTP and socket probes for evidence that depends
 on the wire, including the slow-reader admission probe and clean rejection
 with no NDJSON rows or cursor.
 
+#61 uses `FetchPage` for fixed-budget walks and restored parity. A transport
+observer retains response metadata for media type, cursor trailers, and
+clean initial 503 checks. The only measured root-module production import
+change is `verify/release → internal/client`. Restored parity filters the
+fixture's append ledger and sorts it stably by timestamp to produce its
+expected rows. The independent oracle stays outside the verifier's import
+graph in this revision.
+
 Derive expected rows from fixture inputs and the verifier's ledger of
 acknowledged appends. The append-log oracle in `verify/query-model` computes
 membership from the captured prefix using half-open time bounds and a
@@ -53,23 +63,22 @@ must have no direct or transitive path to the server command, its wired
 or staged implementation libraries, or `internal/client`. A registered
 intermediary still falls under this rule. Test-only adapters may import
 implementation packages to exercise them against the independent model.
-Use the existing architecture registry for package roles, exact direct
-imports, orphan governance, and acyclicity.
+Use the architecture registry for package roles, exact direct imports,
+orphan governance, and acyclicity. Check oracle independence on the
+observed Linux production graph, including transitive paths through
+external dependencies.
 
 ## Graph updates and handoff
 
-Core engineering owns #59, client release integration, and architecture
-fitness. `bog-storage` owns #53 and the recovery and publication lifecycle.
+`bog` owns #59, #61 client release integration, and architecture fitness.
+`bog-storage` owns #53 and the recovery and publication lifecycle.
 Review the ADR 0006 and 0007 interfaces together before composition,
 including commit and capture ordering, deterministic replay, expiry, and
 reference ownership.
 
-Record actual Linux production imports with the changes that introduce or
-retire them. Core engineering owns the verifier's production client edge
-and any production import of the oracle. For #53 composition, core
-engineering and `bog-storage` coordinate the measured revision, diagram,
-and role registry under the wiring PR's leases. Measure the graph after
-composing #53 and #59, promote the staged libraries reached by the server,
-and remove stale entries. Run the architecture suite and Linux build on
-the composed tree before dispatching the release gate.
+Register the measured client edge with the #61 source in the integration
+tree. Once #53 supplies the runtime wiring, measure the combined Linux
+imports and run architecture fitness and the Linux cross-build on that tree.
+Slipway runs the Linux integration verifier. Full qualification stays
+pending through #60.
 [System architecture](../architecture/SYSTEM.md#fitness-and-registry-ownership)

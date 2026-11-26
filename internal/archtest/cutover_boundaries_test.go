@@ -6,22 +6,10 @@ import (
 	"testing"
 )
 
-func TestHTTPPagingBoundary(t *testing.T) {
-	t.Parallel()
-	for _, problem := range pagingBoundaryProblems(registry) {
-		t.Error(problem)
-	}
-}
-
-// TestLinuxArchitecture checks that the registry exactly matches the Linux
-// production graph within the root module. Check the paging seam independently
-// so registering every edge of a bypass still fails the suite.
-func pagingBoundaryProblems(rules map[string]rule) []string {
+// Use actual production imports so every path through the HTTP seam is checked,
+// including paths with unregistered edges.
+func pagingBoundaryProblems(packages map[string]listedPackage) []string {
 	const httpapi = "bog/internal/httpapi"
-	packages := make(map[string]listedPackage, len(rules))
-	for path, entry := range rules {
-		packages[path] = listedPackage{Imports: entry.imports}
-	}
 	reached := reachableImports(packages, httpapi)
 
 	var problems []string
@@ -39,6 +27,7 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 		adapter    = "bog/internal/retainedpages"
 		backup     = "bog/internal/backup"
 		checkpoint = "bog/internal/checkpoint"
+		external   = "example.com/page-bridge"
 		history    = "bog/internal/history"
 		httpapi    = "bog/internal/httpapi"
 		store      = "bog/internal/store"
@@ -57,6 +46,7 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 		{name: "command injects adapter"},
 		{name: "HTTP imports adapter", bypassFrom: httpapi, want: wantBypass},
 		{name: "HTTP reaches adapter through WAL", bypassFrom: wal, want: wantBypass},
+		{name: "HTTP reaches adapter through an external package", bypassFrom: external, want: wantBypass},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -71,7 +61,7 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 				store:      {runtimeLibrary, nil},
 				wal:        {runtimeLibrary, []string{store}},
 			}
-			if tt.bypassFrom != "" {
+			if tt.bypassFrom != "" && tt.bypassFrom != external {
 				entry := rules[tt.bypassFrom]
 				entry.imports = append(entry.imports, adapter)
 				rules[tt.bypassFrom] = entry
@@ -84,11 +74,15 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 				}
 				packages[path] = productionPackage(name, entry.imports...)
 			}
+			if tt.bypassFrom == external {
+				packages[httpapi] = productionPackage("httpapi", store, wal, external)
+				packages[external] = listedPackage{Imports: []string{adapter}}
+			}
 			if problems := architectureProblems(packages, rules); len(problems) != 0 {
 				t.Fatalf("fixture violates the existing architecture rules: %v", problems)
 			}
-			if got := pagingBoundaryProblems(rules); !slices.Equal(got, tt.want) {
-				t.Errorf("pagingBoundaryProblems() = %q, want %q", got, tt.want)
+			if got := linuxGraphProblems(packages, rules); !slices.Equal(got, tt.want) {
+				t.Errorf("linuxGraphProblems() = %q, want %q", got, tt.want)
 			}
 		})
 	}

@@ -51,7 +51,8 @@ func newDiagnosticSink() *diagnosticSink {
 	return s
 }
 
-// ReportRollback hands an event to the delivery worker without waiting for space.
+// ReportRollback is defined in internal/wal/diagnostics.go.
+// It hands an event to the delivery worker without waiting for space.
 // A full or stopped queue drops the new event and increments DiagnosticsDropped.
 func ReportRollback(op OpCode, err error) {
 	category := ErrorOther

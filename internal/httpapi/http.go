@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -30,6 +31,7 @@ type API struct {
 	slots            chan struct{}
 	maxResponseBytes int
 	queryWorkBudget  uint64
+	cursorKey        [32]byte
 }
 
 const (
@@ -50,8 +52,13 @@ func NewWithQueryMaxResponseBytes(s *store.Store, w appender, maxBytes int) http
 // NewWithQueryLimits limits response bytes, concurrent queries, and work per query.
 // Admission returns 503 "query capacity exhausted" and the work limit returns
 // 503 "query work budget exhausted". Cancellation detected before response
-// commit returns 408 "request cancelled". These errors use plain text.
+// commit returns 408 "request cancelled". These errors use plain text. Each
+// handler has its own signing key for continuation cursors.
 func NewWithQueryLimits(s *store.Store, w appender, maxBytes, concurrency int, workBudget uint64) http.Handler {
+	return newAPI(s, w, maxBytes, workBudget).handler(concurrency)
+}
+
+func newAPI(s *store.Store, w appender, maxBytes int, workBudget uint64) *API {
 	if maxBytes <= 0 {
 		panic("query response byte limit must be positive")
 	}
@@ -62,12 +69,20 @@ func NewWithQueryLimits(s *store.Store, w appender, maxBytes, concurrency int, w
 		store: s, wal: w, fatal: func() { os.Exit(1) }, slots: make(chan struct{}, 16),
 		maxResponseBytes: maxBytes, queryWorkBudget: workBudget,
 	}
+	if _, err := rand.Read(a.cursorKey[:]); err != nil {
+		panic(err)
+	}
+	return a
+}
+
+func (a *API) handler(concurrency int) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.health)
 	mux.HandleFunc("/ingest", a.ingest)
 	query := queryAdmission(concurrency, http.HandlerFunc(a.query))
 	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
@@ -77,13 +92,16 @@ func NewWithQueryLimits(s *store.Store, w appender, maxBytes, concurrency int, w
 }
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(http.StatusOK)
 }
 func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -124,14 +142,6 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-var cursorKey = func() []byte {
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		panic(err)
-	}
-	return key
-}()
-
 type cursorData struct {
 	Version  int               `json:"v"`
 	Start    time.Time         `json:"start"`
@@ -141,8 +151,8 @@ type cursorData struct {
 	After    store.Position    `json:"after"`
 }
 
-func containsDigest(value string) [sha256.Size]byte {
-	mac := hmac.New(sha256.New, cursorKey)
+func (a *API) containsDigest(value string) [sha256.Size]byte {
+	mac := hmac.New(sha256.New, a.cursorKey[:])
 	mac.Write([]byte("bog-filter-v1\x00"))
 	mac.Write([]byte(value))
 	var digest [sha256.Size]byte
@@ -150,24 +160,27 @@ func containsDigest(value string) [sha256.Size]byte {
 	return digest
 }
 
-func encodeCursor(c cursorData) (string, error) {
+func (a *API) encodeCursor(c cursorData) (string, error) {
 	b, err := json.Marshal(c)
 	if err != nil {
 		return "", err
 	}
-	mac := hmac.New(sha256.New, cursorKey)
+	mac := hmac.New(sha256.New, a.cursorKey[:])
 	mac.Write([]byte("bog-cursor-v1\x00"))
 	mac.Write(b)
 	return base64.RawURLEncoding.EncodeToString(append(b, mac.Sum(nil)...)), nil
 }
-func decodeCursor(token string) (cursorData, error) {
+func (a *API) decodeCursor(token string) (cursorData, error) {
 	var c cursorData
+	if len(token) > base64.RawURLEncoding.EncodedLen(2048) {
+		return c, errors.New("invalid cursor")
+	}
 	b, err := base64.RawURLEncoding.Strict().DecodeString(token)
 	if err != nil || len(b) <= sha256.Size || len(b) > 2048 {
 		return c, errors.New("invalid cursor")
 	}
 	payload, sig := b[:len(b)-sha256.Size], b[len(b)-sha256.Size:]
-	mac := hmac.New(sha256.New, cursorKey)
+	mac := hmac.New(sha256.New, a.cursorKey[:])
 	mac.Write([]byte("bog-cursor-v1\x00"))
 	mac.Write(payload)
 	if !hmac.Equal(sig, mac.Sum(nil)) || json.Unmarshal(payload, &c) != nil || c.Version != 1 {
@@ -249,10 +262,14 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 				writeQueryError(w, err)
 				return
 			}
-			c, err := decodeCursor(cursor[0])
-			digest = containsDigest(contains)
-			if err != nil || !c.Start.Equal(start) || !c.End.Equal(end) || c.Contains != digest {
-				http.Error(w, "invalid cursor", 400)
+			c, err := a.decodeCursor(cursor[0])
+			if err != nil {
+				http.Error(w, "invalid cursor", http.StatusBadRequest)
+				return
+			}
+			digest = a.containsDigest(contains)
+			if !c.Start.Equal(start) || !c.End.Equal(end) || c.Contains != digest {
+				http.Error(w, "invalid cursor", http.StatusBadRequest)
 				return
 			}
 			count, anchor = &c.Count, &c.After
@@ -279,14 +296,15 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	response := queryResponse{maxBytes: a.maxResponseBytes}
 	emitted := 0
 	for _, row := range rows {
-		fits, err := response.appendRow(row, work)
+		fits, required, err := response.appendRow(row, work)
 		if err != nil {
 			writeQueryError(w, err)
 			return
 		}
 		if !fits {
 			if emitted == 0 {
-				http.Error(w, "query record exceeds response byte limit", http.StatusUnprocessableEntity)
+				message := fmt.Sprintf("query record exceeds response byte limit (cap %d bytes, requires %d bytes)", a.maxResponseBytes, required)
+				http.Error(w, message, http.StatusUnprocessableEntity)
 				return
 			}
 			break
@@ -317,16 +335,16 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 				writeQueryError(w, err)
 				return
 			}
-			digest = containsDigest(contains)
+			digest = a.containsDigest(contains)
 		}
-		token, err = encodeCursor(cursorData{1, start, end, digest, captured, *next})
+		token, err = a.encodeCursor(cursorData{1, start, end, digest, captured, *next})
 		if err != nil {
 			writeQueryError(w, err)
 			return
 		}
 	}
 	// Reserve the entire encoded body before committing status or cursor.
-	delivery := (uint64(len(response.body)) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit
+	delivery := (uint64(response.size) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit
 	if err := work.Charge(delivery); err != nil {
 		writeQueryError(w, err)
 		return
@@ -335,9 +353,13 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Bog-Next-Cursor", token)
 	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	if _, err := w.Write(response.body); err != nil {
-		// The response may already be committed. Return and release the slot.
-		return
+	w.Header().Set("Content-Length", strconv.Itoa(response.size))
+	w.WriteHeader(http.StatusOK)
+	for _, record := range response.rows {
+		if n, err := w.Write(record); err != nil || n != len(record) {
+			// Headers are committed. A short body is detectable by the client.
+			return
+		}
 	}
 }
 

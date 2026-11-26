@@ -120,16 +120,16 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 	s := new(store.Store)
 	s.Publish([]store.Row{row, row, row, row, row})
 	const line = "{\"ts\":\"2025-01-01T00:00:01Z\",\"line\":\"same\"}\n"
-	handler := func(budget uint64) http.Handler { return NewWithQueryLimits(s, nil, 2*len(line), 1, budget) }
+	makeAPI := func(budget uint64) *API { return newAPI(s, nil, 2*len(line), budget) }
 	query := func(h http.Handler, params string) *httptest.ResponseRecorder {
 		out := httptest.NewRecorder()
 		h.ServeHTTP(out, httptest.NewRequest("GET", queryBounds+params, nil))
 		return out
 	}
-	assertPage := func(out *httptest.ResponseRecorder, lines, ordinal int) string {
+	assertPage := func(a *API, out *httptest.ResponseRecorder, lines, ordinal int) string {
 		t.Helper()
 		token := out.Header().Get("Bog-Next-Cursor")
-		c, err := decodeCursor(token)
+		c, err := a.decodeCursor(token)
 		if out.Code != 200 || out.Body.String() != strings.Repeat(line, lines) || err != nil || c.Count != 5 || c.After.Ordinal != ordinal {
 			t.Fatalf("page: status=%d headers=%v body=%q cursor=%+v err=%v", out.Code, out.Header(), out.Body.String(), c, err)
 		}
@@ -155,22 +155,27 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 		{"response delivery", firstPass + extension + encoding + rescan + delivery - 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			assertQueryRejection(t, query(handler(tc.budget), "&page=1&limit=5"), 503, "query work budget exhausted")
+			assertQueryRejection(t, query(makeAPI(tc.budget).handler(1), "&page=1&limit=5"), 503, "query work budget exhausted")
 		})
 	}
-	assertPage(query(handler(firstPass+extension+encoding+rescan+delivery), "&page=1&limit=5"), 2, 1)
-	token := assertPage(query(handler(firstPass+encodingPerRow+deliveryPerRow), "&page=1&limit=1"), 1, 0)
+	a := makeAPI(firstPass + extension + encoding + rescan + delivery)
+	assertPage(a, query(a.handler(1), "&page=1&limit=5"), 2, 1)
+	a = makeAPI(firstPass + encodingPerRow + deliveryPerRow)
+	h := a.handler(1)
+	token := assertPage(a, query(h, "&page=1&limit=1"), 1, 0)
 
 	auth := 1 + uint64(len(token))
-	assertQueryRejection(t, query(handler(auth-1), "&cursor="+token+"&limit=2"), 503, "query work budget exhausted")
+	path := "&cursor=" + token
+	// Vary the work budget between synchronous requests to the same issuer.
+	a.queryWorkBudget = auth - 1
+	assertQueryRejection(t, query(h, path+"&limit=2"), 503, "query work budget exhausted")
 	const continuationRescan = rescan + 5
 	continuationCost := auth + extension + encoding + continuationRescan + delivery
-	h := handler(continuationCost - 1)
-	fullPage := "&cursor=" + token + "&limit=4"
-	assertQueryRejection(t, query(h, fullPage), 503, "query work budget exhausted")
-	assertPage(query(handler(continuationCost), fullPage), 2, 2)
-	// The same cursor can be retried on the same handler with a smaller page.
-	assertPage(query(h, "&cursor="+token+"&limit=2"), 2, 2)
+	a.queryWorkBudget = continuationCost - 1
+	assertQueryRejection(t, query(h, path+"&limit=4"), 503, "query work budget exhausted")
+	assertPage(a, query(h, path+"&limit=2"), 2, 2)
+	a.queryWorkBudget = continuationCost
+	assertPage(a, query(h, path+"&limit=4"), 2, 2)
 }
 
 type queryScanContext struct {

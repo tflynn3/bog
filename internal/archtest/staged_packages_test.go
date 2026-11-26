@@ -41,6 +41,7 @@ func TestStagedPackageDeclarations(t *testing.T) {
 
 // TestLinuxArchitecture validates the roles against measured Linux production
 // reachability. This check gives each staged role a reviewable activation plan.
+// Promotion follows server reachability, including transitive imports.
 func stagedPackageProblems(rules map[string]rule, declarations map[string]stagingDeclaration) []string {
 	var problems []string
 	for _, path := range slices.Sorted(maps.Keys(rules)) {
@@ -73,8 +74,21 @@ func stagedPackageProblems(rules map[string]rule, declarations map[string]stagin
 
 func TestStagedPackageDeclarationFixtures(t *testing.T) {
 	t.Parallel()
-	const backup = "bog/internal/backup"
+	const (
+		backup      = "bog/internal/backup"
+		checkpoint  = "bog/internal/checkpoint"
+		history     = "bog/internal/history"
+		idempotency = "bog/internal/idempotency"
+	)
 	valid := stagingDeclaration{owner: "bog-storage", activation: "Prove verified writable restore and restart parity."}
+	cutover := map[string]rule{
+		server:      {serverCommand, []string{backup, history}},
+		backup:      {role: runtimeLibrary},
+		checkpoint:  {role: runtimeLibrary},
+		history:     {runtimeLibrary, []string{checkpoint}},
+		idempotency: {role: staged},
+	}
+	retries := stagingDeclaration{owner: "bog-storage", activation: "Commit retry records with their batches."}
 	tests := []struct {
 		name         string
 		rules        map[string]rule
@@ -126,6 +140,25 @@ func TestStagedPackageDeclarationFixtures(t *testing.T) {
 				backup:          {role: staged},
 			},
 			declarations: map[string]stagingDeclaration{backup: valid},
+		},
+		{
+			name:         "retained composition leaves keyed retries staged",
+			rules:        cutover,
+			declarations: map[string]stagingDeclaration{idempotency: retries},
+		},
+		{
+			name:  "transitively wired checkpoint rejects a stale declaration",
+			rules: cutover,
+			declarations: map[string]stagingDeclaration{
+				checkpoint:  {owner: "bog-storage", activation: "Publish durable generations."},
+				idempotency: retries,
+			},
+			want: []string{"stale staging declaration for " + checkpoint + ": package is registered as runtime library"},
+		},
+		{
+			name:  "cutover still requires the keyed retry declaration",
+			rules: cutover,
+			want:  []string{"staged package " + idempotency + " has no staging declaration"},
 		},
 	}
 	for _, tt := range tests {

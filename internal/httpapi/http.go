@@ -32,6 +32,7 @@ type API struct {
 }
 
 const DefaultQueryMaxResponseBytes = 32 << 20
+const DefaultQueryConcurrency = 8
 
 func New(s *store.Store, w appender) http.Handler {
 	return NewWithQueryMaxResponseBytes(s, w, DefaultQueryMaxResponseBytes)
@@ -39,6 +40,11 @@ func New(s *store.Store, w appender) http.Handler {
 
 // NewWithQueryMaxResponseBytes sets the maximum encoded NDJSON body size.
 func NewWithQueryMaxResponseBytes(s *store.Store, w appender, maxBytes int) http.Handler {
+	return NewWithQueryLimits(s, w, maxBytes, DefaultQueryConcurrency)
+}
+
+// NewWithQueryLimits sets the response byte cap and concurrent query limit.
+func NewWithQueryLimits(s *store.Store, w appender, maxBytes, concurrency int) http.Handler {
 	if maxBytes <= 0 {
 		panic("query response byte limit must be positive")
 	}
@@ -46,7 +52,14 @@ func NewWithQueryMaxResponseBytes(s *store.Store, w appender, maxBytes int) http
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.health)
 	mux.HandleFunc("/ingest", a.ingest)
-	mux.HandleFunc("/query", a.query)
+	query := queryAdmission(concurrency, http.HandlerFunc(a.query))
+	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		query.ServeHTTP(w, r)
+	})
 	return mux
 }
 func (a *API) health(w http.ResponseWriter, r *http.Request) {

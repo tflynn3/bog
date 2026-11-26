@@ -1,18 +1,14 @@
 package wal
 
 import (
-	"bufio"
-	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 	"os"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 
 	"bog/internal/store"
@@ -32,22 +28,25 @@ type file interface {
 	Close() error
 }
 type Log struct {
-	mu             sync.Mutex
-	cond           *sync.Cond
-	queue          []*appendRequest
-	running        bool
-	f              file
-	s              *store.Store
-	offset         int64
-	poisoned       bool
-	closed         bool
-	closeDone      bool
-	closeErr       error
-	committed      bool
-	root           *os.Root
-	dir            *os.File
-	syncDir        func() error
-	lastDiagnostic time.Time
+	mu        sync.Mutex
+	cond      *sync.Cond
+	queue     []*appendRequest
+	running   bool
+	f         file
+	s         *store.Store
+	offset    int64
+	poisoned  error
+	closed    bool
+	closeDone bool
+	closeErr  error
+
+	root            *os.Root
+	dir             *os.File
+	syncDir         func() error
+	lastOutcome     atomic.Pointer[CommitOutcome]
+	lastDiagnostic  time.Time
+	diagnosticDrops atomic.Uint64
+	diagnostics     *diagnosticDispatcher
 }
 
 const maxGroup = 16
@@ -58,277 +57,6 @@ type appendRequest struct {
 	done    chan error
 }
 
-func openRegular(dir *os.File, name string, flags int) (*os.File, error) {
-	fd, err := openat(int(dir.Fd()), name, flags|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0600)
-	var f *os.File
-	if err == nil {
-		f = os.NewFile(uintptr(fd), name)
-	}
-	if err != nil {
-		return nil, err
-	}
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		f.Close()
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("%s is not a regular file", name)
-	}
-	if st, ok := info.Sys().(*syscall.Stat_t); !ok || st.Nlink != 1 || st.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0022 != 0 {
-		f.Close()
-		return nil, fmt.Errorf("%s has unsafe ownership, permissions, or link count", name)
-	}
-	return f, nil
-}
-
-// openParent resolves the parent of the pinned directory, not the parent of
-// the spelling used to reach it (which may be "." or a symlink).
-func openParent(dir *os.File) (*os.File, error) {
-	fd, err := openat(int(dir.Fd()), "..", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	return os.NewFile(uintptr(fd), "data directory parent"), nil
-}
-
-func Open(dir string, s *store.Store) (*Log, error) {
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return nil, err
-	}
-	success := false
-	defer func() {
-		if !success {
-			root.Close()
-		}
-	}()
-	d, err := root.Open(".")
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if !success {
-			d.Close()
-		}
-	}()
-	info, err := d.Stat()
-	if err != nil {
-		return nil, err
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || st.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0022 != 0 {
-		return nil, errors.New("data directory must be owned by the service user and not group- or world-writable")
-	}
-	// Lock the pinned directory inode, not a replaceable pathname in it.
-	if err = syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, err
-	}
-	f, err := openRegular(d, "bog.wal", os.O_RDWR)
-	if errors.Is(err, os.ErrNotExist) {
-		// Never create a replacement WAL when a commit marker already exists.
-		if _, markerErr := root.Lstat("bog.commit"); markerErr == nil {
-			return nil, errors.New("commit marker without WAL")
-		} else if !errors.Is(markerErr, os.ErrNotExist) {
-			return nil, markerErr
-		}
-		var id [16]byte
-		_, err = rand.Read(id[:])
-		if err == nil {
-			name := ".bog-wal-init-" + hex.EncodeToString(id[:])
-			var tmp *os.File
-			tmp, err = openRegular(d, name, os.O_CREATE|os.O_EXCL|os.O_RDWR)
-			if err == nil {
-				defer root.Remove(name)
-				err = writeAll(tmp, []byte(magic))
-				if err == nil {
-					err = tmp.Sync()
-				}
-				if e := tmp.Close(); err == nil {
-					err = e
-				}
-				if err == nil {
-					err = renameNoReplace(d, name, "bog.wal")
-				}
-				if err == nil || errors.Is(err, os.ErrExist) {
-					f, err = openRegular(d, "bog.wal", os.O_RDWR)
-				}
-			}
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-	if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
-		return nil, err
-	}
-	l := &Log{f: f, s: s, root: root, dir: d, syncDir: d.Sync}
-	// The parent directory must persist the data directory's own entry as well.
-	parent, err := openParent(d)
-	if err == nil {
-		err = parent.Sync()
-		if e := parent.Close(); err == nil {
-			err = e
-		}
-	}
-	if err != nil {
-		l.Close()
-		return nil, err
-	}
-	var committedEnd int64 = -1
-	marker, err := openRegular(d, "bog.commit", os.O_RDONLY)
-	hasMarker := err == nil
-	l.committed = hasMarker
-	if err == nil {
-		b, e := io.ReadAll(io.LimitReader(marker, 25))
-		marker.Close()
-		if e != nil || len(b) != 24 || string(b[:8]) != "BOGCMT01" || binary.LittleEndian.Uint64(b[16:]) != ^binary.LittleEndian.Uint64(b[8:16]) {
-			l.Close()
-			return nil, errors.New("invalid commit marker")
-		}
-		end := binary.LittleEndian.Uint64(b[8:])
-		size, e := f.Seek(0, io.SeekEnd)
-		if e != nil || end < uint64(len(magic)) || end > uint64(size) {
-			l.Close()
-			return nil, errors.New("invalid committed offset")
-		}
-		committedEnd = int64(end)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		l.Close()
-		return nil, err
-	}
-	if !hasMarker {
-		size, e := f.Seek(0, io.SeekEnd)
-		if e != nil || size != int64(len(magic)) {
-			l.Close()
-			return nil, errors.New("missing commit marker for populated WAL")
-		}
-		committedEnd = int64(len(magic))
-	}
-	builder := store.NewRecoveryBuilder()
-	if err = l.replay(committedEnd, builder); err != nil {
-		l.Close()
-		return nil, err
-	}
-	if hasMarker {
-		size, e := f.Seek(0, io.SeekEnd)
-		if e == nil && size > committedEnd {
-			e = f.Truncate(committedEnd)
-			if e == nil {
-				e = f.Sync()
-			}
-		}
-		if e == nil {
-			_, e = f.Seek(committedEnd, io.SeekStart)
-		}
-		if e != nil {
-			l.Close()
-			return nil, e
-		}
-	}
-	if !hasMarker {
-		// Persist the WAL and its entry before establishing the first marker.
-		// This also repairs a magic-only bootstrap left by an earlier crash.
-		if err = f.Sync(); err == nil {
-			err = d.Sync()
-		}
-		if err == nil {
-			_, err = l.commit(l.offset)
-		}
-		if err != nil {
-			l.Close()
-			return nil, err
-		}
-	}
-	// Persist directory metadata before readiness without replacing an existing
-	// marker, so an intact store can reopen even when no blocks are free.
-	if err = d.Sync(); err != nil {
-		l.Close()
-		return nil, err
-	}
-	builder.Install(s)
-	success = true
-	return l, nil
-}
-func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
-	info, err := l.f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
-	}
-	if end >= 0 {
-		info = end
-	}
-	if _, err = l.f.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	reader := bufio.NewReaderSize(io.LimitReader(l.f, info), 64*1024)
-	header := make([]byte, len(magic))
-	if _, err = io.ReadFull(reader, header); err != nil || string(header) != magic {
-		return errors.New("invalid WAL magic")
-	}
-	pos := int64(len(magic))
-	var payload []byte
-	var h [16]byte
-	for pos < info {
-		if info-pos < 16 {
-			return l.recoverTail(pos)
-		}
-		_, err = io.ReadFull(reader, h[:])
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return l.recoverTail(pos)
-		}
-		if err != nil {
-			return err
-		}
-		if crc32.Checksum(h[:12], table) != binary.LittleEndian.Uint32(h[12:]) {
-			return fmt.Errorf("invalid WAL header checksum at %d", pos)
-		}
-		n := binary.LittleEndian.Uint32(h[:])
-		if n == 0 || n > store.MaxBatch || binary.LittleEndian.Uint32(h[4:]) != ^n {
-			return fmt.Errorf("invalid WAL header at %d", pos)
-		}
-		if int64(n) > info-pos-16 {
-			return l.recoverTail(pos)
-		}
-		if cap(payload) < int(n) {
-			payload = make([]byte, n)
-		} else {
-			payload = payload[:n]
-		}
-		_, err = io.ReadFull(reader, payload)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return l.recoverTail(pos)
-		}
-		if err != nil {
-			return err
-		}
-		if crc32.Checksum(payload, table) != binary.LittleEndian.Uint32(h[8:]) {
-			return fmt.Errorf("invalid WAL checksum at %d", pos)
-		}
-		if err := builder.DecodeFrame(payload); err != nil {
-			return fmt.Errorf("invalid WAL payload at %d: %w", pos, err)
-		}
-		pos += 16 + int64(n)
-	}
-	l.offset = pos
-	_, err = l.f.Seek(pos, io.SeekStart)
-	return err
-}
-func (l *Log) recoverTail(pos int64) error {
-	if l.committed {
-		return errors.New("incomplete committed frame")
-	}
-	if err := l.f.Truncate(pos); err != nil {
-		return err
-	}
-	if err := l.f.Sync(); err != nil {
-		return err
-	}
-	l.offset = pos
-	_, err := l.f.Seek(pos, io.SeekStart)
-	return err
-}
 func writeAll(w io.Writer, p []byte) error {
 	for len(p) > 0 {
 		n, err := w.Write(p)
@@ -352,21 +80,29 @@ func (l *Log) initCond() {
 }
 
 // Append waits for admission and for its entire batch to become durable and visible.
+// Callers must keep payload and rows unmodified until Append returns.
 func (l *Log) Append(payload []byte, rows []store.Row) error {
 	l.mu.Lock()
+	err := l.admissionError()
+	l.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	decoded, err := matchBatch(payload, rows)
+	if err != nil {
+		return err
+	}
+
+	l.mu.Lock()
 	l.initCond()
-	for len(l.queue) >= maxGroup && !l.closed && !l.poisoned {
+	for len(l.queue) >= maxGroup && l.admissionError() == nil {
 		l.cond.Wait()
 	}
-	if l.poisoned {
+	if err := l.admissionError(); err != nil {
 		l.mu.Unlock()
-		return ErrUncertain
+		return err
 	}
-	if l.closed {
-		l.mu.Unlock()
-		return os.ErrClosed
-	}
-	req := &appendRequest{payload: payload, rows: rows, done: make(chan error, 1)}
+	req := &appendRequest{payload: payload, rows: decoded, done: make(chan error, 1)}
 	l.queue = append(l.queue, req)
 	if !l.running {
 		l.running = true
@@ -374,6 +110,35 @@ func (l *Log) Append(payload []byte, rows []store.Row) error {
 	}
 	l.mu.Unlock()
 	return <-req.done
+}
+
+// Use the same canonical rows for live publication and recovery.
+func matchBatch(payload []byte, rows []store.Row) ([]store.Row, error) {
+	decoded, err := store.Decode(payload)
+	if err != nil {
+		return nil, fmt.Errorf("invalid WAL batch: %w", err)
+	}
+	if len(decoded) != len(rows) {
+		return nil, errors.New("WAL batch row count differs from payload")
+	}
+	for i, row := range decoded {
+		if !row.TS.Equal(rows[i].TS) || row.Line != rows[i].Line {
+			return nil, fmt.Errorf("WAL batch row %d differs from payload", i)
+		}
+	}
+	return decoded, nil
+}
+
+// admissionError is called under mu. Preserve the uncertainty cause for queued
+// and future callers as well as for the group that encountered it.
+func (l *Log) admissionError() error {
+	if l.poisoned != nil {
+		return l.poisoned
+	}
+	if l.closed {
+		return os.ErrClosed
+	}
+	return nil
 }
 
 func (l *Log) run() {
@@ -390,15 +155,20 @@ func (l *Log) run() {
 		l.cond.Broadcast()
 		l.mu.Unlock()
 
-		err := l.appendGroup(group)
+		operation, err := l.appendGroup(group)
+		outcome := newCommitOutcome(operation, err)
 		l.mu.Lock()
-		if errors.Is(err, ErrUncertain) {
-			l.poisoned = true
+		l.lastOutcome.Store(&outcome)
+		if outcome.State == CommitUncertain {
+			l.poisoned = err
 			for _, req := range l.queue {
-				req.done <- ErrUncertain
+				req.done <- err
 			}
 			l.queue = nil
 			l.cond.Broadcast()
+		}
+		if outcome.State == CommitRolledBack {
+			l.diagnoseRollback(outcome)
 		}
 		for _, req := range group {
 			req.done <- err
@@ -407,7 +177,7 @@ func (l *Log) run() {
 	}
 }
 
-func (l *Log) appendGroup(group []*appendRequest) error {
+func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 	next := l.offset
 	for _, req := range group {
 		var h [16]byte
@@ -417,96 +187,45 @@ func (l *Log) appendGroup(group []*appendRequest) error {
 		binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(req.payload, table))
 		binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
 		if err := writeAll(l.f, h[:]); err != nil {
-			return l.rollback("wal_write", err)
+			return "wal_write", l.rollback(err)
 		}
 		if err := writeAll(l.f, req.payload); err != nil {
-			return l.rollback("wal_write", err)
+			return "wal_write", l.rollback(err)
 		}
 		next += int64(len(h) + len(req.payload))
 	}
 	if err := l.f.Sync(); err != nil {
-		return l.rollback("wal_sync", err)
+		return "wal_sync", l.rollback(err)
 	}
 	if l.root != nil {
-		replaced, err := l.commit(next)
+		operation, err := l.commit(next)
 		if err != nil {
-			if !replaced {
-				return l.rollback("marker_preparation", err)
+			if !errors.Is(err, ErrUncertain) {
+				err = l.rollback(err)
 			}
-			return ErrUncertain
+			return operation, err
 		}
 	}
 	l.offset = next
 	for _, req := range group {
 		l.s.Publish(req.rows)
 	}
-	return nil
+	return "commit", nil
 }
 
-func (l *Log) rollback(operation string, err error) error {
-	if e := l.f.Truncate(l.offset); e != nil {
-		return ErrUncertain
+func (l *Log) rollback(cause error) error {
+	if err := l.f.Truncate(l.offset); err != nil {
+		return errors.Join(ErrUncertain, cause, fmt.Errorf("truncate WAL: %w", err))
 	}
-	if e := l.f.Sync(); e != nil {
-		return ErrUncertain
+	if err := l.f.Sync(); err != nil {
+		return errors.Join(ErrUncertain, cause, fmt.Errorf("sync truncated WAL: %w", err))
 	}
-	if _, e := l.f.Seek(l.offset, io.SeekStart); e != nil {
-		return ErrUncertain
+	if _, err := l.f.Seek(l.offset, io.SeekStart); err != nil {
+		return errors.Join(ErrUncertain, cause, fmt.Errorf("seek truncated WAL: %w", err))
 	}
-	l.diagnoseRollback(operation, err, time.Now())
-	return err
+	return cause
 }
 
-// appendGroup is serialized per Log, so this limiter needs no separate lock.
-// A single bucket bounds output regardless of error or operation cardinality.
-func (l *Log) diagnoseRollback(operation string, err error, now time.Time) {
-	const interval = time.Minute
-	if !l.lastDiagnostic.IsZero() && now.Sub(l.lastDiagnostic) < interval {
-		return
-	}
-	l.lastDiagnostic = now
-	category := "other"
-	if errors.Is(err, syscall.ENOSPC) {
-		category = "enospc"
-	} else if errors.Is(err, syscall.EIO) {
-		category = "eio"
-	}
-	log.Printf("WAL rollback confirmed operation=%s category=%s", operation, category)
-}
-
-// commit atomically replaces the durable marker only after the WAL is synced.
-func (l *Log) commit(offset int64) (bool, error) {
-	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		return false, err
-	}
-	name := ".bog-commit-" + hex.EncodeToString(id[:])
-	f, err := openRegular(l.dir, name, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
-	if err != nil {
-		return false, err
-	}
-	defer l.root.Remove(name)
-	b := make([]byte, 24)
-	copy(b, "BOGCMT01")
-	binary.LittleEndian.PutUint64(b[8:], uint64(offset))
-	binary.LittleEndian.PutUint64(b[16:], ^uint64(offset))
-	err = writeAll(f, b)
-	if err == nil {
-		err = f.Sync()
-	}
-	if e := f.Close(); err == nil {
-		err = e
-	}
-	if err != nil {
-		return false, err
-	}
-	// A rename failure is treated as uncertain: do not risk rolling back a
-	// WAL whose marker may already have been replaced.
-	if err = l.root.Rename(name, "bog.commit"); err != nil {
-		return true, err
-	}
-	return true, l.syncDir()
-}
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -524,14 +243,10 @@ func (l *Log) Close() error {
 	}
 	err := l.f.Close()
 	if l.dir != nil {
-		if e := l.dir.Close(); err == nil {
-			err = e
-		}
+		err = errors.Join(err, l.dir.Close())
 	}
 	if l.root != nil {
-		if e := l.root.Close(); err == nil {
-			err = e
-		}
+		err = errors.Join(err, l.root.Close())
 	}
 	l.closeErr = err
 	l.closeDone = true

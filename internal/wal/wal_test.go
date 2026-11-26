@@ -667,7 +667,7 @@ func TestGroupFramesAndRollback(t *testing.T) {
 			b := []byte(`{"ts":"2025-01-01T00:00:00Z","line":"second"}`)
 			ar, _ := store.Decode(a)
 			br, _ := store.Decode(b)
-			err = l.appendGroup([]*appendRequest{{payload: a, rows: ar}, {payload: b, rows: br}})
+			_, err = l.appendGroup([]*appendRequest{{payload: a, rows: ar}, {payload: b, rows: br}})
 			if fail {
 				if err == nil || errors.Is(err, ErrUncertain) {
 					t.Fatalf("failure: %v", err)
@@ -989,9 +989,16 @@ func TestReplayMalformedCommittedFrameDoesNotPublish(t *testing.T) {
 	if err := l.Append(batch, rows); err != nil {
 		t.Fatal(err)
 	}
-	// Append writes a valid frame and commit marker even though its payload is malformed.
+	// Create an otherwise valid committed frame with a malformed payload on disk.
 	malformed := []byte("{\"ts\":\"2025-01-01T00:00:01Z\",\"line\":\"partial\"}\n{bad}")
-	if err := l.Append(malformed, nil); err != nil {
+	frame := replayTestFrame(malformed)
+	if err := writeAll(l.f, frame); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.commit(l.offset + int64(len(frame))); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.Close(); err != nil {
@@ -1055,7 +1062,7 @@ func TestReplayBufferedBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	l := &Log{f: f, committed: true}
+	l := &Log{f: f}
 	builder := store.NewRecoveryBuilder()
 	if err := l.replay(int64(len(data)), builder); err != nil {
 		t.Fatal(err)
@@ -1086,7 +1093,7 @@ func TestReplayBufferedReadAheadBound(t *testing.T) {
 	}
 	defer f.Close()
 	counted := &countedReplayFile{File: f}
-	l := &Log{f: counted, committed: true}
+	l := &Log{f: counted}
 	if err := l.replay(int64(end), store.NewRecoveryBuilder()); err != nil {
 		t.Fatal(err)
 	}

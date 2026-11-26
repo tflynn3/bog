@@ -142,9 +142,9 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "incomplete body", http.StatusBadRequest)
 		return
 	}
-	rows, err := store.Decode(b)
-	if err != nil || !validSurrogates(b) {
-		http.Error(w, "invalid batch", http.StatusBadRequest)
+	rows, err := store.DecodeIngest(b)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	err = a.wal.Append(b, rows)
@@ -157,61 +157,4 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// validSurrogates examines raw JSON strings after Decode has verified JSON syntax.
-// Escaped backslashes are skipped, so their following text is not an escape.
-func validSurrogates(b []byte) bool {
-	inString := false
-	for i := 0; i < len(b); i++ {
-		if !inString {
-			if b[i] == '"' {
-				inString = true
-			}
-			continue
-		}
-		if b[i] == '"' {
-			inString = false
-			continue
-		}
-		if b[i] != '\\' {
-			continue
-		}
-		i++
-		if b[i] != 'u' {
-			continue
-		}
-		n := hexQuad(b[i+1 : i+5])
-		i += 4
-		if n >= 0xdc00 && n <= 0xdfff {
-			return false
-		}
-		if n >= 0xd800 && n <= 0xdbff {
-			if i+6 >= len(b) || b[i+1] != '\\' || b[i+2] != 'u' {
-				return false
-			}
-			low := hexQuad(b[i+3 : i+7])
-			if low < 0xdc00 || low > 0xdfff {
-				return false
-			}
-			i += 6
-		}
-	}
-	return true
-}
-
-func hexQuad(b []byte) uint16 {
-	var n uint16
-	for _, c := range b {
-		n <<= 4
-		switch {
-		case c >= '0' && c <= '9':
-			n += uint16(c - '0')
-		case c >= 'a' && c <= 'f':
-			n += uint16(c - 'a' + 10)
-		default:
-			n += uint16(c - 'A' + 10)
-		}
-	}
-	return n
 }

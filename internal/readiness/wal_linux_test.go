@@ -1,11 +1,8 @@
 package readiness
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"bog/internal/httpapi"
@@ -21,12 +19,6 @@ import (
 )
 
 const testBatch = `{"ts":"2025-01-01T00:00:00Z","line":"private row"}`
-
-type appendFunc func([]byte, []store.Row) error
-
-func (f appendFunc) Append(payload []byte, rows []store.Row) error {
-	return f(payload, rows)
-}
 
 func request(h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
@@ -38,8 +30,11 @@ func assertReady(t *testing.T, h http.Handler, code int, want status) {
 	t.Helper()
 	rec := request(h, http.MethodGet, "/ready", "")
 	var got status
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode /ready: %v (%q)", err, rec.Body.String())
+	body := rec.Body.String()
+	decoder := json.NewDecoder(strings.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&got); err != nil {
+		t.Fatalf("decode /ready: %v (%q)", err, body)
 	}
 	if rec.Code != code || got != want {
 		t.Fatalf("/ready = %d %+v, want %d %+v", rec.Code, got, code, want)
@@ -49,171 +44,193 @@ func assertReady(t *testing.T, h http.Handler, code int, want status) {
 	}
 }
 
-func TestReadyRouteWithAppendResults(t *testing.T) {
+func TestReadyWithRealWAL(t *testing.T) {
 	s := &store.Store{}
 	dir := filepath.Join(t.TempDir(), "data")
 	if err := os.Mkdir(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	w, err := wal.Open(dir, s)
+	log, err := wal.Open(dir, s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := w.Close(); err != nil {
+		if err := log.Close(); err != nil {
 			t.Error(err)
 		}
 	})
-	privateErr := fmt.Errorf("private path: %w", syscall.ENOSPC)
-	var failure error
-	log := appendFunc(func(payload []byte, rows []store.Row) error {
-		if failure != nil {
-			return failure
+	h := NewHandler(t.Context(), dir, log, func(appender Appender) http.Handler {
+		if appender != log {
+			t.Fatal("API did not receive the original WAL")
 		}
-		return w.Append(payload, rows)
+		return httpapi.New(s, appender)
 	})
-	m := &monitor{sample: sample{at: time.Now(), headroom: true}}
-	h := handlerForMonitor(m, log, func(w Appender) http.Handler { return httpapi.New(s, w) })
+	assertIngest := func(t *testing.T, body string, code int) {
+		t.Helper()
+		if rec := request(h, http.MethodPost, "/ingest", body); rec.Code != code {
+			t.Fatalf("POST /ingest = %d %s, want %d", rec.Code, rec.Body, code)
+		}
+	}
+	assertIngest(t, testBatch, http.StatusNoContent)
 	assertReady(t, h, http.StatusOK, status{Ready: true, Reason: "ready"})
 
-	failure = privateErr
-	if rec := request(h, http.MethodPost, "/ingest", testBatch); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("failed ingest = %d %s", rec.Code, rec.Body)
-	}
-	assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"})
-	if rec := request(h, http.MethodPost, "/ingest", "invalid batch"); rec.Code != http.StatusBadRequest {
-		t.Fatalf("invalid ingest during rollback = %d %s", rec.Code, rec.Body)
-	}
-	assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"})
-	rec := request(h, http.MethodGet, "/ready", "")
-	if bytes.Contains(rec.Body.Bytes(), []byte("private")) {
-		t.Fatalf("status leaked input: %s", rec.Body)
-	}
-	if rec := request(h, http.MethodGet, "/healthz", ""); rec.Code != http.StatusOK {
-		t.Fatalf("liveness during rollback = %d", rec.Code)
-	}
+	t.Run("rollback and recovery", func(t *testing.T) {
+		// The open WAL remains writable while creating a new commit marker
+		// fails before rename, allowing the append group to roll back.
+		if err := os.Chmod(dir, 0500); err != nil {
+			t.Fatal(err)
+		}
+		restorePermissions := func() {
+			t.Helper()
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Cleanup(restorePermissions)
+		const writeAccess = 2 // Linux access(2) W_OK.
+		if err := syscall.Access(dir, writeAccess); err == nil {
+			t.Skip("process can write to a read-only directory")
+		} else if !errors.Is(err, syscall.EACCES) {
+			t.Fatalf("check directory write access: %v", err)
+		}
+		assertIngest(t, testBatch, http.StatusServiceUnavailable)
+		assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "other"})
+		assertIngest(t, "invalid batch", http.StatusBadRequest)
+		assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "other"})
+		if rec := request(h, http.MethodGet, "/healthz", ""); rec.Code != http.StatusOK {
+			t.Fatalf("liveness during rollback = %d", rec.Code)
+		}
 
-	failure = nil
-	if rec := request(h, http.MethodPost, "/ingest", testBatch); rec.Code != http.StatusNoContent {
-		t.Fatalf("recovery ingest = %d %s", rec.Code, rec.Body)
-	}
-	assertReady(t, h, http.StatusOK, status{Ready: true, Reason: "ready"})
-	if rec := request(h, http.MethodPost, "/ready", ""); rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET" {
+		restorePermissions()
+		assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "other"})
+		assertIngest(t, testBatch, http.StatusNoContent)
+		assertReady(t, h, http.StatusOK, status{Ready: true, Reason: "ready"})
+	})
+	t.Run("uncertainty", func(t *testing.T) {
+		marker := filepath.Join(dir, "bog.commit")
+		if err := os.Remove(marker); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(marker, 0700); err != nil {
+			t.Fatal(err)
+		}
+		payload := []byte(testBatch)
+		rows, err := store.Decode(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Replacing a directory with a regular marker fails during rename.
+		// Append directly because /ingest terminates on an uncertain commit.
+		for range 2 {
+			if err := log.Append(payload, rows); !errors.Is(err, wal.ErrUncertain) {
+				t.Fatalf("append with unusable commit marker = %v, want ErrUncertain", err)
+			}
+			assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"})
+		}
+	})
+
+	if rec := request(h, http.MethodPost, "/ready", ""); rec.Code != http.StatusMethodNotAllowed ||
+		rec.Header().Get("Allow") != http.MethodGet || rec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("POST /ready = %d, headers %v", rec.Code, rec.Header())
 	}
 	if rec := request(h, http.MethodGet, "/ready/extra", ""); rec.Code != http.StatusNotFound {
 		t.Fatalf("GET /ready/extra = %d", rec.Code)
 	}
-
-	failure = fmt.Errorf("private path: %w", wal.ErrUncertain)
-	// Exercise the adapter directly since the ingest handler exits the
-	// process on an uncertain commit.
-	if err := (&observedAppender{wal: log, monitor: m}).Append(nil, nil); !errors.Is(err, wal.ErrUncertain) {
-		t.Fatalf("uncertainty lost: %v", err)
-	}
-	assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"})
 }
 
-func TestReadyRecoversWithQueuedAppend(t *testing.T) {
-	rollbackStarted := make(chan struct{})
-	releaseRollback := make(chan struct{})
-	durableStarted := make(chan struct{})
-	releaseDurable := make(chan struct{})
-	log := appendFunc(func(payload []byte, _ []store.Row) error {
-		if string(payload) == "rollback" {
-			close(rollbackStarted)
-			<-releaseRollback
-			return syscall.ENOSPC
+type outcomeAppender struct {
+	append func([]byte, []store.Row) error
+	commit wal.CommitOutcome
+}
+
+func (a *outcomeAppender) Append(payload []byte, rows []store.Row) error {
+	return a.append(payload, rows)
+}
+
+func (a *outcomeAppender) LastCommitOutcome() wal.CommitOutcome {
+	return a.commit
+}
+
+func TestReadyAllowsConcurrentAppends(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		entered := make(chan string, 2)
+		release := make(chan struct{}, 2)
+		defer close(release)
+		log := &outcomeAppender{append: func(payload []byte, _ []store.Row) error {
+			entered <- string(payload)
+			<-release
+			return nil
+		}}
+		h := handlerForMonitor(&monitor{}, log, func(a Appender) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := a.Append([]byte(r.URL.Path), nil); err != nil {
+					http.Error(w, err.Error(), http.StatusServiceUnavailable)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})
+		})
+		responses := make(chan int, 2)
+		for _, path := range []string{"/first", "/second"} {
+			go func() { responses <- request(h, http.MethodPost, path, "").Code }()
+			select {
+			case got := <-entered:
+				if got != path {
+					t.Fatalf("appender entered with %q, want %q", got, path)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("appender did not enter for %s", path)
+			}
 		}
-		close(durableStarted)
-		<-releaseDurable
-		return nil
-	})
-	var appender Appender
-	h := handlerForMonitor(&monitor{}, log, func(a Appender) http.Handler {
-		appender = a
-		return http.NotFoundHandler()
-	})
-	rollbackDone := make(chan error, 1)
-	go func() { rollbackDone <- appender.Append([]byte("rollback"), nil) }()
-	<-rollbackStarted
-
-	queued := make(chan struct{})
-	durableDone := make(chan error, 1)
-	go func() {
-		close(queued)
-		durableDone <- appender.Append([]byte("durable"), nil)
-	}()
-	<-queued
-	var overlapped bool
-	select {
-	case <-durableStarted:
-		overlapped = true
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	close(releaseRollback)
-	rollbackErr := <-rollbackDone
-	before := request(h, http.MethodGet, "/ready", "")
-	close(releaseDurable)
-	if err := <-durableDone; err != nil {
-		t.Fatal(err)
-	}
-	if !errors.Is(rollbackErr, syscall.ENOSPC) || before.Code != http.StatusServiceUnavailable {
-		t.Fatalf("rollback error = %v, /ready = %d %s", rollbackErr, before.Code, before.Body)
-	}
-	assertReady(t, h, http.StatusOK, status{Ready: true, Reason: "ready"})
-	if overlapped {
-		t.Fatal("fallback WAL calls overlapped, allowing outcomes to be observed out of order")
-	}
-}
-
-type commitState33 string
-
-type commitOutcome33 struct {
-	State     commitState33
-	At        time.Time
-	Operation string
-	Category  string
-}
-
-type wal33 struct {
-	commit commitOutcome33
-}
-
-func (*wal33) Append([]byte, []store.Row) error {
-	return errors.New("pre-admission failure")
-}
-
-func (w *wal33) LastCommitOutcome() commitOutcome33 {
-	return w.commit
-}
-
-func TestReadyRouteWithWALOutcomeSnapshot(t *testing.T) {
-	w := &wal33{}
-	m := &monitor{sample: sample{at: time.Now(), headroom: true}}
-	h := handlerForMonitor(m, w, func(appender Appender) http.Handler {
-		if appender != w {
-			t.Fatal("WAL with an outcome snapshot was wrapped")
+		assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "sampling_pending"})
+		// Let both requests complete after proving that they were in flight
+		// together. Each receives its own release before the channel closes.
+		for range 2 {
+			release <- struct{}{}
+			select {
+			case code := <-responses:
+				if code != http.StatusNoContent {
+					t.Fatalf("append response = %d", code)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("append did not complete after release")
+			}
 		}
-		return http.NotFoundHandler()
 	})
-	assertReady(t, h, http.StatusOK, status{Ready: true, Reason: "ready"})
-	tests := []struct {
-		state    commitState33
-		category string
-		code     int
-		want     status
-	}{
-		{"rolled_back", "enospc", http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"}},
-		{"durable", "", http.StatusOK, status{Ready: true, Reason: "ready"}},
-		{"uncertain", "private diagnostic", http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"}},
-		{"durable", "", http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"}},
-	}
-	for _, tt := range tests {
-		w.commit = commitOutcome33{State: tt.state, At: time.Now(), Category: tt.category}
-		assertReady(t, h, tt.code, tt.want)
-	}
+}
+
+func TestReadyReadsWALOutcome(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		log := &outcomeAppender{}
+		m := &monitor{sample: sample{at: time.Now(), headroom: true}}
+		h := handlerForMonitor(m, log, func(Appender) http.Handler { return http.NotFoundHandler() })
+		assertReady(t, h, http.StatusOK, status{Ready: true, Reason: "ready"})
+		tests := []struct {
+			name   string
+			commit wal.CommitOutcome
+			code   int
+			want   status
+		}{
+			{"space exhausted", wal.CommitOutcome{State: "rolled_back", Category: "enospc"}, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"}},
+			{"no new outcome", wal.CommitOutcome{}, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"}},
+			{"I/O error", wal.CommitOutcome{State: "rolled_back", Category: "eio"}, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "eio"}},
+			{"unknown state", wal.CommitOutcome{State: "unknown", Category: "other"}, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "eio"}},
+			{"other failure", wal.CommitOutcome{State: "rolled_back", Category: "other"}, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "other"}},
+			{"unexpected category", wal.CommitOutcome{State: "rolled_back", Category: "private diagnostic"}, http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "other"}},
+			{"durable recovery", wal.CommitOutcome{State: "durable", Category: "enospc"}, http.StatusOK, status{Ready: true, Reason: "ready"}},
+			{"uncertain with unknown category", wal.CommitOutcome{State: "uncertain", Category: "private diagnostic"}, http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"}},
+			{"sticky uncertainty", wal.CommitOutcome{State: "durable"}, http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"}},
+		}
+		for _, tt := range tests {
+			t.Log(tt.name)
+			time.Sleep(time.Millisecond)
+			log.commit = tt.commit
+			if log.commit.State != "" {
+				log.commit.At = time.Now()
+			}
+			assertReady(t, h, tt.code, tt.want)
+		}
+	})
 }
 
 func TestDiskHeadroom(t *testing.T) {
@@ -221,12 +238,7 @@ func TestDiskHeadroom(t *testing.T) {
 	if _, err := diskHeadroom(dir); err != nil {
 		t.Fatalf("stat active data directory: %v", err)
 	}
-	if _, err := diskHeadroom(dir + "/missing"); !errors.Is(err, os.ErrNotExist) {
+	if _, err := diskHeadroom(filepath.Join(dir, "missing")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stat missing data directory: %v", err)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	if h := NewHandler(ctx, dir, appendFunc(nil), func(Appender) http.Handler { return http.NotFoundHandler() }); h == nil {
-		t.Fatal("missing handler")
 	}
 }

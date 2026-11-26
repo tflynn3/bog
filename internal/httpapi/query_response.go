@@ -16,11 +16,12 @@ const (
 // queryResponse buffers complete records until the status and cursor can be
 // committed. Each record's allocation is exact and never copies earlier rows.
 type queryResponse struct {
-	rows     [][]byte
-	size     int
-	maxBytes int
-	scratch  bytes.Buffer
-	encoder  jsontext.Encoder
+	rows        [][]byte
+	size        int
+	maxBytes    int
+	measureOnly bool
+	scratch     bytes.Buffer
+	encoder     jsontext.Encoder
 }
 
 // appendRow reports the exact encoded size when the first row doesn't fit.
@@ -58,6 +59,11 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	}
 	if size > remaining {
 		return false, size, nil
+	}
+
+	if b.measureOnly {
+		b.size += size
+		return true, 0, nil
 	}
 
 	record := make([]byte, 0, size)

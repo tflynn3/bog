@@ -129,9 +129,9 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 	assertPage := func(a *API, out *httptest.ResponseRecorder, lines, ordinal int) string {
 		t.Helper()
 		token := out.Header().Get("Bog-Next-Cursor")
-		c, err := a.decodeCursor(token)
-		if out.Code != 200 || out.Body.String() != strings.Repeat(line, lines) || err != nil || c.Count != 5 || c.After.Ordinal != ordinal {
-			t.Fatalf("page: status=%d headers=%v body=%q cursor=%+v err=%v", out.Code, out.Header(), out.Body.String(), c, err)
+		count, pos, err := decodeMemoryCursor(a, token)
+		if out.Code != 200 || out.Body.String() != strings.Repeat(line, lines) || err != nil || count != 5 || pos.Ordinal != ordinal {
+			t.Fatalf("page: status=%d headers=%v body=%q capture count=%d position=%+v err=%v", out.Code, out.Header(), out.Body.String(), count, pos, err)
 		}
 		return token
 	}

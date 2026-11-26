@@ -14,10 +14,11 @@ const (
 )
 
 type queryCapture struct {
-	id       uint64
-	deadline time.Time
-	sourceID string
-	scans    []certifiedScan
+	id            uint64
+	deadline      time.Time
+	sourceID      string
+	scans         []certifiedScan
+	batchedReplay bool
 
 	// The registry lock protects lifetime state. The source ID and scan plan
 	// are immutable after publication.

@@ -18,7 +18,23 @@ type legacyPageSource struct {
 	views map[string]*store.PositionedSnapshot
 }
 
+// Legacy single-row pages can reserve a bounded batch of work to certify
+// and replay the suffix. Each block covers 256 of the store and encoder's
+// primitive units, which are still metered individually inside the batch.
+const (
+	legacyReplayBlocks = 5
+	legacyReplayUnits  = legacyReplayBlocks * 256
+)
+
 func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.QueryWork) (PageResult, error) {
+	return s.page(req, work, false)
+}
+
+// On an unfiltered walk the store still reserves a unit per candidate and per
+// line byte. The candidate reservation covers fixed-size position conversion,
+// and its byte reservation covers encoding the same line. The HTTP planner
+// separately meters delivery and checks cancellation while encoding.
+func (s *legacyPageSource) page(req PageRequest, work *store.QueryWork, prepaid bool) (PageResult, error) {
 	filter := req.Filter
 	if !req.Snapshot {
 		rows, err := s.store.QueryWithWork(filter.Start, filter.End, filter.Contains, req.Limit, work)
@@ -34,10 +50,10 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 	id := req.Capture
 	var view *store.PositionedSnapshot
 	var after *store.TailPosition
+	if err := work.Charge(snapshotBookkeepingWork(prepaid)); err != nil {
+		return PageResult{}, err
+	}
 	if id == "" {
-		if err := work.Charge(1); err != nil {
-			return PageResult{}, err
-		}
 		view = s.store.CapturePositionedSnapshot()
 	} else {
 		s.mu.Lock()
@@ -46,25 +62,29 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 		if view == nil {
 			return PageResult{}, ErrCaptureExpired
 		}
-		if err := work.Charge(1); err != nil {
-			return PageResult{}, err
+		if req.After != "" {
+			position, err := parseLegacyPosition(req.After)
+			if err != nil {
+				return PageResult{}, err
+			}
+			after = &position
 		}
-		position, err := parseLegacyPosition(req.After)
-		if err != nil {
-			return PageResult{}, err
-		}
-		after = &position
 	}
 
 	rows, more, err := view.Page(filter.Start, filter.End, filter.Contains, req.Limit, 0, after, work)
 	if err != nil {
 		return PageResult{}, err
 	}
-	if err := work.Charge(uint64(len(rows))); err != nil {
-		return PageResult{}, err
+	if !prepaid {
+		if err := work.Charge(uint64(len(rows))); err != nil {
+			return PageResult{}, err
+		}
 	}
 	result := PageResult{Rows: make([]PageRow, len(rows)), More: more}
 	for i, row := range rows {
+		if err := work.Charge(); err != nil {
+			return PageResult{}, err
+		}
 		result.Rows[i] = PageRow{Row: row.Row, Position: legacyPosition(row.Position)}
 	}
 	if id == "" {

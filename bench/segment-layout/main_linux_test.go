@@ -3,7 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"slices"
 	"testing"
+	"time"
 
 	"bog/internal/checkpoint"
 )
@@ -12,36 +17,163 @@ func TestSmokeLayouts(t *testing.T) {
 	if maxBlock != checkpoint.MaxBlockSize {
 		t.Fatal("benchmark block limit differs from checkpoint codec")
 	}
-	var out bytes.Buffer
-	if err := run(t.TempDir(), "test", "mixed", 64, 1, &out); err != nil {
-		t.Fatal(err)
+	for _, profile := range []string{"mixed", "entropy"} {
+		t.Run(profile, func(t *testing.T) {
+			parent := t.TempDir()
+			var out bytes.Buffer
+			cfg := config{dir: parent, revision: "test", profile: profile, scale: "smoke", batches: 64, runs: 2}
+			if err := run(cfg, &out); err != nil {
+				t.Fatal(err)
+			}
+			var got report
+			if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.SchemaVersion != 2 || got.Revision != "test" || got.Fixture.Scale != "smoke" ||
+				got.Fixture.Name != profile+"-log-v2" || got.Fixture.Rows != 5253 || len(got.Layouts) != len(layouts) {
+				t.Fatalf("wrong report identity: schema %d, fixture %+v, %d layouts", got.SchemaVersion, got.Fixture, len(got.Layouts))
+			}
+
+			baseline := map[codec]layoutReport{}
+			for i, item := range got.Layouts {
+				l := layouts[i]
+				if item.Name != l.name() || len(item.Backfills) != 2 {
+					t.Fatalf("unexpected layout name or scenarios: %s", item.Name)
+				}
+				if !l.prune {
+					baseline[l.codec] = item
+				}
+				base := baseline[l.codec]
+				checkGeneration(t, l, item.generationReport, base.generationReport, cfg.runs, "initial")
+				for j, scenario := range item.Backfills {
+					wantName := []string{"clustered", "scattered"}[j]
+					if scenario.Scenario != wantName || scenario.AppendedRows != 4 || scenario.Rows != got.Fixture.RewrittenRows ||
+						scenario.Rows != item.Rows+4 || scenario.RewriteBytes != scenario.RetainedBytes {
+						t.Fatalf("%s %s: wrong rewrite accounting", item.Name, scenario.Scenario)
+					}
+					if !scenario.Earliest.Equal(epoch) || (j == 0 && !scenario.Latest.Equal(epoch)) ||
+						(j == 1 && !scenario.Latest.Equal(epoch.Add(62*time.Second))) {
+						t.Errorf("%s %s: wrong backfill bounds", item.Name, scenario.Scenario)
+					}
+					checkGeneration(t, l, scenario.generationReport, base.Backfills[j].generationReport, cfg.runs, scenario.Scenario)
+				}
+				if item.RewriteBytes != item.Backfills[0].RewriteBytes {
+					t.Errorf("%s: top-level rewrite bytes differ from clustered rewrite", item.Name)
+				}
+			}
+			assertEmpty(t, parent)
+		})
 	}
-	var report struct {
-		Layouts []layoutReport `json:"layouts"`
+}
+
+func checkGeneration(t *testing.T, l layout, gen, baseline generationReport, runs int, phase string) {
+	t.Helper()
+	wantBloom := int64(l.indexWidth()-entrySize) * int64(gen.Blocks)
+	if gen.BloomMetadataBytes != wantBloom || gen.RetainedBytes-baseline.RetainedBytes != wantBloom ||
+		gen.BloomBytesPerRetainedByte != float64(wantBloom)/float64(gen.RetainedBytes) {
+		t.Errorf("%s: wrong Bloom byte accounting", l.name())
 	}
-	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
-		t.Fatal(err)
+	wantQueries := queries()
+	if len(gen.Queries) != len(wantQueries) {
+		t.Fatalf("%s: got %d queries, want %d", l.name(), len(gen.Queries), len(wantQueries))
 	}
-	if len(report.Layouts) != 6 {
-		t.Fatalf("got %d layouts", len(report.Layouts))
-	}
-	for i, l := range report.Layouts {
-		q := l.Queries
-		if len(q) != len(queries()) {
-			t.Fatalf("%s returned %d queries", l.Name, len(q))
+	hits := make(map[string]int)
+	for i, m := range gen.Queries {
+		b := baseline.Queries[i]
+		if m.Name != wantQueries[i].name || len(m.ColdSamplesNS) != runs || m.ColdP95NS != p95(m.ColdSamplesNS) ||
+			m.MatchingFraction != float64(m.MatchingRows)/float64(gen.Rows) {
+			t.Errorf("%s: unexpected query result %+v", l.name(), m)
 		}
-		if l.Name != layouts[i].name() || l.RewriteBytes <= 0 || q[0].BlocksRead != l.Blocks ||
-			q[1].MatchingRows != 2 || q[2].MatchingRows != 0 || q[6].MatchingRows != 1 ||
-			q[7].MatchingRows != 2 || q[8].MatchingRows != 0 {
-			t.Fatalf("unexpected report for %s: %+v", l.Name, l)
+		if m.BaselineBlocksRead != b.Blocks || m.BaselineBytesRead != b.Bytes ||
+			m.BlocksAvoided != b.Blocks-m.Blocks || m.BytesAvoided != b.Bytes-m.Bytes ||
+			m.BlocksAvoided < 0 || m.BytesAvoided < 0 {
+			t.Errorf("%s/%s: wrong baseline accounting", l.name(), m.Name)
 		}
-		for _, short := range q[3:6] {
-			if short.BlocksRead != l.Blocks || short.MatchingRows == 0 {
-				t.Errorf("%s pruned or lost a short literal: %+v", l.Name, short)
+		if (m.PeakDecodeBytes == 0) != (m.Blocks == 0) {
+			t.Errorf("%s/%s: invalid decode memory %d", l.name(), m.Name, m.PeakDecodeBytes)
+		}
+		switch m.Name {
+		case "all", "one-byte", "two-byte", "three-byte":
+			if m.Blocks != gen.Blocks || m.MatchingRows == 0 {
+				t.Errorf("%s: unexpected complete scan %+v", l.name(), m)
+			}
+		case "absent", "rare":
+			if l.prune && m.BlocksAvoided == 0 {
+				t.Errorf("%s: missing pruning for %s", l.name(), m.Name)
 			}
 		}
-		if layouts[i].prune && (q[1].BlocksRead >= l.Blocks || q[2].BlocksRead != 0) {
-			t.Errorf("%s did not prune rare/absent literals", l.Name)
+		hits[m.Name] = m.MatchingRows
+	}
+	rare := 2
+	boundedSparse := 2
+	switch phase {
+	case "clustered":
+		rare++
+		boundedSparse += 3
+	case "scattered":
+		rare++
+		boundedSparse += 2
+	}
+	if hits["all"] != gen.Rows || hits["rare"] != rare || hits["bounded"] != rare || hits["exclusive-end"] != 0 ||
+		hits["oversized-tail"] != 1 || hits["absent"] != 0 || hits["case-mismatch"] != 0 ||
+		hits["sparse"] <= 0 || hits["sparse"] >= hits["medium"] || hits["medium"] >= hits["dense"] ||
+		hits["dense"] >= hits["all"] || hits["bounded-sparse"] != boundedSparse {
+		t.Errorf("%s: unexpected cohort counts %v", l.name(), hits)
+	}
+}
+
+func assertEmpty(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("benchmark files remain in %s: %v, %v", dir, entries, err)
+	}
+}
+
+type failedReportWriter struct{}
+
+func (failedReportWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestReportFailureCleansUp(t *testing.T) {
+	parent := t.TempDir()
+	cfg := config{dir: parent, profile: "mixed", scale: "custom", batches: 1, runs: 1}
+	if err := run(cfg, failedReportWriter{}); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("report failure: %v", err)
+	}
+	assertEmpty(t, parent)
+}
+
+func TestEachSampleChecksOracle(t *testing.T) {
+	input := fixture(4, false)
+	path := t.TempDir() + "/raw"
+	size, err := writeGeneration(path, partition(input.rows), layout{codec: rawCodec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := queries()[1] // Equal timestamps and literal, distinct append ordinals.
+	want := slices.Clone(reference(input.rows, q))
+	samples := 0
+	_, err = measureQuery(bytes.NewReader(data), size, q, want, len(input.rows), 3, func() error {
+		samples++
+		if samples == 2 {
+			want[0], want[1] = want[1], want[0]
 		}
+		return nil
+	})
+	if err == nil || samples != 2 {
+		t.Fatalf("oracle failed to catch wrong duplicate order after %d samples: %v", samples, err)
+	}
+
+	samples = 0
+	_, err = measureQuery(bytes.NewReader(data), size, q, reference(input.rows, q), len(input.rows), 3, func() error {
+		samples++
+		return io.ErrClosedPipe
+	})
+	if !errors.Is(err, io.ErrClosedPipe) || samples != 1 {
+		t.Fatalf("failed cache preparation should terminate after one attempt: %d, %v", samples, err)
 	}
 }

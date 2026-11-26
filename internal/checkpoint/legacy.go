@@ -18,9 +18,10 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // Legacy is a read-only, exclusively locked view of a stopped legacy WAL and
 // its commit marker. Close it before starting a writer on the same directory.
 type Legacy struct {
-	root     *os.Root
-	dir, wal *os.File
-	end      int64
+	root      *os.Root
+	dir, wal  *os.File
+	end       int64
+	uncertain bool
 }
 
 // OpenLegacy pins and locks the data directory, and reads the committed boundary.

@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "revision": "bc7e97542df74bac819bbc9a68d25c766c638f34",
+  "binary_sha256": "d9540c9d96cf5e09b6533e677bb9dc948b4029376ff0c8803a5916be753ced6d",
+  "fixture": "linux-release-v1",
+  "mode": "legacy",
+  "cases": {
+    "legacy_baseline": {
+      "status": "pass",
+      "evidence": [
+        {
+          "fixture": {
+            "seed_rows": 8192,
+            "tail_rows": 2048,
+            "line_bytes": 1024,
+            "batch_rows": 64,
+            "memory_limit_bytes": 134217728
+          },
+          "phase": "complete",
+          "status": "pass",
+          "timed_out": false,
+          "start_to_ready_ns": 27708417,
+          "restart_to_ready_ns": 28479916,
+          "ingest_p99_ns": 2414875,
+          "backfill_query_p99_ns": 1346125,
+          "ingest_samples": 32,
+          "backfill_query_samples": 20,
+          "recovered_rows": 10240,
+          "cgroup_peak_memory_bytes": 37806080,
+          "peak_rss_bytes": 30932992,
+          "peak_descriptors": 13,
+          "device_io": {
+            "253:0": {
+              "dbytes": 0,
+              "dios": 0,
+              "rbytes": 0,
+              "rios": 0,
+              "wbytes": 12255232,
+              "wios": 489
+            }
+          },
+          "initial_disk_free_bytes": 2358353920,
+          "minimum_disk_headroom_bytes": 2347405312
+        },
+        {
+          "fixture": {
+            "seed_rows": 32768,
+            "tail_rows": 2048,
+            "line_bytes": 1024,
+            "batch_rows": 64,
+            "memory_limit_bytes": 134217728
+          },
+          "phase": "complete",
+          "status": "pass",
+          "timed_out": false,
+          "start_to_ready_ns": 28104959,
+          "restart_to_ready_ns": 66135542,
+          "ingest_p99_ns": 4385791,
+          "backfill_query_p99_ns": 2790458,
+          "ingest_samples": 32,
+          "backfill_query_samples": 79,
+          "recovered_rows": 34816,
+          "cgroup_peak_memory_bytes": 118960128,
+          "peak_rss_bytes": 84803584,
+          "peak_descriptors": 13,
+          "device_io": {
+            "253:0": {
+              "dbytes": 0,
+              "dios": 0,
+              "rbytes": 0,
+              "rios": 0,
+              "wbytes": 42258432,
+              "wios": 1797
+            }
+          },
+          "initial_disk_free_bytes": 2358353920,
+          "minimum_disk_headroom_bytes": 2321158144
+        }
+      ]
+    },
+    "retained_history_capacity": {
+      "status": "skip",
+      "detail": "legacy baseline cannot qualify live retained history"
+    }
+  }
+}

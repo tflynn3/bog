@@ -1,33 +1,34 @@
-# Offline checkpoint contract (proposed)
+# Offline checkpoint version 1
 
-This scanner reads the existing `BOGWAL01` WAL and `BOGCMT01` commit marker;
-it does not publish checkpoints. WAL integers are little-endian. Each committed
-frame has a 16-byte header containing payload length, its complement, CRC32C of
-the payload, and CRC32C of the preceding header bytes. The payload is decoded by
-the historical store decoder. The marker's offset must land exactly after a
-complete frame. Bytes beyond it are uncommitted and ignored. Row ordinals start
-at zero and increase in append order across frames, including identical rows.
+The legacy scanner reads `BOGWAL01` and `BOGCMT01` under the pinned directory
+lock, checks every committed frame, and leaves both files untouched. Row ordinals
+are zero-based append positions, including duplicates.
 
-A future versioned, checksummed manifest must identify the WAL generation, the
-exact committed frame boundary covered, the next append ordinal, and every
-referenced immutable segment by identity. Legacy WALs have no generation field;
-the handoff must establish a durable unique generation without confusing a
-replacement WAL with the original. Reserve `BOGQSG01` for queryable segments;
-`BOGSEG01` belongs to the archive format. Future segment metadata and blocks must
-be versioned, checksummed, little-endian, and include sparse time bounds. Lengths
-and offsets must be validated against file size and configured limits before
-allocation or reads. Timestamp encoding must cover the store's entire supported
-range, and ordering must retain timestamp, append ordinal and row identity.
+A published `bog.checkpoint` is a JSON envelope containing a version 1 JSON
+payload and the SHA-256 of its exact payload bytes. It records the SHA-256 of the
+WAL bytes through the covered frame boundary, that boundary, the next append
+ordinal, and up to 1024 immutable segment names, sizes, and SHA-256 digests. The
+prefix digest binds this offline checkpoint to those bytes; it is not a unique
+WAL generation identifier. Each segment is one version 1 checksummed block as
+described in BLOCK_FORMAT.md. Its inclusive minimum and maximum timestamps are
+sparse time bounds. Rows within each block are sorted by timestamp then ordinal;
+blocks may overlap. The reader merges them in that order.
 
-Under the pinned directory lock, a future publisher must sync staged segments,
-install their names and sync their directories, then sync and atomically publish
-the manifest and sync its directory before switching readers or allowing reopen
-to skip the covered WAL prefix. Retain old inputs until publication is durable
-and existing readers release them. An uncertain publication stops progress; on
-reopen the authoritative manifest determines the segment set and only the
-uncovered committed WAL suffix is replayed. Missing referenced files or corrupt
-committed data fail closed. Verify orphan status before cleanup. Segment metadata
-and all referenced block checksums must be verified before any data from the
-segment becomes visible; a future lazy verification design must preserve that
-fail-closed guarantee. Publication, segment readers, and memory and Linux crash
-qualification are outside this scanner.
+Files are created exclusively with random names and synced, then the directory is
+synced before the manifest is written and synced. The manifest is renamed over
+the authoritative name and the directory synced again. An error from the rename attempt or the final directory sync is
+an uncertain publication and requires reopening. Old files are retained; orphan
+cleanup is not implemented. Reopening validates the manifest, source prefix,
+frame boundary and committed WAL, and every referenced segment before exposing
+rows. Missing or corrupt referenced files fail closed. Unreferenced files have no
+meaning and are ignored. The offline API can visit uncovered committed frames in append order, but does not integrate reader switching with the live store.
+
+The builder retains at most one decoded legacy frame, one bounded block of sorted row references,
+and one encoded block, plus at most 1024 metadata entries. The reader retains at
+most 1024 decoded blocks plus row/string overhead and one temporary block buffer;
+manifest input is capped at 256 KiB. Ordinal validation also uses one bit per
+row, bounded before allocation by the sum of declared segment payload sizes divided
+by the minimum row size (at most 1024 times (MaxBlockSize - 44) / 24 bits).
+These are fixed limits, but may be large.
+Checkpoints exceeding the segment limit fail; external merge/compaction and live
+recovery remain future work.

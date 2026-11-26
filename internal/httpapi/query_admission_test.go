@@ -129,9 +129,9 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 	assertPage := func(a *API, out *httptest.ResponseRecorder, lines, ordinal int) string {
 		t.Helper()
 		token := out.Header().Get("Bog-Next-Cursor")
-		c, err := a.decodeCursor(token)
-		if out.Code != 200 || out.Body.String() != strings.Repeat(line, lines) || err != nil || c.Count != 5 || c.After.Ordinal != ordinal {
-			t.Fatalf("page: status=%d headers=%v body=%q cursor=%+v err=%v", out.Code, out.Header(), out.Body.String(), c, err)
+		count, pos, err := decodeMemoryCursor(a, token)
+		if out.Code != 200 || out.Body.String() != strings.Repeat(line, lines) || err != nil || count != 5 || pos.Ordinal != ordinal {
+			t.Fatalf("page: status=%d headers=%v body=%q capture count=%d position=%+v err=%v", out.Code, out.Header(), out.Body.String(), count, pos, err)
 		}
 		return token
 	}
@@ -141,7 +141,6 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 	// and anchor validation. Recovering the truncated cursor costs 22 more.
 	const firstPass, extension, rescan = 14, 32, 22
 	const encodingPerRow = uint64(len("same"))
-	const deliveryPerRow = uint64((len(line) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit)
 	const encoding = 2 * encodingPerRow
 	const delivery = uint64((2*len(line) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit)
 	for _, tc := range []struct {
@@ -160,11 +159,11 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 	}
 	a := makeAPI(firstPass + extension + encoding + rescan + delivery)
 	assertPage(a, query(a.handler(1), "&page=1&limit=5"), 2, 1)
-	a = makeAPI(firstPass + encodingPerRow + deliveryPerRow)
+	a = makeAPI(40)
 	h := a.handler(1)
 	token := assertPage(a, query(h, "&page=1&limit=1"), 1, 0)
 
-	auth := 1 + uint64(len(token))
+	auth := 1 + uint64((len(token)+63)/64)
 	path := "&cursor=" + token
 	// Vary the work budget between synchronous requests to the same issuer.
 	a.queryWorkBudget = auth - 1

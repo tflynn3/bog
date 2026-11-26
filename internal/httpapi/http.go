@@ -1,21 +1,11 @@
 package httpapi
 
 import (
-	"context"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
-	"regexp"
-	"strconv"
-	"time"
 
 	"bog/internal/store"
 	"bog/internal/wal"
@@ -25,7 +15,7 @@ type appender interface {
 	Append([]byte, []store.Row) error
 }
 type API struct {
-	store            *store.Store
+	pages            PageSource
 	wal              appender
 	fatal            func()
 	slots            chan struct{}
@@ -55,10 +45,19 @@ func NewWithQueryMaxResponseBytes(s *store.Store, w appender, maxBytes int) http
 // commit returns 408 "request cancelled". These errors use plain text. Each
 // handler has its own signing key for continuation cursors.
 func NewWithQueryLimits(s *store.Store, w appender, maxBytes, concurrency int, workBudget uint64) http.Handler {
-	return newAPI(s, w, maxBytes, workBudget).handler(concurrency)
+	return NewWithPageSource(memoryPageSource{s}, w, maxBytes, concurrency, workBudget)
+}
+
+// NewWithPageSource serves queries from the source supplied by the composition root.
+func NewWithPageSource(source PageSource, w appender, maxBytes, concurrency int, workBudget uint64) http.Handler {
+	return newAPIWithPageSource(source, w, maxBytes, workBudget).handler(concurrency)
 }
 
 func newAPI(s *store.Store, w appender, maxBytes int, workBudget uint64) *API {
+	return newAPIWithPageSource(memoryPageSource{s}, w, maxBytes, workBudget)
+}
+
+func newAPIWithPageSource(source PageSource, w appender, maxBytes int, workBudget uint64) *API {
 	if maxBytes <= 0 {
 		panic("query response byte limit must be positive")
 	}
@@ -66,7 +65,7 @@ func newAPI(s *store.Store, w appender, maxBytes int, workBudget uint64) *API {
 		panic("query work budget must be positive")
 	}
 	a := &API{
-		store: s, wal: w, fatal: func() { os.Exit(1) }, slots: make(chan struct{}, 16),
+		pages: source, wal: w, fatal: func() { os.Exit(1) }, slots: make(chan struct{}, 16),
 		maxResponseBytes: maxBytes, queryWorkBudget: workBudget,
 	}
 	if _, err := rand.Read(a.cursorKey[:]); err != nil {
@@ -140,227 +139,6 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-type cursorData struct {
-	Version  int               `json:"v"`
-	Start    time.Time         `json:"start"`
-	End      time.Time         `json:"end"`
-	Contains [sha256.Size]byte `json:"contains"`
-	Count    int               `json:"count"`
-	After    store.Position    `json:"after"`
-}
-
-func (a *API) containsDigest(value string) [sha256.Size]byte {
-	mac := hmac.New(sha256.New, a.cursorKey[:])
-	mac.Write([]byte("bog-filter-v1\x00"))
-	mac.Write([]byte(value))
-	var digest [sha256.Size]byte
-	copy(digest[:], mac.Sum(nil))
-	return digest
-}
-
-func (a *API) encodeCursor(c cursorData) (string, error) {
-	b, err := json.Marshal(c)
-	if err != nil {
-		return "", err
-	}
-	mac := hmac.New(sha256.New, a.cursorKey[:])
-	mac.Write([]byte("bog-cursor-v1\x00"))
-	mac.Write(b)
-	return base64.RawURLEncoding.EncodeToString(append(b, mac.Sum(nil)...)), nil
-}
-func (a *API) decodeCursor(token string) (cursorData, error) {
-	var c cursorData
-	if len(token) > base64.RawURLEncoding.EncodedLen(2048) {
-		return c, errors.New("invalid cursor")
-	}
-	b, err := base64.RawURLEncoding.Strict().DecodeString(token)
-	if err != nil || len(b) <= sha256.Size || len(b) > 2048 {
-		return c, errors.New("invalid cursor")
-	}
-	payload, sig := b[:len(b)-sha256.Size], b[len(b)-sha256.Size:]
-	mac := hmac.New(sha256.New, a.cursorKey[:])
-	mac.Write([]byte("bog-cursor-v1\x00"))
-	mac.Write(payload)
-	if !hmac.Equal(sig, mac.Sum(nil)) || json.Unmarshal(payload, &c) != nil || c.Version != 1 {
-		return c, errors.New("invalid cursor")
-	}
-	return c, nil
-}
-
-var decimal = regexp.MustCompile(`^[0-9]+$`)
-
-func writeQueryError(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, store.ErrQueryWorkExhausted):
-		http.Error(w, "query work budget exhausted", http.StatusServiceUnavailable)
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		http.Error(w, "request cancelled", http.StatusRequestTimeout)
-	case errors.Is(err, store.ErrInvalidQueryCursor):
-		http.Error(w, "invalid cursor", http.StatusBadRequest)
-	default:
-		http.Error(w, "query failed", http.StatusInternalServerError)
-	}
-}
-
-func (a *API) query(w http.ResponseWriter, r *http.Request) {
-	work := store.NewQueryWork(r.Context(), a.queryWorkBudget)
-	q, queryErr := url.ParseQuery(r.URL.RawQuery)
-	if queryErr != nil {
-		http.Error(w, "invalid query", 400)
-		return
-	}
-	for k, v := range q {
-		if (k != "start" && k != "end" && k != "contains" && k != "limit" && k != "page" && k != "cursor") || len(v) != 1 {
-			http.Error(w, "invalid parameter", 400)
-			return
-		}
-	}
-	start, e1 := store.ParseTime(q.Get("start"))
-	end, e2 := store.ParseTime(q.Get("end"))
-	limit := 500
-	var e3 error
-	if v, ok := q["limit"]; ok {
-		if !decimal.MatchString(v[0]) {
-			e3 = errors.New("invalid limit")
-		} else {
-			limit, e3 = strconv.Atoi(v[0])
-		}
-	}
-	if e1 != nil || e2 != nil || e3 != nil || end.Before(start) || limit < 1 || limit > 1000 {
-		http.Error(w, "invalid query", 400)
-		return
-	}
-	_, page := q["page"]
-	cursor, continuation := q["cursor"]
-	if (page && (q.Get("page") != "1" || continuation)) || (continuation && cursor[0] == "") {
-		http.Error(w, "invalid pagination", 400)
-		return
-	}
-	// Reserve space for a fixed-size cursor and ordinary HTTP headers within
-	// the server's 1 MiB header limit. Preserve the request target as received:
-	// re-encoding already valid query characters can inflate its size.
-	if page {
-		if len(r.RequestURI)+2048+4096 > 1<<20 {
-			http.Error(w, "query too large for continuation", 400)
-			return
-		}
-	}
-	var rows []store.Row
-	var captured int
-	var anchor, next *store.Position
-	var digest [sha256.Size]byte
-	var err error
-	contains := q.Get("contains")
-	if page || continuation {
-		var count *int
-		if continuation {
-			// Charge one unit for token validation and a unit per input byte
-			// for decoding and authenticating the token and its literal.
-			if err := work.Charge(1, uint64(len(cursor[0])), uint64(len(contains))); err != nil {
-				writeQueryError(w, err)
-				return
-			}
-			c, err := a.decodeCursor(cursor[0])
-			if err != nil {
-				http.Error(w, "invalid cursor", http.StatusBadRequest)
-				return
-			}
-			digest = a.containsDigest(contains)
-			if !c.Start.Equal(start) || !c.End.Equal(end) || c.Contains != digest {
-				http.Error(w, "invalid cursor", http.StatusBadRequest)
-				return
-			}
-			count, anchor = &c.Count, &c.After
-		}
-		if page {
-			// The one-row call captures both the snapshot and a usable anchor.
-			rows, captured, next, err = a.store.QueryPageWithWork(start, end, contains, 1, nil, nil, work)
-			if err == nil && next != nil && limit > 1 {
-				anchor = next
-				var rest []store.Row
-				rest, _, next, err = a.store.QueryPageWithWork(start, end, contains, limit-1, &captured, anchor, work)
-				rows = append(rows, rest...)
-			}
-		} else {
-			rows, captured, next, err = a.store.QueryPageWithWork(start, end, contains, limit, count, anchor, work)
-		}
-	} else {
-		rows, err = a.store.QueryWithWork(start, end, contains, limit, work)
-	}
-	if err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	response := queryResponse{maxBytes: a.maxResponseBytes}
-	emitted := 0
-	for _, row := range rows {
-		fits, required, err := response.appendRow(row, work)
-		if err != nil {
-			writeQueryError(w, err)
-			return
-		}
-		if !fits {
-			if emitted == 0 {
-				message := fmt.Sprintf("query record exceeds response byte limit (cap %d bytes, requires %d bytes)", a.maxResponseBytes, required)
-				http.Error(w, message, http.StatusUnprocessableEntity)
-				return
-			}
-			break
-		}
-		emitted++
-	}
-	if (page || continuation) && emitted < len(rows) {
-		// QueryPage only exposes a position when another matching row exists.
-		// Since a fetched row was omitted, the shorter call has that lookahead.
-		shortLimit := emitted
-		if page {
-			shortLimit--
-		}
-		if shortLimit == 0 {
-			next = anchor
-		} else {
-			_, _, next, err = a.store.QueryPageWithWork(start, end, contains, shortLimit, &captured, anchor, work)
-			if err != nil {
-				writeQueryError(w, err)
-				return
-			}
-		}
-	}
-	var token string
-	if next != nil {
-		if page {
-			if err := work.Charge(uint64(len(contains))); err != nil {
-				writeQueryError(w, err)
-				return
-			}
-			digest = a.containsDigest(contains)
-		}
-		token, err = a.encodeCursor(cursorData{1, start, end, digest, captured, *next})
-		if err != nil {
-			writeQueryError(w, err)
-			return
-		}
-	}
-	// Reserve the entire encoded body before committing status or cursor.
-	delivery := (uint64(response.size) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit
-	if err := work.Charge(delivery); err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	if token != "" {
-		w.Header().Set("Bog-Next-Cursor", token)
-	}
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.Header().Set("Content-Length", strconv.Itoa(response.size))
-	w.WriteHeader(http.StatusOK)
-	for _, record := range response.rows {
-		if n, err := w.Write(record); err != nil || n != len(record) {
-			// Headers are committed. A short body is detectable by the client.
-			return
-		}
-	}
 }
 
 // validSurrogates examines raw JSON strings after Decode has verified JSON syntax.

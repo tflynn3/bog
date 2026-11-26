@@ -281,3 +281,89 @@ func TestPaginationRawQueryCharactersHTTP(t *testing.T) {
 		t.Fatalf("last: %d", last.StatusCode)
 	}
 }
+
+func TestQueryResponseByteLimits(t *testing.T) {
+	stamp, _ := store.ParseTime("2025-01-01T00:00:01Z")
+	rows := []store.Row{{TS: stamp, Line: "<&\""}, {TS: stamp, Line: "second"}}
+	encoded := func(row store.Row) string {
+		b, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b) + "\n"
+	}
+	first, second := encoded(rows[0]), encoded(rows[1])
+	bounds := "/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z"
+	for _, tc := range []struct {
+		name string
+		cap  int
+		want int
+		body string
+	}{
+		{"exact first", len(first), 200, first},
+		{"exact both", len(first) + len(second), 200, first + second},
+		{"escaped row too large", len(first) - 1, 422, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &store.Store{}
+			s.Publish(rows)
+			out := httptest.NewRecorder()
+			NewWithQueryMaxResponseBytes(s, nil, tc.cap).ServeHTTP(out, httptest.NewRequest("GET", bounds, nil))
+			if out.Code != tc.want || (tc.want == 200 && out.Body.String() != tc.body) || (tc.want == 422 && (out.Header().Get("Bog-Next-Cursor") != "" || strings.Contains(out.Header().Get("Content-Type"), "ndjson"))) {
+				t.Fatalf("status=%d headers=%v body=%q", out.Code, out.Header(), out.Body.String())
+			}
+		})
+	}
+}
+
+func TestSnapshotByteCutPreservesOrdinal(t *testing.T) {
+	stamp, _ := store.ParseTime("2025-01-01T00:00:01Z")
+	row := store.Row{TS: stamp, Line: "same"}
+	b, _ := json.Marshal(row)
+	size := len(b) + 1
+	s := &store.Store{}
+	s.Publish([]store.Row{row, row, row, row, row})
+	one := NewWithQueryMaxResponseBytes(s, nil, size)
+	oneOut := httptest.NewRecorder()
+	one.ServeHTTP(oneOut, httptest.NewRequest("GET", "/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&page=1&limit=5", nil))
+	oneCursor, err := decodeCursor(oneOut.Header().Get("Bog-Next-Cursor"))
+	if oneOut.Code != 200 || oneOut.Body.Len() != size || err != nil || oneCursor.After.Ordinal != 0 {
+		t.Fatalf("one-row cut: %d cursor=%+v error=%v", oneOut.Code, oneCursor, err)
+	}
+	h := NewWithQueryMaxResponseBytes(s, nil, size*2)
+	bounds := "/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z"
+	query := func(params string) *httptest.ResponseRecorder {
+		out := httptest.NewRecorder()
+		h.ServeHTTP(out, httptest.NewRequest("GET", bounds+params, nil))
+		return out
+	}
+	first := query("&page=1&limit=5")
+	token := first.Header().Get("Bog-Next-Cursor")
+	if first.Code != 200 || first.Body.Len() != size*2 || token == "" {
+		t.Fatalf("first: %d %q", first.Code, first.Body.String())
+	}
+	c, err := decodeCursor(token)
+	if err != nil || c.After.Ordinal != 1 || c.Count != 5 {
+		t.Fatalf("cursor: %+v %v", c, err)
+	}
+	s.Publish([]store.Row{{TS: stamp.Add(-1), Line: "backfill"}, row})
+	second := query("&cursor=" + token + "&limit=5")
+	token = second.Header().Get("Bog-Next-Cursor")
+	if second.Code != 200 || second.Body.Len() != size*2 || token == "" {
+		t.Fatalf("second: %d %q", second.Code, second.Body.String())
+	}
+	c, err = decodeCursor(token)
+	if err != nil || c.After.Ordinal != 3 || c.Count != 5 {
+		t.Fatalf("cursor: %+v %v", c, err)
+	}
+	last := query("&cursor=" + token + "&limit=5")
+	if last.Code != 200 || last.Body.Len() != size || last.Header().Get("Bog-Next-Cursor") != "" {
+		t.Fatalf("last: %d %q", last.Code, last.Body.String())
+	}
+	tiny := NewWithQueryMaxResponseBytes(s, nil, size-1)
+	out := httptest.NewRecorder()
+	tiny.ServeHTTP(out, httptest.NewRequest("GET", bounds+"&page=1", nil))
+	if out.Code != 422 || out.Header().Get("Bog-Next-Cursor") != "" {
+		t.Fatalf("oversized: %d %v", out.Code, out.Header())
+	}
+}

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -23,14 +24,25 @@ type appender interface {
 	Append([]byte, []store.Row) error
 }
 type API struct {
-	store *store.Store
-	wal   appender
-	fatal func()
-	slots chan struct{}
+	store            *store.Store
+	wal              appender
+	fatal            func()
+	slots            chan struct{}
+	maxResponseBytes int
 }
 
+const DefaultQueryMaxResponseBytes = 32 << 20
+
 func New(s *store.Store, w appender) http.Handler {
-	a := &API{store: s, wal: w, fatal: func() { os.Exit(1) }, slots: make(chan struct{}, 16)}
+	return NewWithQueryMaxResponseBytes(s, w, DefaultQueryMaxResponseBytes)
+}
+
+// NewWithQueryMaxResponseBytes sets the maximum encoded NDJSON body size.
+func NewWithQueryMaxResponseBytes(s *store.Store, w appender, maxBytes int) http.Handler {
+	if maxBytes <= 0 {
+		panic("query response byte limit must be positive")
+	}
+	a := &API{store: s, wal: w, fatal: func() { os.Exit(1) }, slots: make(chan struct{}, 16), maxResponseBytes: maxBytes}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.health)
 	mux.HandleFunc("/ingest", a.ingest)
@@ -184,38 +196,77 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var rows []store.Row
+	var captured int
+	var anchor, next *store.Position
+	var firstPage bool
 	if page || continuation {
 		var count *int
-		var after *store.Position
 		if continuation {
 			c, err := decodeCursor(cursor[0])
 			if err != nil || !c.Start.Equal(start) || !c.End.Equal(end) || c.Contains != containsDigest(q.Get("contains")) {
 				http.Error(w, "invalid cursor", 400)
 				return
 			}
-			count, after = &c.Count, &c.After
+			count, anchor = &c.Count, &c.After
 		}
-		var captured int
-		var next *store.Position
 		var ok bool
-		rows, captured, next, ok = a.store.QueryPage(start, end, q.Get("contains"), limit, count, after)
+		if page {
+			// The one-row call captures both the snapshot and a usable anchor.
+			firstPage = true
+			rows, captured, next, ok = a.store.QueryPage(start, end, q.Get("contains"), 1, nil, nil)
+			if ok && next != nil && limit > 1 {
+				anchor = next
+				var rest []store.Row
+				rest, _, next, ok = a.store.QueryPage(start, end, q.Get("contains"), limit-1, &captured, anchor)
+				rows = append(rows, rest...)
+			}
+		} else {
+			rows, captured, next, ok = a.store.QueryPage(start, end, q.Get("contains"), limit, count, anchor)
+		}
 		if !ok {
 			http.Error(w, "invalid cursor", 400)
 			return
 		}
-		if next != nil {
-			w.Header().Set("Bog-Next-Cursor", encodeCursor(cursorData{1, start, end, containsDigest(q.Get("contains")), captured, *next}))
-		}
 	} else {
 		rows = a.store.Query(start, end, q.Get("contains"), limit)
 	}
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	enc := json.NewEncoder(w)
+	var body bytes.Buffer
+	emitted := 0
 	for _, row := range rows {
-		if enc.Encode(row) != nil {
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			http.Error(w, "cannot encode query response", http.StatusInternalServerError)
 			return
 		}
+		if len(encoded)+1 > a.maxResponseBytes-body.Len() {
+			if emitted == 0 {
+				http.Error(w, "query record exceeds response byte limit", http.StatusUnprocessableEntity)
+				return
+			}
+			break
+		}
+		body.Write(encoded)
+		body.WriteByte('\n')
+		emitted++
 	}
+	if (page || continuation) && emitted < len(rows) {
+		// QueryPage only exposes a position when another matching row exists.
+		// Since a fetched row was omitted, the shorter call has that lookahead.
+		shortLimit := emitted
+		if firstPage {
+			shortLimit--
+		}
+		if shortLimit == 0 {
+			next = anchor
+		} else {
+			_, _, next, _ = a.store.QueryPage(start, end, q.Get("contains"), shortLimit, &captured, anchor)
+		}
+	}
+	if next != nil {
+		w.Header().Set("Bog-Next-Cursor", encodeCursor(cursorData{1, start, end, containsDigest(q.Get("contains")), captured, *next}))
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	_, _ = w.Write(body.Bytes())
 }
 
 // validSurrogates examines raw JSON strings after Decode has verified JSON syntax.

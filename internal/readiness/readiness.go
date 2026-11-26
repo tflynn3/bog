@@ -131,9 +131,7 @@ func withReady(api http.Handler, m *monitor, latest func() outcome) http.Handler
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if latest != nil {
-			m.observe(latest())
-		}
+		m.observe(latest())
 		current := m.snapshot(time.Now())
 		w.Header().Set("Content-Type", "application/json")
 		if !current.Ready {

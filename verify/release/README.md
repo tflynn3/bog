@@ -34,7 +34,8 @@ additional evidence. The following cases must pass.
 | Capacity | `retained_history_capacity` |
 | Restored image | `restored_parity` |
 
-The durability report's `enospc` case requires the following `evidence` object.
+The durability report validator requires these fields in the `enospc` case's
+`evidence` object.
 
 ```json
 {
@@ -44,6 +45,12 @@ The durability report's `enospc` case requires the following `evidence` object.
   "recovered_after_space_freed": true
 }
 ```
+
+The durability producer also requires both retarget checks to pass before
+marking `enospc` as passing. In `healthy_to_full`, readiness stays `ready`
+and ingest returns HTTP 204. In `full_to_healthy`, readiness stays
+`low_disk_headroom` and ingest returns HTTP 503. The latter also records
+`post_ingest_reason: "wal_rollback"` and `post_ingest_category: "enospc"`.
 
 ## Live capacity evidence
 
@@ -56,6 +63,10 @@ and recovered row counts must both equal seed plus tail. The validator
 also checks startup and restart timings, mixed-load p99s and sample
 counts, memory peak, RSS, descriptor count, disk headroom, and per-device
 I/O counters.
+
+The live capacity producer carries a held cursor across generation
+replacement while ingest acknowledges writes. It compares the held walk
+against the captured cutoff and fresh walks against the committed ledger.
 
 Each record carries `workload_status` and a separate `cleanup` object. An
 overall pass requires both to pass. Cleanup records `candidate_reaped`,
@@ -90,15 +101,29 @@ inside the original snapshot range, is visible. A separate server with
 `-query-work-budget=1` receives 32 fixture rows and must return a clean HTTP
 503 on a scan for an absent string.
 
-The fixed-budget probe uses three distinct rows with the same timestamp and
+The fixed-budget probe has a one-minute deadline for both searches and walks.
+The tied-row fixture uses three distinct rows with the same timestamp and
 queries with `limit=1`. It starts a fresh candidate for each budget in order
-from 1 through 2048, with a one-minute deadline for the search and walk
-combined. Each budget below the first cursor must return only the work-budget
-error (HTTP 503 with no NDJSON or cursor). The candidate that issues the first
-cursor must serve all three rows in append order through a terminal page at the
-same budget. The `work_budget` case keeps the budget-1 rejection evidence and
-adds `fixed_budget_walk` with `first_cursor_budget`, `rejected_budgets`,
-`pages`, and `rows`.
+from 1 through 2048. Each budget below the first cursor must return only the
+work-budget error (HTTP 503 with no NDJSON or cursor). The candidate that issues
+the first cursor must serve all three rows in append order through a terminal
+page at that budget.
+
+The sparse fixture filters four matches among 42 interior and trailing nonmatches.
+The first request asks for four rows under a 96-byte response cap, which fits
+exactly two of the matching records. Continuations lower the row limit to one
+and must return the omitted match and the late match in order, with no cursor
+on the terminal page. The probe bisects budgets 1 through 2048, assuming
+monotone work metering on the fixed snapshot. It checks the immediate
+predecessor of the issuing budget when one exists and walks every trial that
+issues a cursor at its own budget. A later HTTP 503 fails either walk.
+
+The `work_budget` case keeps the budget-1 rejection evidence. Its
+`fixed_budget_walk` object includes `first_cursor_budget`, `rejected_budgets`,
+`pages`, and `rows` for the tied-row walk. Its nested `sparse_walk` includes
+the same fields plus `response_byte_cap`, `first_limit`, `first_rows`, and
+`resume_limit`. For the sparse walk, `rejected_budgets` counts the sampled
+budgets that returned a clean initial rejection.
 
 ## Restored parity fixture
 

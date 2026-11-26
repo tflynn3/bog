@@ -78,11 +78,42 @@ func (p *releasePager) fetch(ctx context.Context, filter string, limit int, curs
 
 func checkPageRows(got []client.Row, want []row) error {
 	for i, r := range got {
-		if i >= len(want) || r.TS.UTC().Format(time.RFC3339Nano) != want[i].TS || r.Line != want[i].Line {
-			return fmt.Errorf("unexpected row at page offset %d", i)
+		gotTS := r.TS.UTC().Format(time.RFC3339Nano)
+		if i >= len(want) {
+			return fmt.Errorf("unexpected row at page offset %d: got %s %.100q past %d expected rows", i, gotTS, r.Line, len(want))
+		}
+		if gotTS != want[i].TS || r.Line != want[i].Line {
+			return fmt.Errorf("unexpected row at page offset %d: got %s %.100q, want %s %.100q", i, gotTS, r.Line, want[i].TS, want[i].Line)
 		}
 	}
 	return nil
+}
+
+func checkBudgetPage(page client.Page, want []row, terminal bool, seen map[string]bool) error {
+	if err := checkPageRows(page.Rows, want); err != nil {
+		return err
+	}
+	if n := len(page.Rows); n != len(want) {
+		return fmt.Errorf("returned %d rows, want %d", n, len(want))
+	}
+	if terminal {
+		if page.NextCursor != "" {
+			return fmt.Errorf("issued a cursor after the final row")
+		}
+		return nil
+	}
+	if page.NextCursor == "" {
+		return fmt.Errorf("missing continuation cursor")
+	}
+	if seen[page.NextCursor] {
+		return fmt.Errorf("repeated a continuation cursor")
+	}
+	return nil
+}
+
+func responseFramed(res *http.Response) bool {
+	return res.ProtoMajor >= 2 || res.ContentLength >= 0 ||
+		(len(res.TransferEncoding) == 1 && res.TransferEncoding[0] == "chunked")
 }
 
 func hasCursorTrailer(res *http.Response) bool {

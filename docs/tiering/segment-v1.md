@@ -1,0 +1,9 @@
+# Offline segment v1
+
+This is an offline codec only. It is not yet a tiered server, manifest, recovery protocol, or S3 implementation. Do not delete a source WAL on the basis of this codec.
+
+All integers are little-endian. The 48-byte header has magic `BOGSEG01`, a 16-byte WAL generation supplied by the caller, the 64-bit committed WAL end offset, 12 zero reserved bytes, and a CRC32C of the first 44 bytes. The body contains the exact legacy WAL frames from byte 8 through the committed boundary. Each frame has the legacy 16-byte length/complement, payload CRC32C and header CRC32C, followed by its original NDJSON payload. The final 32 bytes are SHA-256 of the header and body. Lengths, complements, checksums, committed boundary, and payload decoding are validated. The original timestamp representation and batch and row order are retained, including duplicates. The supported timestamp range is that of the existing store decoder.
+
+Import requires a stopped source and a directory lock held by the caller. It accepts the legacy 24-byte marker and ignores any uncommitted suffix. The destination is a staging file and must be discarded on any error. Segment readers verify the full-file checksum before visiting frames; callers must discard visitor effects if any later validation or callback fails. Visitor payloads are borrowed and valid only until the next callback.
+
+The codec uses one frame buffer of at most 4 MiB plus the allocations required by the existing batch decoder, and a fixed-size hashing buffer. This is not a proof of bounded end-to-end recovery: a future implementation must bound retained decoded rows, segment metadata, caches, merge fan-in and the writable WAL tail. Sparse time indexes, checksummed manifest pages, durable publication and recovery, reader pinning, S3 verification, lifecycle policy, server integration and crash/fault testing remain to be implemented.

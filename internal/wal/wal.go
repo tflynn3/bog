@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"bog/internal/store"
 )
@@ -30,21 +32,22 @@ type file interface {
 	Close() error
 }
 type Log struct {
-	mu        sync.Mutex
-	cond      *sync.Cond
-	queue     []*appendRequest
-	running   bool
-	f         file
-	s         *store.Store
-	offset    int64
-	poisoned  bool
-	closed    bool
-	closeDone bool
-	closeErr  error
-	committed bool
-	root      *os.Root
-	dir       *os.File
-	syncDir   func() error
+	mu             sync.Mutex
+	cond           *sync.Cond
+	queue          []*appendRequest
+	running        bool
+	f              file
+	s              *store.Store
+	offset         int64
+	poisoned       bool
+	closed         bool
+	closeDone      bool
+	closeErr       error
+	committed      bool
+	root           *os.Root
+	dir            *os.File
+	syncDir        func() error
+	lastDiagnostic time.Time
 }
 
 const maxGroup = 16
@@ -414,21 +417,21 @@ func (l *Log) appendGroup(group []*appendRequest) error {
 		binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(req.payload, table))
 		binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
 		if err := writeAll(l.f, h[:]); err != nil {
-			return l.rollback(err)
+			return l.rollback("wal_write", err)
 		}
 		if err := writeAll(l.f, req.payload); err != nil {
-			return l.rollback(err)
+			return l.rollback("wal_write", err)
 		}
 		next += int64(len(h) + len(req.payload))
 	}
 	if err := l.f.Sync(); err != nil {
-		return l.rollback(err)
+		return l.rollback("wal_sync", err)
 	}
 	if l.root != nil {
 		replaced, err := l.commit(next)
 		if err != nil {
 			if !replaced {
-				return l.rollback(err)
+				return l.rollback("marker_preparation", err)
 			}
 			return ErrUncertain
 		}
@@ -440,7 +443,7 @@ func (l *Log) appendGroup(group []*appendRequest) error {
 	return nil
 }
 
-func (l *Log) rollback(err error) error {
+func (l *Log) rollback(operation string, err error) error {
 	if e := l.f.Truncate(l.offset); e != nil {
 		return ErrUncertain
 	}
@@ -450,7 +453,25 @@ func (l *Log) rollback(err error) error {
 	if _, e := l.f.Seek(l.offset, io.SeekStart); e != nil {
 		return ErrUncertain
 	}
+	l.diagnoseRollback(operation, err, time.Now())
 	return err
+}
+
+// appendGroup is serialized per Log, so this limiter needs no separate lock.
+// A single bucket bounds output regardless of error or operation cardinality.
+func (l *Log) diagnoseRollback(operation string, err error, now time.Time) {
+	const interval = time.Minute
+	if !l.lastDiagnostic.IsZero() && now.Sub(l.lastDiagnostic) < interval {
+		return
+	}
+	l.lastDiagnostic = now
+	category := "other"
+	if errors.Is(err, syscall.ENOSPC) {
+		category = "enospc"
+	} else if errors.Is(err, syscall.EIO) {
+		category = "eio"
+	}
+	log.Printf("WAL rollback confirmed operation=%s category=%s", operation, category)
 }
 
 // commit atomically replaces the durable marker only after the WAL is synced.

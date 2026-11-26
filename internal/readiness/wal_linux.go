@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"os"
-	"reflect"
 	"sync"
 	"syscall"
 	"time"
@@ -19,33 +18,62 @@ type Appender interface {
 	Append([]byte, []store.Row) error
 }
 
-// NewHandler starts sampling the replayed WAL's data directory and adds
-// an uncached GET /ready route to the command's API. Its JSON response is
-// 200 when writes are ready or 503 with an operator-facing reason. Cancel ctx
-// to stop sampling. If
-// Statfs is blocked in the kernel, cancellation prevents subsequent probes
-// and lets shutdown proceed without waiting for that single call.
+// NewHandler samples a directory path and adds an uncached GET /ready route.
+// Use NewHandlerForDirectory when the WAL has already pinned its directory.
 func NewHandler(ctx context.Context, dir string, log Appender, newAPI func(Appender) http.Handler) http.Handler {
-	m := start(ctx, sampleInterval, func() (bool, error) { return diskHeadroom(dir) })
+	return newHandler(ctx, func(fs *syscall.Statfs_t) error { return syscall.Statfs(dir, fs) }, log, newAPI)
+}
+
+// NewHandlerForDirectory samples the filesystem of an already-open WAL
+// directory and adds an uncached GET /ready route. The caller supplies an
+// independently opened, unlocked handle to the pinned directory and owns its
+// lifetime. In particular, use a fresh open relative to the pinned directory,
+// since duplicating the WAL's locked descriptor would share its lock.
+//
+// Cancel ctx before closing dir. Cancellation stops subsequent samples and
+// discards an in-flight result without waiting for the syscall. The probe
+// holds a reference to dir's descriptor until the syscall returns.
+func NewHandlerForDirectory(ctx context.Context, dir *os.File, log Appender, newAPI func(Appender) http.Handler) http.Handler {
+	return newHandler(ctx, func(fs *syscall.Statfs_t) error { return statOpenDirectory(dir, fs) }, log, newAPI)
+}
+
+func newHandler(ctx context.Context, statfs func(*syscall.Statfs_t) error, log Appender, newAPI func(Appender) http.Handler) http.Handler {
+	m := start(ctx, sampleInterval, func() (bool, error) {
+		var fs syscall.Statfs_t
+		if err := statfs(&fs); err != nil {
+			return false, err
+		}
+		return hasHeadroom(fs), nil
+	})
 	return handlerForMonitor(m, log, newAPI)
 }
 
 func handlerForMonitor(m *monitor, log Appender, newAPI func(Appender) http.Handler) http.Handler {
-	if latest := walOutcomes(log); latest != nil {
-		return withReady(newAPI(log), m, latest)
+	if logWithOutcome, ok := log.(interface{ LastCommitOutcome() wal.CommitOutcome }); ok {
+		return withReady(newAPI(log), m, func() outcome {
+			return readinessOutcome(logWithOutcome.LastCommitOutcome())
+		})
 	}
 	return withReady(newAPI(&observedAppender{wal: log, monitor: m}), m, nil)
 }
 
-func diskHeadroom(dir string) (bool, error) {
-	var fs syscall.Statfs_t
-	if err := syscall.Statfs(dir, &fs); err != nil {
-		return false, err
+func statOpenDirectory(dir *os.File, fs *syscall.Statfs_t) error {
+	conn, err := dir.SyscallConn()
+	if err != nil {
+		return err
 	}
+	var statErr error
+	if err := conn.Control(func(fd uintptr) { statErr = syscall.Fstatfs(int(fd), fs) }); err != nil {
+		return err
+	}
+	return statErr
+}
+
+func hasHeadroom(fs syscall.Statfs_t) bool {
 	// A write may allocate both a WAL block and a temporary commit marker.
 	// Use blocks available to unprivileged processes. Filesystems with no
 	// reported inode count (such as some network filesystems) omit that check.
-	return fs.Bavail >= 2 && (fs.Files == 0 || fs.Ffree > 0), nil
+	return fs.Bavail >= 2 && (fs.Files == 0 || fs.Ffree > 0)
 }
 
 type observedAppender struct {
@@ -86,44 +114,24 @@ func (a *observedAppender) Append(payload []byte, rows []store.Row) error {
 	return err
 }
 
-// Issue #33 adds LastCommitOutcome in a separate ordered change. Discover the
-// method so the command also builds at the base revision before that API exists.
-func walOutcomes(log Appender) func() outcome {
-	method := reflect.ValueOf(log).MethodByName("LastCommitOutcome")
-	if !method.IsValid() || method.Type().NumIn() != 0 || method.Type().NumOut() != 1 {
-		return nil
-	}
-	result := method.Type().Out(0)
-	if result.Kind() != reflect.Struct {
-		return nil
-	}
-	state, hasState := result.FieldByName("State")
-	at, hasTime := result.FieldByName("At")
-	category, hasCategory := result.FieldByName("Category")
-	if !hasState || state.Type.Kind() != reflect.String ||
-		!hasTime || at.Type != reflect.TypeFor[time.Time]() ||
-		!hasCategory || category.Type.Kind() != reflect.String {
-		return nil
-	}
-	return func() outcome {
-		snapshot := method.Call(nil)[0]
-		result := outcome{at: snapshot.FieldByIndex(at.Index).Interface().(time.Time)}
-		switch snapshot.FieldByIndex(state.Index).String() {
-		case "durable":
-			result.state = durable
-		case "rolled_back":
-			result.state = rolledBack
-		case "uncertain":
-			result.state = uncertain
-		}
-		if result.state == rolledBack || result.state == uncertain {
-			switch cause := snapshot.FieldByIndex(category.Index).String(); cause {
-			case "enospc", "eio", "other":
-				result.cause = cause
-			default:
-				result.cause = "other"
-			}
-		}
+func readinessOutcome(snapshot wal.CommitOutcome) outcome {
+	result := outcome{at: snapshot.At}
+	switch snapshot.State {
+	case wal.CommitDurable:
+		result.state = durable
 		return result
+	case wal.CommitRolledBack:
+		result.state = rolledBack
+	case wal.CommitUncertain:
+		result.state = uncertain
+	default:
+		return outcome{}
 	}
+	switch snapshot.Category {
+	case "enospc", "eio", "other":
+		result.cause = snapshot.Category
+	default:
+		result.cause = "other"
+	}
+	return result
 }

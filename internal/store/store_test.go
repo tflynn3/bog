@@ -447,7 +447,7 @@ func TestRecoveredRunOracle(t *testing.T) {
 	epoch := time.Unix(1700000000, 0)
 	for _, shuffled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("shuffled=%v", shuffled), func(t *testing.T) {
-			rows := make([]Row, 120)
+			rows := make([]Row, 270)
 			for i := range rows {
 				rows[i] = Row{epoch.Add(time.Duration(i/3) * time.Second), fmt.Sprintf("needle-%d", i/2)}
 			}
@@ -455,10 +455,25 @@ func TestRecoveredRunOracle(t *testing.T) {
 				rand.New(rand.NewSource(42)).Shuffle(len(rows), func(i, j int) { rows[i], rows[j] = rows[j], rows[i] })
 			}
 			builder := NewRecoveryBuilder()
-			builder.Add(rows[:47])
-			builder.Add(rows[47:])
+			builder.Add(rows[:127])
+			builder.Add(rows[127:128])
+			builder.Add(rows[128:257])
+			builder.Add(rows[257:])
 			var s Store
 			builder.Install(&s)
+			if s.restored.length != len(rows) || (s.restored.ordinals == nil) == shuffled {
+				t.Fatal("incorrect recovered run representation")
+			}
+			if len(s.blocks) != len(rows)/blockSize {
+				t.Fatal("missing sealed block")
+			}
+			for i, block := range s.blocks {
+				for _, row := range rows[i*blockSize : (i+1)*blockSize] {
+					if !block.mayContainProbes(literalProbes(row.Line)) {
+						t.Fatal("Bloom false negative")
+					}
+				}
+			}
 			// A live run outside the time range must not prevent a direct scan.
 			s.Publish([]Row{{epoch.Add(-time.Hour), "needle outside"}})
 			start, end := epoch.Add(3*time.Second), epoch.Add(33*time.Second)
@@ -491,7 +506,27 @@ func TestRecoveredRunOracle(t *testing.T) {
 			if !slices.Equal(got, want) {
 				t.Fatalf("got %d rows, want %d", len(got), len(want))
 			}
+			want = append(want, Row{epoch.Add(10 * time.Second), "needle backfill"})
+			sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+			if got := s.Query(start, end, "needle", len(want)+1); !slices.Equal(got, want) {
+				t.Fatal("live backfill merge mismatch")
+			}
 		})
+	}
+}
+
+func TestEmptyRecovery(t *testing.T) {
+	var s Store
+	b := NewRecoveryBuilder()
+	b.Add(nil)
+	b.Install(&s)
+	if s.restored.length != 0 || s.restored.ordinals != nil {
+		t.Fatal("nonempty recovered run")
+	}
+	now := time.Unix(1700000000, 0)
+	s.Publish([]Row{{now, "needle"}})
+	if got := s.Query(now, now.Add(time.Second), "needle", 2); len(got) != 1 {
+		t.Fatal("query after empty recovery")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -213,9 +214,23 @@ type Store struct {
 	publishMu sync.Mutex
 	mu        sync.RWMutex
 	rows      []Row
-	restored  []int          // immutable run for the recovered WAL prefix
+	restored  indexRun       // immutable run for the recovered WAL prefix
 	runs      [][]int        // immutable sorted ordinal runs, one per occupied level
 	blocks    []*blockFilter // immutable summaries of sealed append-ordinal blocks
+}
+
+// indexRun maps sorted ranks to append ordinals. A nil ordinal slice denotes
+// the ordered recovered prefix, whose rank is its ordinal.
+type indexRun struct {
+	ordinals []int
+	length   int
+}
+
+func (r indexRun) ordinal(rank int) int {
+	if r.ordinals == nil {
+		return rank
+	}
+	return r.ordinals[rank]
 }
 
 // RecoveryBuilder collects validated WAL frames before the store becomes ready.
@@ -229,30 +244,40 @@ func NewRecoveryBuilder() *RecoveryBuilder { return &RecoveryBuilder{ordered: tr
 
 // Add appends decoded rows in WAL order and builds summaries of sealed blocks.
 func (b *RecoveryBuilder) Add(rows []Row) {
-	for _, row := range rows {
-		if len(b.rows) > 0 && row.TS.Before(b.rows[len(b.rows)-1].TS) {
+	oldLen := len(b.rows)
+	if b.ordered && len(rows) > 0 {
+		if oldLen > 0 && rows[0].TS.Before(b.rows[oldLen-1].TS) {
 			b.ordered = false
 		}
-		b.rows = append(b.rows, row)
-		if len(b.rows)%blockSize == 0 {
-			b.blocks = append(b.blocks, buildBlock(b.rows[len(b.rows)-blockSize:]))
+		for i := 1; i < len(rows) && b.ordered; i++ {
+			if rows[i].TS.Before(rows[i-1].TS) {
+				b.ordered = false
+			}
 		}
+	}
+	b.rows = append(b.rows, rows...)
+	for len(b.blocks)*blockSize+blockSize <= len(b.rows) {
+		start := len(b.blocks) * blockSize
+		b.blocks = append(b.blocks, buildBlock(b.rows[start:start+blockSize]))
 	}
 }
 
 // Install publishes the complete recovered prefix. It must be called before live writes.
 func (b *RecoveryBuilder) Install(s *Store) {
-	run := make([]int, len(b.rows))
-	for i := range run {
-		run[i] = i
-	}
+	run := indexRun{length: len(b.rows)}
 	if !b.ordered {
-		sort.Slice(run, func(i, j int) bool {
-			a, c := run[i], run[j]
-			if b.rows[a].TS.Equal(b.rows[c].TS) {
-				return a < c
+		run.ordinals = make([]int, len(b.rows))
+		for i := range run.ordinals {
+			run.ordinals[i] = i
+		}
+		slices.SortFunc(run.ordinals, func(a, c int) int {
+			if b.rows[a].TS.Before(b.rows[c].TS) {
+				return -1
 			}
-			return b.rows[a].TS.Before(b.rows[c].TS)
+			if b.rows[c].TS.Before(b.rows[a].TS) {
+				return 1
+			}
+			return a - c
 		})
 	}
 	s.publishMu.Lock()
@@ -362,11 +387,13 @@ func (s *Store) QueryPage(start, end time.Time, contains string, limit int, snap
 
 func (s *Store) query(start, end time.Time, contains string, limit int, snapshot *int, after *Position, lookahead bool) ([]Row, int, *Position, bool) {
 	s.mu.RLock()
-	rows, runs, blocks := s.rows, s.runs, s.blocks
-	if len(s.restored) > 0 {
-		combined := make([][]int, 0, len(runs)+1)
-		combined = append(combined, s.restored)
-		runs = append(combined, runs...)
+	rows, blocks := s.rows, s.blocks
+	runs := make([]indexRun, 0, len(s.runs)+1)
+	if s.restored.length > 0 {
+		runs = append(runs, s.restored)
+	}
+	for _, run := range s.runs {
+		runs = append(runs, indexRun{ordinals: run, length: len(run)})
 	}
 	count := len(rows)
 	if snapshot != nil {
@@ -390,14 +417,14 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	offsets := make([]int, len(runs))
 	bound := 0
 	for i, run := range runs {
-		lo := sort.Search(len(run), func(j int) bool { return !rows[run[j]].TS.Before(start) })
+		lo := sort.Search(run.length, func(j int) bool { return !rows[run.ordinal(j)].TS.Before(start) })
 		if len(contains) >= 4 {
-			hi := lo + sort.Search(len(run)-lo, func(j int) bool { return !rows[run[lo+j]].TS.Before(end) })
+			hi := lo + sort.Search(run.length-lo, func(j int) bool { return !rows[run.ordinal(lo+j)].TS.Before(end) })
 			bound += hi - lo
 		}
 		if after != nil {
-			lo += sort.Search(len(run)-lo, func(j int) bool {
-				ordinal := run[lo+j]
+			lo += sort.Search(run.length-lo, func(j int) bool {
+				ordinal := run.ordinal(lo + j)
 				t := rows[ordinal].TS
 				return t.After(after.Time) || (t.Equal(after.Time) && ordinal > after.Ordinal)
 			})
@@ -407,7 +434,7 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	wide := len(contains) >= 4 && bound >= 32768
 	active := -1
 	for i, offset := range offsets {
-		if offset < len(runs[i]) && rows[runs[i][offset]].TS.Before(end) {
+		if offset < runs[i].length && rows[runs[i].ordinal(offset)].TS.Before(end) {
 			if active >= 0 {
 				active = -2
 				break
@@ -424,8 +451,8 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	direct := func(budget int) ([]Row, *Position, bool) {
 		run := runs[active]
 		examined := 0
-		for directOffset < len(run) {
-			ordinal := run[directOffset]
+		for directOffset < run.length {
+			ordinal := run.ordinal(directOffset)
 			row := rows[ordinal]
 			if !row.TS.Before(end) {
 				break
@@ -458,8 +485,8 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	ordered := func(budget int) ([]Row, *Position, bool) {
 		h := &candidates{rows: rows, items: make([]candidate, 0, len(runs))}
 		for i, offset := range offsets {
-			if offset < len(runs[i]) && rows[runs[i][offset]].TS.Before(end) {
-				h.items = append(h.items, candidate{runs[i][offset], i, offset})
+			if offset < runs[i].length && rows[runs[i].ordinal(offset)].TS.Before(end) {
+				h.items = append(h.items, candidate{runs[i].ordinal(offset), i, offset})
 			}
 		}
 		heap.Init(h)
@@ -488,8 +515,8 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			}
 			next := current.offset + 1
 			run := runs[current.run]
-			if next < len(run) && rows[run[next]].TS.Before(end) {
-				h.items[0] = candidate{run[next], current.run, next}
+			if next < run.length && rows[run.ordinal(next)].TS.Before(end) {
+				h.items[0] = candidate{run.ordinal(next), current.run, next}
 				heap.Fix(h, 0)
 			} else {
 				heap.Pop(h)
@@ -547,8 +574,8 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	h := &candidates{rows: rows, items: make([]candidate, 0, len(runs))}
 	advance := func(runIndex, offset int) {
 		run := runs[runIndex]
-		for offset < len(run) {
-			ordinal := run[offset]
+		for offset < run.length {
+			ordinal := run.ordinal(offset)
 			row := rows[ordinal]
 			if !row.TS.Before(end) {
 				return

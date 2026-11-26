@@ -54,6 +54,7 @@ type parityProof struct {
 	Point          backup.Point `json:"verified_point"`
 	CapturedRows   int          `json:"captured_rows"`
 	PostRestore204 bool         `json:"post_restore_204"`
+	PostAppendRows int          `json:"post_append_rows"`
 	RestartRows    int          `json:"restart_rows"`
 }
 
@@ -85,24 +86,31 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 	defer client.CloseIdleConnections()
 	flags := []string{"-query-max-response-bytes=256"}
 	added := row{rows[1].TS, "after restore [match]"}
+	augmented := append(slices.Clone(rows), added)
 	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
 		if err := checkRestoredWalks(ctx, client, base, rows); err != nil {
 			return err
 		}
 		proof.CapturedRows = len(rows)
 		status, err := ingest(ctx, client, base, []row{added})
-		proof.PostRestore204 = status == http.StatusNoContent && err == nil
-		return err
+		if err != nil {
+			return fmt.Errorf("append to restored image: %w", err)
+		}
+		proof.PostRestore204 = status == http.StatusNoContent
+		if err := checkRestoredWalks(ctx, client, base, augmented); err != nil {
+			return fmt.Errorf("walk after acknowledged post-restore write: %w", err)
+		}
+		proof.PostAppendRows = len(augmented)
+		return nil
 	})
 	if err != nil {
 		return proof, fmt.Errorf("serve restored image: %w", err)
 	}
 	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
-		rows = append(rows, added)
-		if err := checkRestoredWalks(ctx, client, base, rows); err != nil {
+		if err := checkRestoredWalks(ctx, client, base, augmented); err != nil {
 			return err
 		}
-		proof.RestartRows = len(rows)
+		proof.RestartRows = len(augmented)
 		return nil
 	})
 	if err != nil {

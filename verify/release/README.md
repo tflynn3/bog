@@ -90,15 +90,27 @@ inside the original snapshot range, is visible. A separate server with
 `-query-work-budget=1` receives 32 fixture rows and must return a clean HTTP
 503 on a scan for an absent string.
 
+The fixed-budget probe uses three distinct rows with the same timestamp and
+queries with `limit=1`. It starts a fresh candidate for each budget in order
+from 1 through 2048, with a one-minute deadline for the search and walk
+combined. Each budget below the first cursor must return only the work-budget
+error (HTTP 503 with no NDJSON or cursor). The candidate that issues the first
+cursor must serve all three rows in append order through a terminal page at the
+same budget. The `work_budget` case keeps the budget-1 rejection evidence and
+adds `fixed_budget_walk` with `first_cursor_budget`, `rejected_budgets`,
+`pages`, and `rows`.
+
 ## Restored parity fixture
 
 The Linux test `TestReleaseRestoredParity` publishes a checkpoint and appends
 a WAL tail with overlapping times, ties, duplicates, and backfill. It exports,
 verifies, and restores that capture before starting the pinned candidate.
 Fresh HTTP cursors must reproduce the exact append-order model across page
-sizes and literal filters with a 256-byte response cap. The candidate must
-acknowledge an ingest on the restored image, then return the augmented model
-after restart. The test writes a report bound to the same candidate identity.
+sizes and literal filters with a 256-byte response cap. After the candidate
+acknowledges an ingest on the restored image, a fresh walk must return the
+augmented model before shutdown, and another must return it after restart.
+The `restored_parity` evidence records their row counts in `post_append_rows`
+and `restart_rows`. The report is bound to the same candidate identity.
 
 The workflow passes `-parity parity.json` when validating the collected reports
 and runs the verifier tests with the race detector on Linux.

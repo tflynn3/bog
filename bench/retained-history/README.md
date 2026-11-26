@@ -82,6 +82,44 @@ It then verifies publication, the expected uncovered tail and further pages
 from the original cursor. A candidate lacking the control path fails in the
 `live_capability` phase.
 
+## Cutover diagnostics
+
+Each fixture's additive `diagnostics` object records the starting and
+restarting candidate separately. It includes exit code or signal, whether
+the candidate had already exited when cleanup began, and the last 32 KiB
+of combined output. Cgroup memory events include the kernel's OOM kill
+counter for the two lifetimes together. Start-to-ready and restart-to-ready
+include process startup and the successful HTTP readiness probe. The
+replay-only measurement is null because the candidate does not expose
+that phase separately.
+
+Query timings are measured from request start. Each phase retains counts
+by client-observed admission, maximum time to headers and to full body
+completion, the latest attempt, and the first failed attempt if present.
+An NDJSON response identifies admission once the client sees its headers.
+A complete 503 with the matching refusal text and no cursor distinguishes
+capacity from work-budget rejection. Check the failure phase, elapsed
+time, time budget, and partial byte count when a response is interrupted.
+
+The live runner verifies one uniquely identifiable acknowledged backfill in
+a fresh query after the original cursor crosses publication and drains.
+Compare those phases with the release saturation sequence before attributing
+a fresh query timeout to admission or response delivery. The restart walk
+still compares the entire fixture. The compaction-running ingest p99 and
+sample count cover only acknowledgements after the start response and
+before a status request that observed the same operation still running.
+The existing mixed-load p99 includes every mixed-load acknowledgement.
+[Release diagnosis sequence](../../verify/linux/README.md#cutover-diagnostics)
+
+Every 100 ms in live mode, the runner samples the apparent bytes in
+`.bog-checkpoint-stage` and counts published generation pin records in
+the fixture directory. Pin age uses record modification time. Records
+can outlive their locks, so these observations describe records on disk.
+The samples can miss short-lived peaks. Zero represents an empty observed
+sample. A null measurement or a query phase that never ran has an entry
+in `diagnostics.unavailable`. Optional diagnostic gaps do not change the
+release verdict.
+
 ## Architecture integration
 
 Register `bog/bench/retained-history` as a verifier command with no Bog package

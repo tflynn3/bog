@@ -169,7 +169,8 @@ func TestMixedLoadKeepsOriginalCutoff(t *testing.T) {
 	defer srv.Close()
 	s := newService(srv.URL)
 	defer s.client.CloseIdleConnections()
-	var r result
+	r := result{Diagnostics: &capacityDiagnostics{Queries: make(map[string]*queryPhase)}}
+	s.queryPhases = r.Diagnostics.Queries
 	if err := f.load(t.Context(), s, options{mode: "live", control: "/compact"}, &r); err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +182,11 @@ func TestMixedLoadKeepsOriginalCutoff(t *testing.T) {
 	}
 	if n, err := f.recover(t.Context(), s); err != nil || n != f.SeedRows+f.TailRows {
 		t.Fatalf("recover: %d %v", n, err)
+	}
+	if d := r.Diagnostics; d.RunningSamples < 1 || d.RunningSamples >= r.IngestSamples ||
+		d.RunningIngestP99 == nil || d.OpeningCompaction.State != "running" || d.OverlapCompaction.State != "running" ||
+		d.Queries["fresh_backfill"].Last.Admission != "ndjson_response" || d.Queries["restart_walk"].Attempts < 1 {
+		t.Fatalf("incomplete phase diagnostics: %+v", d)
 	}
 	if r.IngestSamples != f.TailRows/f.BatchRows || r.QuerySamples < 2 || r.Compaction == nil || r.Compaction.Generation != 2 {
 		t.Fatalf("incomplete mixed evidence: %+v", r)

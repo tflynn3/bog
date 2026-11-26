@@ -237,10 +237,13 @@ func (s *server) refuseCorruption(ctx context.Context) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.launch(); err != nil {
+	if err := s.launchFor("corruption_refusal"); err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, s.close()) }()
+	defer func() {
+		s.recordStartupError(err)
+		err = errors.Join(err, s.close())
+	}()
 	ctx, cancel := context.WithTimeout(ctx, processTimeout)
 	defer cancel()
 	ticker := time.NewTicker(5 * time.Millisecond)
@@ -250,10 +253,10 @@ func (s *server) refuseCorruption(ctx context.Context) (err error) {
 		case <-s.process.done:
 			var exit *exec.ExitError
 			if errors.As(s.process.result, &exit) && exit.ExitCode() > 0 &&
-				strings.Contains(s.process.logs.buf.String(), "invalid WAL checksum") {
+				strings.Contains(s.process.logs.text(), "invalid WAL checksum") {
 				return nil
 			}
-			return fmt.Errorf("expected startup to refuse committed checksum corruption, got %v: %s", s.process.result, s.process.logs.buf.String())
+			return fmt.Errorf("expected startup to refuse committed checksum corruption, got %v: %s", s.process.result, s.process.logs.text())
 		case <-ctx.Done():
 			return fmt.Errorf("corrupt candidate did not exit: %w", ctx.Err())
 		case <-ticker.C:

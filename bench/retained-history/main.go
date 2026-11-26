@@ -42,21 +42,22 @@ func fixtures(mode string) []fixture {
 }
 
 type result struct {
-	Fixture       fixture        `json:"fixture"`
-	Phase         string         `json:"phase"`
-	Status        string         `json:"status"`
-	Workload      string         `json:"workload_status"`
-	Detail        string         `json:"detail,omitempty"`
-	TimedOut      bool           `json:"timed_out"`
-	StartReady    *time.Duration `json:"start_to_ready_ns"`
-	RestartReady  *time.Duration `json:"restart_to_ready_ns"`
-	IngestP99     *time.Duration `json:"ingest_p99_ns"`
-	QueryP99      *time.Duration `json:"backfill_query_p99_ns"`
-	IngestSamples int            `json:"ingest_samples"`
-	QuerySamples  int            `json:"backfill_query_samples"`
-	RecoveredRows int            `json:"recovered_rows"`
-	Compaction    *compaction    `json:"compaction,omitempty"`
-	Cleanup       cleanupProof   `json:"cleanup"`
+	Fixture       fixture              `json:"fixture"`
+	Phase         string               `json:"phase"`
+	Status        string               `json:"status"`
+	Workload      string               `json:"workload_status"`
+	Detail        string               `json:"detail,omitempty"`
+	TimedOut      bool                 `json:"timed_out"`
+	StartReady    *time.Duration       `json:"start_to_ready_ns"`
+	RestartReady  *time.Duration       `json:"restart_to_ready_ns"`
+	IngestP99     *time.Duration       `json:"ingest_p99_ns"`
+	QueryP99      *time.Duration       `json:"backfill_query_p99_ns"`
+	IngestSamples int                  `json:"ingest_samples"`
+	QuerySamples  int                  `json:"backfill_query_samples"`
+	RecoveredRows int                  `json:"recovered_rows"`
+	Compaction    *compaction          `json:"compaction,omitempty"`
+	Cleanup       cleanupProof         `json:"cleanup"`
+	Diagnostics   *capacityDiagnostics `json:"diagnostics,omitempty"`
 	resources
 }
 

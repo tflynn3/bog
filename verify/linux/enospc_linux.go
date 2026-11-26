@@ -151,7 +151,7 @@ func mountCommand(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
-func diskCase(ctx context.Context, binary, root string) (proof diskEvidence, err error) {
+func diskCase(ctx context.Context, binary, root string, diag *caseDiagnostics) (proof diskEvidence, err error) {
 	mount := filepath.Join(root, "enospc")
 	if err := os.Mkdir(mount, 0700); err != nil {
 		return proof, err
@@ -209,6 +209,7 @@ func diskCase(ctx context.Context, binary, root string) (proof diskEvidence, err
 	if err != nil {
 		return proof, err
 	}
+	s.diagnostics = diag
 	defer func() { err = errors.Join(err, s.close()) }()
 	if err := checkHealthyToFull(ctx, s, healthy, dir, filler, &proof); err != nil {
 		return proof, fmt.Errorf("retarget from healthy to full: %w", err)

@@ -152,7 +152,7 @@ func TestChildExitAndForcedCleanup(t *testing.T) {
 		name, script string
 		exitCode     int
 	}{
-		{"startup failure", "exit 17", 17},
+		{"startup failure", "echo failed >&2; exit 17", 17},
 		{"ignores SIGTERM", "trap '' TERM\nprintf ready > ready\nexec sleep 30", -1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -198,6 +198,14 @@ func TestChildExitAndForcedCleanup(t *testing.T) {
 			if !errors.As(err, &exit) || exit.ExitCode() != tc.exitCode ||
 				(tc.exitCode == -1 && !strings.Contains(err.Error(), "grace period")) {
 				t.Fatalf("unexpected child exit: %v", err)
+			}
+			var evidence candidateEvidence
+			evidence.finish(p)
+			if !evidence.Reaped || evidence.WaitError == "" ||
+				(tc.exitCode == -1 && (evidence.Signal == "" || evidence.ExitCode != nil)) ||
+				(tc.exitCode != -1 && (evidence.ExitCode == nil || *evidence.ExitCode != tc.exitCode ||
+					evidence.Signal != "" || evidence.LogTail != "failed\n")) {
+				t.Fatalf("unexpected candidate evidence: %+v", evidence)
 			}
 			pid, err := os.ReadFile(cgroup)
 			if err != nil || string(pid) != strconv.Itoa(p.cmd.Process.Pid) {

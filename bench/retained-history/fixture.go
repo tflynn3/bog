@@ -76,7 +76,12 @@ func p99(samples []time.Duration) *time.Duration {
 	return &samples[k-1]
 }
 
-func (f fixture) appendRange(ctx context.Context, s service, lo, hi int, samples *[]time.Duration) error {
+type ingestSample struct {
+	latency time.Duration
+	ack     time.Time
+}
+
+func (f fixture) appendRange(ctx context.Context, s service, lo, hi int, samples *[]ingestSample) error {
 	for i := lo; i < hi; i += f.BatchRows {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -90,7 +95,7 @@ func (f fixture) appendRange(ctx context.Context, s service, lo, hi int, samples
 			return fmt.Errorf("append at ordinal %d: %w", i, err)
 		}
 		if samples != nil {
-			*samples = append(*samples, d)
+			*samples = append(*samples, ingestSample{d, time.Now()})
 		}
 	}
 	return nil
@@ -117,7 +122,7 @@ func (f fixture) load(ctx context.Context, s service, o options, r *result) erro
 			if _, err := s.compact(ctx, o.control, "start", hi); err != nil {
 				return err
 			}
-			c, err := s.waitCompaction(ctx, o.control, hi, generation)
+			c, err := s.waitCompaction(ctx, o.control, hi, generation, nil)
 			if err != nil {
 				return err
 			}
@@ -129,13 +134,29 @@ func (f fixture) load(ctx context.Context, s service, o options, r *result) erro
 	}
 	r.Phase = "mixed_load"
 	w := f.newWalk(f.SeedRows, true)
+	w.phase = "seed_capture"
 	if _, err := w.page(ctx, s, f); err != nil {
 		return fmt.Errorf("capture seed cutoff: %w", err)
 	}
-	var writes, reads []time.Duration
+	var writes []ingestSample
+	var reads []time.Duration
+	var runningThrough time.Time
 	defer func() {
 		r.IngestSamples, r.QuerySamples = len(writes), len(reads)
-		r.IngestP99, r.QueryP99 = p99(writes), p99(reads)
+		all := make([]time.Duration, 0, len(writes))
+		var overlapping []time.Duration
+		for i, sample := range writes {
+			all = append(all, sample.latency)
+			// The first fixture batch precedes the compaction start response.
+			if i > 0 && !sample.ack.After(runningThrough) {
+				overlapping = append(overlapping, sample.latency)
+			}
+		}
+		r.IngestP99, r.QueryP99 = p99(all), p99(reads)
+		if r.Diagnostics != nil {
+			r.Diagnostics.RunningSamples = len(overlapping)
+			r.Diagnostics.RunningIngestP99 = p99(overlapping)
+		}
 	}()
 	// Append one acknowledged batch before resuming the cursor. Later
 	// writes have a single producer so tie order stays deterministic.
@@ -148,6 +169,9 @@ func (f fixture) load(ctx context.Context, s service, o options, r *result) erro
 		c, err := s.compact(ctx, o.control, "start", first)
 		if err != nil {
 			return err
+		}
+		if r.Diagnostics != nil {
+			r.Diagnostics.OpeningCompaction = &c
 		}
 		if c.State != "running" || c.Generation != generation || c.CoveredRows != f.SeedRows || c.CommittedRows != first {
 			return fmt.Errorf("invalid opening compaction state: %+v", c)
@@ -170,6 +194,7 @@ func (f fixture) load(ctx context.Context, s service, o options, r *result) erro
 		writer <- err
 	}()
 	var mixedErr error
+	w.phase = "mixed_continuation"
 	// Leave a continuation pending until after live publication so the walk
 	// exercises the same pin on both sides of the generation change.
 	for w.cursor != "" && (o.mode != "live" || len(w.want)-w.offset > 509) {
@@ -182,10 +207,17 @@ func (f fixture) load(ctx context.Context, s service, o options, r *result) erro
 		reads = append(reads, d)
 		if o.mode == "live" && len(reads) == 1 {
 			<-firstWrite
+			sent := time.Now()
 			c, err := s.compact(mixed, o.control, "status", first)
+			if err == nil && r.Diagnostics != nil {
+				r.Diagnostics.OverlapCompaction = &c
+			}
 			if err == nil && (c.State != "running" || c.Generation != generation ||
 				c.CoveredRows != f.SeedRows || c.CommittedRows < first+f.BatchRows) {
 				err = fmt.Errorf("compaction did not span a continuation and an acknowledged batch: %+v", c)
+			}
+			if err == nil {
+				runningThrough = sent
 			}
 			if err != nil {
 				mixedErr = err
@@ -198,7 +230,9 @@ func (f fixture) load(ctx context.Context, s service, o options, r *result) erro
 		return err
 	}
 	if o.mode == "live" {
-		c, err := s.waitCompaction(ctx, o.control, first, generation)
+		c, err := s.waitCompaction(ctx, o.control, first, generation, func(sent time.Time) {
+			runningThrough = sent
+		})
 		r.Compaction = &c
 		if err != nil {
 			return err
@@ -206,10 +240,23 @@ func (f fixture) load(ctx context.Context, s service, o options, r *result) erro
 		if c.CommittedRows != f.SeedRows+f.TailRows {
 			return fmt.Errorf("unexpected final uncovered tail: %+v", c)
 		}
+		r.Phase, w.phase = "after_publication_continuation", "after_publication_continuation"
 		for w.cursor != "" {
 			if _, err := w.page(ctx, s, f); err != nil {
 				return fmt.Errorf("resume after compaction: %w", err)
 			}
+		}
+		r.Phase = "fresh_backfill"
+		// The third row of the first overlapping batch is distinct from the
+		// tied duplicate pair and was absent from the captured seed cutoff.
+		ordinal := first + 2
+		row := f.row(ordinal)
+		fresh := walk{
+			filter: filter{row.TS, row.TS.Add(time.Millisecond), row.Line},
+			want:   []int{ordinal}, phase: "fresh_backfill",
+		}
+		if _, err := fresh.page(ctx, s, f); err != nil {
+			return fmt.Errorf("fresh acknowledged backfill at ordinal %d: %w", ordinal, err)
 		}
 	}
 	return nil
@@ -217,6 +264,7 @@ func (f fixture) load(ctx context.Context, s service, o options, r *result) erro
 
 func (f fixture) recover(ctx context.Context, s service) (int, error) {
 	w := f.newWalk(f.SeedRows+f.TailRows, false)
+	w.phase = "restart_walk"
 	for w.pages == 0 || w.cursor != "" {
 		if _, err := w.page(ctx, s, f); err != nil {
 			return w.offset, err

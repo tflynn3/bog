@@ -51,7 +51,9 @@ func run(ctx context.Context, args []string) (err error) {
 	if *benchmark {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		defer cancel()
-		proof, err := runCase(ctx, *binary, filepath.Join(root, "benchmark"), benchmarkCase)
+		diag := newCaseDiagnostics()
+		r.Diagnostics["benchmark"] = diag
+		proof, err := runCase(ctx, *binary, filepath.Join(root, "benchmark"), benchmarkCase, diag)
 		return r.record("benchmark", proof, err)
 	}
 	for _, c := range []struct {
@@ -59,17 +61,21 @@ func run(ctx context.Context, args []string) (err error) {
 		probe func(context.Context, *server) (any, error)
 	}{{"sigkill", sigkillCase}, {"recovery", recoveryCase}} {
 		caseCtx, cancel := context.WithTimeout(ctx, time.Minute)
-		proof, caseErr := runCase(caseCtx, *binary, filepath.Join(root, c.name), c.probe)
+		diag := newCaseDiagnostics()
+		r.Diagnostics[c.name] = diag
+		proof, caseErr := runCase(caseCtx, *binary, filepath.Join(root, c.name), c.probe, diag)
 		cancel()
 		err = errors.Join(err, r.record(c.name, proof, caseErr))
 	}
 	caseCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	proof, caseErr := diskCase(caseCtx, *binary, root)
+	diag := newCaseDiagnostics()
+	r.Diagnostics["enospc"] = diag
+	proof, caseErr := diskCase(caseCtx, *binary, root, diag)
 	return errors.Join(err, r.record("enospc", proof, caseErr))
 }
 
-func runCase(ctx context.Context, binary, dir string, probe func(context.Context, *server) (any, error)) (_ any, err error) {
+func runCase(ctx context.Context, binary, dir string, probe func(context.Context, *server) (any, error), diag *caseDiagnostics) (_ any, err error) {
 	if err := os.Mkdir(dir, 0700); err != nil {
 		return nil, err
 	}
@@ -77,6 +83,7 @@ func runCase(ctx context.Context, binary, dir string, probe func(context.Context
 	if err != nil {
 		return nil, err
 	}
+	s.diagnostics = diag
 	defer func() { err = errors.Join(err, s.close()) }()
 	if err := s.start(ctx); err != nil {
 		return nil, fmt.Errorf("start candidate: %w", err)

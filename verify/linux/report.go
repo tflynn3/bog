@@ -18,11 +18,12 @@ const fixtureID = "linux-release-v1"
 var revisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 type report struct {
-	SchemaVersion int                `json:"schema_version"`
-	Revision      string             `json:"revision"`
-	BinarySHA256  string             `json:"binary_sha256"`
-	Fixture       string             `json:"fixture"`
-	Cases         map[string]outcome `json:"cases"`
+	SchemaVersion int                         `json:"schema_version"`
+	Revision      string                      `json:"revision"`
+	BinarySHA256  string                      `json:"binary_sha256"`
+	Fixture       string                      `json:"fixture"`
+	Cases         map[string]outcome          `json:"cases"`
+	Diagnostics   map[string]*caseDiagnostics `json:"diagnostics,omitempty"`
 }
 
 type outcome struct {
@@ -54,7 +55,7 @@ func newReport(binary, revision, fixture string) (report, error) {
 	if n != stat.Size() {
 		return report{}, errors.New("candidate changed while hashing")
 	}
-	return report{1, revision, hex.EncodeToString(hash.Sum(nil)), fixture, make(map[string]outcome)}, nil
+	return report{1, revision, hex.EncodeToString(hash.Sum(nil)), fixture, make(map[string]outcome), make(map[string]*caseDiagnostics)}, nil
 }
 
 func (r report) record(name string, evidence any, err error) error {

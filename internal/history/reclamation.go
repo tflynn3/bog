@@ -15,15 +15,33 @@ type retiredDirectory struct {
 }
 
 func (c *Catalog) trackRetired(g *generation) {
+	c.trackSuperseded(g, nil)
+}
+
+// A shared file will become a retirement candidate when the generation
+// that stops referencing it is installed. Keep only disappeared names
+// here, so an append-only replacement at the ceiling does not fill the
+// candidate table with the entire still-live manifest.
+func (c *Catalog) trackSuperseded(g, successor *generation) {
 	if len(g.segments) == 0 {
 		return
 	}
-	i := c.retiredIndex(g.dirInfo)
-	if i < 0 {
-		i = len(c.retired)
-		c.retired = append(c.retired, retiredDirectory{info: g.dirInfo, segments: make(map[string]os.FileInfo)})
+	var retained map[string]struct{}
+	if successor != nil && os.SameFile(g.dirInfo, successor.dirInfo) {
+		retained = make(map[string]struct{}, len(successor.segments))
+		for _, s := range successor.segments {
+			retained[s.name] = struct{}{}
+		}
 	}
+	i := c.retiredIndex(g.dirInfo)
 	for _, s := range g.segments {
+		if _, shared := retained[s.name]; shared {
+			continue
+		}
+		if i < 0 {
+			i = len(c.retired)
+			c.retired = append(c.retired, retiredDirectory{info: g.dirInfo, segments: make(map[string]os.FileInfo)})
+		}
 		c.retired[i].segments[s.name] = s.stat
 	}
 }

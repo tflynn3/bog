@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"slices"
-	"sort"
 	"strings"
 	"syscall"
 
@@ -103,7 +102,7 @@ func publishCaptured(ctx context.Context, root *os.Root, dir *os.File, input io.
 		}
 		start = previous.CoveredOffset
 		m.NextOrdinal = previous.NextOrdinal
-		m.Segments = append(m.Segments, previous.Segments...)
+		m.Segments = previous.Segments
 	}
 	p.stage = stage
 	return p.publish(ctx, m, &next, func(visit func(uint64, []store.Row) error) error {
@@ -165,6 +164,8 @@ func (p *publication) checkPrevious(ctx context.Context, previous *Manifest) err
 		!slices.Equal(m.Segments, previous.Segments) {
 		return fmt.Errorf("%w: previous checkpoint is no longer authoritative", ErrIntegrity)
 	}
+	var scratch [32 << 10]byte
+	seen := make(map[string]struct{}, len(m.Segments))
 	for _, s := range m.Segments {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -172,21 +173,25 @@ func (p *publication) checkPrevious(ctx context.Context, previous *Manifest) err
 		if !validSegmentName(s.Name) || s.Size < blockHeaderSize+blockRowSize || s.Size > MaxBlockSize {
 			return fmt.Errorf("%w: invalid segment metadata", ErrIntegrity)
 		}
-		if err := verifyPreviousSegment(p.dir, s); err != nil {
+		if _, duplicate := seen[s.Name]; duplicate {
+			return fmt.Errorf("%w: repeated segment %s", ErrIntegrity, s.Name)
+		}
+		seen[s.Name] = struct{}{}
+		if err := verifyPreviousSegment(p.dir, s, &scratch); err != nil {
 			return fmt.Errorf("%w: referenced segment %s: %v", ErrIntegrity, s.Name, err)
 		}
 	}
 	return nil
 }
 
-func verifyPreviousSegment(dir *os.File, s segmentMeta) (err error) {
+func verifyPreviousSegment(dir *os.File, s segmentMeta, scratch *[32 << 10]byte) (err error) {
 	f, err := openPublicationFile(dir, s.Name)
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
 	h := sha256.New()
-	n, err := io.Copy(h, io.LimitReader(f, s.Size+1))
+	n, err := io.CopyBuffer(h, io.LimitReader(f, s.Size+1), scratch[:])
 	if err != nil {
 		return err
 	}
@@ -277,60 +282,7 @@ func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, sc
 	if err := p.root.Chmod(stageDir, 0700); err != nil {
 		return nil, err
 	}
-	var run []BlockRow
-	size := blockHeaderSize
-	flush := func() error {
-		if len(run) == 0 {
-			return nil
-		}
-		sort.Slice(run, func(i, j int) bool { return lessRow(run[i], run[j]) })
-		if len(m.Segments) >= MaxSegments {
-			return errors.New("checkpoint segment limit exceeded")
-		}
-		b, e := EncodeBlock(run)
-		if e != nil {
-			return e
-		}
-		name, e := randomName(segmentPrefix)
-		if e != nil {
-			return e
-		}
-		sum := digest(b)
-		if e = a.stageSegment(name, b, sum); e != nil {
-			return e
-		}
-		m.Segments = append(m.Segments, segmentMeta{Name: name, Size: int64(len(b)), SHA256: sum})
-		run = nil
-		size = blockHeaderSize
-		return nil
-	}
-	err = scan(func(first uint64, rows []store.Row) error {
-		if first != m.NextOrdinal || len(rows) == 0 || uint64(len(rows)) > ^uint64(0)-first {
-			return fmt.Errorf("%w: invalid checkpoint batch ordinals", ErrIntegrity)
-		}
-		for i, row := range rows {
-			if len(row.Line) > MaxBlockSize-blockHeaderSize-blockRowSize {
-				return errors.New("row exceeds block limit")
-			}
-			n := blockRowSize + len(row.Line)
-			if size+n > MaxBlockSize {
-				if e := flush(); e != nil {
-					return e
-				}
-			}
-			run = append(run, BlockRow{Row: row, Ordinal: first + uint64(i)})
-			size += n
-		}
-		m.NextOrdinal = first + uint64(len(rows))
-		return nil
-	})
-	if err == nil && next != nil && m.NextOrdinal != *next {
-		err = fmt.Errorf("%w: checkpoint scan did not match prefix ordinal", ErrIntegrity)
-	}
-	if err == nil {
-		err = flush()
-	}
-	if err != nil {
+	if err := a.buildSegments(m, next, scan); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {

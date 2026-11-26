@@ -13,7 +13,7 @@ import (
 )
 
 // MaxSegments limits both manifest size and the number of simultaneously decoded
-// blocks during a merge. Large checkpoints must be split by a future compactor.
+// runs that a v1 reader may need to merge.
 const MaxSegments = 1024
 const maxManifestSize = 256 << 10
 const manifestName = "bog.checkpoint"

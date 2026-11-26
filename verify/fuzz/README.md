@@ -39,7 +39,7 @@ Run these entry points on each native Linux release runner and retain the
 verbose output with the verifier race log.
 
 ```sh
-go test -race -count=1 -v -timeout=3m -run '^(TestStorageRecovery|TestInterruptedBackupRetries|TestBackupRetryRestrictiveUmask|TestRetainedExportLifecycle)$' ./verify/fuzz
+go test -race -count=1 -v -timeout=3m -run '^(TestStorageRecovery|TestCheckpointSegmentCeiling|TestInterruptedBackupRetries|TestBackupRetryRestrictiveUmask|TestRetainedExportLifecycle)$' ./verify/fuzz
 go test -run '^$' -fuzz '^FuzzWALRecovery$' -fuzztime 30s -timeout 1m -parallel 2 ./verify/fuzz
 go test -run '^$' -fuzz '^FuzzCheckpointPublication$' -fuzztime 30s -timeout 1m -parallel 2 ./verify/fuzz
 ```
@@ -85,3 +85,46 @@ The cancel case requires context cancellation and checks that the empty
 destination survives. Both cases check that the stage and its claim records
 are removed. The worker uses the same 45-second parent deadline and resource
 limits as the deterministic corpus.
+
+## Checkpoint publication at the segment ceiling
+
+`TestCheckpointSegmentCeiling` runs in the existing `verify/fuzz` race
+step on native Linux amd64 and arm64. Run the focused case with verbose
+output to retain the per-attempt evidence.
+
+```sh
+go test -race -count=1 -v -timeout=1m -run '^TestCheckpointSegmentCeiling$' ./verify/fuzz
+```
+
+Seed `ceiling-v1` starts with 1,024 valid one-row blocks and a checksummed
+manifest bound to an acknowledged WAL frame. Each three-row backfill adds
+two identical tied rows and one older row. Publication at the ceiling
+must coalesce multiple original blocks with the backfill. Five advances
+cover two such repacks, with incremental publications in between.
+
+The test cancels after the first block is staged, exhausts the staging
+budget at manifest admission, kills two subprocesses after segment
+installation and before the authority rename, and forces the manifest
+rename to return ENOENT at the same boundary. Each attempt preserves the
+exact predecessor namespace after cleanup. Uncertain attempts fence off
+publication and catalog replacement until recovery has checked the old
+authority against the reopened or still-live WAL. Logs identify the seed,
+phase, file count, bytes, staging usage, pin usage, and published cutoffs.
+
+An acquired reader and a paused scan keep the predecessor readable through
+retry and all five advances. The three-capture budget allows both predecessor
+readers and one successor reader at a time. Reclamation preserves the
+predecessor's segments until the admitted scan finishes, even after both
+readers close.
+The test compares exact rows and append ordinals, checks that offsets and
+ordinals advance, and reopens the WAL and catalog after final reclamation
+to verify the settled generation and file set.
+
+The fixture caps each artifact at 256 KiB plus one byte and inventories at
+most 1,036 files and 1 MiB of logical file contents, including installed
+losing outputs and staging. Publication has a 256 KiB staging budget and
+an 8 KiB cumulative segment-write ceiling across the successful advances.
+The parent enforces the 45-second corpus deadline. Kill workers reuse the
+12-second phase barrier and SIGKILL reaping, and all workers use the
+existing relative address-space and per-file write limits. This focused
+fixture runs alongside the separate 128 MiB capacity verifier fixtures.

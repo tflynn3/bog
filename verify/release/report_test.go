@@ -16,6 +16,9 @@ const testRevision = "0ab9ea87c20ebf0c585f384523059abb65cb79d8"
 
 const proofJSON = `{"errno":"ENOSPC","disposable_local_filesystem":true,"observed_enospc":true,"recovered_after_space_freed":true}`
 
+const healthyToFullJSON = `"healthy_to_full":{"readiness_status":200,"readiness_reason":"ready","ingest_status":204,"replayed_after_restart":true}`
+const fullToHealthyJSON = `"full_to_healthy":{"readiness_status":503,"readiness_reason":"low_disk_headroom","ingest_status":503,"post_ingest_reason":"wal_rollback","post_ingest_category":"enospc"}`
+
 func TestValidateReport(t *testing.T) {
 	t.Parallel()
 	id := identity{1, testRevision, strings.Repeat("a", 64), "test-fixture"}
@@ -79,8 +82,59 @@ func TestValidateReport(t *testing.T) {
 	}
 }
 
-func TestValidateCommand(t *testing.T) {
+func TestValidateRetargetEvidence(t *testing.T) {
 	t.Parallel()
+	id := identity{1, testRevision, strings.Repeat("a", 64), capacityFixtureID}
+	modern := healthyToFullJSON + "," + fullToHealthyJSON
+	for _, tc := range []struct {
+		name, directions, problem string
+		strict                    bool
+	}{
+		{"historical", "", "", false},
+		{"native requires directions", "", "healthy_to_full", true},
+		{"native success", modern, "", true},
+		{"compatibility success", modern, "", false},
+		{"healthy direction only", healthyToFullJSON, "full_to_healthy", false},
+		{"full direction only", fullToHealthyJSON, "healthy_to_full", false},
+		{"null healthy direction", `"healthy_to_full":null,` + fullToHealthyJSON, "healthy_to_full", true},
+		{"wrong healthy readiness status", strings.Replace(modern, "200", "503", 1), "healthy_to_full", true},
+		{"wrong healthy readiness reason", strings.Replace(modern, `"ready"`, `"low_disk_headroom"`, 1), "healthy_to_full", true},
+		{"healthy ingest rejected", strings.Replace(modern, "204", "503", 1), "healthy_to_full", true},
+		{"missing healthy replay", strings.Replace(modern, `,"replayed_after_restart":true`, "", 1), "replayed_after_restart", true},
+		{"healthy replay failed", strings.Replace(modern, `"replayed_after_restart":true`, `"replayed_after_restart":false`, 1), "healthy_to_full", true},
+		{"wrong full readiness status", strings.Replace(modern, "503", "200", 1), "full_to_healthy", true},
+		{"wrong full readiness reason", strings.Replace(modern, `"low_disk_headroom"`, `"ready"`, 1), "full_to_healthy", true},
+		{"full ingest acknowledged", strings.Replace(modern, `"ingest_status":503`, `"ingest_status":204`, 1), "full_to_healthy", true},
+		{"missing rollback reason", strings.Replace(modern, `"post_ingest_reason":"wal_rollback",`, "", 1), "post_ingest_reason", true},
+		{"wrong rollback reason", strings.Replace(modern, `"wal_rollback"`, `"low_disk_headroom"`, 1), "full_to_healthy", true},
+		{"wrong rollback category", strings.Replace(modern, `"enospc"`, `"io"`, 1), "full_to_healthy", true},
+		{"null rollback category", strings.Replace(modern, `"enospc"`, "null", 1), "post_ingest_category", true},
+		{"duplicate direction", modern + "," + fullToHealthyJSON, "duplicate", true},
+		{"duplicate readiness status", strings.Replace(modern, "200", `503,"readiness_status":200`, 1), "duplicate", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			proof := proofJSON
+			if tc.directions != "" {
+				proof = proof[:len(proof)-1] + "," + tc.directions + "}"
+			}
+			raw, err := json.Marshal(report{id, map[string]outcome{
+				"sigkill": {Status: "pass"}, "recovery": {Status: "pass"},
+				"enospc": {Status: "pass", Evidence: jsontext.Value(proof)},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validateReportWithRetarget(raw, id, durabilityCases, tc.strict)
+			if tc.problem == "" && err != nil || tc.problem != "" && (err == nil || !strings.Contains(err.Error(), tc.problem)) {
+				t.Fatalf("wanted %q, got %v", tc.problem, err)
+			}
+		})
+	}
+}
+
+func TestValidateCommand(t *testing.T) {
+	t.Setenv("BOG_RELEASE_REQUIRE_RETARGET", "")
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "candidate")
 	data := []byte("prebuilt candidate")
@@ -113,6 +167,23 @@ func TestValidateCommand(t *testing.T) {
 		writeFixture(t, path, raw)
 		args = append(args, "-"+fixture.name, path)
 	}
+	if err := run(t.Context(), args); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BOG_RELEASE_REQUIRE_RETARGET", "1")
+	if err := run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "durability report: case \"enospc\": healthy_to_full") {
+		t.Fatalf("native validation accepted historical durability evidence: %v", err)
+	}
+	proof := proofJSON[:len(proofJSON)-1] + "," + healthyToFullJSON + "," + fullToHealthyJSON + "}"
+	path := filepath.Join(dir, "durability.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), proofJSON) {
+		t.Fatalf("missing original proof: %s", raw)
+	}
+	writeFixture(t, path, []byte(strings.Replace(string(raw), proofJSON, proof, 1)))
 	if err := run(t.Context(), args); err != nil {
 		t.Fatal(err)
 	}

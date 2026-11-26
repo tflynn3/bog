@@ -15,14 +15,38 @@ env:
   GOTOOLCHAIN: local
   GOWORK: 'off'
   GOAMD64: v1
+  GOARM64: v8.0
   CGO_ENABLED: '0'
   FIXTURE: linux-release-v1
   REVISION: ${{ inputs.revision }}
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    name: Native Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            runner_arch: X64
+            machine: x86_64
+            tuning_key: GOAMD64
+            tuning: v1
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            runner_arch: ARM64
+            machine: aarch64
+            tuning_key: GOARM64
+            tuning: v8.0
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 72
+    env:
+      EXPECTED_ARCH: ${{ matrix.arch }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+      EXPECTED_MACHINE: ${{ matrix.machine }}
+      TUNING_KEY: ${{ matrix.tuning_key }}
+      EXPECTED_TUNING: ${{ matrix.tuning }}
     defaults:
       run:
         shell: bash
@@ -33,7 +57,8 @@ jobs:
           mkdir -p "$EVIDENCE"
           printf 'EVIDENCE=%s\nBINARY=%s\n' "$EVIDENCE" "$RUNNER_TEMP/bog-release-candidate" >> "$GITHUB_ENV"
           {
-            printf 'revision=%q\nfixture=%s\n' "$REVISION" "$FIXTURE"
+            printf 'revision=%q\ngate_revision=%s\nfixture=%s\nexpected_arch=%s\n' \
+              "$REVISION" "$GITHUB_WORKFLOW_SHA" "$FIXTURE" "$EXPECTED_ARCH"
             uname -a
             printf 'runner_os=%s\nrunner_arch=%s\nimage_os=%s\nimage_version=%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
             cat /etc/os-release
@@ -42,10 +67,15 @@ jobs:
             findmnt --target /sys/fs/cgroup
           } | tee "$EVIDENCE/run.txt"
           [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "Expected a full lowercase commit SHA" | tee -a "$EVIDENCE/run.txt"; exit 1; }
-          [[ "$RUNNER_ARCH" == X64 && "$(uname -m)" == x86_64 ]]
+          if [[ "$RUNNER_OS" != Linux || "$RUNNER_ARCH" != "$EXPECTED_RUNNER_ARCH" ||
+                "$(uname -sm)" != "Linux $EXPECTED_MACHINE" ]]; then
+            echo "Native Linux $EXPECTED_ARCH runner unavailable" | tee -a "$EVIDENCE/run.txt"
+            exit 1
+          fi
 
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.workflow_sha }}
           path: gate
           persist-credentials: false
 
@@ -57,6 +87,9 @@ jobs:
 
       - name: Record fixture configuration
         run: |
+          gate_head=$(git -C gate rev-parse HEAD)
+          printf 'gate_head=%s\n' "$gate_head" | tee -a "$EVIDENCE/run.txt"
+          [[ "$gate_head" == "$GITHUB_WORKFLOW_SHA" ]]
           cp gate/verify/release/README.md "$EVIDENCE/fixture.md"
           cp candidate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
           cp candidate/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
@@ -75,54 +108,87 @@ jobs:
             head=$(git rev-parse HEAD)
             printf 'HEAD=%s\n' "$head"
             [[ "$head" == "$REVISION" ]]
-            [[ -z "$(git status --porcelain)" ]]
+            tree_status=$(git status --porcelain)
+            [[ -z "$tree_status" ]]
             go version
-            [[ "$(go env GOVERSION GOOS GOARCH GOTOOLCHAIN GOAMD64 CGO_ENABLED)" == $'go1.27.0\nlinux\namd64\nlocal\nv1\n0' ]]
+            go_config=$(go env GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOTOOLCHAIN "$TUNING_KEY" CGO_ENABLED)
+            printf '%s\n' "$go_config"
+            expected_config=$(printf '%s\n' go1.27.0 linux "$EXPECTED_ARCH" linux "$EXPECTED_ARCH" local "$EXPECTED_TUNING" 0)
+            [[ "$go_config" == "$expected_config" ]]
             go build -trimpath -buildvcs=true -o "$BINARY" ./cmd/bog
             go version -m "$BINARY" | tee "$EVIDENCE/build-info.txt"
             grep -Eq "^[[:space:]]+build[[:space:]]+vcs.revision=$REVISION$" "$EVIDENCE/build-info.txt"
             grep -Eq '^[[:space:]]+build[[:space:]]+vcs.modified=false$' "$EVIDENCE/build-info.txt"
+            for setting in GOOS=linux "GOARCH=$EXPECTED_ARCH" "$TUNING_KEY=$EXPECTED_TUNING" CGO_ENABLED=0; do
+              grep -Fxq $'\tbuild\t'"$setting" "$EVIDENCE/build-info.txt"
+            done
             sha256sum "$BINARY" | tee "$EVIDENCE/binary.sha256"
           } 2>&1 | tee "$EVIDENCE/build.log"
 
       - name: Run release evidence producers
         if: steps.build.outcome == 'success'
-        timeout-minutes: 48
+        timeout-minutes: 52
         run: |
           record() {
             local name=$1 status=$2
-            printf '%s revision=%s exit=%d\n' "$name" "$REVISION" "$status" | tee -a "$EVIDENCE/producers.txt"
+            printf '%s revision=%s arch=%s exit=%d\n' "$name" "$REVISION" "$EXPECTED_ARCH" "$status" | tee -a "$EVIDENCE/producers.txt"
           }
           common=(-binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE")
+          runner_uid=$(id -u)
+          runner_gid=$(id -g)
           admission() (
             cd gate || exit
             timeout --kill-after=5s 2m go run ./verify/release "${common[@]}" -report "$EVIDENCE/admission.json"
           )
           durability() (
             cd candidate || exit
-            timeout --kill-after=5s 15m go run ./verify/linux "${common[@]}" -report "$EVIDENCE/durability.json"
+            timeout --kill-after=5s 2m go build -trimpath -o "$RUNNER_TEMP/bog-durability-verifier" ./verify/linux || exit
+            fixture_parent=$(mktemp -d "$RUNNER_TEMP/bog-durability.XXXXXXXX") || exit
+            cleanup() {
+              local status=$?
+              if rmdir -- "$fixture_parent"; then
+                printf 'durability_fixture_parent_removed=%s\n' "$fixture_parent" || status=1
+              else
+                printf 'durability_fixture_cleanup_failed=%s\n' "$fixture_parent" >&2
+                if (( status == 0 )); then status=1; fi
+              fi
+              exit "$status"
+            }
+            trap cleanup EXIT
+            printf 'durability_fixture_parent=%s\n' "$fixture_parent" || exit
+            sudo -n systemd-run --quiet --wait --pipe --collect --expand-environment=no \
+              --uid="$runner_uid" --gid="$runner_gid" -p PrivateMounts=yes \
+              -p RuntimeMaxSec=15min -p TimeoutStopSec=30s \
+              --setenv="TMPDIR=$fixture_parent" "$RUNNER_TEMP/bog-durability-verifier" \
+              "${common[@]}" -report "$EVIDENCE/durability.json"
           )
           capacity() (
             cd candidate || exit
             work=$(mktemp -d "$RUNNER_TEMP/bog-capacity.XXXXXXXX") || exit
             cleanup() {
               local status=$?
-              rm -rf -- "$work" || status=1
+              if ! rm -rf -- "$work" && (( status == 0 )); then status=1; fi
               exit "$status"
             }
             trap cleanup EXIT
-            go build -trimpath -o "$work/capacity" ./bench/retained-history || exit
+            timeout --kill-after=5s 2m go build -trimpath -o "$work/capacity" ./bench/retained-history || exit
             sudo -n systemd-run --quiet --wait --pipe --collect --expand-environment=no \
-              --uid="$(id -u)" --gid="$(id -g)" -p 'Delegate=memory io' -p DelegateSubgroup=runner \
+              --uid="$runner_uid" --gid="$runner_gid" -p 'Delegate=memory io' -p DelegateSubgroup=runner \
               -p RuntimeMaxSec=24min -p TimeoutStopSec=10s \
               /bin/bash -euo pipefail -c '
                 work=$1 evidence=$2
                 shift 2
                 read -r unified </proc/self/cgroup
-                [[ "$unified" == 0::/*/runner ]]
+                if [[ "$unified" != 0::/*/runner ]]; then
+                  echo "Capacity requires a delegated cgroup v2 runner subgroup" >&2
+                  exit 1
+                fi
                 group="/sys/fs/cgroup${unified#0::}"
                 parent="${group%/*}"
-                printf "+memory +io\n" > "$parent/cgroup.subtree_control"
+                if ! printf "+memory +io\n" > "$parent/cgroup.subtree_control"; then
+                  echo "Capacity requires delegated cgroup v2 memory and I/O controllers" >&2
+                  exit 1
+                fi
                 {
                   printf "capacity_mode=live\ncapacity_cgroup=%s\ncapacity_work_dir=%s\n" "$parent" "$work"
                   cat "$parent/cgroup.controllers" "$parent/cgroup.subtree_control"
@@ -141,10 +207,10 @@ jobs:
           )
           failed=0
           for name in admission durability capacity parity; do
-            status=0
-            "$name" 2>&1 | tee "$EVIDENCE/$name.log" || status=$?
-            record "$name" "$status"
-            if (( status != 0 )); then failed=1; fi
+            statuses=(0 0)
+            "$name" 2>&1 | tee "$EVIDENCE/$name.log" || statuses=("${PIPESTATUS[@]}")
+            record "$name" "${statuses[0]}" || failed=1
+            if (( statuses[0] != 0 || statuses[1] != 0 )); then failed=1; fi
           done
           exit "$failed"
 
@@ -152,6 +218,8 @@ jobs:
         if: always() && steps.build.outcome == 'success'
         working-directory: gate
         timeout-minutes: 3
+        env:
+          BOG_RELEASE_REQUIRE_RETARGET: '1'
         run: |
           {
             failed=0
@@ -176,6 +244,25 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-release-evidence
+          name: linux-release-evidence-${{ matrix.arch }}
           path: ${{ runner.temp }}/bog-release-evidence
           if-no-files-found: error
+
+  qualification:
+    name: Require both native Linux qualifications
+    if: always()
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      NATIVE_RESULT: ${{ needs.verify.result }}
+    steps:
+      - name: Check native evidence
+        shell: bash
+        run: |
+          if [[ "$NATIVE_RESULT" != success ]]; then
+            printf 'Incomplete release evidence for %s. Native verification result: %s. See the amd64 and arm64 jobs for failures or unavailable runner capabilities.\n' \
+              "$REVISION" "$NATIVE_RESULT" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          printf 'Native amd64 and arm64 release evidence passed for %s.\n' "$REVISION" >> "$GITHUB_STEP_SUMMARY"

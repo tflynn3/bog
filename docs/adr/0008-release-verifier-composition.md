@@ -1,20 +1,51 @@
 # ADR 0008 — Release verifier composition
 
-**Status** — Cycle 52 decision. Production-client verification and
-retained runtime wiring are pending at
-`d67892082f0ea3e9a951e55076d5eb80127bf031`.
+**Status** — Accepted. Native qualification is pending for the final
+composed candidate.
 
 ## Release gate
 
-#53 remains the retained-history release gate. Compose its runtime wiring
-with #59 and qualify the Linux candidate built from the full composed SHA.
-Admission, Linux durability and active-filesystem readiness, live capacity,
-and restored parity all exercise the same binary. The gate binds every
-required report to that revision, the binary SHA-256, and the
-`linux-release-v1` fixture. Admission and restored parity run from the
-workflow checkout. Dispatch from a workflow revision that includes the
-production-client probes when qualifying that integration.
+#53 remains the retained-history release gate. Qualify one clean candidate
+revision composing #53, #59 paging, and #60 descriptor-backed readiness.
+Dispatch the workflow from a revision containing the #70 fixed-budget
+probes, with the full 40-character lowercase SHA of the final candidate.
+The workflow records its own revision and runs admission, restored parity,
+and report validation from that checkout. Durability and capacity run from
+the candidate checkout.
 [Release verifier contract](../../verify/release/README.md)
+
+Both Ubuntu 24.04 runners must pass. The amd64 job uses `ubuntu-24.04`
+with `GOAMD64=v1`, and the arm64 job uses `ubuntu-24.04-arm` with
+`GOARM64=v8.0`. Each job checks the Linux runner architecture, the kernel
+machine, and Go host and target architectures. It confirms a clean
+checkout at the requested SHA, builds `cmd/bog` once natively with Go
+1.27.0 and cgo disabled, then checks the embedded build and VCS metadata.
+Admission, durability, live capacity, and restored parity use that job's
+single binary. The validator binds all reports to the candidate SHA, the
+job's binary SHA-256, and the `linux-release-v1` fixture. The job rechecks
+the digest after running the producers.
+
+The gate requires both capacity fixtures, with 196,608 and 393,216 seed
+rows, and both ENOSPC retarget directions on each runner. The durability
+producer uses a dedicated absolute `TMPDIR` in a bounded systemd service
+with a private mount namespace. The producer owns child-process and mount
+cleanup. After it exits, the workflow removes the fixture parent with
+`rmdir` to independently require that the producer removed its fixture
+root. A leftover directory fails qualification and its path is logged.
+Schema-v1 reports remain readable without retarget fields for historical
+validation. The native workflow sets `BOG_RELEASE_REQUIRE_RETARGET=1` to
+require both directions, including acknowledged ingest and replay on the
+healthy filesystem and ENOSPC rollback on the full filesystem.
+
+The jobs upload `linux-release-evidence-amd64` and
+`linux-release-evidence-arm64` independently, including on failure. The
+artifacts record runner and build identity, reports, producer exit
+statuses, and logs. Unavailable native runners, missing mount privileges
+or delegated cgroup v2 memory and I/O controllers, and missing reports
+leave qualification incomplete. When a runner cannot start, the workflow
+job status records the missing run. Both jobs and their validation and
+cleanup checks must pass on the final candidate after #60.
+[Linux release workflow](../../.github/workflows/linux-release.yml)
 
 ADR 0006 defines fixed-budget continuation, framing, and expiry. ADR 0007
 defines the command-owned adapter and its handoff to the WAL owner. ADR 0005

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -91,6 +92,10 @@ func decodeFields(data []byte, fields map[string]any) (map[string]jsontext.Value
 }
 
 func validateReport(data []byte, expected identity, required []string) error {
+	return validateReportWithRetarget(data, expected, required, false)
+}
+
+func validateReportWithRetarget(data []byte, expected identity, required []string, requireRetarget bool) error {
 	var got identity
 	var cases map[string]jsontext.Value
 	fields, err := decodeFields(data, map[string]any{
@@ -110,7 +115,7 @@ func validateReport(data []byte, expected identity, required []string) error {
 	}
 	for name, raw := range cases {
 		mandatory := slices.Contains(required, name)
-		if err := validateOutcome(raw, mandatory, mandatory && name == "enospc"); err != nil {
+		if err := validateOutcome(raw, mandatory, mandatory && name == "enospc", requireRetarget); err != nil {
 			return fmt.Errorf("case %q: %w", name, err)
 		}
 	}
@@ -120,7 +125,7 @@ func validateReport(data []byte, expected identity, required []string) error {
 	return nil
 }
 
-func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC bool) error {
+func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC, requireRetarget bool) error {
 	var status string
 	fields, err := decodeFields(raw, map[string]any{"status": &status})
 	if err != nil {
@@ -145,7 +150,7 @@ func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC bool) error {
 		return nil
 	}
 	var proof enospcEvidence
-	_, err = decodeFields(fields["evidence"], map[string]any{
+	evidence, err := decodeFields(fields["evidence"], map[string]any{
 		"errno": &proof.Errno, "disposable_local_filesystem": &proof.DisposableLocalFilesystem,
 		"observed_enospc": &proof.ObservedENOSPC, "recovered_after_space_freed": &proof.RecoveredAfterSpaceFreed,
 	})
@@ -154,6 +159,39 @@ func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC bool) error {
 	}
 	if proof.Errno != "ENOSPC" || !proof.DisposableLocalFilesystem || !proof.ObservedENOSPC || !proof.RecoveredAfterSpaceFreed {
 		return errors.New("require observed kernel ENOSPC on disposable local storage and recovery after freeing space")
+	}
+	_, healthyToFull := evidence["healthy_to_full"]
+	_, fullToHealthy := evidence["full_to_healthy"]
+	// Historical schema-v1 reports omit both directions.
+	if !requireRetarget && !healthyToFull && !fullToHealthy {
+		return nil
+	}
+	return validateRetarget(evidence)
+}
+
+func validateRetarget(evidence map[string]jsontext.Value) error {
+	var readiness, ingest int
+	var reason string
+	var replayed bool
+	if _, err := decodeFields(evidence["healthy_to_full"], map[string]any{
+		"readiness_status": &readiness, "readiness_reason": &reason,
+		"ingest_status": &ingest, "replayed_after_restart": &replayed,
+	}); err != nil {
+		return fmt.Errorf("healthy_to_full: %w", err)
+	}
+	if readiness != http.StatusOK || reason != "ready" || ingest != http.StatusNoContent || !replayed {
+		return errors.New("healthy_to_full: require ready (200), acknowledged ingest (204), and replay after restart")
+	}
+	var rollback, category string
+	if _, err := decodeFields(evidence["full_to_healthy"], map[string]any{
+		"readiness_status": &readiness, "readiness_reason": &reason,
+		"ingest_status": &ingest, "post_ingest_reason": &rollback, "post_ingest_category": &category,
+	}); err != nil {
+		return fmt.Errorf("full_to_healthy: %w", err)
+	}
+	if readiness != http.StatusServiceUnavailable || reason != "low_disk_headroom" ||
+		ingest != http.StatusServiceUnavailable || rollback != "wal_rollback" || category != "enospc" {
+		return errors.New("full_to_healthy: require low_disk_headroom (503), rejected ingest (503), and wal_rollback (enospc)")
 	}
 	return nil
 }
@@ -171,6 +209,9 @@ func validateFile(path string, expected identity, required []string) (err error)
 	}
 	if len(data) > maxReport {
 		return errors.New("report exceeds 16 MiB")
+	}
+	if os.Getenv("BOG_RELEASE_REQUIRE_RETARGET") == "1" {
+		return validateReportWithRetarget(data, expected, required, true)
 	}
 	return validateReport(data, expected, required)
 }

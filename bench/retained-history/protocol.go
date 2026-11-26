@@ -39,6 +39,10 @@ func (s service) request(ctx context.Context, method, path string, body io.Reade
 }
 
 func (s service) requestObserved(ctx context.Context, method, path string, body io.Reader, q *queryAttempt) (res *http.Response, data []byte, err error) {
+	return s.requestBounded(ctx, method, path, body, q, 8<<20)
+}
+
+func (s service) requestBounded(ctx context.Context, method, path string, body io.Reader, q *queryAttempt, maxBody int64) (res *http.Response, data []byte, err error) {
 	start := time.Now()
 	if q != nil {
 		budget := s.client.Timeout
@@ -63,10 +67,9 @@ func (s service) requestObserved(ctx context.Context, method, path string, body 
 		q.observeHeaders(res, time.Since(start))
 	}
 	defer func() { err = errors.Join(err, res.Body.Close()) }()
-	const maxBody = 8 << 20
 	data, err = io.ReadAll(io.LimitReader(res.Body, maxBody+1))
-	if err == nil && len(data) > maxBody {
-		err = errors.New("response exceeds 8 MiB")
+	if err == nil && int64(len(data)) > maxBody {
+		err = fmt.Errorf("response exceeds %d bytes", maxBody)
 	}
 	if q != nil {
 		q.BodyBytes = len(data)
@@ -130,19 +133,23 @@ type filter struct {
 }
 
 type walk struct {
-	filter filter
-	want   []int
-	offset int
-	pages  int
-	cursor string
-	seen   map[string]bool
-	phase  string
+	filter           filter
+	want             []int
+	offset           int
+	pages            int
+	firstResumeLimit int
+	cursor           string
+	seen             map[string]bool
+	phase            string
 }
 
 func (w *walk) page(ctx context.Context, s service, f fixture) (_ time.Duration, err error) {
 	var attempt queryAttempt
 	defer func() { recordQuery(s.queryPhases, w.phase, attempt, err) }()
 	limit := [...]int{1, 193, 509}[w.pages%3]
+	if w.pages == 1 && w.firstResumeLimit > 0 {
+		limit = w.firstResumeLimit
+	}
 	q := url.Values{"start": {w.filter.start.Format(time.RFC3339Nano)}, "end": {w.filter.end.Format(time.RFC3339Nano)},
 		"contains": {w.filter.literal}, "limit": {strconv.Itoa(limit)}}
 	if w.pages == 0 {
@@ -207,55 +214,70 @@ type compaction struct {
 	State         string `json:"state"`
 }
 
-func (s service) compact(ctx context.Context, path, action string, cutoff int) (compaction, error) {
-	var c compaction
+type compactionReply struct {
+	compaction
+	Metrics json.RawMessage `json:"metrics"`
+}
+
+func (s service) compact(ctx context.Context, path, action string, cutoff int) (compactionReply, error) {
+	var reply compactionReply
 	u, err := url.ParseRequestURI(path)
-	if err != nil || u.Host != "" || !strings.HasPrefix(path, "/") || u.RawQuery != "" {
-		return c, errors.New("invalid compaction control path")
+	if err != nil || u.Host != "" || !strings.HasPrefix(path, "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return reply, errors.New("invalid compaction control path")
 	}
 	method := http.MethodGet
 	if action != "status" {
 		method = http.MethodPost
 	}
-	res, data, err := s.request(ctx, method, path+"?"+url.Values{"action": {action}, "cutoff": {strconv.Itoa(cutoff)}}.Encode(), nil)
+	res, data, err := s.requestBounded(ctx, method, path+"?"+url.Values{"action": {action}, "cutoff": {strconv.Itoa(cutoff)}}.Encode(), nil, nil, 64<<10)
 	if err != nil {
-		return c, err
+		return reply, err
 	}
 	if res.StatusCode != http.StatusOK {
-		return c, fmt.Errorf("live compaction %s HTTP %d: %.200s", action, res.StatusCode, data)
+		return reply, fmt.Errorf("live compaction %s HTTP %d: %.200s", action, res.StatusCode, data)
 	}
-	if err := json.Unmarshal(data, &c); err != nil {
-		return c, fmt.Errorf("decode compaction %s: %w", action, err)
+	// Presence matters even when the accepted cutoff and initial generation
+	// are zero. Decode the required fields separately from optional metrics.
+	var wire struct {
+		State         *string         `json:"state"`
+		Generation    *uint64         `json:"generation"`
+		CoveredRows   *int            `json:"covered_rows"`
+		CommittedRows *int            `json:"committed_rows"`
+		Metrics       json.RawMessage `json:"metrics"`
 	}
-	return c, nil
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return reply, fmt.Errorf("decode compaction %s: %w", action, err)
+	}
+	if wire.State == nil || wire.Generation == nil || wire.CoveredRows == nil || wire.CommittedRows == nil ||
+		(*wire.State != "running" && *wire.State != "complete") ||
+		*wire.CoveredRows < 0 || *wire.CommittedRows < *wire.CoveredRows {
+		return reply, fmt.Errorf("invalid compaction %s state or row counters", action)
+	}
+	return compactionReply{compaction{*wire.Generation, *wire.CoveredRows, *wire.CommittedRows, *wire.State}, wire.Metrics}, nil
 }
 
-func (s service) waitCompaction(ctx context.Context, path string, cutoff int, generation uint64, observeRunning func(time.Time)) (compaction, error) {
-	ticker := time.NewTicker(30 * time.Millisecond)
+func (s service) waitCompaction(ctx context.Context, path string, cutoff int, generation uint64) (compaction, error) {
+	ticker := time.NewTicker(compactionPollInterval)
 	defer ticker.Stop()
 	for {
-		sent := time.Now()
 		c, err := s.compact(ctx, path, "status", cutoff)
 		if err != nil {
-			return c, err
+			return c.compaction, err
 		}
-		switch c.State {
-		case "running":
-			if observeRunning != nil && c.Generation == generation {
-				observeRunning(sent)
-			}
-		case "complete":
-			if c.Generation <= generation || c.CoveredRows != cutoff || c.CommittedRows < cutoff {
-				return c, fmt.Errorf("unexpected compaction cutoff or generation: %+v", c)
-			}
-			return c, nil
-		default:
-			return c, fmt.Errorf("unexpected compaction state %q", c.State)
+		if c.State == "complete" {
+			return c.compaction, c.validatePublication(cutoff, generation)
 		}
 		select {
 		case <-ctx.Done():
-			return c, ctx.Err()
+			return c.compaction, ctx.Err()
 		case <-ticker.C:
 		}
 	}
+}
+
+func (c compaction) validatePublication(cutoff int, previous uint64) error {
+	if c.State != "complete" || c.Generation <= previous || c.CoveredRows != cutoff || c.CommittedRows < cutoff {
+		return fmt.Errorf("unexpected compaction cutoff or generation: %+v", c)
+	}
+	return nil
 }

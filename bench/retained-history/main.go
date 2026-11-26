@@ -22,11 +22,12 @@ import (
 const capacityCase = "retained_history_capacity"
 
 type fixture struct {
-	SeedRows    int    `json:"seed_rows"`
-	TailRows    int    `json:"tail_rows"`
-	LineBytes   int    `json:"line_bytes"`
-	BatchRows   int    `json:"batch_rows"`
-	MemoryBytes uint64 `json:"memory_limit_bytes"`
+	SeedRows      int    `json:"seed_rows"`
+	TailRows      int    `json:"tail_rows"`
+	LineBytes     int    `json:"line_bytes"`
+	BatchRows     int    `json:"batch_rows"`
+	MemoryBytes   uint64 `json:"memory_limit_bytes"`
+	scatteredTail bool
 }
 
 func fixtures(mode string) []fixture {
@@ -36,7 +37,7 @@ func fixtures(mode string) []fixture {
 	}
 	var result []fixture
 	for _, size := range sizes {
-		result = append(result, fixture{size, 2048, 1024, 64, 128 << 20})
+		result = append(result, fixture{size, 2048, 1024, 64, 128 << 20, mode == "live"})
 	}
 	return result
 }
@@ -226,6 +227,9 @@ func run(ctx context.Context, args []string) (err error) {
 		run := measure(ctx, o, binary, filepath.Join(dir, fmt.Sprintf("store-%d", i)), size)
 		runs = append(runs, run)
 		if run.Status != "pass" {
+			if run.Detail == "" && run.Cleanup.Detail == "" {
+				failures = errors.Join(failures, fmt.Errorf("%d seed rows, %s: fixture status %q", size.SeedRows, run.Phase, run.Status))
+			}
 			if run.Detail != "" {
 				failures = errors.Join(failures, fmt.Errorf("%d seed rows, %s: %s", size.SeedRows, run.Phase, run.Detail))
 			}

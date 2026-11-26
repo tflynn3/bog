@@ -75,8 +75,10 @@ a loopback path, default `/_capacity/compaction`, with these operations:
   currently published checkpoint. A completed operation must advance the
   generation and cover exactly the requested cutoff.
 
-Live seeding advances the checkpoint every 8,192 rows at both sizes. Mixed load
-starts with the same 64-row uncovered prefix at each size. The runner verifies
+Live seeding advances the checkpoint at most every 8,192 rows at both sizes.
+The clustered trial uses the last two seed batches, then seeding finishes at
+the exact seed cutoff. The scattered trial starts with the same 64-row
+uncovered prefix at each size. The runner verifies
 that compaction stays active through an acknowledged batch and a continuation.
 It then verifies publication, the expected uncovered tail and further pages
 from the original cursor. A candidate lacking the control path fails in the
@@ -128,3 +130,50 @@ table. The existing fitness failure also needs a staged `bog/internal/backup`
 entry allowing its direct import of `bog/internal/store`. Those changes belong
 with the architecture owner. The release job needs a delegated cgroup v2
 parent on its Linux worker.
+
+### Publication and pin-drain sample contract
+
+Each live fixture reports two independent timelines under
+`diagnostics.backfill_timelines`. Clustered backfill uses the last two
+seed batches in a narrow timestamp band. Scattered backfill spreads the
+mixed tail's tied groups through the broad query range. Each timeline
+identifies the held cutoff, replacement cutoff, published generation,
+and acknowledged rows, batch count, timing and timestamp range. The existing
+top-level compaction
+proof continues to describe the scattered operation.
+
+Samples use monotonic nanoseconds relative to the start of their phase.
+The timeline keeps its early samples and most recent samples and counts
+any omitted intermediate samples. Phase boundaries include the held
+capture, compaction start, overlap, exact publication, held exhaustion,
+fresh visibility and the drain observation. The report also carries the
+phase failure when work stops early. The start request to first validated
+completion is a client-observed upper bound on publication lag. The send
+time of the last validated running request gives a conservative lower
+bound. These bounds include observation delay.
+
+The existing loopback control may add a `metrics` object to either reply.
+Each value is a nonnegative JSON integer. Missing, null or malformed
+fields carry individual unavailable reasons. A supplied zero is valid.
+
+| Candidate field | Meaning at the status snapshot | Runtime handoff |
+| --- | --- | --- |
+| `publication_lag_ns` | Start acceptance to durable publication and installation of the requested cutoff, available on completion | #53 |
+| `staging_reserved_bytes` | Outstanding staging reservations | #71 via #53 control |
+| `staging_used_bytes` | Bytes charged to live staging | #71 via #53 control |
+| `oldest_pin_age_ns` | Age of the oldest live generation pin, zero if there are no live pins | #53 |
+| `reclaimable_bytes` | Bytes eligible for reclaim under the authority and pin rules | #53 |
+| `retired_generation_pins` | Live pins for the predecessor retired by this operation, available after publication | #53 |
+
+Filesystem samples report apparent checkpoint staging bytes, published pin
+record count and oldest record modification age separately. They cannot
+establish reservations, pin liveness or reclaim eligibility. Cursor
+exhaustion establishes client completion. Runtime pin drain requires a
+positive predecessor count while the held cursor is outstanding followed
+by an observed zero after exhaustion. An unconfirmed drain has a reason,
+and status polling for drain has a separate bounded budget within the
+fixture deadline. A predecessor count that remains positive through the
+drain budget fails the workload. Missing runtime instrumentation is diagnostic evidence
+for the existing #53 storage and #71 resource handoff. The established
+capacity verdict still requires exact cutoffs, concurrent overlap, query
+parity, restart and cleanup in both fixtures.

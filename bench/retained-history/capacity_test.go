@@ -18,7 +18,7 @@ import (
 )
 
 func TestFixtureReproducibility(t *testing.T) {
-	f := fixture{32, 8, 64, 4, 1024}
+	f := fixture{32, 8, 64, 4, 1024, false}
 	batch, err := f.batch(0, 40)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestFixtureReproducibility(t *testing.T) {
 }
 
 func TestWalkProtocol(t *testing.T) {
-	f := fixture{32, 8, 64, 4, 1024}
+	f := fixture{32, 8, 64, 4, 1024, false}
 	for _, tc := range []struct {
 		name     string
 		next     []string

@@ -116,6 +116,7 @@ type candidateEvidence struct {
 }
 
 type capacityDiagnostics struct {
+	Backfills         []*backfillTimeline    `json:"backfill_timelines,omitempty"`
 	Queries           map[string]*queryPhase `json:"queries"`
 	Candidates        []*candidateEvidence   `json:"candidates"`
 	ReplayDuration    *time.Duration         `json:"replay_duration_ns"`
@@ -154,24 +155,16 @@ func (l *candidateLog) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (d *capacityDiagnostics) sampleStorage(dir string) (err error) {
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return err
+func (d *capacityDiagnostics) sampleStorage(dir string) error {
+	sample, err := observeStorage(dir, time.Now())
+	if sample.StagingBytes != nil && (d.StagingBytes == nil || *sample.StagingBytes > *d.StagingBytes) {
+		d.StagingBytes = sample.StagingBytes
 	}
-	defer func() { err = errors.Join(err, root.Close()) }()
-	bytes, stagingErr := stagingBytes(root)
-	if stagingErr == nil && (d.StagingBytes == nil || bytes > *d.StagingBytes) {
-		d.StagingBytes = &bytes
+	if sample.PinRecords != nil && (d.PinCount == nil || *sample.PinRecords > *d.PinCount) {
+		d.PinCount = sample.PinRecords
 	}
-	count, age, pinErr := pinRecords(root, time.Now())
-	if pinErr == nil {
-		if d.PinCount == nil || count > *d.PinCount {
-			d.PinCount = &count
-		}
-		recordMaximum(&d.OldestPin, age)
-	}
-	return errors.Join(stagingErr, pinErr)
+	recordMaximum(&d.OldestPin, sample.OldestRecord)
+	return err
 }
 
 func stagingBytes(root *os.Root) (int64, error) {

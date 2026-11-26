@@ -16,9 +16,28 @@ Run as a user who can mount and unmount a private tmpfs using either mount
 privileges or noninteractive `sudo -n`. The verifier creates fresh data
 directories and binds the candidate to loopback. The disk-full case creates
 an 8 MiB tmpfs, allocates its remaining blocks, and requires an extra write
-to return kernel `ENOSPC`. It also requires Bog to reject a valid ingest
-while full, checks replay at capacity, and verifies a new acknowledged batch
-after freeing space and restarting again.
+to return kernel `ENOSPC`. Bog opens a data directory through a symlink.
+The verifier then atomically retargets the symlink across filesystems while
+Bog is serving.
+
+- With a healthy directory open and the path pointing at the full tmpfs,
+  `/ready` must continue reporting `ready`. Ingest must return HTTP 204.
+  A fresh walk after restart confirms the batch was committed to the
+  original healthy directory.
+- With the full tmpfs open and the path pointing at the healthy directory,
+  `/ready` must continue reporting `low_disk_headroom`. Ingest must return
+  HTTP 503 and readiness must report `wal_rollback` with category `enospc`.
+  The verifier checks the live walk, restores the launch path, and checks
+  replay at capacity. After freeing space, it acknowledges another batch,
+  kills the candidate, and checks a complete walk after restart.
+
+Each retarget direction samples readiness for six seconds before ingest, with
+a ten-second deadline for each observation. This outlasts cached readiness
+evidence and spans multiple disk samples. The `enospc` case reports
+`healthy_to_full` and `full_to_healthy` with the observed readiness status
+and reason and the ingest HTTP status. It also records replay success for
+`healthy_to_full` and the rollback reason and category for
+`full_to_healthy`. Candidate cleanup precedes unmount on every exit path.
 
 Every candidate runs in its own process group. The verifier terminates the
 group on startup failure or cancellation and before reaping an exited leader.

@@ -9,44 +9,53 @@ continuations. All three flags require positive values.
 | `-query-work-budget` | 134217728 | Work units per request |
 | `-query-max-response-bytes` | 33554432 | Encoded NDJSON bytes per response |
 
-A query acquires a slot immediately or returns 503. It holds the slot through
-the response write, including time spent waiting on a slow reader. When the
-handler returns, the server releases the slot. Ingest and health requests
-use independent paths and can run while all query slots are occupied.
+A query acquires a slot immediately or returns 503. It holds that slot through
+body delivery, including time spent waiting on a slow reader. Ingest and health
+requests use independent paths. Snapshot paging also allows up to 64 captures
+per handler, including first requests preparing a plan and expired captures
+still draining.
 
 ## Work accounting
 
-Each admitted request has one work budget tied to its request context. Every
-scan in that request draws from it, including pagination lookahead and the
-second scan needed to recover a cursor when the byte limit shortens a page.
-Index runs, binary seeks, snapshot visibility probes, and blocks considered
-for Bloom pruning each cost work. The scan charges one unit per candidate,
-plus one per decoded line byte for candidates eligible for exact matching.
-Cursor checks and revisited candidates also consume work.
+Each admitted request has one work meter tied to its context. The page source
+charges capture, index traversal, positioning, seek, merge, visibility, filter,
+and lookahead work. The in-memory source charges one unit per candidate, plus
+one per decoded line byte for candidates eligible for matching. Revisiting a
+candidate costs work again.
 
-The handler charges for continuation token validation and filter
-authentication. It charges one unit per decoded line byte inspected during
-response encoding, then reserves one unit per 16 encoded NDJSON bytes before
-committing the response, rounding up for a nonempty body. The delivery charge
-includes escapes and each record's terminating newline. The handler buffers the
-encoded page within the response byte cap and escapes large records in bounded
-chunks.
+HTTP charges for cursor signing and authentication in fixed-size blocks and
+charges one unit per literal byte when hashing the filter. It charges one
+unit per decoded line byte for response encoding, then reserves one unit per
+16 encoded NDJSON bytes for delivery, rounded up. Delivery includes JSON escapes
+and each record's terminating newline.
+
+Before returning the first cursor, the handler certifies the rest of the
+captured walk through exhaustion using the first request's meter. It measures
+each remaining record and stores up to 512 scan anchors and row counts. The
+plan retains no row bodies. A continuation reuses the certified source limits
+and exclusive anchors, and can start within a scan or span scans. Its source
+calls, encoding, delivery, and cursor work fit within the issuing budget for
+any valid client row limit, including a smaller one. A fixed-budget walk may
+still encounter temporary admission saturation or expire.
+
+For the composed #53 release gate, the retained-history capacity fixtures need
+a work budget sized for full-walk certification. The larger fixture uses
+393216 seed rows with 1024-byte lines, so measuring the complete restart walk
+alone exceeds the default budget. Keep the deliberately small budgets in the
+fixed-budget release probe.
 
 ## HTTP responses
 
 | Status | Plain-text body | Meaning |
 | --- | --- | --- |
-| 503 | `query capacity exhausted` | All query slots are in use. |
-| 503 | `query work budget exhausted` | The request could not reserve the work needed to finish. |
+| 400 | `invalid cursor` | The token is malformed, came from a different issuer, or the filter changed. |
 | 408 | `request cancelled` | The handler observed cancellation before committing the response. |
-| 422 | `query record exceeds response byte limit` | The first matching record on this request exceeds the response byte cap. |
+| 410 | `query capture expired` | The authenticated capture expired or became unavailable. Start a fresh walk. |
+| 422 | `query record exceeds response byte limit (cap … bytes, requires … bytes)` | A record cannot fit on its own in a page being prepared or certified. |
+| 503 | `query capacity exhausted` | All query slots or capture slots are in use. |
+| 503 | `query work budget exhausted` | The request could not finish within its work or replay plan bounds. |
 
 These responses carry neither NDJSON rows nor a `Bog-Next-Cursor` header.
-After a 503, callers can retry a continuation using its original cursor. A
-lower `limit` can reduce work for a continuation that returns rows. A 422
-requires a larger response byte cap to retrieve that record.
-
-Successful requests return the ordered prefix that fits the row and byte
-limits. A continuation advances past the last emitted row and keeps its
-original snapshot, including append order for duplicate timestamps. See the
-[query response limits](query-response-limits.md) for pagination details.
+A continuation can retry a temporary failure using its original cursor while
+the capture is live. See [query response limits](query-response-limits.md) for
+pagination details.

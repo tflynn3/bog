@@ -66,9 +66,12 @@ func (s *Store) QueryPositionedPage(start, end time.Time, contains string, limit
 	if err := work.Charge(); err != nil {
 		return nil, false, err
 	}
-	view := s.queryView()
-	if count < 0 || count > len(view.rows) {
-		return nil, false, fmt.Errorf("store: published prefix count %d outside [0, %d]", count, len(view.rows))
+	return s.queryView().positionedPage(start, end, contains, limit, count, firstOrdinal, after, work)
+}
+
+func (v queryView) positionedPage(start, end time.Time, contains string, limit, count int, firstOrdinal uint64, after *TailPosition, work *QueryWork) ([]PositionedRow, bool, error) {
+	if count < 0 || count > len(v.rows) {
+		return nil, false, fmt.Errorf("store: published prefix count %d outside [0, %d]", count, len(v.rows))
 	}
 	if count > 0 && uint64(count-1) > math.MaxUint64-firstOrdinal {
 		return nil, false, errors.New("store: published prefix ordinals overflow uint64")
@@ -87,7 +90,7 @@ func (s *Store) QueryPositionedPage(start, end time.Time, contains string, limit
 		lower = &Position{after.Time, ordinal}
 	}
 	matches := queryMatches{limit: limit, lookahead: true, positioned: []PositionedRow{}, firstOrdinal: firstOrdinal}
-	if err := view.scan(start, end, contains, count, lower, &matches, work); err != nil {
+	if err := v.scan(start, end, contains, count, lower, &matches, work); err != nil {
 		return nil, false, err
 	}
 	return matches.positioned, matches.more, nil

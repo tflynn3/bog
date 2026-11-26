@@ -32,12 +32,12 @@ type publicationIntent struct {
 }
 
 func (a *publicationAttempt) stageSegment(name string, b []byte, sum string) error {
-	l := a.legacy
+	p := a.pub
 	path := stageDir + "/" + name
-	if err := l.writeNew(path, b); err != nil {
+	if err := p.writeNew(path, b); err != nil {
 		return err
 	}
-	info, err := l.root.Lstat(path)
+	info, err := p.root.Lstat(path)
 	if err != nil {
 		return err
 	}
@@ -47,8 +47,8 @@ func (a *publicationAttempt) stageSegment(name string, b []byte, sum string) err
 }
 
 func (a *publicationAttempt) recordIntent() error {
-	l := a.legacy
-	previous, err := l.root.Lstat(manifestName)
+	p := a.pub
+	previous, err := p.root.Lstat(manifestName)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -67,123 +67,184 @@ func (a *publicationAttempt) recordIntent() error {
 	if len(b) > maxManifestSize {
 		return errors.New("checkpoint intent too large")
 	}
-	if err := l.writeNew(stagedIntent, b); err != nil {
+	if err := p.writeNew(stagedIntent, b); err != nil {
 		return err
 	}
-	if err := l.root.Rename(stagedIntent, intentName); err != nil {
+	if err := p.root.Rename(stagedIntent, intentName); err != nil {
 		return err
 	}
 	// Make the ownership record durable before the first final name can exist.
-	if err := l.syncStaging(); err != nil {
+	if err := p.syncStaging(); err != nil {
 		return err
 	}
-	return l.dir.Sync()
+	return p.dir.Sync()
 }
 
 func (a *publicationAttempt) install() error {
-	l := a.legacy
+	p := a.pub
 	if err := a.recordIntent(); err != nil {
 		return err
 	}
 	a.installing = true
 	for _, file := range a.files {
 		path := stageDir + "/" + file.Name
-		if err := l.root.Link(path, file.Name); err != nil {
+		if err := p.root.Link(path, file.Name); err != nil {
 			return err
 		}
-		if err := l.root.Remove(path); err != nil {
+		if err := p.root.Remove(path); err != nil {
 			return err
 		}
 	}
 	// Persist the removal of staging links as well as the final segment names.
-	if err := l.syncStaging(); err != nil {
+	if err := p.syncStaging(); err != nil {
 		return err
 	}
-	syncDir := l.dir.Sync
-	if l.segmentDirSync != nil {
-		syncDir = l.segmentDirSync
+	syncDir := p.dir.Sync
+	if p.segmentDirSync != nil {
+		syncDir = p.segmentDirSync
 	}
 	return syncDir()
 }
 
-func (l *Legacy) syncStaging() error {
-	dir, err := l.openStaging()
+// RecoverCaptured resolves an interrupted publication while the caller owns
+// the WAL directory lock. Authoritative runs under the publication lock. It
+// must validate the manifest, every referenced segment, and the owner's WAL
+// boundary, or return os.ErrNotExist if the manifest itself is absent.
+func RecoverCaptured(root *os.Root, dir *os.File, authoritative func() (*Manifest, error)) (err error) {
+	if authoritative == nil {
+		return errors.New("missing authoritative checkpoint validator")
+	}
+	p, lock, err := lockOwnedPublication(root, dir)
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	return p.resolve(authoritative)
 }
 
-func (l *Legacy) openStaging() (*os.File, error) {
-	fd, err := syscall.Openat(int(l.dir.Fd()), stageDir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	dir := os.NewFile(uintptr(fd), stageDir)
-	info, err := dir.Stat()
-	if err == nil {
-		st := info.Sys().(*syscall.Stat_t)
-		if st.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0077 != 0 {
-			err = fmt.Errorf("%w: unsafe publication staging directory", ErrIntegrity)
-		}
-	}
-	if err != nil {
-		return nil, errors.Join(err, dir.Close())
-	}
-	return dir, nil
-}
-
-// resolvePublication validates the authoritative namespace and makes it durable
-// before deleting any losing outputs. Missing is a valid first-publication
-// outcome. Other errors leave the attempt intact for diagnosis or retry.
+// resolvePublication retains the offline reader's additional WAL checks.
 func (l *Legacy) resolvePublication(keepRows bool) (*Published, error) {
-	pending := CheckPublication(l.dir)
-	if pending != nil && !errors.Is(pending, ErrPublicationUncertain) {
-		return nil, pending
-	}
-	p, err := l.readPublished(keepRows)
-	if err != nil && err != syscall.ENOENT {
+	var published *Published
+	err := l.publication().resolve(func() (*Manifest, error) {
+		var err error
+		published, err = l.readPublished(keepRows)
+		if err != nil {
+			return nil, err
+		}
+		return &published.manifest, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := l.dir.Sync(); err != nil {
-		return nil, fmt.Errorf("sync checkpoint directory: %w", err)
-	}
-	if pending != nil {
-		stage, err := l.openStaging()
-		if err != nil {
-			return nil, err
-		}
-		if err := stage.Close(); err != nil {
-			return nil, err
-		}
-		intent, err := l.readIntent()
-		if err != nil {
-			return nil, err
-		}
-		if p == nil && intent.HadManifest {
-			return nil, fmt.Errorf("%w: previous authoritative manifest is missing", ErrIntegrity)
-		}
-		reachable := make(map[string]bool)
-		if p != nil {
-			for _, s := range p.manifest.Segments {
-				reachable[s.Name] = true
-			}
-		}
-		if err := l.removeOwned(intent.Segments, reachable); err != nil {
-			return nil, err
-		}
-		if err := l.clearStaging(); err != nil {
-			return nil, err
-		}
-	}
-	if p == nil {
-		return nil, os.ErrNotExist
-	}
-	return p, nil
+	return published, nil
 }
 
-func (l *Legacy) readIntent() (_ publicationIntent, err error) {
-	f, err := l.openFile(intentName)
+// resolve validates the authoritative namespace and makes it durable before
+// deleting losing outputs. Missing is a valid first-publication outcome.
+func (p *publication) resolve(load func() (*Manifest, error)) error {
+	info, err := p.root.Lstat(stageDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if info != nil {
+		if err := checkStaging(info); err != nil {
+			return err
+		}
+	}
+	m, authorityErr := load()
+	if authorityErr != nil {
+		if !errors.Is(authorityErr, os.ErrNotExist) {
+			return authorityErr
+		}
+		// Only absence of the manifest itself is a first-publication case.
+		// A validator can encounter a missing referenced file instead.
+		_, err := p.root.Lstat(manifestName)
+		if err == nil || !errors.Is(err, os.ErrNotExist) || m != nil {
+			return fmt.Errorf("%w: validate authoritative manifest: %v", ErrIntegrity, errors.Join(authorityErr, err))
+		}
+	} else if m == nil {
+		return fmt.Errorf("%w: authoritative validator returned no manifest", ErrIntegrity)
+	}
+	if err := p.dir.Sync(); err != nil {
+		return fmt.Errorf("sync checkpoint directory: %w", err)
+	}
+	if info != nil {
+		if err := p.recoverStaging(info, m); err != nil {
+			return err
+		}
+	}
+	if m == nil {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+func (p *publication) recoverStaging(info os.FileInfo, m *Manifest) error {
+	if info.Mode().Perm() != 0700 {
+		return p.removeEmptyStaging()
+	}
+	stage, err := openStaging(p.dir)
+	if err != nil {
+		return err
+	}
+	names, err := p.stagingNames(stage)
+	var intent publicationIntent
+	if err == nil {
+		intent, err = readIntent(stage)
+	}
+	if err = errors.Join(err, stage.Close()); err != nil {
+		return err
+	}
+	if m == nil && intent.HadManifest {
+		return fmt.Errorf("%w: previous authoritative manifest is missing", ErrIntegrity)
+	}
+	reachable := make(map[string]bool)
+	if m != nil {
+		for _, s := range m.Segments {
+			reachable[s.Name] = true
+		}
+	}
+	if err := p.removeOwned(intent.Segments, reachable); err != nil {
+		return err
+	}
+	return p.removeStaging(names)
+}
+
+func openPublicationFile(dir *os.File, name string) (*os.File, error) {
+	fd, err := syscall.Openat(int(dir.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), name)
+	info, err := f.Stat()
+	if err == nil && (!ownedByService(info) || !info.Mode().IsRegular() ||
+		info.Sys().(*syscall.Stat_t).Nlink != 1 || info.Mode().Perm()&0022 != 0) {
+		err = fmt.Errorf("%w: unsafe publication file %q", ErrIntegrity, name)
+	}
+	if err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+	return f, nil
+}
+
+func readPublicationFile(dir *os.File, name string, limit int64) (_ []byte, err error) {
+	f, err := openPublicationFile(dir, name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%w: publication file %q exceeds size limit", ErrIntegrity, name)
+	}
+	return b, nil
+}
+
+func readIntent(stage *os.File) (publicationIntent, error) {
+	b, err := readPublicationFile(stage, intentBase, maxManifestSize)
 	if err == syscall.ENOENT {
 		// Final names can only be installed after this record is durable.
 		return publicationIntent{}, nil
@@ -191,14 +252,9 @@ func (l *Legacy) readIntent() (_ publicationIntent, err error) {
 	if err != nil {
 		return publicationIntent{}, err
 	}
-	defer func() { err = errors.Join(err, f.Close()) }()
-	b, err := io.ReadAll(io.LimitReader(f, maxManifestSize+1))
-	if err != nil {
-		return publicationIntent{}, err
-	}
 	var env manifestEnvelope
 	var intent publicationIntent
-	if len(b) > maxManifestSize || json.Unmarshal(b, &env) != nil ||
+	if json.Unmarshal(b, &env) != nil ||
 		digest(env.Payload) != env.SHA256 || json.Unmarshal(env.Payload, &intent) != nil || len(intent.Segments) > MaxSegments {
 		return publicationIntent{}, fmt.Errorf("%w: invalid publication intent", ErrIntegrity)
 	}
@@ -213,29 +269,29 @@ func (l *Legacy) readIntent() (_ publicationIntent, err error) {
 	return intent, nil
 }
 
-func (l *Legacy) removeOwned(files []ownedSegment, reachable map[string]bool) error {
+func (p *publication) removeOwned(files []ownedSegment, reachable map[string]bool) error {
 	var err error
 	for _, file := range files {
 		if reachable[file.Name] {
 			continue
 		}
-		owned, checkErr := l.matchesOwnedSegment(file)
+		owned, checkErr := p.matchesOwnedSegment(file)
 		if checkErr != nil {
 			err = errors.Join(err, checkErr)
 		} else if owned {
-			err = errors.Join(err, l.root.Remove(file.Name))
+			err = errors.Join(err, p.root.Remove(file.Name))
 		}
 	}
 	if len(files) > 0 {
-		err = errors.Join(err, l.dir.Sync())
+		err = errors.Join(err, p.dir.Sync())
 	}
 	return err
 }
 
 // Match the recorded inode and content in the pinned directory. A crash
 // between link and staging unlink can leave two links to this inode.
-func (l *Legacy) matchesOwnedSegment(file ownedSegment) (_ bool, err error) {
-	info, err := l.root.Lstat(file.Name)
+func (p *publication) matchesOwnedSegment(file ownedSegment) (_ bool, err error) {
+	info, err := p.root.Lstat(file.Name)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -247,7 +303,7 @@ func (l *Legacy) matchesOwnedSegment(file ownedSegment) (_ bool, err error) {
 		info.Size() != file.Size || info.Mode().Perm()&0022 != 0 {
 		return false, nil
 	}
-	fd, err := syscall.Openat(int(l.dir.Fd()), file.Name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	fd, err := syscall.Openat(int(p.dir.Fd()), file.Name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return false, err
 	}
@@ -272,43 +328,4 @@ func validDigest(sum string) bool {
 	var b [sha256.Size]byte
 	_, err := hex.Decode(b[:], []byte(sum))
 	return err == nil
-}
-
-func (l *Legacy) clearStaging() error {
-	dir, err := l.openStaging()
-	if err != nil {
-		return err
-	}
-	names, err := dir.Readdirnames(MaxSegments + 4)
-	if errors.Is(err, io.EOF) {
-		err = nil
-	}
-	if err = errors.Join(err, dir.Close()); err != nil {
-		return err
-	}
-	if len(names) > MaxSegments+3 {
-		return fmt.Errorf("%w: too many staging files", ErrIntegrity)
-	}
-	for _, name := range names {
-		switch {
-		case name == intentBase, name == "intent", name == "manifest", validSegmentName(name):
-		default:
-			return fmt.Errorf("%w: unexpected staging file %q", ErrIntegrity, name)
-		}
-	}
-	for _, name := range names {
-		path := stageDir + "/" + name
-		if path != intentName {
-			if err := l.root.Remove(path); err != nil {
-				return err
-			}
-		}
-	}
-	if err := l.root.Remove(intentName); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := l.root.Remove(stageDir); err != nil {
-		return err
-	}
-	return l.dir.Sync()
 }

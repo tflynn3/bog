@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -277,27 +276,21 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		writeQueryError(w, err)
 		return
 	}
-	var body bytes.Buffer
+	response := queryResponse{maxBytes: a.maxResponseBytes}
 	emitted := 0
 	for _, row := range rows {
-		if err := work.Charge(); err != nil {
+		fits, err := response.appendRow(row, work)
+		if err != nil {
 			writeQueryError(w, err)
 			return
 		}
-		encoded, err := json.Marshal(row)
-		if err != nil {
-			http.Error(w, "cannot encode query response", http.StatusInternalServerError)
-			return
-		}
-		if len(encoded)+1 > a.maxResponseBytes-body.Len() {
+		if !fits {
 			if emitted == 0 {
 				http.Error(w, "query record exceeds response byte limit", http.StatusUnprocessableEntity)
 				return
 			}
 			break
 		}
-		body.Write(encoded)
-		body.WriteByte('\n')
 		emitted++
 	}
 	if (page || continuation) && emitted < len(rows) {
@@ -332,7 +325,9 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := work.Charge(); err != nil {
+	// Reserve the entire encoded body before committing status or cursor.
+	delivery := (uint64(len(response.body)) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit
+	if err := work.Charge(delivery); err != nil {
 		writeQueryError(w, err)
 		return
 	}
@@ -340,7 +335,7 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Bog-Next-Cursor", token)
 	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	if _, err := w.Write(body.Bytes()); err != nil {
+	if _, err := w.Write(response.body); err != nil {
 		// The response may already be committed. Return and release the slot.
 		return
 	}

@@ -47,8 +47,9 @@ func (w *blockingQueryWriter) Write([]byte) (int, error) {
 
 func assertQueryRejection(t *testing.T, out *httptest.ResponseRecorder, status int, message string) {
 	t.Helper()
+	_, hasCursor := out.Header()["Bog-Next-Cursor"]
 	if out.Code != status || out.Body.String() != message+"\n" ||
-		out.Header().Get("Bog-Next-Cursor") != "" || !strings.HasPrefix(out.Header().Get("Content-Type"), "text/plain") {
+		hasCursor || !strings.HasPrefix(out.Header().Get("Content-Type"), "text/plain") {
 		t.Fatalf("rejection: status=%d headers=%v body=%q", out.Code, out.Header(), out.Body.String())
 	}
 }
@@ -139,63 +140,83 @@ func TestLiveQueryWorkBudgetAndByteTruncation(t *testing.T) {
 	// needs two candidates. Extending it costs 32 more including the seek
 	// and anchor validation. Recovering the truncated cursor costs 22 more.
 	const firstPass, extension, rescan = 14, 32, 22
+	const encodingPerRow = uint64(len("same"))
+	const deliveryPerRow = uint64((len(line) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit)
+	const encoding = 2 * encodingPerRow
+	const delivery = uint64((2*len(line) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit)
 	for _, tc := range []struct {
 		name   string
 		budget uint64
 	}{
 		{"anchor lookahead", firstPass - 1},
 		{"first page extension", firstPass},
-		{"byte truncation rescan", firstPass + extension + rescan - 1},
+		{"encoding", firstPass + extension + encoding - 1},
+		{"byte truncation rescan", firstPass + extension + encoding + rescan - 1},
+		{"response delivery", firstPass + extension + encoding + rescan + delivery - 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertQueryRejection(t, query(handler(tc.budget), "&page=1&limit=5"), 503, "query work budget exhausted")
 		})
 	}
-	assertPage(query(handler(firstPass+extension+rescan), "&page=1&limit=5"), 2, 1)
-	token := assertPage(query(handler(firstPass), "&page=1&limit=1"), 1, 0)
+	assertPage(query(handler(firstPass+extension+encoding+rescan+delivery), "&page=1&limit=5"), 2, 1)
+	token := assertPage(query(handler(firstPass+encodingPerRow+deliveryPerRow), "&page=1&limit=1"), 1, 0)
 
 	auth := 1 + uint64(len(token))
 	assertQueryRejection(t, query(handler(auth-1), "&cursor="+token+"&limit=2"), 503, "query work budget exhausted")
 	const continuationRescan = rescan + 5
-	h := handler(auth + extension + continuationRescan - 1)
-	assertQueryRejection(t, query(h, "&cursor="+token+"&limit=4"), 503, "query work budget exhausted")
-	assertPage(query(handler(auth+extension+continuationRescan), "&cursor="+token+"&limit=4"), 2, 2)
+	continuationCost := auth + extension + encoding + continuationRescan + delivery
+	h := handler(continuationCost - 1)
+	fullPage := "&cursor=" + token + "&limit=4"
+	assertQueryRejection(t, query(h, fullPage), 503, "query work budget exhausted")
+	assertPage(query(handler(continuationCost), fullPage), 2, 2)
 	// The same cursor can be retried on the same handler with a smaller page.
 	assertPage(query(h, "&cursor="+token+"&limit=2"), 2, 2)
 }
 
 type queryScanContext struct {
 	context.Context
-	cancel context.CancelFunc
-	checks int
+	cancel   context.CancelFunc
+	checks   int
+	cancelAt int
 }
 
 func (c *queryScanContext) Err() error {
 	c.checks++
-	if c.checks == 7 {
-		// Two admission checks, store entry, run and seek setup, and the
-		// first candidate have completed. Cancel during page lookahead.
+	if c.checks == c.cancelAt {
 		c.cancel()
 	}
 	return c.Context.Err()
 }
 
-func TestLiveQueryCancellationDuringScan(t *testing.T) {
+func TestLiveQueryCancellationBeforeCommit(t *testing.T) {
 	s := new(store.Store)
 	stamp := time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC)
 	row := store.Row{TS: stamp, Line: "same"}
 	s.Publish([]store.Row{row, row})
 	h := NewWithQueryLimits(s, nil, DefaultQueryMaxResponseBytes, 1, DefaultQueryWorkBudget)
 	path := queryBounds + "&page=1&limit=1"
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	out := httptest.NewRecorder()
-	h.ServeHTTP(out, httptest.NewRequest("GET", path, nil).WithContext(&queryScanContext{Context: ctx, cancel: cancel}))
-	assertQueryRejection(t, out, http.StatusRequestTimeout, "request cancelled")
-	out = httptest.NewRecorder()
-	h.ServeHTTP(out, httptest.NewRequest("GET", path, nil))
-	if out.Code != http.StatusOK || out.Header().Get("Bog-Next-Cursor") == "" {
-		t.Fatalf("retry: status=%d headers=%v body=%q", out.Code, out.Header(), out.Body.String())
+	for _, tc := range []struct {
+		name    string
+		checkAt int
+	}{
+		{"lookahead", 7},
+		{"line encoding", 9},
+		{"delivery after cursor prepared", 11},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			out := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", path, nil).WithContext(&queryScanContext{Context: ctx, cancel: cancel, cancelAt: tc.checkAt})
+			h.ServeHTTP(out, req)
+			assertQueryRejection(t, out, http.StatusRequestTimeout, "request cancelled")
+
+			out = httptest.NewRecorder()
+			h.ServeHTTP(out, httptest.NewRequest("GET", path, nil))
+			if out.Code != http.StatusOK || out.Header().Get("Bog-Next-Cursor") == "" {
+				t.Fatalf("retry: status=%d headers=%v body=%q", out.Code, out.Header(), out.Body.String())
+			}
+		})
 	}
 }
 

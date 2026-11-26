@@ -18,13 +18,22 @@ import (
 func main() {
 	dir := flag.String("data-dir", ".", "existing data directory")
 	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
+	queryConcurrency := flag.Int("query-concurrency", 8, "maximum active queries (excess requests are rejected)")
+	queryTimeout := flag.Duration("query-timeout", 10*time.Second, "query execution and response write deadline")
+	queryRows := flag.Int64("query-max-rows", 1000000, "maximum query candidate and index visits")
+	queryBytes := flag.Int64("query-max-match-bytes", 256<<20, "maximum bytes presented to literal matching")
+	queryResultBytes := flag.Int64("query-max-result-bytes", 16<<20, "maximum estimated encoded query response bytes")
 	flag.Parse()
+	if *queryConcurrency < 1 || *queryTimeout <= 0 || *queryRows < 1 || *queryBytes < 1 || *queryResultBytes < 1 {
+		log.Fatal("query limits must be positive")
+	}
+	queryConfig := httpapi.QueryConfig{Concurrency: *queryConcurrency, Timeout: *queryTimeout, Limits: store.QueryLimits{Rows: *queryRows, MatchBytes: *queryBytes, ResultBytes: *queryResultBytes}}
 	s := &store.Store{}
 	w, err := wal.Open(*dir, s)
 	if err != nil {
 		log.Fatal(err)
 	}
-	server := &http.Server{Addr: *addr, Handler: httpapi.New(s, w), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	server := &http.Server{Addr: *addr, Handler: httpapi.NewWithQueryConfig(s, w, queryConfig), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)

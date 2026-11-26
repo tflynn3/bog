@@ -50,3 +50,7 @@ Cycle 11 local benchmark record (Linux ARM64, Go 1.27, 3 runs, 1s per run; times
 | RestoredSingleRun/dense_to_sparse | 14,058; 15,897; 17,009 | 13,775; 13,412; 13,775 |
 
 Replay steady allocation fell from about 3,848,260 to 3,553,570 bytes/op; shuffled fell from about 3,848,325 to 3,635,570 bytes/op. These microbenchmarks do not measure the production p95 gate.
+
+Query requests use a separate admission pool. `-query-concurrency` (default 8) limits active queries; excess requests receive HTTP 503 with `query overloaded`. There is no waiting queue. `-query-timeout` (default 10s) bounds query execution and response writes. Canceled requests return 408 (`query canceled`) and deadline expiry returns 504 (`query deadline exceeded`) if a response can still be sent.
+
+Each request, including cursor validation and pagination lookahead, has independent work limits: `-query-max-rows` (default 1000000) counts index probes and candidate visits, `-query-max-match-bytes` (default 268435456) counts line bytes presented to literal matching, and `-query-max-result-bytes` (default 16777216) limits a conservative JSON response size estimate (six bytes per line byte plus 128 per row). All settings must be positive. Exhaustion returns HTTP 422 with `query budget exhausted`, before any rows or continuation cursor are sent. These limits do not apply to ingest or health checks.

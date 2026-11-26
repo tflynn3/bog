@@ -38,6 +38,13 @@ func requireOK(t testing.TB, err error) {
 	}
 }
 
+func privateDir(t testing.TB) string {
+	t.Helper()
+	dir := t.TempDir()
+	requireOK(t, os.Chmod(dir, 0700))
+	return dir
+}
+
 func cleanup(t testing.TB, close func() error) {
 	t.Helper()
 	t.Cleanup(func() { requireOK(t, close()) })
@@ -62,7 +69,7 @@ func publishFixture(t *testing.T, dir string) (m *checkpoint.Manifest, committed
 
 func TestPublisherCompatibilityAndWALOracle(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := privateDir(t)
 	l, err := wal.Open(dir, &store.Store{})
 	requireOK(t, err)
 	func() {
@@ -146,6 +153,7 @@ func hashText(b []byte) string {
 func writeFile(t testing.TB, path string, b []byte) {
 	t.Helper()
 	requireOK(t, os.WriteFile(path, b, 0600))
+	requireOK(t, os.Chmod(path, 0600))
 }
 
 func writeManifest(t testing.TB, dir string, m manifest) {
@@ -161,7 +169,7 @@ func writeManifest(t testing.TB, dir string, m manifest) {
 // reader also accepts sparse runs, so construct those with the shared codec.
 func segmentFixture(t testing.TB, runs [][]checkpoint.BlockRow) (string, manifest) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := privateDir(t)
 	m := manifest{Version: 1, CoveredOffset: 8, SourceSHA256: hashText([]byte("BOGWAL01"))}
 	for i, run := range runs {
 		b, err := checkpoint.EncodeBlock(run)
@@ -482,7 +490,7 @@ func TestInvalidAppendOrderAndCoverage(t *testing.T) {
 }
 
 func TestEmptyCheckpointAndOrphanFiles(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateDir(t)
 	ctx := context.Background()
 	var c Catalog
 	cleanup(t, c.Close)
@@ -660,7 +668,7 @@ func BenchmarkHistory(b *testing.B) {
 
 func TestPublishSuccessorInSameDirectory(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := privateDir(t)
 	appendPayload := func(payload string) {
 		l, err := wal.Open(dir, &store.Store{})
 		requireOK(t, err)
@@ -668,7 +676,7 @@ func TestPublishSuccessorInSameDirectory(t *testing.T) {
 		appendFrame(t, l, []byte(payload))
 	}
 	appendPayload(`{"ts":"2026-01-01T00:00:00Z","line":"tie"}`)
-	_, firstEnd := publishFixture(t, dir)
+	firstManifest, firstEnd := publishFixture(t, dir)
 	var c Catalog
 	cleanup(t, c.Close)
 	first, err := c.Replace(ctx, dir)
@@ -694,5 +702,17 @@ func TestPublishSuccessorInSameDirectory(t *testing.T) {
 	want := []checkpoint.BlockRow{row(epoch.AddDate(-1, 0, 0), 1, "backfill"), row(epoch, 0, "tie"), row(epoch, 2, "tie")}
 	if got := scanRows(t, r2, all); !slices.Equal(got, want) {
 		t.Fatalf("successor snapshot: got %v, want %v", got, want)
+	}
+	requireOK(t, c.Reclaim(ctx, dir))
+	for _, segment := range firstManifest.Segments {
+		assertSegment(t, dir, segment.Name, true)
+	}
+	requireOK(t, r.Close())
+	requireOK(t, c.Reclaim(ctx, dir))
+	for _, segment := range firstManifest.Segments {
+		assertSegment(t, dir, segment.Name, false)
+	}
+	if got := scanRows(t, r2, all); !slices.Equal(got, want) {
+		t.Fatalf("successor changed after reclamation: got %v, want %v", got, want)
 	}
 }

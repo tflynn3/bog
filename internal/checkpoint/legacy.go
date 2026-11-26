@@ -30,6 +30,7 @@ type Legacy struct {
 
 	publicationMu   sync.Mutex
 	uncertain       error
+	segmentDirSync  func() error
 	manifestRename  func(string, string) error
 	manifestDirSync func() error
 }

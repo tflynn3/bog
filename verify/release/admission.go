@@ -335,16 +335,24 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
 	if _, ok := cases["one_slot_saturation"]; !ok {
 		saturationErr = record(cases, "one_slot_saturation", nil, saturationErr)
 	}
-	budgetErr := serve(ctx, binary, client, []string{"-query-concurrency=1", "-query-work-budget=1"}, func(base string) error {
+	var budgetProof struct {
+		rejection
+		FixedBudgetWalk budgetWalkProof `json:"fixed_budget_walk"`
+	}
+	rejectionErr := serve(ctx, binary, client, []string{"-query-concurrency=1", "-query-work-budget=1"}, func(base string) error {
 		if _, err := ingest(ctx, client, base, seed[:batchRows]); err != nil {
 			return err
 		}
 		result, err := requireRejection(ctx, client, base+queryPath("", 1, budgetFilter))
-		return record(cases, "work_budget", result, err)
+		budgetProof.rejection = result
+		return err
 	})
-	if _, ok := cases["work_budget"]; !ok {
-		budgetErr = record(cases, "work_budget", nil, budgetErr)
+	if rejectionErr != nil {
+		rejectionErr = fmt.Errorf("budget-1 absent filter: %w", rejectionErr)
 	}
+	walk, walkErr := probeBudgetWalk(ctx, binary, client)
+	budgetProof.FixedBudgetWalk = walk
+	budgetErr := record(cases, "work_budget", budgetProof, errors.Join(rejectionErr, walkErr))
 	return errors.Join(saturationErr, budgetErr)
 }
 

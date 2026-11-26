@@ -354,29 +354,58 @@ func TestStorageDirection(t *testing.T) {
 }
 
 func TestLinuxRegistryCorruptionHarness(t *testing.T) {
-	if _, registered := linuxRegistry(nil)[fuzzVerifier]; registered {
-		t.Fatal("corruption harness registered on the pinned base")
+	t.Parallel()
+	entry, present := registry[fuzzVerifier]
+	if !present || entry.role != testOnly || len(entry.imports) != 0 {
+		t.Fatalf("corruption harness registration = %+v, present = %t", entry, present)
 	}
-	for _, production := range []bool{false, true} {
-		pkg := productionPackage("fuzz")
-		pkg.TestGoFiles = []string{"harness_linux_test.go"}
-		var want []string
-		if production {
-			want = []string{fuzzVerifier + " must contain Linux test files only"}
-		} else {
-			pkg.GoFiles = nil
-		}
-		pkgs := map[string]listedPackage{fuzzVerifier: pkg}
-		entry, present := linuxRegistry(pkgs)[fuzzVerifier]
-		if !present || entry.role != testOnly || len(entry.imports) != 0 {
-			t.Fatalf("corruption harness registration = %+v, present = %t", entry, present)
-		}
-		if got := architectureProblems(pkgs, map[string]rule{fuzzVerifier: entry}); !slices.Equal(got, want) {
-			t.Errorf("architectureProblems() = %q, want %q", got, want)
-		}
+	harness := listedPackage{
+		Name:        "fuzz",
+		Module:      &struct{ Main bool }{Main: true},
+		TestGoFiles: []string{"harness_linux_test.go"},
 	}
-	if _, registered := linuxRegistry(nil)[fuzzVerifier]; registered {
-		t.Fatal("composed inventory mutated the pinned base registry")
+	rules := map[string]rule{fuzzVerifier: entry}
+	tests := []struct {
+		name   string
+		change func(map[string]listedPackage)
+		want   []string
+	}{
+		{name: "Linux test files only"},
+		{
+			name: "harness absent from Linux inventory",
+			change: func(pkgs map[string]listedPackage) {
+				delete(pkgs, fuzzVerifier)
+			},
+			want: []string{"stale test-only registration: " + fuzzVerifier + " is absent from the Linux inventory"},
+		},
+		{
+			name: "production files added alongside tests",
+			change: func(pkgs map[string]listedPackage) {
+				pkg := pkgs[fuzzVerifier]
+				pkg.GoFiles = []string{"harness_linux.go"}
+				pkgs[fuzzVerifier] = pkg
+			},
+			want: []string{fuzzVerifier + " must contain Linux test files only"},
+		},
+		{
+			name: "converted to production only",
+			change: func(pkgs map[string]listedPackage) {
+				pkgs[fuzzVerifier] = productionPackage("fuzz")
+			},
+			want: []string{fuzzVerifier + " must contain Linux test files only"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			pkgs := map[string]listedPackage{fuzzVerifier: harness}
+			if tt.change != nil {
+				tt.change(pkgs)
+			}
+			if got := architectureProblems(pkgs, rules); !slices.Equal(got, tt.want) {
+				t.Errorf("architectureProblems() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

@@ -1,8 +1,9 @@
 # ADR 0005 — Pinned writable recovery authority
 
-**Status** — Cycle 46 integration decision. The pinned base still rejects
-restored images at server startup. Runtime implementation and qualification
-belong to the composed [#53] and [#59] candidate.
+**Status** — Cycle 46 integration decision with the Cycle 47 readiness
+handoff. The current base rejects restored images at server startup and
+samples readiness by path. Writable restore and retained paging belong to
+[#53] and [#59]. Descriptor-backed readiness is planned in [#60].
 
 This decision extends the [retained-history cutover](0004-retained-history-cutover.md).
 One Linux process, one listener, one WAL owner, and one pinned local data
@@ -68,10 +69,9 @@ after generation replacement. HTTP certifies a walk at the fixed work
 budget before issuing its first cursor, including for smaller resume limits.
 Insufficient budget fails before response commitment. Every emitted row has
 its own exclusive position, so trimming by encoded bytes preserves the
-correct resume point. An expired
-capture returns 410. HTTP releases an unpublished capture and retires a
-published capture after expiry and admitted requests drain. A still-live
-cursor remains retryable through the terminal page.
+correct resume point. An expired capture returns 410. HTTP releases an
+unpublished capture and retires a published capture after expiry and admitted
+requests drain. A still-live cursor remains retryable through the terminal page.
 
 For export, keep the generation and WAL pins through the whole `backup.Export`
 call. The captured point fixes the frame range and excludes later appends.
@@ -115,6 +115,30 @@ publication, sync, and close errors. When an unresolved authority or timed-out
 drain requires process termination, leave durable state for restart recovery
 and let process exit release the locks.
 
+### Readiness descriptor handoff (#60)
+
+After recovery selects the writable authority and before serving, `cmd/bog`
+obtains an independently opened, unlocked directory handle from the WAL
+owner. Open it relative to the pinned directory descriptor and check that
+it identifies that directory. A duplicate of the locked descriptor shares
+the open file description and could extend the lifetime of its lock. Treat
+failure to acquire the probe handle as a startup error and unwind resources
+already acquired before returning.
+
+`cmd/bog` supplies the handle to `readiness.NewHandlerForDirectory` and owns
+its lifetime. Readiness borrows the handle for background `fstatfs` samples
+and observes terminal commit outcomes from the active WAL owner. Retargeting
+the configured path after startup leaves the sampled filesystem unchanged.
+`GET /ready` reads the sampled state and WAL outcome without filesystem I/O
+on the request path.
+
+On shutdown, `cmd/bog` cancels the sampler before closing its handle.
+Cancellation stops further samples and discards an in-flight result. An
+in-flight `fstatfs` keeps its descriptor reference until it returns. Arrange
+for the probe handle to close without making HTTP or storage drain wait on a
+stalled sample. Surface close failures and keep the WAL owner responsible for
+the separate locked descriptor until storage users drain.
+
 ## Keep the v1 prefix digest meaningful
 
 The v1 manifest's `SourceSHA256` is SHA-256 over the **exact WAL bytes**
@@ -150,9 +174,19 @@ continuation representation.
   Compare a fresh walk to the view with the acknowledged writes and repeat
   after restart.
 - Exercise publication interruption, failed validation, and shutdown with
-  outstanding pins. Run the uncached Linux architecture inventory and Linux
-  cross-build on the composed tree. Use the same revision-pinned Linux
-  binary for the release evidence in [SYSTEM.md](../architecture/SYSTEM.md).
+  outstanding pins or an in-flight readiness sample. Confirm that the WAL
+  lock remains held while storage users drain.
+- Retarget the configured directory path across healthy and full filesystems
+  in both directions while the server is running. The existing ENOSPC
+  verifier requires readiness and ingest to follow the active WAL filesystem
+  after each path change. See the
+  [Linux verifier contract](../../verify/linux/README.md).
+- Run `go test -count=1 ./internal/archtest` and
+  `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on the composed tree.
+  Use the same revision-pinned Linux binary for verified restore, fixed-budget
+  pagination, active-WAL readiness, and the other release checks in
+  [SYSTEM.md](../architecture/SYSTEM.md#release-evidence).
 
 [#53]: https://github.com/tflynn3/bog/issues/53
 [#59]: https://github.com/tflynn3/bog/issues/59
+[#60]: https://github.com/tflynn3/bog/issues/60

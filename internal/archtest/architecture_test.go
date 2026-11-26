@@ -53,6 +53,7 @@ var registry = map[string]rule{
 	"bog/internal/client":        {standalone, []string{"bog/internal/store"}},
 	"bog/internal/ingest":        {testOnly, nil},
 	"bog/internal/archtest":      {testOnly, nil},
+	fuzzVerifier:                 {testOnly, nil},
 	"bog/verify/release":         {verifier, nil},
 	"bog/verify/linux":           {verifier, nil},
 	"bog/bench/retained-history": {verifier, nil},
@@ -107,20 +108,9 @@ func TestLinuxArchitecture(t *testing.T) {
 		}
 		packages[pkg.ImportPath] = pkg
 	}
-	for _, problem := range architectureProblems(packages, linuxRegistry(packages)) {
+	for _, problem := range architectureProblems(packages, registry) {
 		t.Error(problem)
 	}
-}
-
-func linuxRegistry(packages map[string]listedPackage) map[string]rule {
-	// The corruption harness landed on the target after this change's base.
-	// Make this entry unconditional once the target and cutover are composed.
-	if _, present := packages[fuzzVerifier]; !present {
-		return registry
-	}
-	rules := maps.Clone(registry)
-	rules[fuzzVerifier] = rule{testOnly, nil}
-	return rules
 }
 
 func architectureProblems(packages map[string]listedPackage, rules map[string]rule) []string {

@@ -417,47 +417,66 @@ type Position struct {
 // QueryPage captures the published row count when snapshot is nil. A continuation
 // is valid only when its position still identifies a matching row in that snapshot.
 func (s *Store) QueryPage(start, end time.Time, contains string, limit int, snapshot *int, after *Position) ([]Row, int, *Position, bool) {
-	return s.query(start, end, contains, limit, snapshot, after, true)
+	rows, count, next, err := s.QueryPageWithWork(start, end, contains, limit, snapshot, after, nil)
+	return rows, count, next, err == nil
 }
 
-func (s *Store) query(start, end time.Time, contains string, limit int, snapshot *int, after *Position, lookahead bool) ([]Row, int, *Position, bool) {
+// QueryPageWithWork is QueryPage with cancellation and work accounting.
+func (s *Store) QueryPageWithWork(start, end time.Time, contains string, limit int, snapshot *int, after *Position, work *QueryWork) ([]Row, int, *Position, error) {
+	return s.query(start, end, contains, limit, snapshot, after, true, work)
+}
+
+func (s *Store) query(start, end time.Time, contains string, limit int, snapshot *int, after *Position, lookahead bool, work *QueryWork) ([]Row, int, *Position, error) {
+	if err := work.Charge(); err != nil {
+		return nil, 0, nil, err
+	}
 	s.mu.RLock()
-	rows, blocks := s.rows, s.blocks
-	runs := make([]indexRun, 0, len(s.runs)+1)
-	hasRestored := s.restored.length > 0
-	if hasRestored {
-		runs = append(runs, s.restored)
-	}
-	for _, run := range s.runs {
-		if run.length > 0 {
-			runs = append(runs, run)
-		}
-	}
+	rows, blocks, restored, levels := s.rows, s.blocks, s.restored, s.runs
+	s.mu.RUnlock()
 	count := len(rows)
 	if snapshot != nil {
 		count = *snapshot
 		if count < 1 || count > len(rows) || after == nil || after.Ordinal < 0 || after.Ordinal >= count {
-			s.mu.RUnlock()
-			return nil, 0, nil, false
+			return nil, 0, nil, ErrInvalidQueryCursor
 		}
 		row := rows[after.Ordinal]
+		if err := work.row(row.Line, true); err != nil {
+			return nil, 0, nil, err
+		}
 		if !row.TS.Equal(after.Time) || row.TS.Before(start) || !row.TS.Before(end) || !strings.Contains(row.Line, contains) {
-			s.mu.RUnlock()
-			return nil, 0, nil, false
+			return nil, 0, nil, ErrInvalidQueryCursor
 		}
 	}
-	s.mu.RUnlock()
 	if !start.Before(end) || limit <= 0 {
-		return []Row{}, count, nil, true
+		return []Row{}, count, nil, nil
+	}
+	// Publication replaces the run levels, so the captured slice is immutable.
+	runs := make([]indexRun, 0, len(levels)+1)
+	if restored.length > 0 {
+		runs = append(runs, restored)
+	}
+	for _, run := range levels {
+		if run.length > 0 {
+			runs = append(runs, run)
+		}
 	}
 	// Seek once to the start and cursor for each run. Upper bounds are deferred
 	// until a bounded scan has had a chance to answer the query.
 	offsets := make([]int, len(runs))
 	lower := make([]int, len(runs))
 	for i, run := range runs {
+		if err := work.Charge(1); err != nil {
+			return nil, 0, nil, err
+		}
+		if err := work.seek(run.length); err != nil {
+			return nil, 0, nil, err
+		}
 		lo := sort.Search(run.length, func(j int) bool { return !rows[run.ordinal(j)].TS.Before(start) })
 		lower[i] = lo
 		if after != nil {
+			if err := work.seek(run.length - lo); err != nil {
+				return nil, 0, nil, err
+			}
 			lo += sort.Search(run.length-lo, func(j int) bool {
 				ordinal := run.ordinal(lo + j)
 				t := rows[ordinal].TS
@@ -477,7 +496,7 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		}
 	}
 	if active == -1 {
-		return []Row{}, count, nil, true
+		return []Row{}, count, nil, nil
 	}
 	var directResult []Row
 	var directLast int
@@ -485,7 +504,7 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	if active >= 0 {
 		directOffset = offsets[active]
 	}
-	direct := func(budget int) ([]Row, *Position, bool) {
+	direct := func(scanThreshold int) ([]Row, *Position, bool, error) {
 		run := runs[active]
 		examined := 0
 		for directOffset < run.length {
@@ -494,16 +513,19 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			if !row.TS.Before(end) {
 				break
 			}
-			if budget > 0 && examined >= budget {
-				return nil, nil, false
+			if scanThreshold > 0 && examined >= scanThreshold {
+				return nil, nil, false, nil
 			}
 			directOffset++
 			examined++
+			if err := work.row(row.Line, ordinal < count); err != nil {
+				return nil, nil, false, err
+			}
 			if ordinal >= count || !strings.Contains(row.Line, contains) {
 				continue
 			}
 			if len(directResult) == limit {
-				return directResult, &Position{rows[directLast].TS, directLast}, true
+				return directResult, &Position{rows[directLast].TS, directLast}, true, nil
 			}
 			if directResult == nil {
 				directResult = make([]Row, 0, min(limit, count))
@@ -511,15 +533,15 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			directResult = append(directResult, row)
 			directLast = ordinal
 			if !lookahead && len(directResult) == limit {
-				return directResult, nil, true
+				return directResult, nil, true, nil
 			}
 		}
 		if directResult == nil {
 			directResult = []Row{}
 		}
-		return directResult, nil, true
+		return directResult, nil, true, nil
 	}
-	ordered := func(budget int) ([]Row, *Position, bool) {
+	ordered := func(scanThreshold int) ([]Row, *Position, bool, error) {
 		h := &candidates{rows: rows, items: make([]candidate, 0, len(runs))}
 		for i, offset := range offsets {
 			if offset < runs[i].length && rows[runs[i].ordinal(offset)].TS.Before(end) {
@@ -531,15 +553,18 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		var last candidate
 		examined := 0
 		for h.Len() > 0 {
-			if budget > 0 && examined >= budget {
-				return nil, nil, false
+			if scanThreshold > 0 && examined >= scanThreshold {
+				return nil, nil, false, nil
 			}
 			current := h.items[0]
 			examined++
 			row := rows[current.ordinal]
+			if err := work.row(row.Line, current.ordinal < count); err != nil {
+				return nil, nil, false, err
+			}
 			if current.ordinal < count && strings.Contains(row.Line, contains) {
 				if len(result) == limit {
-					return result, &Position{rows[last.ordinal].TS, last.ordinal}, true
+					return result, &Position{rows[last.ordinal].TS, last.ordinal}, true, nil
 				}
 				if result == nil {
 					result = make([]Row, 0, min(limit, count))
@@ -547,7 +572,7 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 				result = append(result, row)
 				last = current
 				if !lookahead && len(result) == limit {
-					return result, nil, true
+					return result, nil, true, nil
 				}
 			}
 			next := current.offset + 1
@@ -562,17 +587,17 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		if result == nil {
 			result = []Row{}
 		}
-		return result, nil, true
+		return result, nil, true, nil
 	}
 	var runProbes []uint64
 	var runEnds []int
 	if len(contains) >= 4 {
-		// Bound work even for absent literals and runs containing newer rows.
-		budget := max(512, limit)
+		// Try a bounded scan before paying for the Bloom selection paths.
+		scanThreshold := max(512, limit)
 		if limit <= int(^uint(0)>>1)/2 {
-			budget = max(512, 2*limit)
+			scanThreshold = max(512, 2*limit)
 		} else {
-			budget = int(^uint(0) >> 1)
+			scanThreshold = int(^uint(0) >> 1)
 		}
 		// The multi-run policy uses the full-window estimate before attempting
 		// the merge. A single run can answer dense pages without that estimate.
@@ -580,14 +605,21 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		intervalStart, intervalEnd := 0, count
 		implicit := active >= 0 && runs[active].ordinals == nil
 		if active >= 0 {
-			if result, next, complete := direct(budget); complete {
-				return result, count, next, true
+			result, next, complete, err := direct(scanThreshold)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if complete {
+				return result, count, next, nil
 			}
 		}
 		if implicit {
 			// An implicit run is already in append order. Resume the bounded
 			// scan and inspect only blocks that may contain the literal.
 			run := runs[active]
+			if err := work.seek(run.length); err != nil {
+				return nil, 0, nil, err
+			}
 			hi := run.base + sort.Search(run.length, func(i int) bool { return !rows[run.base+i].TS.Before(end) })
 			hi = min(hi, count)
 			directOffset += run.base
@@ -595,6 +627,9 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			for directOffset < hi {
 				block := directOffset / blockSize
 				blockEnd := min((block+1)*blockSize, hi)
+				if err := work.Charge(1); err != nil {
+					return nil, 0, nil, err
+				}
 				if block < len(blocks) && !blocks[block].mayContainProbes(probes) {
 					directOffset = blockEnd
 					continue
@@ -603,11 +638,14 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 					ordinal := directOffset
 					directOffset++
 					row := rows[ordinal]
+					if err := work.row(row.Line, true); err != nil {
+						return nil, 0, nil, err
+					}
 					if !strings.Contains(row.Line, contains) {
 						continue
 					}
 					if len(directResult) == limit {
-						return directResult, count, &Position{rows[directLast].TS, directLast}, true
+						return directResult, count, &Position{rows[directLast].TS, directLast}, nil
 					}
 					if directResult == nil {
 						directResult = make([]Row, 0, min(limit, count))
@@ -615,23 +653,30 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 					directResult = append(directResult, row)
 					directLast = ordinal
 					if !lookahead && len(directResult) == limit {
-						return directResult, count, nil, true
+						return directResult, count, nil, nil
 					}
 				}
 			}
 			if directResult == nil {
 				directResult = []Row{}
 			}
-			return directResult, count, nil, true
+			return directResult, count, nil, nil
 		}
 		for i, run := range runs {
+			if err := work.seek(run.length - lower[i]); err != nil {
+				return nil, 0, nil, err
+			}
 			hi := lower[i] + sort.Search(run.length-lower[i], func(j int) bool { return !rows[run.ordinal(lower[i]+j)].TS.Before(end) })
 			bound += hi - lower[i]
 		}
 		if bound >= 32768 {
 			if active == -2 {
-				if result, next, complete := ordered(budget); complete {
-					return result, count, next, true
+				result, next, complete, err := ordered(scanThreshold)
+				if err != nil {
+					return nil, 0, nil, err
+				}
+				if complete {
+					return result, count, next, nil
 				}
 			}
 			allImplicit := active == -2
@@ -646,6 +691,9 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 				runEnds = make([]int, len(runs))
 				for i, run := range runs {
 					if run.ordinals == nil {
+						if err := work.seek(run.length); err != nil {
+							return nil, 0, nil, err
+						}
 						hi := sort.Search(run.length, func(j int) bool { return !rows[run.base+j].TS.Before(end) })
 						runEnds[i] = max(0, min(hi, count-run.base))
 					}
@@ -656,6 +704,9 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 				possibleRows := 0
 				for first := intervalStart / blockSize * blockSize; first < intervalEnd; first += blockSize {
 					block := first / blockSize
+					if err := work.Charge(1); err != nil {
+						return nil, 0, nil, err
+					}
 					if block < len(blocks) && !blocks[block].mayContainProbes(probes) {
 						continue
 					}
@@ -666,56 +717,75 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 					possible = append(possible, first)
 				}
 				if possibleRows <= bound/4 {
-					result, next := queryBlocks(rows, possible, count, start, end, contains, limit, after, lookahead)
-					return result, count, next, true
+					result, next, err := queryBlocks(rows, possible, count, start, end, contains, limit, after, lookahead, work)
+					if err != nil {
+						return nil, 0, nil, err
+					}
+					return result, count, next, nil
 				}
 			}
 		}
 	}
 	if active >= 0 {
-		result, next, _ := direct(0)
-		return result, count, next, true
+		result, next, _, err := direct(0)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		return result, count, next, nil
 	}
 	// The unbounded merge skips non-matches within each run before touching the
 	// heap, avoiding heap maintenance for every rejected row.
 	h := &candidates{rows: rows, items: make([]candidate, 0, len(runs))}
-	advance := func(runIndex, offset int) {
+	advance := func(runIndex, offset int) error {
 		run := runs[runIndex]
 		if runProbes != nil && run.ordinals == nil {
 			for offset < runEnds[runIndex] {
 				ordinal := run.base + offset
 				block := ordinal / blockSize
 				blockEnd := min((block+1)*blockSize-run.base, runEnds[runIndex])
+				if err := work.Charge(1); err != nil {
+					return err
+				}
 				if block < len(blocks) && !blocks[block].mayContainProbes(runProbes) {
 					offset = blockEnd
 					continue
 				}
 				for offset < blockEnd {
 					ordinal = run.base + offset
-					if strings.Contains(rows[ordinal].Line, contains) {
+					line := rows[ordinal].Line
+					if err := work.row(line, true); err != nil {
+						return err
+					}
+					if strings.Contains(line, contains) {
 						heap.Push(h, candidate{ordinal, runIndex, offset})
-						return
+						return nil
 					}
 					offset++
 				}
 			}
-			return
+			return nil
 		}
 		for offset < run.length {
 			ordinal := run.ordinal(offset)
 			row := rows[ordinal]
 			if !row.TS.Before(end) {
-				return
+				return nil
+			}
+			if err := work.row(row.Line, ordinal < count); err != nil {
+				return err
 			}
 			if ordinal < count && strings.Contains(row.Line, contains) {
 				heap.Push(h, candidate{ordinal, runIndex, offset})
-				return
+				return nil
 			}
 			offset++
 		}
+		return nil
 	}
 	for i, offset := range offsets {
-		advance(i, offset)
+		if err := advance(i, offset); err != nil {
+			return nil, 0, nil, err
+		}
 	}
 	result := []Row{}
 	var last candidate
@@ -726,17 +796,25 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		}
 		result = append(result, rows[last.ordinal])
 		if lookahead || len(result) < limit {
-			advance(last.run, last.offset+1)
+			if err := advance(last.run, last.offset+1); err != nil {
+				return nil, 0, nil, err
+			}
 		}
 	}
 	var next *Position
 	if h.Len() > 0 {
 		next = &Position{rows[last.ordinal].TS, last.ordinal}
 	}
-	return result, count, next, true
+	return result, count, next, nil
 }
 
 func (s *Store) Query(start, end time.Time, contains string, limit int) []Row {
-	rows, _, _, _ := s.query(start, end, contains, limit, nil, nil, false)
+	rows, _ := s.QueryWithWork(start, end, contains, limit, nil)
 	return rows
+}
+
+// QueryWithWork is Query with cancellation and work accounting.
+func (s *Store) QueryWithWork(start, end time.Time, contains string, limit int, work *QueryWork) ([]Row, error) {
+	rows, _, _, err := s.query(start, end, contains, limit, nil, nil, false, work)
+	return rows, err
 }

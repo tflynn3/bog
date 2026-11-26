@@ -24,7 +24,11 @@ func TestCursorAuthenticationDomainSeparation(t *testing.T) {
 	if _, err := decodeCursor(forged); err == nil {
 		t.Fatal("filter digest authenticated a cursor payload")
 	}
-	if _, err := decodeCursor(encodeCursor(cursorData{Version: 1})); err != nil {
+	token, err := encodeCursor(cursorData{Version: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeCursor(token); err != nil {
 		t.Fatal(err)
 	}
 }

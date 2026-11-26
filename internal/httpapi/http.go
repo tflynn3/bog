@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -29,9 +30,14 @@ type API struct {
 	fatal            func()
 	slots            chan struct{}
 	maxResponseBytes int
+	queryWorkBudget  uint64
 }
 
-const DefaultQueryMaxResponseBytes = 32 << 20
+const (
+	DefaultQueryMaxResponseBytes = 32 << 20
+	DefaultQueryConcurrency      = 8
+	DefaultQueryWorkBudget       = 128 << 20
+)
 
 func New(s *store.Store, w appender) http.Handler {
 	return NewWithQueryMaxResponseBytes(s, w, DefaultQueryMaxResponseBytes)
@@ -39,14 +45,35 @@ func New(s *store.Store, w appender) http.Handler {
 
 // NewWithQueryMaxResponseBytes sets the maximum encoded NDJSON body size.
 func NewWithQueryMaxResponseBytes(s *store.Store, w appender, maxBytes int) http.Handler {
+	return NewWithQueryLimits(s, w, maxBytes, DefaultQueryConcurrency, DefaultQueryWorkBudget)
+}
+
+// NewWithQueryLimits limits response bytes, concurrent queries, and work per query.
+// Admission returns 503 "query capacity exhausted" and the work limit returns
+// 503 "query work budget exhausted". Cancellation detected before response
+// commit returns 408 "request cancelled". These errors use plain text.
+func NewWithQueryLimits(s *store.Store, w appender, maxBytes, concurrency int, workBudget uint64) http.Handler {
 	if maxBytes <= 0 {
 		panic("query response byte limit must be positive")
 	}
-	a := &API{store: s, wal: w, fatal: func() { os.Exit(1) }, slots: make(chan struct{}, 16), maxResponseBytes: maxBytes}
+	if workBudget == 0 {
+		panic("query work budget must be positive")
+	}
+	a := &API{
+		store: s, wal: w, fatal: func() { os.Exit(1) }, slots: make(chan struct{}, 16),
+		maxResponseBytes: maxBytes, queryWorkBudget: workBudget,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.health)
 	mux.HandleFunc("/ingest", a.ingest)
-	mux.HandleFunc("/query", a.query)
+	query := queryAdmission(concurrency, http.HandlerFunc(a.query))
+	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		query.ServeHTTP(w, r)
+	})
 	return mux
 }
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
@@ -124,12 +151,15 @@ func containsDigest(value string) [sha256.Size]byte {
 	return digest
 }
 
-func encodeCursor(c cursorData) string {
-	b, _ := json.Marshal(c)
+func encodeCursor(c cursorData) (string, error) {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
 	mac := hmac.New(sha256.New, cursorKey)
 	mac.Write([]byte("bog-cursor-v1\x00"))
 	mac.Write(b)
-	return base64.RawURLEncoding.EncodeToString(append(b, mac.Sum(nil)...))
+	return base64.RawURLEncoding.EncodeToString(append(b, mac.Sum(nil)...)), nil
 }
 func decodeCursor(token string) (cursorData, error) {
 	var c cursorData
@@ -149,11 +179,21 @@ func decodeCursor(token string) (cursorData, error) {
 
 var decimal = regexp.MustCompile(`^[0-9]+$`)
 
-func (a *API) query(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+func writeQueryError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrQueryWorkExhausted):
+		http.Error(w, "query work budget exhausted", http.StatusServiceUnavailable)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		http.Error(w, "request cancelled", http.StatusRequestTimeout)
+	case errors.Is(err, store.ErrInvalidQueryCursor):
+		http.Error(w, "invalid cursor", http.StatusBadRequest)
+	default:
+		http.Error(w, "query failed", http.StatusInternalServerError)
 	}
+}
+
+func (a *API) query(w http.ResponseWriter, r *http.Request) {
+	work := store.NewQueryWork(r.Context(), a.queryWorkBudget)
 	q, queryErr := url.ParseQuery(r.URL.RawQuery)
 	if queryErr != nil {
 		http.Error(w, "invalid query", 400)
@@ -198,41 +238,52 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	var rows []store.Row
 	var captured int
 	var anchor, next *store.Position
-	var firstPage bool
+	var digest [sha256.Size]byte
+	var err error
+	contains := q.Get("contains")
 	if page || continuation {
 		var count *int
 		if continuation {
+			// Charge one unit for token validation and a unit per input byte
+			// for decoding and authenticating the token and its literal.
+			if err := work.Charge(1, uint64(len(cursor[0])), uint64(len(contains))); err != nil {
+				writeQueryError(w, err)
+				return
+			}
 			c, err := decodeCursor(cursor[0])
-			if err != nil || !c.Start.Equal(start) || !c.End.Equal(end) || c.Contains != containsDigest(q.Get("contains")) {
+			digest = containsDigest(contains)
+			if err != nil || !c.Start.Equal(start) || !c.End.Equal(end) || c.Contains != digest {
 				http.Error(w, "invalid cursor", 400)
 				return
 			}
 			count, anchor = &c.Count, &c.After
 		}
-		var ok bool
 		if page {
 			// The one-row call captures both the snapshot and a usable anchor.
-			firstPage = true
-			rows, captured, next, ok = a.store.QueryPage(start, end, q.Get("contains"), 1, nil, nil)
-			if ok && next != nil && limit > 1 {
+			rows, captured, next, err = a.store.QueryPageWithWork(start, end, contains, 1, nil, nil, work)
+			if err == nil && next != nil && limit > 1 {
 				anchor = next
 				var rest []store.Row
-				rest, _, next, ok = a.store.QueryPage(start, end, q.Get("contains"), limit-1, &captured, anchor)
+				rest, _, next, err = a.store.QueryPageWithWork(start, end, contains, limit-1, &captured, anchor, work)
 				rows = append(rows, rest...)
 			}
 		} else {
-			rows, captured, next, ok = a.store.QueryPage(start, end, q.Get("contains"), limit, count, anchor)
-		}
-		if !ok {
-			http.Error(w, "invalid cursor", 400)
-			return
+			rows, captured, next, err = a.store.QueryPageWithWork(start, end, contains, limit, count, anchor, work)
 		}
 	} else {
-		rows = a.store.Query(start, end, q.Get("contains"), limit)
+		rows, err = a.store.QueryWithWork(start, end, contains, limit, work)
+	}
+	if err != nil {
+		writeQueryError(w, err)
+		return
 	}
 	var body bytes.Buffer
 	emitted := 0
 	for _, row := range rows {
+		if err := work.Charge(); err != nil {
+			writeQueryError(w, err)
+			return
+		}
 		encoded, err := json.Marshal(row)
 		if err != nil {
 			http.Error(w, "cannot encode query response", http.StatusInternalServerError)
@@ -253,20 +304,46 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		// QueryPage only exposes a position when another matching row exists.
 		// Since a fetched row was omitted, the shorter call has that lookahead.
 		shortLimit := emitted
-		if firstPage {
+		if page {
 			shortLimit--
 		}
 		if shortLimit == 0 {
 			next = anchor
 		} else {
-			_, _, next, _ = a.store.QueryPage(start, end, q.Get("contains"), shortLimit, &captured, anchor)
+			_, _, next, err = a.store.QueryPageWithWork(start, end, contains, shortLimit, &captured, anchor, work)
+			if err != nil {
+				writeQueryError(w, err)
+				return
+			}
 		}
 	}
+	var token string
 	if next != nil {
-		w.Header().Set("Bog-Next-Cursor", encodeCursor(cursorData{1, start, end, containsDigest(q.Get("contains")), captured, *next}))
+		if page {
+			if err := work.Charge(uint64(len(contains))); err != nil {
+				writeQueryError(w, err)
+				return
+			}
+			digest = containsDigest(contains)
+		}
+		token, err = encodeCursor(cursorData{1, start, end, digest, captured, *next})
+		if err != nil {
+			writeQueryError(w, err)
+			return
+		}
+	}
+	if err := work.Charge(); err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	if token != "" {
+		w.Header().Set("Bog-Next-Cursor", token)
 	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	_, _ = w.Write(body.Bytes())
+	if _, err := w.Write(body.Bytes()); err != nil {
+		// The response may already be committed. Return and release the slot.
+		return
+	}
 }
 
 // validSurrogates examines raw JSON strings after Decode has verified JSON syntax.

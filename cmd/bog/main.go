@@ -19,16 +19,24 @@ func main() {
 	dir := flag.String("data-dir", ".", "existing data directory")
 	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
 	maxResponseBytes := flag.Int("query-max-response-bytes", httpapi.DefaultQueryMaxResponseBytes, "maximum encoded NDJSON query response bytes")
+	queryConcurrency := flag.Int("query-concurrency", httpapi.DefaultQueryConcurrency, "maximum concurrent GET /query requests (503 when full)")
+	queryWorkBudget := flag.Uint64("query-work-budget", httpapi.DefaultQueryWorkBudget, "maximum work units per query (503 on exhaustion, charges include candidate rows and decoded bytes)")
 	flag.Parse()
 	if *maxResponseBytes <= 0 {
 		log.Fatal("query-max-response-bytes must be positive")
+	}
+	if *queryConcurrency <= 0 {
+		log.Fatal("query-concurrency must be positive")
+	}
+	if *queryWorkBudget == 0 {
+		log.Fatal("query-work-budget must be positive")
 	}
 	s := &store.Store{}
 	w, err := wal.Open(*dir, s)
 	if err != nil {
 		log.Fatal(err)
 	}
-	server := &http.Server{Addr: *addr, Handler: httpapi.NewWithQueryMaxResponseBytes(s, w, *maxResponseBytes), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	server := &http.Server{Addr: *addr, Handler: httpapi.NewWithQueryLimits(s, w, *maxResponseBytes, *queryConcurrency, *queryWorkBudget), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)

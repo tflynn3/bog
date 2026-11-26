@@ -95,7 +95,7 @@ func rowLess(rows []Row, a, b int) bool {
 	}
 	return rows[a].TS.Before(rows[b].TS)
 }
-func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, literal string, limit int, after *Position, lookahead bool) ([]Row, *Position) {
+func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, literal string, limit int, after *Position, lookahead bool, work *QueryWork) ([]Row, *Position, error) {
 	capacity := limit
 	if lookahead && capacity < count {
 		capacity++
@@ -108,7 +108,12 @@ func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, lite
 		last := min(first+blockSize, count)
 		for ordinal := first; ordinal < last; ordinal++ {
 			row := rows[ordinal]
-			if row.TS.Before(start) || !row.TS.Before(end) || (after != nil && (row.TS.Before(after.Time) || (row.TS.Equal(after.Time) && ordinal <= after.Ordinal))) || !strings.Contains(row.Line, literal) {
+			eligible := !row.TS.Before(start) && row.TS.Before(end) &&
+				(after == nil || row.TS.After(after.Time) || (row.TS.Equal(after.Time) && ordinal > after.Ordinal))
+			if err := work.row(row.Line, eligible); err != nil {
+				return nil, nil, err
+			}
+			if !eligible || !strings.Contains(row.Line, literal) {
 				continue
 			}
 			if h.Len() < capacity {
@@ -130,5 +135,5 @@ func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, lite
 	for _, ordinal := range h.ordinals {
 		result = append(result, rows[ordinal])
 	}
-	return result, next
+	return result, next, nil
 }

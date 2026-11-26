@@ -16,31 +16,37 @@ func compareBackup(ctx context.Context, opts options, out io.Writer) (int, error
 		return exitUsage, fmt.Errorf("configure server client: %w", err)
 	}
 	defer server.CloseIdleConnections()
+	server.MaxPageBytes = opts.maxPageBytes
 	walk, err := server.NewBoundedWalk(opts.query, opts.maxPages)
 	if err != nil {
 		return exitUsage, err
 	}
 
-	// OpenRestored verifies the whole bundle and pins the same directory for
-	// all reads. The operator keeps this reference separate from the server.
-	reader, err := backup.OpenRestored(ctx, opts.bundle)
+	query := backup.Query{Start: opts.query.Start, End: opts.query.End, Contains: opts.query.Contains}
+	reference, err := backup.OpenReferenceWalk(ctx, opts.bundle, query, opts.query.Limit)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return exitIncomplete, fmt.Errorf("comparison interrupted while verifying backup %q: %w", opts.bundle, err)
+			return exitIncomplete, fmt.Errorf("comparison interrupted while opening reference backup %q: %w", opts.bundle, err)
+		}
+		if errors.Is(err, backup.ErrReferenceWalk) {
+			return exitIncomplete, fmt.Errorf("reference backup %q: %w", opts.bundle, err)
 		}
 		return exitVerification, verificationError(opts.bundle, err)
 	}
-	point := reader.Point()
-	source := referenceStream(reader, opts.query, opts.maxPages)
+	point := reference.Point()
+	source := referenceStream(reference, opts.maxPages)
 	live := func(ctx context.Context) (queryPage, error) {
 		p, err := walk.NextPage(ctx)
+		if errors.Is(err, client.ErrPageBytes) {
+			return queryPage{}, fmt.Errorf("live page exceeds -max-page-bytes=%d; increase -max-page-bytes or reduce -limit: %w", opts.maxPageBytes, err)
+		}
 		if err != nil {
 			return queryPage{}, err
 		}
 		return queryPage{rows: p.Rows, terminal: p.NextCursor == ""}, nil
 	}
 	result, status, err := compare(ctx, source, live)
-	if closeErr := reader.Close(); closeErr != nil {
+	if closeErr := reference.Close(); closeErr != nil {
 		err = errors.Join(err, fmt.Errorf("close reference backup %q: %w", opts.bundle, closeErr))
 		if status == exitOK {
 			status = exitIncomplete
@@ -53,20 +59,18 @@ func compareBackup(ctx context.Context, opts options, out io.Writer) (int, error
 		result.matched, result.referencePages, result.livePages, formatPoint(point)))
 }
 
-func referenceStream(reader *backup.Reader, q client.Query, maxPages int) pageStream {
-	query := backup.Query{Start: q.Start, End: q.End, Contains: q.Contains}
+func referenceStream(walk *backup.ReferenceWalk, maxPages int) pageStream {
 	pages := 0
 	return func(ctx context.Context) (queryPage, error) {
 		if pages == maxPages {
 			return queryPage{}, fmt.Errorf("after %d pages: %w", pages, client.ErrPageBudget)
 		}
-		rows, next, err := reader.QueryPage(ctx, query, q.Limit)
+		rows, terminal, err := walk.NextPage(ctx)
 		if err != nil {
 			return queryPage{}, err
 		}
-		query.After = next
 		pages++
-		page := queryPage{terminal: next == nil, rows: make([]client.Row, len(rows))}
+		page := queryPage{terminal: terminal, rows: make([]client.Row, len(rows))}
 		for i, r := range rows {
 			page.rows[i] = r.Row
 		}

@@ -221,3 +221,56 @@ func TestBoundedWalkRetryAfterFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestBoundedWalkPageByteCeiling(t *testing.T) {
+	body := contractRow("at the byte ceiling")
+	for _, framing := range []string{"fixed", "chunked", "error response"} {
+		t.Run(framing, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("page") != "1" {
+					t.Errorf("failed request advanced the cursor: %s", r.URL)
+				}
+				if calls.Add(1) > 1 {
+					writeContractPage(t, w, body, "")
+					return
+				}
+				if framing == "error response" {
+					http.Error(w, strings.Repeat("x", maxError+1), http.StatusServiceUnavailable)
+					return
+				}
+				if framing == "chunked" {
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						t.Errorf("flush response: %v", err)
+						return
+					}
+				}
+				if n, err := io.WriteString(w, body+" "); err != nil || n != len(body)+1 {
+					t.Errorf("write response: %d bytes, %v", n, err)
+				}
+			}))
+			defer s.Close()
+			c, err := New(s.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.CloseIdleConnections()
+			c.MaxPageBytes = int64(len(body))
+			walk, err := c.NewBoundedWalk(Query{Limit: 1}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			page, err := walk.NextPage(t.Context())
+			var response *HTTPError
+			if !errors.As(err, &response) || errors.Is(err, ErrPageBytes) != (framing != "error response") ||
+				len(page.Rows) != 0 || page.NextCursor != "" {
+				t.Fatalf("oversized response returned %+v, %v", page, err)
+			}
+			page, err = walk.NextPage(t.Context())
+			if err != nil || len(page.Rows) != 1 || page.Rows[0].Line != "at the byte ceiling" || page.NextCursor != "" {
+				t.Fatalf("retry at ceiling returned %+v, %v", page, err)
+			}
+		})
+	}
+}

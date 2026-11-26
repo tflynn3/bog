@@ -73,11 +73,20 @@ func makeBundle(t *testing.T) (string, []client.Row, backup.Point) {
 		{TS: start.Add(time.Nanosecond), Line: "keep-later"},
 		{TS: start.Add(time.Second), Line: "keep-exclusive-end"},
 	}
+	dir, point := makeBundleFromRows(t, rows, len(rows)-2)
+	return dir, rows, point
+}
+
+func makeBundleFromRows(t *testing.T, rows []client.Row, tailBatchSize int) (string, backup.Point) {
+	t.Helper()
 	checkpointRows := []checkpoint.BlockRow{{Row: rows[0], Ordinal: 0}, {Row: rows[1], Ordinal: 1}}
 	block, err := checkpoint.EncodeBlock(checkpointRows)
 	check(t, err)
 	prefix := append([]byte("BOGWAL01"), encodeFrame(t, rows[:2])...)
-	wal := append(bytes.Clone(prefix), encodeFrame(t, rows[2:])...)
+	wal := bytes.Clone(prefix)
+	for batch := range slices.Chunk(rows[2:], tailBatchSize) {
+		wal = append(wal, encodeFrame(t, batch)...)
+	}
 	segment := checkpoint.Segment{
 		Name: "bog-segment-00000000000000000000000000000001",
 		Size: int64(len(block)), SHA256: fmt.Sprintf("%x", sha256.Sum256(block)),
@@ -99,7 +108,7 @@ func makeBundle(t *testing.T) (string, []client.Row, backup.Point) {
 	}
 	dir := filepath.Join(t.TempDir(), "reference")
 	check(t, backup.Export(t.Context(), snapshot{point, envelope, block, wal}, dir))
-	return dir, rows, point
+	return dir, point
 }
 
 func encodeFrame(t *testing.T, rows []client.Row) []byte {
@@ -268,8 +277,9 @@ func TestCLIRejectsCorruptBackupBeforeHTTP(t *testing.T) {
 }
 
 func TestCLICancelsInFlightRequest(t *testing.T) {
-	t.Parallel()
+	scratch := t.TempDir()
 	dir, _, _ := makeBundle(t)
+	t.Setenv("TMPDIR", scratch)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -286,6 +296,7 @@ func TestCLICancelsInFlightRequest(t *testing.T) {
 		stdout.Len() != 0 || !strings.Contains(stderr.String(), "context canceled") {
 		t.Fatalf("compare exit %d, stdout %q, stderr %q", code, &stdout, &stderr)
 	}
+	assertEmptyScratch(t, scratch)
 }
 
 func TestCLIUsage(t *testing.T) {
@@ -308,6 +319,11 @@ func TestCLIUsage(t *testing.T) {
 		{append(compareArgs("unused", "http://localhost"), "-end", "2025-12-31T00:00:00Z"), 2, "-end precedes -start"},
 		{append(compareArgs("unused", "http://localhost"), "-limit", "1001"), 2, "-limit must be between"},
 		{append(compareArgs("unused", "http://localhost"), "-max-pages", "0"), 2, "-max-pages must be positive"},
+		{append(compareArgs("unused", "http://localhost"), "-max-page-bytes", "0"), 2, "-max-page-bytes must be between"},
+		{append(compareArgs("unused", "http://localhost"), "-max-page-bytes", "-1"), 2, "-max-page-bytes must be between"},
+		{append(compareArgs("unused", "http://localhost"), "-max-page-bytes", "9223372036854775807"), 2, "-max-page-bytes must be between"},
+		{append(compareArgs("unused", "http://localhost"), "-max-page-bytes", "9223372036854775808"), 2, "-max-page-bytes"},
+		{[]string{"verify", "-backup", "unused", "-max-page-bytes", "1"}, 2, "flag provided but not defined"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if code := run(t.Context(), tc.args, &stdout, &stderr); code != tc.code ||

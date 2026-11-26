@@ -10,20 +10,20 @@ func queryAdmission(limit int, next http.Handler) http.Handler {
 	}
 	slots := make(chan struct{}, limit)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Context().Err() != nil {
-			http.Error(w, "request cancelled", http.StatusRequestTimeout)
+		if err := r.Context().Err(); err != nil {
+			writeQueryError(w, err)
 			return
 		}
 		select {
 		case slots <- struct{}{}:
 			defer func() { <-slots }()
 		default:
-			http.Error(w, "query capacity exhausted", http.StatusServiceUnavailable)
+			writeQueryError(w, ErrQueryCapacityExhausted)
 			return
 		}
 		// Cancellation may have happened while acquiring the slot.
-		if r.Context().Err() != nil {
-			http.Error(w, "request cancelled", http.StatusRequestTimeout)
+		if err := r.Context().Err(); err != nil {
+			writeQueryError(w, err)
 			return
 		}
 		next.ServeHTTP(w, r)

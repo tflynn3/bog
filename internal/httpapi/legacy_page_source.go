@@ -34,10 +34,10 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 	id := req.Capture
 	var view *store.PositionedSnapshot
 	var after *store.TailPosition
+	if err := work.Charge(1); err != nil {
+		return PageResult{}, err
+	}
 	if id == "" {
-		if err := work.Charge(1); err != nil {
-			return PageResult{}, err
-		}
 		view = s.store.CapturePositionedSnapshot()
 	} else {
 		s.mu.Lock()
@@ -46,9 +46,8 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 		if view == nil {
 			return PageResult{}, ErrCaptureExpired
 		}
-		if err := work.Charge(1); err != nil {
-			return PageResult{}, err
-		}
+	}
+	if req.After != "" {
 		position, err := parseLegacyPosition(req.After)
 		if err != nil {
 			return PageResult{}, err

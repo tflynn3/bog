@@ -20,6 +20,8 @@ const largeLiteral = "oversized-line-tail"
 const sparseLiteral = "cohort-sparse"
 const mediumLiteral = "cohort-medium"
 const denseLiteral = "cohort-dense"
+const falsePositiveQuery = "bloom-false-positive"
+const falsePositiveLiteral = "Q7mR2"
 
 type fixtureInput struct {
 	rows    []checkpoint.BlockRow
@@ -30,14 +32,25 @@ type fixtureInput struct {
 var epoch = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 var batchPattern = []int{1, 7, 64, 256}
 
+func rowsForBatches(batches int) int {
+	rows := 5 // Extremes, oversized line, and two rare duplicates.
+	for i := range batches {
+		rows += batchPattern[i%len(batchPattern)]
+	}
+	return rows
+}
+
 func fixture(batches int, entropy bool) (input fixtureInput) {
+	input.rows = make([]checkpoint.BlockRow, 0, rowsForBatches(batches))
+	input.anchors = make([]checkpoint.BlockRow, 0, batches)
 	rng := rand.New(rand.NewPCG(seed, 0))
 	appendRow := func(ts time.Time, line string) {
 		input.rows = append(input.rows, checkpoint.BlockRow{
 			Row: store.Row{TS: ts, Line: line}, Ordinal: uint64(len(input.rows)),
 		})
 	}
-	appendRow(firstTime, "first supported timestamp")
+	// Both four-byte grams of Q7mR2 are present without the literal.
+	appendRow(firstTime, "first supported timestamp gram=Q7mR gram=7mR2")
 	for b := range batches {
 		for i := range batchPattern[b%len(batchPattern)] {
 			ts := epoch.Add(time.Duration(b) * time.Second)
@@ -130,6 +143,7 @@ func queries() []query {
 		{"all", "", firstTime, endTime},
 		{"rare", rareLiteral, firstTime, endTime},
 		{"absent", "unseen-error-8877", firstTime, endTime},
+		{falsePositiveQuery, falsePositiveLiteral, firstTime, endTime},
 		{"one-byte", "x", firstTime, endTime},
 		{"two-byte", "é", firstTime, endTime},
 		{"three-byte", "€", firstTime, endTime},

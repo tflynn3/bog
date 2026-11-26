@@ -14,13 +14,15 @@ type measurement struct {
 	MatchingRows     int       `json:"matching_rows"`
 	MatchingFraction float64   `json:"matching_fraction_of_retained_rows"`
 	payloadReads
-	BaselineBlocksRead int     `json:"baseline_logical_blocks_read"`
-	BaselineBytesRead  int64   `json:"baseline_payload_bytes_read"`
-	BlocksAvoided      int     `json:"payload_reads_avoided"`
-	BytesAvoided       int64   `json:"payload_bytes_avoided"`
-	PeakDecodeBytes    int     `json:"peak_decode_bytes"`
-	ColdSamplesNS      []int64 `json:"cold_samples_ns"`
-	ColdP95NS          int64   `json:"cold_p95_ns"`
+	BaselineBlocksRead   int     `json:"baseline_logical_blocks_read"`
+	BaselineBytesRead    int64   `json:"baseline_payload_bytes_read"`
+	BaselineDecodedBytes int64   `json:"baseline_decoded_bytes"`
+	BlocksAvoided        int     `json:"payload_reads_avoided"`
+	BytesAvoided         int64   `json:"payload_bytes_avoided"`
+	DecodedBytesAvoided  int64   `json:"decoded_bytes_avoided"`
+	PeakDecodeBytes      int     `json:"peak_decode_bytes"`
+	ColdSamplesNS        []int64 `json:"cold_samples_ns"`
+	ColdP95NS            int64   `json:"cold_p95_ns"`
 }
 
 // p95 uses nearest rank and leaves samples in collection order.
@@ -35,10 +37,12 @@ func (m *measurement) compareReads(baseline measurement) error {
 		!m.Start.Equal(baseline.Start) || !m.End.Equal(baseline.End) || m.MatchingRows != baseline.MatchingRows {
 		return fmt.Errorf("baseline query does not match %s", m.Name)
 	}
-	if m.Blocks > baseline.Blocks || m.Bytes > baseline.Bytes {
+	if m.Blocks > baseline.Blocks || m.Bytes > baseline.Bytes || m.DecodedBytes > baseline.DecodedBytes {
 		return fmt.Errorf("%s read more payload than its unfiltered baseline", m.Name)
 	}
 	m.BaselineBlocksRead, m.BaselineBytesRead = baseline.Blocks, baseline.Bytes
 	m.BlocksAvoided, m.BytesAvoided = baseline.Blocks-m.Blocks, baseline.Bytes-m.Bytes
+	m.BaselineDecodedBytes = baseline.DecodedBytes
+	m.DecodedBytesAvoided = baseline.DecodedBytes - m.DecodedBytes
 	return nil
 }

@@ -55,21 +55,23 @@ func TestP95NearestRank(t *testing.T) {
 }
 
 func TestComparePayloadReads(t *testing.T) {
-	base := measurement{Name: "sparse", Literal: "literal", payloadReads: payloadReads{Blocks: 4, Bytes: 200}}
+	base := measurement{Name: "sparse", Literal: "literal", payloadReads: payloadReads{Blocks: 4, Bytes: 200, DecodedBytes: 400}}
 	for _, tc := range []struct {
 		name          string
 		reads         payloadReads
 		baselineName  string
 		blocksAvoided int
 		bytesAvoided  int64
+		decodeAvoided int64
 		wantErr       bool
 	}{
-		{"same reads", payloadReads{4, 200}, "sparse", 0, 0, false},
-		{"pruned", payloadReads{1, 50}, "sparse", 3, 150, false},
-		{"no reads", payloadReads{}, "sparse", 4, 200, false},
-		{"increased reads", payloadReads{5, 50}, "sparse", 0, 0, true},
-		{"increased bytes", payloadReads{4, 201}, "sparse", 0, 0, true},
-		{"different query", payloadReads{1, 50}, "medium", 0, 0, true},
+		{"same reads", payloadReads{4, 200, 400}, "sparse", 0, 0, 0, false},
+		{"pruned", payloadReads{1, 50, 100}, "sparse", 3, 150, 300, false},
+		{"no reads", payloadReads{}, "sparse", 4, 200, 400, false},
+		{"increased reads", payloadReads{5, 50, 100}, "sparse", 0, 0, 0, true},
+		{"increased bytes", payloadReads{4, 201, 400}, "sparse", 0, 0, 0, true},
+		{"increased decoded bytes", payloadReads{4, 200, 401}, "sparse", 0, 0, 0, true},
+		{"different query", payloadReads{1, 50, 100}, "medium", 0, 0, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := measurement{Name: tc.baselineName, Literal: "literal", payloadReads: tc.reads}
@@ -78,7 +80,8 @@ func TestComparePayloadReads(t *testing.T) {
 				t.Fatalf("compareReads error = %v", err)
 			}
 			if err == nil && (m.BlocksAvoided != tc.blocksAvoided || m.BytesAvoided != tc.bytesAvoided ||
-				m.BaselineBlocksRead != base.Blocks || m.BaselineBytesRead != base.Bytes) {
+				m.BaselineBlocksRead != base.Blocks || m.BaselineBytesRead != base.Bytes ||
+				m.BaselineDecodedBytes != base.DecodedBytes || m.DecodedBytesAvoided != tc.decodeAvoided) {
 				t.Errorf("wrong baseline accounting: %+v", m)
 			}
 		})

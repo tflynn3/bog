@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"math/rand/v2"
 	"os"
 	"strings"
@@ -79,7 +81,7 @@ func TestLayoutRoundTripAndRejection(t *testing.T) {
 				return nil
 			}
 			n, err := scanBlocks(bytes.NewReader(data), int64(len(data)), q, visit)
-			if err != nil || n.Blocks != 1 || n.Bytes != int64(stored) || visits != 1 {
+			if err != nil || n.Blocks != 1 || n.Bytes != int64(stored) || n.DecodedBytes != int64(len(raw)) || visits != 1 {
 				t.Fatalf("scan returned %+v reads, %d visits, %v", n, visits, err)
 			}
 			reject := func(data []byte, q query) {
@@ -125,5 +127,26 @@ func TestIncompressibleBlocksFallBackToRaw(t *testing.T) {
 		if !bytes.Equal(data[headerSize+entrySize:], raw) {
 			t.Errorf("codec %d expanded an incompressible block", c)
 		}
+	}
+}
+
+type shortIO struct{}
+
+func (shortIO) ReadAt([]byte, int64) (int, error)  { return 0, nil }
+func (shortIO) WriteAt([]byte, int64) (int, error) { return 0, nil }
+
+func TestLayoutRejectsShortIO(t *testing.T) {
+	if err := writeLayout(shortIO{}, layout{codec: rawCodec}, 1, func(int) ([]byte, summary, error) {
+		t.Fatal("attempted to write a block after a short header write")
+		return nil, summary{}, nil
+	}); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("writeLayout returned %v, want short write", err)
+	}
+	_, err := scanBlocks(shortIO{}, headerSize, query{}, func([]byte, int) error {
+		t.Fatal("visited a block after a short header read")
+		return nil
+	})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("scanBlocks returned %v, want unexpected EOF", err)
 	}
 }

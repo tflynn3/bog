@@ -1,12 +1,20 @@
 # ADR 0015 — Retained-history runtime cutover
 
-**Status** — Proposed for the #53 integration review. The architecture
-companion was measured at `6105ab8eb78d56412c7cc14c6385aaed21bb10ac`.
-That checkout serves ordinary WAL recovery and an in-memory query view.
-The Storage draft and native qualification are pending.
+**Status** — Proposed. The #53 integration review awaits Storage’s
+composed revision. The baseline at
+`63626c1bddc3664327d49ec70fb64e84e4943024` passes the portable architecture
+suite for Linux amd64 and arm64, the race run, vet on `internal/archtest`,
+and the Linux amd64 cross-build. Both native qualification verdicts are
+pending the composed revision.
 [#53](https://github.com/tflynn3/bog/issues/53)
 
 ## Runtime interfaces
+
+The measured command calls `wal.Open` and `httpapi.NewWithQueryLimits`.
+Startup rejects `bog.backup` and `bog.wal.tail`, and the live capacity
+verifier cannot reach `/_capacity/compaction`. The paging constructor
+and read-only image APIs are available for the command cutover.
+[Command startup](../../cmd/bog/main.go), [HTTP construction](../../cmd/bog/ready.go)
 
 Keep one Linux process, one HTTP listener, one WAL owner, and one pinned
 local data directory. The owner takes the directory lock before
@@ -60,10 +68,9 @@ bytes. [V1 prefix digest](0005-pinned-writable-recovery-authority.md#keep-the-v1
 
 Promote each retained package only when both Linux production inventories
 show that `cmd/bog` reaches it. Remove the corresponding staging
-declaration in the same change. As measured, `cmd/bog-verify` reaches
-`internal/backup`, `internal/client`, and `internal/store` directly.
-The server reaches none of checkpoint, history, backup, or idempotency,
-so their staging declarations remain active.
+declaration in the same change. As measured, `cmd/bog-verify` directly
+imports `internal/backup`, `internal/client`, and `internal/store`. Both
+server inventories leave checkpoint, history, backup, and idempotency staged.
 
 | Staged package | Owner | Activation criteria |
 | --- | --- | --- |
@@ -99,15 +106,18 @@ server reachability on the composed tree with the architecture suite's
 Linux amd64 and arm64 settings. Update measured edges, package roles,
 and the system diagram together. Run `go test -count=1 ./internal/archtest`
 and `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on the
-composed tree and land runtime and governance in one reviewed PR.
+composed tree and land runtime and governance in one reviewed PR. The
+companion owns `SYSTEM.md`, this ADR, `architecture_test.go`, and
+`staged_packages_test.go`.
 [System fitness settings](../architecture/SYSTEM.md#fitness-and-registry-ownership)
 
-The native matrix qualifies the same clean revision on amd64 and arm64.
-Each runner uses its own SHA-256-pinned binary for all producers. Require
-exact HTTP order through verified restore, acknowledged append, restart,
-and generation replacement with a held cursor and concurrent backfill.
+Both native verdicts are required for the same clean revision on amd64
+and arm64. Each runner uses its own SHA-256-pinned binary for all
+producers. Require exact HTTP order through verified restore, acknowledged
+append, restart, and generation replacement with a held cursor and concurrent
+backfill. Exhaust issued cursors at their original work budgets.
 Run both 128 MiB capacity fixtures, capture exact publication and pin-drain
 observations, and retain cleanup evidence. Verify readiness and ingest
-against the active WAL filesystem after path retargets. Require both
-native verdicts. [System release evidence](../architecture/SYSTEM.md#release-evidence),
+against the active WAL filesystem after path retargets.
+[System release evidence](../architecture/SYSTEM.md#release-evidence),
 [Release composition](0008-release-verifier-composition.md)

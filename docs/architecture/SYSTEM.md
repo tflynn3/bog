@@ -17,8 +17,8 @@ access layer. [Single-writer decision](../adr/0001-single-writer-retained-histor
 
 ## Observed Linux production imports
 
-The graph was measured at `6105ab8eb78d56412c7cc14c6385aaed21bb10ac`,
-the #53 architecture companion's base. `go list -deps` reports identical
+The graph was measured at `63626c1bddc3664327d49ec70fb64e84e4943024`,
+the companion checkout's pinned base. `go list -deps` reports identical
 root-module production edges on Linux amd64 (v1) and arm64 (v8.0) with cgo
 disabled and the fitness suite's build settings. Arrows point from importer
 to direct dependency. Nodes with no outgoing arrows have zero direct
@@ -27,7 +27,7 @@ below.
 
 ```mermaid
 flowchart TD
-    subgraph Runtime["Server and reachable libraries"]
+    subgraph Runtime["Server and reachable libraries at 63626c1"]
         Cmd["cmd/bog"]
         HTTP["internal/httpapi"]
         Ready["internal/readiness"]
@@ -92,9 +92,16 @@ flowchart TD
 
 ## Retained-history handoff
 
-#53 composes the retained `PageSource` in `cmd/bog` and injects it through
-`httpapi.NewWithPageSource`. HTTP owns admission, cursor authentication and
-expiry, fixed-budget certification through exhaustion, and NDJSON framing.
+#53 is open for the command cutover. The composed Storage draft is
+required to measure the cutover graph. At the observed revision, `cmd/bog`
+still calls `wal.Open` and serves queries through `httpapi.NewWithQueryLimits`.
+The command rejects verified v1 restores at startup and has no
+`/_capacity/compaction` route. [Cutover issue](https://github.com/tflynn3/bog/issues/53)
+
+The cutover calls for `cmd/bog` to inject a command-local retained
+`PageSource` through `httpapi.NewWithPageSource`. HTTP owns admission,
+cursor authentication and expiry, fixed-budget certification through
+exhaustion, and NDJSON framing.
 The adapter pins the validated generation and the matching durable,
 query-visible tail together under WAL owner synchronization. A held cursor
 keeps its original view across replacement while fresh walks see later
@@ -132,7 +139,9 @@ that role unchanged. Standalone libraries sit outside the server tree and
 must be reachable through production imports from a registered command.
 The operator and evidence commands are verifier roots in the fitness
 registry. Test-only packages have Linux test files and no Linux
-production files. [Command root boundaries](../adr/0012-command-root-boundaries.md),
+production files. Reachability includes direct and transitive paths from
+each registered command root.
+[Command root boundaries](../adr/0012-command-root-boundaries.md),
 [Standalone package consumers](../adr/0014-standalone-package-consumers.md)
 
 | Package or entry point | Role | Responsibility |
@@ -158,8 +167,9 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `bench/segment-layout` | Nested-module benchmark | Checkpoint layout experiment outside the root module |
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
-`bog-storage` owns the four staged libraries' server activation. Remove each
-staging declaration when server reachability changes its role. Keyed retries
+`bog-storage` owns the four staged libraries' server activation. Both Linux
+inventories retain these roles at the observed revision. Remove each staging
+declaration when server reachability changes its role. Keyed retries
 require the production WAL to commit and recover retry records atomically
 with their batches. Exercise concurrent same-key submissions, conflicting
 bodies, and retries after an ambiguous response and process restart.
@@ -171,10 +181,10 @@ bodies, and retries after an ambiguous response and process restart.
 | Rank | Property | Design choice and cost |
 | --- | --- | --- |
 | 1 | Durability | Acknowledge only durable whole batches and activate only durably published generations. Fence on uncertainty and fail startup on invalid committed authority, even when availability suffers. |
-| 2 | Exact queries | Preserve timestamp and ordinal order through restart, restore, and replacement. Certification spends work before cursor issuance, and pinned generations and tails delay reclamation. |
-| 3 | Bounded resources | Bound query work, response bytes, and concurrency. The retained path also bounds replay, append reservations, live captures, pinned generations, and staging. At capacity it can defer maintenance and refuse whole batches. |
-| 4 | Recovery time | Legacy startup replays the full committed WAL. Retained startup validates generation and writable authority, then replays a bounded committed suffix. Validation adds I/O before the listener opens. |
-| 5 | Throughput | Group syncs across admitted commits and prune provably irrelevant scan work. Retaining and hashing the readable v1 WAL prefix costs disk space and bandwidth. Tail-only v1 restores keep the verified checkpoint boundary and have finite writable tail capacity. |
+| 2 | Exact queries | Timestamp and append ordinal define order in the current store and across the planned restore and replacement paths. Certifying a retained walk spends work before cursor issuance. Held generations and tails delay reclamation. |
+| 3 | Bounded resources | The current server caps query work, response bytes, and concurrency while keeping committed history in memory. The cutover adds budgets for replay, append reservations, captures, pinned generations, and staging. Capacity can defer maintenance or refuse whole batches. |
+| 4 | Recovery time | Current startup replays the full committed WAL. The cutover trades additional authority and generation validation I/O for replay of only the bounded committed suffix when a valid checkpoint is available. |
+| 5 | Throughput | Group syncs across admitted commits and prune irrelevant query work. In the cutover design, retaining and hashing the readable v1 WAL prefix costs disk space and bandwidth. Tail-only v1 restores keep the verified checkpoint boundary and have finite writable tail capacity. |
 
 ## Operator verification boundary
 
@@ -196,8 +206,11 @@ Qualify the same clean composed revision on native Linux amd64
 builds once with Go 1.27.0 and cgo disabled, and uses that job's pinned
 binary for every producer. Reports bind to the full revision, the native
 binary's SHA-256, and the `linux-release-v1` fixture. Both matrix jobs
-must pass report validation and cleanup. The matrix is configured and
-qualification of the composed #53 revision is pending.
+must pass report validation and cleanup. Both native verdicts are pending
+the composed #53 revision from Storage. On the pinned baseline recorded
+above, the portable fitness suite passed for both Linux inventories,
+including under the race detector. Vet on `internal/archtest` and the Linux
+amd64 cross-build also passed.
 [Linux release workflow](../../.github/workflows/linux-release.yml)
 
 | Producer | Report | Required evidence |
@@ -233,10 +246,11 @@ expiry with admitted operations still draining.
 
 Core engineering owns the architecture record and fitness registry.
 `bog-storage` owns #53 recovery, publication, and command composition.
-`bog-query` owns the #59 HTTP paging contract. Recheck write leases at
-dispatch and at the Storage draft handoff. #60 follows the #53 command
-lease. Review the measured edges and roles together with the runtime
-wiring in one PR.
+`bog-query` owns the #59 HTTP paging contract. The companion's write lease
+covers this record, ADR 0015, `architecture_test.go`, and
+`staged_packages_test.go`. Recheck write leases at dispatch and at the
+Storage draft handoff. #60 follows the #53 command lease. Review measured
+edges and roles together with the runtime wiring in one PR.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification)
 
@@ -252,7 +266,8 @@ imports and nested modules are outside the root-module production registry.
   the WAL outcome and cannot reach retained storage packages.
   [Paging boundary](../../internal/archtest/cutover_boundaries_test.go)
 - Checkpoint, history, and backup cannot reach the WAL. Storage cannot
-  depend on HTTP, readiness, or the Go HTTP client.
+  depend on HTTP, readiness, or the Go HTTP client. The measured paging
+  and storage authority checks follow imports outside the root module too.
   [Storage authority](../../internal/archtest/storage_authority_test.go)
 - Command roots enforce server and operator exclusions. The oracle and the
   three release evidence roots enforce their independent dependency rules.

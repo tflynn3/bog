@@ -1,6 +1,10 @@
 package store
 
-import "math/bits"
+import (
+	"math/bits"
+	"sort"
+	"time"
+)
 
 // indexRun covers a contiguous append-ordinal range starting at base. An
 // explicit run maps timestamp-sorted ranks to ordinals through ordinals.
@@ -16,6 +20,36 @@ func (r indexRun) ordinal(rank int) int {
 		return r.base + rank
 	}
 	return r.ordinals[rank]
+}
+
+// seekStart uses one lower bound per run. In an implicit run containing
+// the anchor, timestamp order and ordinal order coincide, so its successor
+// rank follows directly from the ordinal. The timestamp-bearing API keeps
+// its original start and resume seek charges for existing callers.
+func (r indexRun) seekStart(rows []Row, start time.Time, after *Position, legacy bool, work *QueryWork) (int, error) {
+	first := 0
+	if after == nil || legacy {
+		if err := work.seek(r.length); err != nil {
+			return 0, err
+		}
+		first = sort.Search(r.length, func(rank int) bool {
+			return !rows[r.ordinal(rank)].TS.Before(start)
+		})
+		if after == nil {
+			return first, nil
+		}
+	}
+	if !legacy && r.ordinals == nil && after.Ordinal >= r.base && after.Ordinal-r.base < r.length {
+		return after.Ordinal - r.base + 1, nil
+	}
+	if err := work.seek(r.length - first); err != nil {
+		return 0, err
+	}
+	return first + sort.Search(r.length-first, func(rank int) bool {
+		ordinal := r.ordinal(first + rank)
+		order := rows[ordinal].TS.Compare(after.Time)
+		return order > 0 || (order == 0 && ordinal > after.Ordinal)
+	}), nil
 }
 
 // Store one minimum per group of sorted ranks and per subtree of groups. This
@@ -54,28 +88,38 @@ func (r indexRun) nextVisible(offset, count int, work *QueryWork) (int, error) {
 	if rank, err := r.probeRanks(offset+1, end, count, work); err != nil || rank < r.length || end == r.length {
 		return rank, err
 	}
-	return r.seekVisible(1, 0, len(r.blockMins)/2*visibilityBlockSize, end, count, work)
+	return r.nextVisibleBlock(offset/visibilityBlockSize, count, work)
 }
 
-func (r indexRun) seekVisible(node, first, width, offset, count int, work *QueryWork) (int, error) {
-	if first+width <= offset || first >= r.length {
-		return r.length, nil
+// nextVisibleBlock climbs from the exhausted block to locate the nearest
+// right sibling that contains a visible row. Starting locally avoids probing
+// the upper tree levels whenever the next visible block is nearby.
+func (r indexRun) nextVisibleBlock(block, count int, work *QueryWork) (int, error) {
+	leaves := len(r.blockMins) / 2
+	node := leaves + block
+	for node > 1 {
+		if node%2 == 0 {
+			if err := work.Charge(1); err != nil {
+				return 0, err
+			}
+			if r.blockMins[node+1] < count {
+				node++
+				for node < leaves {
+					node *= 2
+					if err := work.Charge(1); err != nil {
+						return 0, err
+					}
+					if r.blockMins[node] >= count {
+						node++
+					}
+				}
+				first := (node - leaves) * visibilityBlockSize
+				return r.probeRanks(first, min(first+visibilityBlockSize, r.length), count, work)
+			}
+		}
+		node /= 2
 	}
-	if err := work.Charge(1); err != nil {
-		return 0, err
-	}
-	if r.blockMins[node] >= count {
-		return r.length, nil
-	}
-	if width == visibilityBlockSize {
-		return r.probeRanks(first, min(first+width, r.length), count, work)
-	}
-	half := width / 2
-	rank, err := r.seekVisible(2*node, first, half, offset, count, work)
-	if err != nil || rank < r.length {
-		return rank, err
-	}
-	return r.seekVisible(2*node+1, first+half, half, offset, count, work)
+	return r.length, nil
 }
 
 func (r indexRun) probeRanks(first, end, count int, work *QueryWork) (int, error) {

@@ -80,15 +80,15 @@ func TestQueryWorkBoundaries(t *testing.T) {
 		{"direct", "hit", direct, false, 3 + 4, 1, false},
 		{"direct lookahead through nonmatch", "hit", direct, true, 3 + 3*4, 1, true},
 		{"merged", "hit", merged, false, 5 + 2*4, 1, false},
-		{"merged lookahead", "hit", merged, true, 5 + 3*4, 1, true},
+		{"merged lookahead", "hit", merged, true, 5 + 2*4, 1, true},
 		{"explicit direct fallback", "needle", large(513, "xxxx", true, false, false, false), false, 1 + 10 + 10 + 513*5, 0, false},
 		{"direct Bloom pruning", "needle", large(1024, "xxxx", false, false, false, false), true, 1 + 11 + 11 + 512*5 + 4, 0, false},
 		{"block candidates after Bloom", "needle", large(32768, "xxxx", true, false, false, true), true, 1 + 16 + 16 + 512*5 + 256 + 127*5 + 7, 1, false},
-		{"bounded merge", "needle", large(32768, "xxxx", false, true, true, false), true, 2*(1+15+15) + 2*7, 1, true},
-		{"per-run Bloom fallback", "needle", large(32768, "xxxx", false, true, false, true), true, 2*(1+15+15+15) + 512*5 + 256 + 127*5 + 7, 1, false},
+		{"bounded merge", "needle", large(32768, "xxxx", false, true, true, false), true, 2*(1+15) + 2*7, 1, true},
+		{"per-run Bloom fallback", "needle", large(32768, "xxxx", false, true, false, true), true, 2*(1+15+15) + 512*5 + 252 + 127*5 + 7, 1, false},
 		// Each block contains all three grams, so Bloom selection gives up
-		// after 65 blocks and the merge must revisit the bounded scan's rows.
-		{"merge after Bloom false positives", "abcdef", large(32768, "abcd bcde cdef", true, true, false, false), true, 2*(1+15+15) + 512*15 + 65 + 32768*15, 0, false},
+		// after 65 blocks, and the merge resumes the bounded scan.
+		{"merge after Bloom false positives", "abcdef", large(32768, "abcd bcde cdef", true, true, false, false), true, 2*(1+15+15) + 65 + 32768*15, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, budget := range []uint64{tc.budget - 1, tc.budget} {
@@ -109,6 +109,19 @@ func TestQueryWorkBoundaries(t *testing.T) {
 				}
 				if err != nil || len(rows) != tc.wantLines || (next != nil) != tc.wantNext {
 					t.Fatalf("exact budget: rows=%v next=%v err=%v", rows, next, err)
+				}
+				if tc.page {
+					page, err := tc.s.QuerySnapshotPageWithWork(start, end, tc.literal, 1, nil, nil,
+						NewQueryWork(t.Context(), budget))
+					if err != nil || page.HighWater != len(tc.s.rows) || page.More != tc.wantNext ||
+						!reflect.DeepEqual(page.Rows, rows) || len(page.Ordinals) != len(rows) {
+						t.Fatalf("ordinal page: %+v, %v", page, err)
+					}
+					for i, ordinal := range page.Ordinals {
+						if ordinal < 0 || ordinal >= len(tc.s.rows) || tc.s.rows[ordinal] != rows[i] {
+							t.Fatalf("row %d has incorrect ordinal %d", i, ordinal)
+						}
+					}
 				}
 				// Metering preserves the exact results and cursor of the legacy callers.
 				var want []Row

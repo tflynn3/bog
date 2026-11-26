@@ -95,7 +95,7 @@ func rowLess(rows []Row, a, b int) bool {
 	}
 	return rows[a].TS.Before(rows[b].TS)
 }
-func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, literal string, limit int, after *Position, lookahead bool, work *QueryWork) ([]Row, *Position, error) {
+func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, literal string, limit int, after *Position, lookahead, positions bool, work *QueryWork) (queryResult, error) {
 	capacity := limit
 	if lookahead && capacity < count {
 		capacity++
@@ -111,7 +111,7 @@ func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, lite
 			eligible := !row.TS.Before(start) && row.TS.Before(end) &&
 				(after == nil || row.TS.After(after.Time) || (row.TS.Equal(after.Time) && ordinal > after.Ordinal))
 			if err := work.row(row.Line, eligible); err != nil {
-				return nil, nil, err
+				return queryResult{}, err
 			}
 			if !eligible || !strings.Contains(row.Line, literal) {
 				continue
@@ -125,15 +125,10 @@ func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, lite
 		}
 	}
 	sort.Slice(h.ordinals, func(i, j int) bool { return rowLess(rows, h.ordinals[i], h.ordinals[j]) })
-	var next *Position
-	if len(h.ordinals) > limit {
-		h.ordinals = h.ordinals[:limit]
-		ordinal := h.ordinals[len(h.ordinals)-1]
-		next = &Position{rows[ordinal].TS, ordinal}
+	result := newQueryResult(positions, min(len(h.ordinals), limit))
+	result.more = len(h.ordinals) > limit
+	for _, ordinal := range h.ordinals[:min(len(h.ordinals), limit)] {
+		result.append(rows[ordinal], ordinal)
 	}
-	result := make([]Row, 0, len(h.ordinals))
-	for _, ordinal := range h.ordinals {
-		result = append(result, rows[ordinal])
-	}
-	return result, next, nil
+	return result, nil
 }

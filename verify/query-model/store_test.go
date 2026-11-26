@@ -46,6 +46,33 @@ func (s *storeAdapter) query(req model.Request) (model.Page, error) {
 	return page, nil
 }
 
+func (s *storeAdapter) queryLocated(req model.Request) (model.Page, error) {
+	var snapshot, after *int
+	if req.Cursor != nil {
+		snapshot, after = &req.Cursor.HighWater, &req.Cursor.After.Ordinal
+	}
+	f := req.Filter
+	got, err := s.store.QuerySnapshotPageWithWork(f.Start, f.End, f.Contains, req.Limit, snapshot, after, nil)
+	if err != nil {
+		return model.Page{}, err
+	}
+	if len(got.Rows) != len(got.Ordinals) {
+		return model.Page{}, fmt.Errorf("got %d rows and %d ordinals", len(got.Rows), len(got.Ordinals))
+	}
+	page := model.Page{Rows: make([]model.Row, len(got.Rows)), HighWater: got.HighWater}
+	for i, row := range got.Rows {
+		page.Rows[i] = model.Row{Time: row.TS, Line: row.Line}
+	}
+	if got.More {
+		if len(got.Rows) == 0 {
+			return model.Page{}, fmt.Errorf("empty page with more matches")
+		}
+		last := len(got.Rows) - 1
+		page.Next = &model.Position{Time: got.Rows[last].TS, Ordinal: got.Ordinals[last]}
+	}
+	return page, nil
+}
+
 var epoch = time.Date(2025, 1, 2, 0, 0, 0, 123, time.UTC)
 
 func loadHistory(batches [][]model.Row) (*storeAdapter, *model.Log) {
@@ -159,6 +186,19 @@ func TestSeededStoreSnapshotWalk(t *testing.T) {
 }
 
 func TestStoreSnapshotWalkConcurrentPublish(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query func(*storeAdapter, model.Request) (model.Page, error)
+	}{
+		{"timestamp cursor", (*storeAdapter).query},
+		{"ordinal cursor", (*storeAdapter).queryLocated},
+	} {
+		t.Run(tc.name, func(t *testing.T) { checkConcurrentStoreWalk(t, tc.query) })
+	}
+}
+
+func checkConcurrentStoreWalk(t *testing.T, query func(*storeAdapter, model.Request) (model.Page, error)) {
+	t.Helper()
 	const seed = 43
 	s, log := loadHistory(model.SeededBatches(seed, epoch, 1536, true))
 	filter := model.Filter{Start: epoch, End: epoch.Add(time.Second)}
@@ -167,7 +207,7 @@ func TestStoreSnapshotWalkConcurrentPublish(t *testing.T) {
 	published := 0
 	checkWalk(t, seed, log, filter, []int{1, 11, 17}, func(req model.Request) (model.Page, error) {
 		if req.Cursor == nil || published == len(late) {
-			return s.query(req)
+			return query(s, req)
 		}
 		batch := late[published]
 		published++
@@ -182,7 +222,7 @@ func TestStoreSnapshotWalkConcurrentPublish(t *testing.T) {
 		})
 		<-ready
 		close(start)
-		page, err := s.query(req)
+		page, err := query(s, req)
 		writer.Wait()
 		log.Append(batch)
 		return page, err
@@ -190,5 +230,5 @@ func TestStoreSnapshotWalkConcurrentPublish(t *testing.T) {
 	if published != len(late) {
 		t.Fatalf("seed=%d: published %d late batches, want %d", seed, published, len(late))
 	}
-	checkWalk(t, seed, log, filter, []int{53}, s.query)
+	checkWalk(t, seed, log, filter, []int{53}, func(req model.Request) (model.Page, error) { return query(s, req) })
 }

@@ -215,3 +215,65 @@ func TestMarkerPreparationDiagnostic(t *testing.T) {
 		t.Fatalf("diagnostic = %q", got)
 	}
 }
+
+type gatedDiagnosticSink struct {
+	started chan DiagnosticEvent
+	release chan struct{}
+}
+
+func (s *gatedDiagnosticSink) Emit(event DiagnosticEvent) {
+	s.started <- event
+	<-s.release
+}
+
+func TestAsyncSinkSaturationAndClose(t *testing.T) {
+	before := DiagnosticsDropped.Load()
+	downstream := &gatedDiagnosticSink{started: make(chan DiagnosticEvent, 1), release: make(chan struct{})}
+	sink := NewAsyncSink(downstream, 1)
+	event := DiagnosticEvent{OpCode: DiagnosticOpWALWrite, ErrCategory: DiagnosticErrENOSPC}
+	sink.Emit(event)
+	select {
+	case got := <-downstream.started:
+		if got != event {
+			t.Fatalf("event = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delivery did not start")
+	}
+	sink.Emit(event) // Fill the queue while the worker is blocked.
+	returned := make(chan struct{})
+	go func() { sink.Emit(event); sink.Close(); sink.Close(); close(returned) }()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("Emit or Close blocked")
+	}
+	sink.Emit(event) // Closed sinks reject new events.
+	if got := DiagnosticsDropped.Load() - before; got != 2 {
+		t.Fatalf("dropped = %d, want 2", got)
+	}
+	close(downstream.release)
+	select {
+	case <-sink.Done():
+	case <-time.After(time.Second):
+		t.Fatal("worker did not exit")
+	}
+	if got := DiagnosticsDropped.Load() - before; got != 3 {
+		t.Fatalf("dropped after shutdown = %d, want 3", got)
+	}
+}
+
+func TestDiagnosticCategory(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want DiagnosticErrCategory
+	}{
+		{fmt.Errorf("private: %w", syscall.ENOSPC), DiagnosticErrENOSPC},
+		{fmt.Errorf("private: %w", syscall.EIO), DiagnosticErrEIO},
+		{errors.New("private"), DiagnosticErrOther},
+	} {
+		if got := DiagnosticCategory(tc.err); got != tc.want {
+			t.Errorf("category = %v, want %v", got, tc.want)
+		}
+	}
+}

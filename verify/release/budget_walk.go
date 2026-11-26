@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	bogclient "bog/internal/client"
 )
 
 const (
@@ -134,28 +136,49 @@ func findSparseBudgetWalk(ctx context.Context, client *http.Client, maxBudget in
 
 const budgetRejectionBody = "query work budget exhausted\n"
 
-func tryBudgetWalk(ctx context.Context, client *http.Client, launch budgetLaunch, budget int, fixture budgetFixture, proof *budgetWalkStats) error {
+func tryBudgetWalk(ctx context.Context, raw *http.Client, launch budgetLaunch, budget int, fixture budgetFixture, proof *budgetWalkStats) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("fixed-budget search at budget %d: %w", budget, err)
 	}
-	err := launch(ctx, budget, func(base string) error {
-		if _, err := ingest(ctx, client, base, fixture.seed); err != nil {
+	start, err := time.Parse(time.RFC3339, fixtureStart)
+	if err != nil {
+		return fmt.Errorf("parse budget fixture start: %w", err)
+	}
+	end, err := time.Parse(time.RFC3339, fixtureEnd)
+	if err != nil {
+		return fmt.Errorf("parse budget fixture end: %w", err)
+	}
+	query := bogclient.Query{Start: start, End: end, Contains: fixture.filter, Limit: fixture.firstLimit}
+	err = launch(ctx, budget, func(base string) error {
+		transport, _ := raw.Transport.(*http.Transport)
+		client, err := bogclient.New(base, transport)
+		if err != nil {
+			return fmt.Errorf("create budget walk client: %w", err)
+		}
+		if transport == nil {
+			defer client.CloseIdleConnections()
+		}
+		client.MaxPageBytes = int64(fixture.byteCap)
+		if _, err := ingest(ctx, raw, base, fixture.seed); err != nil {
 			return fmt.Errorf("seed budget fixture: %w", err)
 		}
-		first, err := requestBudgetPage(ctx, client, base, "", fixture.firstLimit, fixture.filter)
+		first, err := fetchBudgetPage(ctx, client, query, "")
 		if err != nil {
-			return fmt.Errorf("first page: %w", err)
-		}
-		if first.status == http.StatusServiceUnavailable {
-			if first.cursorHeader || strings.HasPrefix(first.contentType, "application/x-ndjson") ||
-				string(first.body) != budgetRejectionBody {
-				return fmt.Errorf("unclean HTTP 503 budget rejection (cursor header=%t, content type=%q): %.200q",
-					first.cursorHeader, first.contentType, first.body)
+			// A joined error includes a response close failure and must fail the walk.
+			status, ok := err.(*bogclient.HTTPError)
+			if !ok || status.StatusCode != http.StatusServiceUnavailable {
+				return fmt.Errorf("page 1: %w", err)
+			}
+			if status.Cause != nil || status.Body != budgetRejectionBody {
+				return fmt.Errorf("unclean HTTP 503 budget rejection: %w", err)
+			}
+			if err := confirmBudgetRejection(ctx, raw, base, fixture); err != nil {
+				return err
 			}
 			proof.RejectedBudgets++
 			return nil
 		}
-		return checkBudgetWalk(ctx, client, base, budget, first, fixture, proof)
+		return checkBudgetWalk(ctx, client, query, budget, first, fixture, proof)
 	})
 	if err := errors.Join(err, ctx.Err()); err != nil {
 		return fmt.Errorf("fixed-budget walk at budget %d: %w", budget, err)
@@ -163,50 +186,70 @@ func tryBudgetWalk(ctx context.Context, client *http.Client, launch budgetLaunch
 	return nil
 }
 
-func requestBudgetPage(ctx context.Context, client *http.Client, base, cursor string, limit int, filter string) (response, error) {
+func fetchBudgetPage(ctx context.Context, client *bogclient.Client, query bogclient.Query, cursor string) (bogclient.Page, error) {
 	ctx, cancel := context.WithTimeout(ctx, queryDeadline)
 	defer cancel()
-	return request(ctx, client, http.MethodGet, base+queryPath(cursor, limit, filter), nil)
+	return client.FetchPage(ctx, query, cursor)
 }
 
-func checkBudgetWalk(ctx context.Context, client *http.Client, base string, budget int, res response, fixture budgetFixture, proof *budgetWalkStats) error {
-	seen := make(map[string]bool)
+func confirmBudgetRejection(ctx context.Context, raw *http.Client, base string, fixture budgetFixture) error {
+	// FetchPage's HTTPError exposes the body and status. Repeat the rejected
+	// first-page request on the same seeded candidate to inspect its headers.
+	ctx, cancel := context.WithTimeout(ctx, queryDeadline)
+	defer cancel()
+	path := queryPath("", fixture.firstLimit, fixture.filter)
+	if fixture.filter == "" {
+		// FetchPage sends contains even for an empty literal.
+		path += "&contains="
+	}
+	res, err := request(ctx, raw, http.MethodGet, base+path, nil)
+	if err != nil {
+		return fmt.Errorf("confirm HTTP 503 budget rejection: %w", err)
+	}
+	if res.status != http.StatusServiceUnavailable || res.cursorHeader ||
+		strings.HasPrefix(strings.ToLower(res.contentType), "application/x-ndjson") || string(res.body) != budgetRejectionBody {
+		return fmt.Errorf("unclean HTTP 503 budget rejection (got HTTP %d, cursor header=%t, content type=%q): %.200q",
+			res.status, res.cursorHeader, res.contentType, res.body)
+	}
+	return nil
+}
+
+func checkBudgetWalk(ctx context.Context, client *bogclient.Client, query bogclient.Query, budget int, res bogclient.Page, fixture budgetFixture, proof *budgetWalkStats) error {
+	seen := make(map[string]struct{})
+	query.Limit = fixture.resumeLimit
 	for page, offset := 1, 0; offset < len(fixture.want); page++ {
 		count := fixture.firstRows
 		if page > 1 {
 			count = min(fixture.resumeLimit, len(fixture.want)-offset)
 			var err error
-			res, err = requestBudgetPage(ctx, client, base, res.cursor, fixture.resumeLimit, fixture.filter)
+			res, err = fetchBudgetPage(ctx, client, query, res.NextCursor)
 			if err != nil {
-				return fmt.Errorf("continue page %d: %w", page, err)
+				return fmt.Errorf("page %d: %w", page, err)
 			}
 		}
-		if fixture.byteCap > 0 && res.status == http.StatusOK && len(res.body) > fixture.byteCap {
-			return fmt.Errorf("page %d exceeded response byte cap %d", page, fixture.byteCap)
-		}
-		if len(res.body) > 0 && res.body[len(res.body)-1] != '\n' {
-			return fmt.Errorf("page %d has incomplete NDJSON framing", page)
-		}
-		n, err := checkRows(res, fixture.want[offset:offset+count])
-		if err != nil {
-			return fmt.Errorf("page %d: %w", page, err)
-		}
+		n := len(res.Rows)
 		if n != count {
 			return fmt.Errorf("page %d returned %d rows, want %d", page, n, count)
 		}
+		for i, got := range res.Rows {
+			want := fixture.want[offset+i]
+			if got.TS.UTC().Format(time.RFC3339Nano) != want.TS || got.Line != want.Line {
+				return fmt.Errorf("page %d: unexpected row at snapshot offset %d", page, offset+i)
+			}
+		}
 		offset += n
 		if offset == len(fixture.want) {
-			if res.cursorHeader {
-				return fmt.Errorf("page %d issued a cursor after the final row", page)
+			if res.NextCursor != "" {
+				return fmt.Errorf("page %d: issued a cursor after the final row", page)
 			}
 		} else {
-			if res.cursor == "" {
-				return fmt.Errorf("page %d missing continuation cursor", page)
+			if res.NextCursor == "" {
+				return fmt.Errorf("page %d: missing continuation cursor", page)
 			}
-			if seen[res.cursor] {
-				return fmt.Errorf("page %d repeated a continuation cursor", page)
+			if _, repeated := seen[res.NextCursor]; repeated {
+				return fmt.Errorf("page %d: repeated a continuation cursor (cursor cycle)", page)
 			}
-			seen[res.cursor] = true
+			seen[res.NextCursor] = struct{}{}
 		}
 		if page == 1 {
 			proof.FirstCursorBudget = budget

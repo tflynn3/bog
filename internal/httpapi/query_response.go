@@ -3,6 +3,8 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json/jsontext"
+	"fmt"
+	"net/http"
 	"unicode/utf8"
 
 	"bog/internal/store"
@@ -29,41 +31,15 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	if err := work.Charge(); err != nil {
 		return false, 0, err
 	}
-	const prefix, field, suffix = `{"ts":`, `,"line":"`, "\"}\n"
-	stamp, err := row.TS.MarshalJSON()
-	if err != nil {
-		return false, 0, err
-	}
-
-	remaining := b.maxBytes - b.size
-	size := len(prefix) + len(stamp) + len(field) + len(suffix)
-	for line := row.Line; ; {
-		// Escaping can only expand the remaining input.
-		if b.size != 0 && len(line) > remaining-size {
-			return false, 0, nil
-		}
-		if len(line) == 0 {
-			break
-		}
-		n := queryChunkEnd(line)
-		if err := work.Charge(uint64(n)); err != nil {
-			return false, 0, err
-		}
-		payload, err := b.escapeChunk(line[:n])
-		if err != nil {
-			return false, 0, err
-		}
-		size += len(payload)
-		line = line[n:]
-	}
-	if size > remaining {
-		return false, size, nil
+	stamp, size, complete, err := b.measureRow(row, b.maxBytes-b.size, b.size != 0, work)
+	if err != nil || !complete || size > b.maxBytes-b.size {
+		return false, size, err
 	}
 
 	record := make([]byte, 0, size)
-	record = append(record, prefix...)
+	record = append(record, queryRecordPrefix...)
 	record = append(record, stamp...)
-	record = append(record, field...)
+	record = append(record, queryRecordField...)
 	for line := row.Line; len(line) > 0; {
 		// The measurement pass reserved the work for these bytes.
 		if err := work.Charge(); err != nil {
@@ -77,10 +53,88 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 		record = append(record, payload...)
 		line = line[n:]
 	}
-	record = append(record, suffix...)
+	record = append(record, queryRecordSuffix...)
 	b.rows = append(b.rows, record)
 	b.size += len(record)
 	return true, 0, nil
+}
+
+const (
+	queryRecordPrefix = `{"ts":`
+	queryRecordField  = `,"line":"`
+	queryRecordSuffix = "\"}\n"
+)
+
+// measureRow uses the same encoding as delivery. Certification measures
+// complete records independently of how the client will split the pages.
+func (b *queryResponse) measureRow(row store.Row, remaining int, allowEarlyExit bool, work *store.QueryWork) ([]byte, int, bool, error) {
+	stamp, err := row.TS.MarshalJSON()
+	if err != nil {
+		return nil, 0, false, err
+	}
+
+	size := len(queryRecordPrefix) + len(stamp) + len(queryRecordField) + len(queryRecordSuffix)
+	for line := row.Line; ; {
+		// Escaping can only expand the remaining input.
+		if allowEarlyExit && len(line) > remaining-size {
+			return nil, 0, false, nil
+		}
+		if len(line) == 0 {
+			break
+		}
+		n := queryChunkEnd(line)
+		if err := work.Charge(uint64(n)); err != nil {
+			return nil, 0, false, err
+		}
+		payload, err := b.escapeChunk(line[:n])
+		if err != nil {
+			return nil, 0, false, err
+		}
+		size += len(payload)
+		line = line[n:]
+	}
+	return stamp, size, true, nil
+}
+
+type oversizedQueryRecord struct{ cap, required int }
+
+func (e *oversizedQueryRecord) Error() string {
+	return fmt.Sprintf("query record exceeds response byte limit (cap %d bytes, requires %d bytes)", e.cap, e.required)
+}
+
+func (b *queryResponse) appendRows(rows []PageRow, work *store.QueryWork) (int, error) {
+	for i, row := range rows {
+		fits, required, err := b.appendRow(row.Row, work)
+		if err != nil {
+			return i, err
+		}
+		if !fits {
+			if b.size == 0 {
+				return i, &oversizedQueryRecord{b.maxBytes, required}
+			}
+			return i, nil
+		}
+	}
+	return len(rows), nil
+}
+
+func queryDeliveryWork(size int) uint64 {
+	return (uint64(size) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit
+}
+
+func (b *queryResponse) reserveDelivery(work *store.QueryWork) error {
+	return work.Charge(queryDeliveryWork(b.size))
+}
+
+func (b *queryResponse) write(w http.ResponseWriter, token string) {
+	setQueryPageHeaders(w.Header(), b.size, token)
+	w.WriteHeader(http.StatusOK)
+	for _, record := range b.rows {
+		if n, err := w.Write(record); err != nil || n != len(record) {
+			// The client can detect the interrupted body using Content-Length.
+			return
+		}
+	}
 }
 
 // escapeChunk returns the escaped payload without the quotes and newline

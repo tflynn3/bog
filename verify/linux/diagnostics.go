@@ -87,8 +87,8 @@ func (d *caseDiagnostics) observeQuery(kind string, q queryResponse, err error) 
 	e.Last = q
 }
 
-func (q *queryResponse) observeHeaders(resp *http.Response, elapsed time.Duration) {
-	q.Status, q.Headers = &resp.StatusCode, &elapsed
+func (q *queryResponse) observeHeaders(resp *http.Response, elapsed *time.Duration) {
+	q.Status, q.Headers = &resp.StatusCode, elapsed
 	q.Cursor = len(resp.Header.Values("Bog-Next-Cursor")) > 0
 	q.Phase = "body"
 	switch {
@@ -98,6 +98,18 @@ func (q *queryResponse) observeHeaders(resp *http.Response, elapsed time.Duratio
 		q.Admission = "http_rejection"
 	default:
 		q.Admission = "unexpected_response"
+	}
+}
+
+func (q *queryResponse) observeBody(body []byte, elapsed *time.Duration, transportErr error) {
+	q.Bytes, q.Body = len(body), elapsed
+	if elapsed == nil {
+		return
+	}
+	q.observeRejection(body)
+	q.Phase = "validation"
+	if transportErr != nil {
+		q.Phase = "close"
 	}
 }
 

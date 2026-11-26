@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -171,6 +173,110 @@ func testPoll(t *testing.T, ready func() (bool, error)) {
 	}
 }
 
+func TestQueryPageAcceptsLegacyResponses(t *testing.T) {
+	t.Parallel()
+	sample := fixtureRows("legacy", 1, 1, "")[0]
+	for _, tc := range []struct {
+		name, cursor, next string
+		rows               []row
+		chunked            bool
+	}{
+		{name: "fresh chunked page", next: "opaque-token", rows: []row{sample}, chunked: true},
+		{name: "terminal continuation", cursor: "opaque-token", rows: []row{sample}},
+		{name: "empty terminal page"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.RequestURI() != queryPath(tc.cursor, 1) {
+					t.Errorf("unexpected query: %s %s", r.Method, r.URL.RequestURI())
+				}
+				w.Header().Set("Content-Type", "application/x-ndjson")
+				if tc.next != "" {
+					w.Header().Set("Bog-Next-Cursor", tc.next)
+				}
+				if tc.chunked {
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+				body, err := encodeRows(tc.rows)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := w.Write(body); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer h.Close()
+			h.Client().Timeout = processTimeout
+			s := &server{addr: strings.TrimPrefix(h.URL, "http://"), client: h.Client()}
+			got, next, err := s.page(t.Context(), tc.cursor, 1)
+			if err != nil || next != tc.next || !slices.EqualFunc(got, tc.rows, func(a, b row) bool {
+				return a.TS.Equal(b.TS) && a.Line == b.Line
+			}) {
+				t.Fatalf("page = %v, %q, %v, want %v, %q", got, next, err, tc.rows, tc.next)
+			}
+		})
+	}
+}
+
+func TestQueryPageRejectsInvalidResponse(t *testing.T) {
+	t.Parallel()
+	const valid = `{"ts":"2025-01-01T00:00:00Z","line":""}` + "\n"
+	for _, tc := range []struct {
+		name, mediaType, body, want string
+		next                        []string
+		trailer                     bool
+	}{
+		{name: "wrong media type", mediaType: "text/plain", body: valid, want: "Content-Type"},
+		{name: "malformed second row", body: valid + "{broken}\n", next: []string{"token"}, want: "decode query NDJSON row 2"},
+		{name: "unterminated record", body: strings.TrimSuffix(valid, "\n"), want: "unterminated NDJSON"},
+		{name: "blank record", body: "\n", want: "decode query NDJSON"},
+		{name: "null record", body: "null\n", want: "missing ts or line"},
+		{name: "missing line", body: `{"ts":"2025-01-01T00:00:00Z"}` + "\n", want: "missing ts or line"},
+		{name: "invalid timestamp", body: `{"ts":"yesterday","line":"x"}` + "\n", want: "decode query NDJSON"},
+		{name: "invalid UTF-8", body: "{\"ts\":\"2025-01-01T00:00:00Z\",\"line\":\"\xff\"}\n", want: "invalid UTF-8"},
+		{name: "too many rows", body: valid + valid + valid, want: "more rows than requested"},
+		{name: "empty cursor", body: valid, next: []string{""}, want: "invalid query page continuation"},
+		{name: "duplicate cursor header", body: valid, next: []string{"a", "b"}, want: "invalid query page continuation"},
+		{name: "cursor without rows", next: []string{"token"}, want: "invalid query page continuation"},
+		{name: "cursor trailer", body: valid, trailer: true, want: "query cursor trailer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mediaType := tc.mediaType
+				if mediaType == "" {
+					mediaType = "application/x-ndjson"
+				}
+				w.Header().Set("Content-Type", mediaType)
+				for _, next := range tc.next {
+					w.Header().Add("Bog-Next-Cursor", next)
+				}
+				if tc.trailer {
+					w.Header().Set("Trailer", "Bog-Next-Cursor")
+				}
+				if _, err := io.WriteString(w, tc.body); err != nil {
+					t.Error(err)
+				}
+				if tc.trailer {
+					w.Header().Set("Bog-Next-Cursor", "trailer-token")
+				}
+			}))
+			defer h.Close()
+			h.Client().Timeout = processTimeout
+			s := &server{addr: strings.TrimPrefix(h.URL, "http://"), client: h.Client()}
+			rows, next, err := s.page(t.Context(), "", 2)
+			if rows != nil || next != "" || err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("page = %v, %q, %v, expected %q and no page", rows, next, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestHTTPWalkRejectsBrokenPages(t *testing.T) {
 	t.Parallel()
 	rows := fixtureRows("test", 2, 1, "")
@@ -207,6 +313,7 @@ func TestHTTPWalkRejectsBrokenPages(t *testing.T) {
 
 func writeTestPage(t *testing.T, w http.ResponseWriter, cursor string, rows []row) {
 	t.Helper()
+	w.Header().Set("Content-Type", "application/x-ndjson")
 	if cursor != "" {
 		w.Header().Set("Bog-Next-Cursor", cursor)
 	}

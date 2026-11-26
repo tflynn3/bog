@@ -53,7 +53,11 @@ committed WAL, tests tied backfill and the original snapshot, and then corrupts
 a committed payload byte. Startup must fail without changing the corrupted WAL
 or the commit marker. This injection uses the `BOGWAL01` frame layout and
 `bog.commit` used by both historical candidates. Every successful restart
-checks that the previous process's cursor returns HTTP 400.
+checks that the previous process's cursor returns HTTP 400 with the exact
+body `invalid cursor\n` and no continuation header or trailer. Fresh and
+continuation pages must return HTTP 200 with `application/x-ndjson`, fully
+terminated rows, and a valid continuation if present. The verifier accepts
+both length-delimited and legacy chunked pages.
 
 ## Historical correctness and benchmark
 
@@ -106,7 +110,7 @@ never succeeded or the case expected the candidate to refuse startup.
 Replay-only duration is unavailable because the candidate has no separate
 replay timing signal. Query evidence groups fresh pages, continuations,
 and stale-cursor checks. It retains counts by client-observed admission,
-maximum phase durations, the latest attempt, and the first HTTP failure
+maximum phase durations, the latest attempt, and the first query failure
 when present. Case evidence still carries the ledger and retarget checks.
 
 For a fresh backfill deadline, read the pinned admission report in sequence.
@@ -119,6 +123,8 @@ same 12-second context. Compare the capacity report's
 whether the held walk completed and how far the fresh request progressed
 under its own budget. Missing headers leave admission unknown. Headers
 without a complete body place the interruption in response delivery.
-A completed rejection identifies the HTTP refusal when available. Use
-candidate exit, logs, and memory counters to correlate process failure
-with the query. [Release admission fixture](../release/README.md#admission-fixture)
+Once the body is read and closed, malformed pages and unrelated HTTP 400
+responses are recorded as validation failures even though both response
+timings are available. A completed rejection identifies the HTTP refusal
+when available. Use candidate exit, logs, and memory counters to correlate
+process failure with the query. [Release admission fixture](../release/README.md#admission-fixture)

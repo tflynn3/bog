@@ -1,19 +1,15 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -306,146 +302,58 @@ func (s *server) startupExit() error {
 	return fmt.Errorf("candidate exited before health (%v): %s", s.process.result, s.process.logs.text())
 }
 
-func (s *server) request(ctx context.Context, method, path string, data []byte, status int) (_ []byte, _ http.Header, err error) {
-	kind := "fresh_page"
-	switch {
-	case !strings.HasPrefix(path, "/query?"):
-		kind = ""
-	case status == http.StatusBadRequest:
-		kind = "stale_cursor"
-	case strings.Contains(path, "?cursor=") || strings.Contains(path, "&cursor="):
-		kind = "continuation"
-	}
-	start := time.Now()
-	q := queryResponse{Admission: "unknown", Phase: "headers"}
-	if s.diagnostics != nil && kind != "" {
-		q.Lifetime = len(s.diagnostics.Candidates)
-		defer func() {
-			q.Elapsed = time.Since(start)
-			s.diagnostics.observeQuery(kind, q, err)
-		}()
-	}
+// httpExchange carries the received response and transport timings. The body
+// is always closed before exchange returns, including after a partial read.
+type httpExchange struct {
+	response  *http.Response
+	body      []byte
+	headersAt *time.Duration
+	bodyAt    *time.Duration
+}
+
+const maxResponseBody = 4 << 20
+
+func (s *server) exchange(ctx context.Context, method, path string, data []byte, start time.Time) (httpExchange, error) {
+	var result httpExchange
 	req, err := http.NewRequestWithContext(ctx, method, "http://"+s.addr+path, bytes.NewReader(data))
 	if err != nil {
-		return nil, nil, err
+		return result, err
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
+		return result, err
+	}
+	headersAt := time.Since(start)
+	result.response, result.headersAt = resp, &headersAt
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody+1))
+	result.body = body
+	if len(body) > maxResponseBody {
+		readErr = errors.Join(readErr, errors.New("response exceeds 4 MiB"))
+	}
+	if readErr == nil {
+		bodyAt := time.Since(start)
+		result.bodyAt = &bodyAt
+	}
+	return result, errors.Join(readErr, resp.Body.Close())
+}
+
+func (r httpExchange) expectStatus(method, path string, status int) error {
+	if r.response.StatusCode != status {
+		path, _, _ = strings.Cut(path, "?")
+		return fmt.Errorf("%s %s: HTTP %d, expected %d (response %.200q)", method, path, r.response.StatusCode, status, r.body)
+	}
+	return nil
+}
+
+func (s *server) request(ctx context.Context, method, path string, data []byte, status int) ([]byte, http.Header, error) {
+	result, err := s.exchange(ctx, method, path, data, time.Now())
+	if err != nil {
 		return nil, nil, err
 	}
-	q.observeHeaders(resp, time.Since(start))
-	const maxBody = 4 << 20
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
-	q.Bytes = len(body)
-	if readErr == nil && len(body) <= maxBody {
-		elapsed := time.Since(start)
-		q.Body = &elapsed
-		q.observeRejection(body)
-		q.Phase = "close"
-	}
-	if err := errors.Join(readErr, resp.Body.Close()); err != nil {
+	if err := result.expectStatus(method, path, status); err != nil {
 		return nil, nil, err
 	}
-	if len(body) > maxBody {
-		return nil, nil, errors.New("response exceeds 4 MiB")
-	}
-	q.Phase = "validation"
-	if resp.StatusCode != status {
-		return nil, nil, fmt.Errorf("%s %s: HTTP %d, expected %d (response %.200q)", method, strings.SplitN(path, "?", 2)[0], resp.StatusCode, status, body)
-	}
-	return body, resp.Header, nil
-}
-
-func queryPath(cursor string, limit int) string {
-	params := url.Values{"start": {epoch.Format(time.RFC3339)}, "end": {epoch.Add(time.Hour).Format(time.RFC3339)}, "limit": {strconv.Itoa(limit)}}
-	if cursor == "" {
-		params.Set("page", "1")
-	} else {
-		params.Set("cursor", cursor)
-	}
-	return "/query?" + params.Encode()
-}
-
-func (s *server) page(ctx context.Context, cursor string, limit int) ([]row, string, error) {
-	body, hdr, err := s.request(ctx, http.MethodGet, queryPath(cursor, limit), nil, http.StatusOK)
-	if err != nil {
-		return nil, "", err
-	}
-	if len(body) != 0 && body[len(body)-1] != '\n' {
-		return nil, "", errors.New("query ended with an unterminated NDJSON record")
-	}
-	var rows []row
-	scan := bufio.NewScanner(bytes.NewReader(body))
-	scan.Buffer(nil, 4<<20)
-	for scan.Scan() {
-		var r row
-		if err := json.Unmarshal(scan.Bytes(), &r); err != nil {
-			return nil, "", err
-		}
-		rows = append(rows, r)
-	}
-	next := hdr.Values("Bog-Next-Cursor")
-	if len(rows) > limit || len(next) > 1 || (len(next) == 1 && (next[0] == "" || len(rows) == 0)) {
-		return nil, "", errors.New("invalid query page size or continuation")
-	}
-	return rows, hdr.Get("Bog-Next-Cursor"), scan.Err()
-}
-
-func (s *server) capture(ctx context.Context) (string, error) {
-	rows, cursor, err := s.page(ctx, "", 1)
-	if err != nil {
-		return "", err
-	}
-	if len(rows) != 1 || cursor == "" {
-		return "", errors.New("expected one row and an issuer cursor")
-	}
-	rows, _, err = s.page(ctx, cursor, 1)
-	if err == nil && len(rows) != 1 {
-		err = errors.New("issuer cursor yielded no continuation row")
-	}
-	return cursor, err
-}
-
-func (s *server) resume(ctx context.Context, cursor string) error {
-	if err := s.start(ctx); err != nil {
-		return err
-	}
-	return s.rejectCursor(ctx, cursor)
-}
-
-func (s *server) rejectCursor(ctx context.Context, cursor string) error {
-	if cursor == "" {
-		return errors.New("missing pre-restart cursor")
-	}
-	_, _, err := s.request(ctx, http.MethodGet, queryPath(cursor, 1), nil, http.StatusBadRequest)
-	return err
-}
-
-func (s *server) reconcile(ctx context.Context, l ledger, cursor string, got []row) (reconciliation, error) {
-	seen := make(map[string]bool)
-	maxRows := 0
-	for _, b := range l {
-		maxRows += len(b.rows)
-	}
-	for i := 0; i <= maxRows; i++ {
-		page, next, err := s.page(ctx, cursor, 1+i%3)
-		if err != nil {
-			return reconciliation{}, err
-		}
-		got = append(got, page...)
-		if len(got) > maxRows {
-			break
-		}
-		if next == "" {
-			return l.reconcile(got)
-		}
-		if seen[next] || next == cursor {
-			return reconciliation{}, errors.New("query repeated a cursor")
-		}
-		seen[next] = true
-		cursor = next
-	}
-	return reconciliation{}, errors.New("query exceeded the fixture row/page bound")
+	return result.body, result.response.Header, nil
 }
 
 func (s *server) submit(ctx context.Context, rows []row, suffix string, status int) error {

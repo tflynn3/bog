@@ -40,81 +40,121 @@ func Decode(data []byte) ([]Row, error) {
 	return decodeAppend(nil, data)
 }
 
+// DecodeIngest validates a new NDJSON batch, including paired UTF-16 surrogate
+// escapes. Row errors identify the physical line and contain no input values.
+// Decode retains compatibility with previously committed WAL payloads.
+func DecodeIngest(data []byte) ([]Row, error) {
+	return decodeBatch(nil, data, true)
+}
+
 // decodeAppend appends a complete batch to rows, retaining Decode validation.
 func decodeAppend(rows []Row, data []byte) ([]Row, error) {
-	initialLen := len(rows)
-	if len(data) == 0 || len(data) > MaxBatch || !utf8.Valid(data) {
-		return nil, errors.New("invalid batch")
+	return decodeBatch(rows, data, false)
+}
+
+func decodeBatch(rows []Row, data []byte, ingest bool) ([]Row, error) {
+	if len(data) > MaxBatch {
+		return nil, errors.New("batch too large")
 	}
-	for len(data) > 0 {
-		line, rest, found := bytes.Cut(data, []byte{'\n'})
-		if found {
-			data = rest
-		} else {
-			data = nil
+	if !ingest && !utf8.Valid(data) {
+		return nil, errors.New("invalid UTF-8")
+	}
+	initialLen := len(rows)
+	for number := 1; len(data) > 0; number++ {
+		line, rest, _ := bytes.Cut(data, []byte{'\n'})
+		data = rest
+		if ingest && !utf8.Valid(line) {
+			return nil, fmt.Errorf("line %d: invalid UTF-8", number)
 		}
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
-		if ts, text, ok := plainRow(line); ok {
-			t, err := checkedTime(ts)
-			if err != nil {
-				return nil, err
-			}
-			rows = append(rows, Row{t, text})
-			continue
-		}
-		d := json.NewDecoder(bytes.NewReader(line))
-		tok, err := d.Token()
-		if err != nil || tok != json.Delim('{') {
-			return nil, errors.New("expected object")
-		}
-		var ts, text string
-		seen := map[string]bool{}
-		for d.More() {
-			k, e := d.Token()
-			if e != nil {
-				return nil, e
-			}
-			key, ok := k.(string)
-			if !ok || seen[key] || (key != "ts" && key != "line") {
-				return nil, errors.New("invalid field")
-			}
-			seen[key] = true
-			var v json.RawMessage
-			if e = d.Decode(&v); e != nil {
-				return nil, e
-			}
-			var s string
-			if len(v) == 0 || v[0] != '"' || json.Unmarshal(v, &s) != nil {
-				return nil, errors.New("field must be string")
-			}
-			if key == "ts" {
-				ts = s
-			} else {
-				text = s
-			}
-		}
-		if _, err = d.Token(); err != nil {
-			return nil, err
-		}
-		var extra any
-		if err = d.Decode(&extra); err != io.EOF {
-			return nil, errors.New("trailing data")
-		}
-		if !seen["ts"] || !seen["line"] {
-			return nil, errors.New("missing field")
-		}
-		t, err := checkedTime(ts)
+		row, err := decodeRow(line, ingest)
 		if err != nil {
+			if ingest {
+				return nil, fmt.Errorf("line %d: %w", number, err)
+			}
 			return nil, err
 		}
-		rows = append(rows, Row{t, text})
+		rows = append(rows, row)
 	}
 	if len(rows) == initialLen {
 		return nil, errors.New("empty batch")
 	}
 	return rows, nil
+}
+
+func decodeRow(line []byte, ingest bool) (Row, error) {
+	ts, text, plain := plainRow(line)
+	if !plain {
+		var err error
+		ts, text, err = decodeJSONRow(line, ingest)
+		if err != nil {
+			return Row{}, err
+		}
+	}
+	t, err := checkedTime(ts)
+	if err != nil {
+		return Row{}, err
+	}
+	return Row{t, text}, nil
+}
+
+func decodeJSONRow(line []byte, ingest bool) (ts, text string, err error) {
+	d := json.NewDecoder(bytes.NewReader(line))
+	tok, err := d.Token()
+	if err != nil {
+		return "", "", errors.New("invalid JSON")
+	}
+	if tok != json.Delim('{') {
+		return "", "", errors.New("expected JSON object")
+	}
+	var seenTS, seenLine bool
+	for d.More() {
+		tok, err := d.Token()
+		if err != nil {
+			return "", "", errors.New("invalid JSON")
+		}
+		var field string
+		var value *string
+		var seen *bool
+		switch tok {
+		case "ts":
+			field, value, seen = "ts", &ts, &seenTS
+		case "line":
+			field, value, seen = "line", &text, &seenLine
+		default:
+			return "", "", errors.New("unknown field: expected ts or line")
+		}
+		if *seen {
+			return "", "", fmt.Errorf("duplicate %s field", field)
+		}
+		*seen = true
+		var raw json.RawMessage
+		if err := d.Decode(&raw); err != nil {
+			return "", "", errors.New("invalid JSON")
+		}
+		if len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, value) != nil {
+			return "", "", fmt.Errorf("%s field must be a string", field)
+		}
+	}
+	if _, err := d.Token(); err != nil {
+		return "", "", errors.New("invalid JSON")
+	}
+	var extra json.RawMessage
+	if err := d.Decode(&extra); err != io.EOF {
+		return "", "", errors.New("trailing data after JSON object")
+	}
+	if ingest && !validSurrogates(line) {
+		return "", "", errors.New("unpaired Unicode surrogate escape")
+	}
+	if !seenTS {
+		return "", "", errors.New("missing ts field")
+	}
+	if !seenLine {
+		return "", "", errors.New("missing line field")
+	}
+	return ts, text, nil
 }
 
 // plainRow accepts only the unescaped, two-field form. All other forms go
@@ -197,10 +237,67 @@ func plainRow(b []byte) (ts, line string, ok bool) {
 func checkedTime(ts string) (time.Time, error) {
 	t, err := ParseTime(ts)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("timestamp: %w", err)
+		return time.Time{}, errors.New("invalid ts: expected an RFC3339 timestamp")
 	}
 	if t.Equal(time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)) {
 		return time.Time{}, errors.New("timestamp reserved for exclusive query end")
 	}
 	return t, nil
+}
+
+// validSurrogates examines raw JSON strings after the decoder has verified JSON syntax.
+// Escaped backslashes are skipped, so their following text is not an escape.
+func validSurrogates(b []byte) bool {
+	inString := false
+	for i := 0; i < len(b); i++ {
+		if !inString {
+			if b[i] == '"' {
+				inString = true
+			}
+			continue
+		}
+		if b[i] == '"' {
+			inString = false
+			continue
+		}
+		if b[i] != '\\' {
+			continue
+		}
+		i++
+		if b[i] != 'u' {
+			continue
+		}
+		n := hexQuad(b[i+1 : i+5])
+		i += 4
+		if n >= 0xdc00 && n <= 0xdfff {
+			return false
+		}
+		if n >= 0xd800 && n <= 0xdbff {
+			if i+6 >= len(b) || b[i+1] != '\\' || b[i+2] != 'u' {
+				return false
+			}
+			low := hexQuad(b[i+3 : i+7])
+			if low < 0xdc00 || low > 0xdfff {
+				return false
+			}
+			i += 6
+		}
+	}
+	return true
+}
+
+func hexQuad(b []byte) uint16 {
+	var n uint16
+	for _, c := range b {
+		n <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			n += uint16(c - '0')
+		case c >= 'a' && c <= 'f':
+			n += uint16(c - 'a' + 10)
+		default:
+			n += uint16(c - 'A' + 10)
+		}
+	}
+	return n
 }

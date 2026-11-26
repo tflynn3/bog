@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -25,23 +26,31 @@ func parseQuery(r *http.Request, tokenSize int) (queryParams, error) {
 	if err != nil {
 		return params, errors.New("invalid query")
 	}
-	for k, values := range q {
-		switch k {
-		case "start", "end", "contains", "limit", "page", "cursor":
-		default:
-			return params, errors.New("invalid parameter")
+	known := 0
+	for _, field := range [...]string{"start", "end", "contains", "limit", "page", "cursor"} {
+		if values, present := q[field]; present {
+			known++
+			if len(values) != 1 {
+				return params, fmt.Errorf("invalid %s: must appear only once", field)
+			}
 		}
-		if len(values) != 1 {
-			return params, errors.New("invalid parameter")
-		}
+	}
+	if known != len(q) {
+		return params, errors.New("invalid parameter")
+	}
+	if !q.Has("start") {
+		return params, errors.New("missing start")
 	}
 	start, err := store.ParseTime(q.Get("start"))
 	if err != nil {
-		return params, errors.New("invalid start")
+		return params, errors.New("invalid start: expected an RFC3339 timestamp")
+	}
+	if !q.Has("end") {
+		return params, errors.New("missing end")
 	}
 	end, err := store.ParseTime(q.Get("end"))
 	if err != nil {
-		return params, errors.New("invalid end")
+		return params, errors.New("invalid end: expected an RFC3339 timestamp")
 	}
 	if end.Before(start) {
 		return params, errors.New("invalid range: end precedes start")
@@ -49,9 +58,12 @@ func parseQuery(r *http.Request, tokenSize int) (queryParams, error) {
 	limit := 500
 	if q.Has("limit") {
 		value := q.Get("limit")
+		if !decimal.MatchString(value) {
+			return params, errors.New("invalid limit: expected decimal digits")
+		}
 		limit, err = strconv.Atoi(value)
-		if err != nil || !decimal.MatchString(value) || limit < 1 || limit > maxQueryLimit {
-			return params, errors.New("invalid limit")
+		if err != nil || limit < 1 || limit > maxQueryLimit {
+			return params, fmt.Errorf("invalid limit: must be between 1 and %d", maxQueryLimit)
 		}
 	}
 	page, continuation := q.Has("page"), q.Has("cursor")

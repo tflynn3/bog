@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -578,13 +579,18 @@ func TestMarkerDirectorySyncFailureIsUncertain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l.syncDir = func() error { return errors.New("injected directory sync failure") }
-	rows, _ := store.Decode(batch)
-	if err := l.Append(batch, rows); !errors.Is(err, ErrUncertain) {
-		t.Fatalf("append: %v", err)
+	l.syncDir = func() error { return syscall.EIO }
+	rows, err := store.Decode(batch)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := l.Append(batch, rows); !errors.Is(err, ErrUncertain) {
-		t.Fatalf("poisoned append: %v", err)
+	for range 2 {
+		if err := l.Append(batch, rows); !errors.Is(err, ErrUncertain) || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	if got := l.LastCommitOutcome(); got.State != "uncertain" || got.Category != "eio" || got.At.IsZero() {
+		t.Fatalf("marker sync outcome = %+v", got)
 	}
 	if got := s.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10); len(got) != 0 {
 		t.Fatal("published uncertain batch")

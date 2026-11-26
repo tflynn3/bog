@@ -1,6 +1,6 @@
 # ADR 0009 — Destination-scoped backup staging recovery
 
-**Status** — Accepted for issue #64.
+**Status** — Accepted for issue #64 and extended for issue #69.
 
 ## Context
 
@@ -32,6 +32,44 @@ A competing writer for the same destination waits according to its context.
 Process exit releases the locks, including on SIGKILL. Lock ownership uses
 open filesystem handles and needs no PID, timestamp, or timeout to classify
 an abandoned attempt.
+
+### Guard bootstrap and recovery
+
+The first publisher creates the canonical guard with exclusive create. The
+returned descriptor is usable even if the inherited umask creates a mode-000
+file. The creator takes the guard lock and sets mode 0600 through that
+descriptor. A publisher reopening the canonical name first validates an
+empty regular file owned by the effective user, on the parent filesystem,
+with one link and only possible owner read and write bits. A publisher can
+restore owner access to this inode before it can obtain a lockable
+descriptor. Concurrent permission repairs converge on mode 0600. First
+openers serialize completion on the guard's exclusive lock.
+
+Under the guard lock, compare the opened descriptor to the no-follow entry
+in the pinned parent, then sync the guard file and the parent before working
+on a claim. Run both syncs even when the guard already has mode 0600, since
+a previous publisher could have stopped between chmod and sync. Recheck the
+guard entry on subsequent lock acquisitions. A retry never unlinks,
+recreates, or swaps an existing guard. A canceled waiter can leave the
+permissions repaired for the next publisher. Failed initialization leaves
+the canonical guard available for another validated attempt.
+
+Linux pins even a mode-000 inode using `O_PATH` and applies chmod through
+that pin. Kernels without `fchmodat2` need a mounted procfs for the descriptor
+path fallback. macOS requires access to open the guard. It uses a no-follow
+chmod relative to the pinned parent and validates the entry's identity
+before and after chmod and again on reopen. Those checks rely on the parent
+namespace staying under the service's control during the name-based chmod.
+
+Darwin also applies umask to symlinks. If an interrupted publisher leaves
+an unreadable claim or owner record, recovery under the guard checks the
+link's type, owner, link count, filesystem, and expected payload length
+before granting owner read access to the link itself. Recovery then applies
+the normal payload and stage identity checks. Linux can read the link
+payload without this permission step. The publisher never changes the
+process umask.
+
+### Stage lifecycle
 
 1. Atomically create an intent symlink containing a random 128-bit nonce in
    canonical hexadecimal and sync the parent. The destination hash and nonce
@@ -85,3 +123,10 @@ exercises cleanup beside an intact image. The Linux placeholder test observes
 one rename event and verifies the installed image at the parent sync boundary.
 A Linux regression test publishes Export and Restore destinations directly
 under an active WAL directory.
+
+Non-root subprocess tests on Linux and macOS exercise mode-000 guard
+bootstrap, interrupted export and restore under umask 0777, and same-parent
+retry under and after that umask. They verify stage cleanup and byte-for-byte
+preservation of published data. Concurrent first opens check that all
+publishers use the same inode, and a canceled waiter checks that repairing
+permissions leaves the original lock domain in force.

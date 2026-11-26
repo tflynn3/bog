@@ -1,15 +1,11 @@
 package backup
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -21,8 +17,6 @@ import (
 	"bog/internal/store"
 	"bog/internal/wal"
 )
-
-const stageChildEnv = "BOG_TEST_STAGING_CHILD"
 
 func TestBackupCanPublishUnderActiveWALDirectory(t *testing.T) {
 	dir := t.TempDir()
@@ -40,86 +34,6 @@ func TestBackupCanPublishUnderActiveWALDirectory(t *testing.T) {
 	target := filepath.Join(dir, "restored")
 	must(t, Restore(ctx, bundle, target))
 	assertBackupPoint(t, target, f)
-}
-
-func TestBackupStagingChild(t *testing.T) {
-	mode := os.Getenv(stageChildEnv)
-	if mode == "" {
-		return
-	}
-	park := func() error {
-		if _, err := fmt.Fprintln(os.Stdout, "backup stage ready"); err != nil {
-			return err
-		}
-		var b [1]byte
-		_, err := io.ReadFull(os.Stdin, b[:])
-		return fmt.Errorf("interruption helper was released: %v", err)
-	}
-	stopPublisher := func(ctx context.Context, destination string, fill func(*os.Root) error) error {
-		if mode == "renamed" {
-			return publishWithOps(ctx, destination, fill, publicationOps{
-				rename:     renameStage,
-				syncParent: func(*os.File) error { return park() },
-			})
-		}
-		return publish(ctx, destination, func(root *os.Root) error {
-			if err := fill(root); err != nil {
-				return err
-			}
-			if err := syncDirectory(root); err != nil {
-				return err
-			}
-			return park()
-		})
-	}
-	dest := os.Getenv("BOG_TEST_STAGING_DEST")
-	switch mode {
-	case "restore":
-		must(t, restoreBackup(t.Context(), os.Getenv("BOG_TEST_STAGING_BUNDLE"), dest, stopPublisher))
-	case "export", "renamed":
-		must(t, exportBackup(t.Context(), newFixture(t), dest, stopPublisher))
-	default:
-		t.Fatalf("unknown helper mode %q", mode)
-	}
-	t.Fatal("backup helper exited without interruption")
-}
-
-func startInterruptedBackup(t *testing.T, mode, bundle, dest string) func() {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	t.Cleanup(cancel)
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestBackupStagingChild$")
-	cmd.Env = append(cmd.Environ(), stageChildEnv+"="+mode,
-		"BOG_TEST_STAGING_DEST="+dest, "BOG_TEST_STAGING_BUNDLE="+bundle)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	stdout, err := cmd.StdoutPipe()
-	must(t, err)
-	_, err = cmd.StdinPipe()
-	must(t, err)
-	must(t, cmd.Start())
-	var once sync.Once
-	kill := func() {
-		t.Helper()
-		once.Do(func() {
-			killErr := cmd.Process.Kill()
-			if errors.Is(killErr, os.ErrProcessDone) {
-				killErr = nil
-			}
-			waitErr := cmd.Wait()
-			must(t, killErr)
-			var exit *exec.ExitError
-			if !errors.As(waitErr, &exit) || exit.ProcessState.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
-				t.Fatalf("interruption helper exited with %v\n%s", waitErr, stderr.String())
-			}
-		})
-	}
-	t.Cleanup(kill)
-	line, err := bufio.NewReader(stdout).ReadString('\n')
-	if err != nil || line != "backup stage ready\n" {
-		t.Fatalf("staging barrier returned %q, %v", line, err)
-	}
-	return kill
 }
 
 func TestBackupRetryAfterSIGKILL(t *testing.T) {

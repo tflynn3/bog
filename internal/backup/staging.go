@@ -17,9 +17,11 @@ import (
 )
 
 const (
-	stagingPrefix = ".bog-backup-v1-"
-	stagePrefix   = stagingPrefix + "stage-"
-	stagingGuard  = stagingPrefix + "lock"
+	stagingPrefix  = ".bog-backup-v1-"
+	stagePrefix    = stagingPrefix + "stage-"
+	stagingGuard   = stagingPrefix + "lock"
+	stageNonceSize = 16
+	stageOwnerSize = 20
 )
 
 type publisher func(context.Context, string, func(*os.Root) error) error
@@ -56,11 +58,11 @@ func publishWithOps(ctx context.Context, destination string, fill func(*os.Root)
 	if err != nil {
 		return err
 	}
-	guard, err := openStagingGuard(parent, info)
+	guard, err := openStagingGuard(ctx, parent, dir, info)
 	if err != nil {
 		return err
 	}
-	defer func() { err = publicationClose(err, guard.Close()) }()
+	defer func() { err = publicationClose(err, guard.file.Close()) }()
 	claim := newStageClaim(parent, dir, info, name)
 	attempt, err := claim.begin(ctx, guard)
 	if err != nil {
@@ -76,10 +78,10 @@ func publishWithOps(ctx context.Context, destination string, fill func(*os.Root)
 	// guard is held by another process. A later retry can finish cleanup.
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := lockFile(finishCtx, guard); err != nil {
+	if err := guard.lock(finishCtx); err != nil {
 		return errors.Join(fillErr, ctx.Err(), err)
 	}
-	defer func() { err = publicationClose(err, unlock(guard)) }()
+	defer func() { err = publicationClose(err, unlock(guard.file)) }()
 	if fillErr = errors.Join(fillErr, ctx.Err()); fillErr != nil {
 		return errors.Join(fillErr, claim.clear(attempt.name, attempt.info, true))
 	}
@@ -162,28 +164,6 @@ func (a stageAttempt) fill(fill func(*os.Root) error) (err error) {
 	return syncDirectory(stage)
 }
 
-func openStagingGuard(parent *os.Root, parentInfo os.FileInfo) (*os.File, error) {
-	// Keep this entry across attempts so waiters always lock the same inode.
-	// The parent directory inode is reserved for storage ownership.
-	f, err := parent.OpenFile(stagingGuard, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("open backup staging guard: %w", err)
-	}
-	info, err := f.Stat()
-	if err == nil {
-		st, ok := info.Sys().(*syscall.Stat_t)
-		dir, dirOK := parentInfo.Sys().(*syscall.Stat_t)
-		if !ok || !dirOK || !info.Mode().IsRegular() || st.Uid != uint32(os.Geteuid()) ||
-			st.Dev != dir.Dev || st.Nlink != 1 || info.Mode().Perm()&0077 != 0 {
-			err = errors.New("unsafe backup staging guard")
-		}
-	}
-	if err != nil {
-		return nil, errors.Join(err, f.Close())
-	}
-	return f, nil
-}
-
 func lockFile(ctx context.Context, file *os.File) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -229,13 +209,13 @@ func flock(file *os.File, how int) error {
 
 // The backup guard serializes claim lookup, lock acquisition and removal. A
 // publisher drops it during copying, keeping the narrower stage lock.
-func (c stageClaim) begin(ctx context.Context, guard *os.File) (stageAttempt, error) {
+func (c stageClaim) begin(ctx context.Context, guard stagingGuardHandle) (stageAttempt, error) {
 	for {
-		if err := lockFile(ctx, guard); err != nil {
+		if err := guard.lock(ctx); err != nil {
 			return stageAttempt{}, err
 		}
 		attempt, busy, err := c.beginLocked(ctx)
-		if unlockErr := unlock(guard); unlockErr != nil {
+		if unlockErr := unlock(guard.file); unlockErr != nil {
 			if attempt.file != nil {
 				unlockErr = errors.Join(unlockErr, attempt.file.Close())
 			}
@@ -266,7 +246,7 @@ func (c stageClaim) beginLocked(ctx context.Context) (stageAttempt, bool, error)
 }
 
 func (c stageClaim) create() (_ stageAttempt, err error) {
-	var nonce [16]byte
+	var nonce [stageNonceSize]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return stageAttempt{}, err
 	}
@@ -332,7 +312,7 @@ func (c stageClaim) create() (_ stageAttempt, err error) {
 }
 
 func (c stageClaim) recover() (busy bool, err error) {
-	token, err := c.parent.Readlink(c.key)
+	token, err := readStagingLink(c, c.key, hex.EncodedLen(stageNonceSize))
 	if errors.Is(err, os.ErrNotExist) {
 		// A standalone owner entry has no matching claim and must be
 		// preserved. Refuse to start a transaction in that namespace.
@@ -347,7 +327,7 @@ func (c stageClaim) recover() (busy bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("read backup staging claim: %w", err)
 	}
-	var nonce [16]byte
+	var nonce [stageNonceSize]byte
 	if len(token) != hex.EncodedLen(len(nonce)) {
 		return false, errors.New("invalid backup staging claim")
 	}
@@ -355,7 +335,7 @@ func (c stageClaim) recover() (busy bool, err error) {
 		return false, errors.New("invalid backup staging claim")
 	}
 	name := c.stageName(token)
-	owner, err := c.parent.Readlink(c.key + ".owner")
+	owner, err := readStagingLink(c, c.key+".owner", hex.EncodedLen(stageOwnerSize))
 	hasOwner := err == nil
 	if !hasOwner && !errors.Is(err, os.ErrNotExist) {
 		return false, fmt.Errorf("read backup staging owner: %w", err)
@@ -406,7 +386,7 @@ func (c stageClaim) identity(token string, info os.FileInfo) (string, error) {
 		st.Dev != parent.Dev || info.Mode().Perm()&0077 != 0 {
 		return "", errors.New("unsafe backup staging directory")
 	}
-	var identity [20]byte
+	var identity [stageOwnerSize]byte
 	binary.LittleEndian.PutUint64(identity[:8], uint64(st.Dev))
 	binary.LittleEndian.PutUint64(identity[8:16], uint64(st.Ino))
 	binary.LittleEndian.PutUint32(identity[16:], c.ownerChecksum(token, identity[:16]))
@@ -423,7 +403,7 @@ func (c stageClaim) ownerChecksum(token string, identity []byte) uint32 {
 }
 
 func (c stageClaim) validStageOwner(token, owner string) bool {
-	var identity [20]byte
+	var identity [stageOwnerSize]byte
 	if len(owner) != hex.EncodedLen(len(identity)) {
 		return false
 	}

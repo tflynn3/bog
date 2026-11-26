@@ -11,6 +11,9 @@ import (
 const (
 	queryStringChunk          = 4 << 10
 	queryDeliveryBytesPerUnit = 16
+	queryRecordPrefix         = `{"ts":`
+	queryRecordField          = `,"line":"`
+	queryRecordSuffix         = "\"}\n"
 )
 
 // queryResponse buffers complete records until the status and cursor can be
@@ -29,41 +32,24 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	if err := work.Charge(); err != nil {
 		return false, 0, err
 	}
-	const prefix, field, suffix = `{"ts":`, `,"line":"`, "\"}\n"
 	stamp, err := row.TS.MarshalJSON()
 	if err != nil {
 		return false, 0, err
 	}
 
 	remaining := b.maxBytes - b.size
-	size := len(prefix) + len(stamp) + len(field) + len(suffix)
-	for line := row.Line; ; {
-		// Escaping can only expand the remaining input.
-		if b.size != 0 && len(line) > remaining-size {
-			return false, 0, nil
-		}
-		if len(line) == 0 {
-			break
-		}
-		n := queryChunkEnd(line)
-		if err := work.Charge(uint64(n)); err != nil {
-			return false, 0, err
-		}
-		payload, err := b.escapeChunk(line[:n])
-		if err != nil {
-			return false, 0, err
-		}
-		size += len(payload)
-		line = line[n:]
+	size, err := b.measureLine(row.Line, stamp, remaining, b.size != 0, work)
+	if err != nil {
+		return false, 0, err
 	}
-	if size > remaining {
+	if size == 0 || size > remaining {
 		return false, size, nil
 	}
 
 	record := make([]byte, 0, size)
-	record = append(record, prefix...)
+	record = append(record, queryRecordPrefix...)
 	record = append(record, stamp...)
-	record = append(record, field...)
+	record = append(record, queryRecordField...)
 	for line := row.Line; len(line) > 0; {
 		// The measurement pass reserved the work for these bytes.
 		if err := work.Charge(); err != nil {
@@ -77,10 +63,39 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 		record = append(record, payload...)
 		line = line[n:]
 	}
-	record = append(record, suffix...)
+	record = append(record, queryRecordSuffix...)
 	b.rows = append(b.rows, record)
 	b.size += len(record)
 	return true, 0, nil
+}
+
+// measureLine returns zero when early trimming proves the row cannot fit.
+func (b *queryResponse) measureLine(line string, stamp []byte, remaining int, allowEarlyExit bool, work *store.QueryWork) (int, error) {
+	size := len(queryRecordPrefix) + len(stamp) + len(queryRecordField) + len(queryRecordSuffix)
+	for {
+		// Escaping can only expand the remaining input.
+		if allowEarlyExit && len(line) > remaining-size {
+			return 0, nil
+		}
+		if len(line) == 0 {
+			break
+		}
+		n := queryChunkEnd(line)
+		if err := work.Charge(uint64(n)); err != nil {
+			return 0, err
+		}
+		payload, err := b.escapeChunk(line[:n])
+		if err != nil {
+			return 0, err
+		}
+		size += len(payload)
+		line = line[n:]
+	}
+	return size, nil
+}
+
+func queryDeliveryUnits(size int) uint64 {
+	return (uint64(size) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit
 }
 
 // escapeChunk returns the escaped payload without the quotes and newline

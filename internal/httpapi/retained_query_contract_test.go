@@ -280,3 +280,144 @@ func TestRetainedQueryContractCancelledReplayAndExpiryDuringDrain(t *testing.T) 
 		}
 	})
 }
+
+// A retained source can use opaque positions unrelated to the store's
+// timestamp format and reject any replay that does not have a row anchor.
+type certifiedRequestSource struct {
+	filter      PageFilter
+	rows        []PageRow
+	requests    []PageRequest
+	active      bool
+	releases    int
+	failPrepare bool
+}
+
+func (s *certifiedRequestSource) Page(_ context.Context, req PageRequest, work *store.QueryWork) (PageResult, error) {
+	if !req.Snapshot || req.Filter != s.filter {
+		return PageResult{}, errPageSourceContract
+	}
+	if err := work.Charge(2); err != nil {
+		return PageResult{}, err
+	}
+	s.requests = append(s.requests, req)
+	const id = "retained-view"
+	start := 0
+	if req.Capture == "" {
+		if s.active || req.After != "" {
+			return PageResult{}, errPageSourceContract
+		}
+		s.active = true
+	} else {
+		if req.Capture != id || !s.active {
+			return PageResult{}, ErrCaptureExpired
+		}
+		for i, row := range s.rows {
+			if err := work.Charge(1); err != nil {
+				return PageResult{}, err
+			}
+			if req.After == row.Position {
+				start = i + 1
+				break
+			}
+		}
+		if start == 0 {
+			return PageResult{}, errPageSourceContract
+		}
+	}
+	// This adapter stops at a source boundary after two rows even if
+	// the requested scan limit is larger.
+	end := min(start+min(req.Limit, 2), len(s.rows))
+	rows := s.rows[start:end]
+	if s.failPrepare && start == 1 {
+		rows = append([]PageRow(nil), rows...)
+		rows[0].Row.TS = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	return PageResult{Capture: id, Rows: rows, More: end < len(s.rows)}, nil
+}
+
+func (s *certifiedRequestSource) Release(id string) error {
+	if id != "retained-view" {
+		return errPageSourceContract
+	}
+	if s.active {
+		s.releases++
+		s.active = false
+	}
+	return nil
+}
+
+func TestRetainedQueryReplaysCertifiedRequestsAfterByteTrim(t *testing.T) {
+	t.Parallel()
+	stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	source := &certifiedRequestSource{
+		filter: PageFilter{Start: stamp, End: stamp.AddDate(0, 0, 1), Contains: "@"},
+		rows: []PageRow{
+			{Row: store.Row{TS: stamp, Line: "@z"}, Position: "last-in-lexical-order"},
+			{Row: store.Row{TS: stamp, Line: "@a"}, Position: "first-in-lexical-order"},
+			{Row: store.Row{TS: stamp, Line: "@<"}, Position: "opaque-3"},
+			{Row: store.Row{TS: stamp.Add(time.Hour), Line: "@!"}, Position: "opaque-4"},
+		},
+	}
+	record := func(i int) string { return jsonRow(t, source.rows[i].Row) }
+	capBytes := len(record(0)) + len(record(1))
+	handler := NewWithPageSource(source, nil, capBytes, 1, 160)
+	defer func() {
+		if err := handler.Close(t.Context()); err != nil {
+			t.Error(err)
+		}
+	}()
+	request := func(params string) *httptest.ResponseRecorder {
+		return requestCapturePage(handler, "&contains=@"+params)
+	}
+
+	// The later record cannot be prepared. The handler must release the
+	// unpublished capture and leave the entire response in error framing.
+	source.failPrepare = true
+	assertQueryRejection(t, request("&page=1&limit=4"), http.StatusInternalServerError, "query failed")
+	if source.active || source.releases != 1 {
+		t.Fatalf("failed preparation left capture state active=%t, releases=%d", source.active, source.releases)
+	}
+	source.failPrepare = false
+	source.requests = nil
+
+	token := assertRetainedPage(t, request("&page=1&limit=4"), record(0)+record(1))
+	if token == "" || len(source.requests) != 3 {
+		t.Fatalf("issuance token present=%t, scans=%v", token != "", source.requests)
+	}
+	certified := append([]PageRequest(nil), source.requests[1:]...)
+	for i, after := range []PagePosition{source.rows[0].Position, source.rows[2].Position} {
+		if q := certified[i]; q.Capture != "retained-view" || q.After != after || q.Limit != maxQueryLimit {
+			t.Fatalf("scan %d: %+v", i, q)
+		}
+	}
+
+	// A larger resume wants both remaining rows and crosses a source
+	// boundary, but the escaped record makes both exceed the byte cap.
+	wide := request("&cursor=" + token + "&limit=4")
+	narrow := request("&cursor=" + token + "&limit=1")
+	next := assertRetainedPage(t, wide, record(2))
+	if retry := assertRetainedPage(t, narrow, record(2)); next == "" || retry != next {
+		t.Fatal("replaying with a smaller limit changed the cursor at the same byte cut")
+	}
+	if got := source.requests[3:]; len(got) != 3 || got[0] != certified[0] || got[1] != certified[1] || got[2] != certified[0] {
+		t.Fatalf("replay used requests outside the certified plan: %v", got)
+	}
+
+	for range 2 {
+		if token := assertRetainedPage(t, request("&cursor="+next+"&limit=1"), record(3)); token != "" {
+			t.Fatal("terminal page returned a cursor")
+		}
+	}
+	if !source.active || source.releases != 1 {
+		t.Fatal("terminal replay released a still-live cursor")
+	}
+	for range 2 {
+		if err := handler.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertQueryRejection(t, request("&cursor="+next), http.StatusGone, "query capture expired")
+	if source.active || source.releases != 2 {
+		t.Fatalf("capture state after close: active=%t, releases=%d", source.active, source.releases)
+	}
+}

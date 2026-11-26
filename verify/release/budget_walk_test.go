@@ -13,6 +13,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
+
+	"bog/internal/httpapi"
+	"bog/internal/store"
 )
 
 // Keep the four fields consumed by existing admission report readers under
@@ -247,7 +251,7 @@ func TestFindBudgetWalk(t *testing.T) {
 		{"success without first cursor", 1, 3, []page{{status: 200, body: firstRow, ndjson: true}}, [4]int{0, 1, 0, 0}, "missing continuation cursor"},
 		{"first page exceeds row limit", 0, 3, []page{{status: 200, body: firstRow + secondRow, ndjson: true}}, [4]int{}, "unexpected row"},
 		{"out of append order", 0, 3, []page{{status: 200, body: secondRow, cursor: new(firstToken), ndjson: true}}, [4]int{}, "unexpected row"},
-		{"empty continuation", 0, 3, []page{first, {status: 200, cursor: new(secondToken), ndjson: true}}, [4]int{1, 0, 1, 1}, "empty query page with next cursor"},
+		{"empty continuation", 0, 3, []page{first, {status: 200, cursor: new(secondToken), ndjson: true}}, [4]int{1, 0, 1, 1}, "page 2: continuation cursor without any row progress"},
 		{"repeated cursor", 0, 3, []page{first, {status: 200, body: secondRow, cursor: new(firstToken), ndjson: true}}, [4]int{1, 0, 1, 1}, "next cursor does not advance pagination"},
 		{"early termination", 0, 3, []page{first, {status: 200, body: secondRow, ndjson: true}}, [4]int{1, 0, 1, 1}, "missing continuation cursor"},
 		{"rejected second page", 0, 3, []page{first, rejection}, [4]int{1, 0, 1, 1}, "page 2: Bog HTTP 503"},
@@ -474,4 +478,36 @@ func TestSparseBudgetWalkStopsOnRunFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+type budgetFixtureAppender struct{ data *store.Store }
+
+func (a budgetFixtureAppender) Append(_ []byte, rows []store.Row) error {
+	a.data.Publish(rows)
+	return nil
+}
+
+func TestBudgetVerifierAgainstQueryHandler(t *testing.T) {
+	// Bound the lifetime of the legacy handler's cursor timers to this test.
+	synctest.Test(t, func(t *testing.T) {
+		fixture := sparseBudgetFixture()
+		launch := func(capBytes int) budgetLaunch {
+			return func(_ context.Context, budget int, check func(string) error) error {
+				data := new(store.Store)
+				server := httptest.NewServer(httpapi.NewWithQueryLimits(data, budgetFixtureAppender{data}, capBytes, 1, uint64(budget)))
+				defer server.Close()
+				return check(server.URL)
+			}
+		}
+		raw := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+		defer raw.CloseIdleConnections()
+		tied, err := findBudgetWalk(t.Context(), raw, 11, launch(httpapi.DefaultQueryMaxResponseBytes))
+		if err != nil || tied.ExactThresholdBudget != 11 || tied.Pages != 3 || tied.Rows != 3 {
+			t.Fatalf("tied walk: %+v, %v", tied, err)
+		}
+		sparse, err := findSparseBudgetWalk(t.Context(), raw, 512, fixture, launch(fixture.byteCap))
+		if err != nil || sparse.ExactThresholdBudget != 314 || sparse.Pages != 3 || sparse.Rows != 4 {
+			t.Fatalf("sparse walk: %+v, %v", sparse, err)
+		}
+	})
 }

@@ -19,7 +19,9 @@ var cursorTokenSize = base64.RawURLEncoding.EncodedLen(cursorSize)
 
 // Cursor encoding and authentication process bounded tokens and positions in
 // blocks. The base token charge covers fixed setup, including HMAC padding.
-var cursorTokenWork = 1 + cursorBlockWork(cursorTokenSize)
+const cursorBytesPerUnit = 2 * sha256.BlockSize
+
+var cursorTokenWork = 1 + (uint64(cursorTokenSize)+cursorBytesPerUnit-1)/cursorBytesPerUnit
 
 func cursorBlockWork(size int) uint64 {
 	return (uint64(size) + sha256.BlockSize - 1) / sha256.BlockSize

@@ -18,24 +18,33 @@ const (
 // queryResponse buffers complete records until the status and cursor can be
 // committed. Each record's allocation is exact and never copies earlier rows.
 type queryResponse struct {
-	rows     [][]byte
-	size     int
-	maxBytes int
-	scratch  bytes.Buffer
-	encoder  jsontext.Encoder
+	rows            [][]byte
+	size            int
+	maxBytes        int
+	prepaidEncoding bool
+	deliveryBytes   uint64
+	scratch         bytes.Buffer
+	encoder         jsontext.Encoder
 }
 
 // appendRow reports the exact encoded size when the first row doesn't fit.
 // For later rows, the encoder can stop as soon as it proves the row won't fit.
 func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, int, error) {
-	if err := work.Charge(); err != nil {
-		return false, 0, err
-	}
 	stamp, size, complete, err := b.measureRow(row, b.maxBytes-b.size, b.size != 0, work)
 	if err != nil || !complete || size > b.maxBytes-b.size {
 		return false, size, err
 	}
 
+	if err := b.appendMeasuredRow(row, stamp, size, work); err != nil {
+		return false, 0, err
+	}
+	return true, 0, nil
+}
+
+func (b *queryResponse) appendMeasuredRow(row store.Row, stamp []byte, size int, work *store.QueryWork) error {
+	if err := work.Charge(); err != nil {
+		return err
+	}
 	record := make([]byte, 0, size)
 	record = append(record, queryRecordPrefix...)
 	record = append(record, stamp...)
@@ -43,12 +52,12 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	for line := row.Line; len(line) > 0; {
 		// The measurement pass reserved the work for these bytes.
 		if err := work.Charge(); err != nil {
-			return false, 0, err
+			return err
 		}
 		n := queryChunkEnd(line)
 		payload, err := b.escapeChunk(line[:n])
 		if err != nil {
-			return false, 0, err
+			return err
 		}
 		record = append(record, payload...)
 		line = line[n:]
@@ -56,7 +65,8 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	record = append(record, queryRecordSuffix...)
 	b.rows = append(b.rows, record)
 	b.size += len(record)
-	return true, 0, nil
+	b.deliveryBytes += b.recordDeliveryBytes(stamp, size)
+	return nil
 }
 
 const (
@@ -68,6 +78,9 @@ const (
 // measureRow uses the same encoding as delivery. Certification measures
 // complete records independently of how the client will split the pages.
 func (b *queryResponse) measureRow(row store.Row, remaining int, allowEarlyExit bool, work *store.QueryWork) ([]byte, int, bool, error) {
+	if err := work.Charge(); err != nil {
+		return nil, 0, false, err
+	}
 	stamp, err := row.TS.MarshalJSON()
 	if err != nil {
 		return nil, 0, false, err
@@ -83,7 +96,11 @@ func (b *queryResponse) measureRow(row store.Row, remaining int, allowEarlyExit 
 			break
 		}
 		n := queryChunkEnd(line)
-		if err := work.Charge(uint64(n)); err != nil {
+		units := uint64(n)
+		if b.prepaidEncoding {
+			units = 0
+		}
+		if err := work.Charge(units); err != nil {
 			return nil, 0, false, err
 		}
 		payload, err := b.escapeChunk(line[:n])
@@ -118,12 +135,21 @@ func (b *queryResponse) appendRows(rows []PageRow, work *store.QueryWork) (int, 
 	return len(rows), nil
 }
 
-func queryDeliveryWork(size int) uint64 {
-	return (uint64(size) + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit
+func queryDeliveryWork(size uint64) uint64 {
+	return (size + queryDeliveryBytesPerUnit - 1) / queryDeliveryBytesPerUnit
+}
+
+func (b *queryResponse) recordDeliveryBytes(stamp []byte, size int) uint64 {
+	if b.prepaidEncoding {
+		// The fixed candidate charge already covers the bounded timestamp
+		// and JSON framing. Reserve delivery of the escaped line separately.
+		size -= len(queryRecordPrefix) + len(stamp) + len(queryRecordField) + len(queryRecordSuffix)
+	}
+	return uint64(size)
 }
 
 func (b *queryResponse) reserveDelivery(work *store.QueryWork) error {
-	return work.Charge(queryDeliveryWork(b.size))
+	return work.Charge(queryDeliveryWork(b.deliveryBytes))
 }
 
 func (b *queryResponse) write(w http.ResponseWriter, token string) {

@@ -43,7 +43,7 @@ func TestLiveQueryScanWork(t *testing.T) {
 		{"merged nonmatches", merged, "&contains=x", 2 + 3 + 3*5},
 		// The first 512 rows are scanned. Four blocks are pruned after
 		// the upper bound seek, so the final unit is a Bloom check.
-		{"Bloom pruning", bloom, "&page=1&limit=1&contains=needle", 1 + 11 + 11 + 512*5 + 4},
+		{"Bloom pruning", bloom, "&page=1&limit=1&contains=needle", 1 + 1 + 11 + 11 + 512*5 + 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := func(budget uint64) *httptest.ResponseRecorder {
@@ -86,20 +86,16 @@ func TestLiveQuerySmallWorkBudget(t *testing.T) {
 	if ordinary.Code != http.StatusOK || ordinary.Body.String() != jsonRow(t, rows[0])+jsonRow(t, rows[1]) {
 		t.Fatalf("ordinary query: status=%d body=%q", ordinary.Code, ordinary.Body.String())
 	}
-	first := query(queryBounds, "&page=1&limit=1")
-	token := first.Header().Get("Bog-Next-Cursor")
-	if first.Code != http.StatusOK || first.Body.String() != jsonRow(t, rows[0]) || token == "" {
-		t.Fatalf("legacy first page: status=%d headers=%v body=%q", first.Code, first.Header(), first.Body.String())
-	}
-	assertQueryRejection(t, query(queryBounds, "&cursor="+token), http.StatusServiceUnavailable, "query work budget exhausted")
 	assertQueryRejection(t, query(queryBounds, "&limit=3"), http.StatusServiceUnavailable, "query work budget exhausted")
-	assertQueryRejection(t, query(queryBounds, "&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
-
-	// The retained constructor must reach the final match before publishing
-	// a cursor, even though one-row lookahead reaches the second match.
-	h = NewWithPageSource(&legacyPageSource{store: s}, nil, DefaultQueryMaxResponseBytes, 1, budget)
-	assertQueryRejection(t, query(queryBounds, "&page=1&limit=1"), http.StatusServiceUnavailable, "query work budget exhausted")
-	assertQueryRejection(t, query(queryBounds, "&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
+	for _, handler := range []http.Handler{
+		h, NewWithPageSource(&legacyPageSource{store: s}, nil, DefaultQueryMaxResponseBytes, 1, budget),
+	} {
+		h = handler
+		// Lookahead reaches the second match at this budget. Issuance must
+		// reject because proving the rest of the walk crosses the gap.
+		assertQueryRejection(t, query(queryBounds, "&page=1&limit=1"), http.StatusServiceUnavailable, "query work budget exhausted")
+		assertQueryRejection(t, query(queryBounds, "&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
+	}
 
 	last := rows[len(rows)-1]
 	bounds := "/query?start=" + last.TS.Format(time.RFC3339Nano) + "&end=" + last.TS.Add(time.Nanosecond).Format(time.RFC3339Nano)
@@ -201,4 +197,53 @@ func TestLiveQueryConcurrentCursorResume(t *testing.T) {
 		t.Fatalf("fresh query: status=%d body=%q", fresh.Code, fresh.Body.String())
 	}
 	releaseSecond()
+}
+
+func TestTiedWalkConcurrentReplayAtIssuingBudget(t *testing.T) {
+	t.Parallel()
+	stamp := time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC)
+	rows := []store.Row{{TS: stamp, Line: "c"}, {TS: stamp, Line: "a"}, {TS: stamp, Line: "b"}}
+	data := new(store.Store)
+	data.Publish(rows)
+	a := newAPIForSource(&legacyPageSource{store: data}, nil, DefaultQueryMaxResponseBytes, 11)
+	handler := a.handler(2)
+	defer func() {
+		if err := a.Close(t.Context()); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	first := assertRetainedPage(t, requestCapturePage(handler, "&page=1&limit=1"), jsonRow(t, rows[0]))
+	if first == "" {
+		t.Fatal("first page returned no cursor at 11 units")
+	}
+	// The store changes both its append count and seek indexes. Neither
+	// change can affect work or membership in the captured walk.
+	data.Publish([]store.Row{{TS: stamp, Line: "new tie"}, {TS: stamp.Add(-time.Second), Line: "backfill"}})
+
+	type walk struct{ second, last *httptest.ResponseRecorder }
+	walks := make(chan walk, 2)
+	for range 2 {
+		go func() {
+			second := requestCapturePage(handler, "&limit=1&cursor="+first)
+			token := second.Header().Get("Bog-Next-Cursor")
+			last := requestCapturePage(handler, "&limit=1&cursor="+token)
+			walks <- walk{second, last}
+		}()
+	}
+	got := [2]walk{
+		waitForAdmission(t, walks, "first fixed-budget walk"),
+		waitForAdmission(t, walks, "second fixed-budget walk"),
+	}
+	var next string
+	for i, replay := range got {
+		token := assertRetainedPage(t, replay.second, jsonRow(t, rows[1]))
+		if token == "" || token == first || (i > 0 && token != next) {
+			t.Fatalf("walk %d returned a different cursor for the same continuation", i)
+		}
+		next = token
+		if token := assertRetainedPage(t, replay.last, jsonRow(t, rows[2])); token != "" {
+			t.Fatal("last tied row returned a cursor")
+		}
+	}
 }

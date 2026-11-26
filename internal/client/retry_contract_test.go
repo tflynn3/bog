@@ -283,23 +283,31 @@ func TestQueryResponseValidation(t *testing.T) {
 		headers    http.Header
 		limit      int64
 		chunked    bool
+		rowLimit   int
+		wantRows   int
+		wantCursor string
 		wantError  string
 	}{
 		{name: "empty terminal"},
-		{name: "exact size cap", body: row, limit: int64(len(row))},
-		{name: "identity encoding", body: row, headers: http.Header{"Content-Encoding": {"Identity"}}},
+		{name: "exact size and row caps", body: row, limit: int64(len(row)), rowLimit: 1, wantRows: 1},
+		{name: "omitted row cap", body: strings.Repeat(row, 501), wantRows: 501},
+		{name: "exact row cap with cursor", body: row, rowLimit: 1, headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, wantRows: 1, wantCursor: fixtureNext},
+		{name: "over row cap with cursor", body: row + row, rowLimit: 1, headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, wantError: "exceeds requested limit 1"},
+		{name: "identity encoding", body: row, headers: http.Header{"Content-Encoding": {"Identity"}}, wantRows: 1},
 		{name: "length exceeds cap", body: row, limit: int64(len(row) - 1), wantError: "size limit"},
 		{name: "chunked exceeds cap", body: row, limit: int64(len(row) - 1), chunked: true, wantError: "size limit"},
 		{name: "invalid cap", body: row, limit: -1, wantError: "invalid response size limit"},
 		{name: "duplicate encoding", body: row, headers: http.Header{"Content-Encoding": {"identity", "gzip"}}, wantError: "encoding"},
 		{name: "compressed response", body: row, headers: http.Header{"Content-Encoding": {"gzip"}}, wantError: "encoding"},
 		{name: "trailing cursor", body: row, headers: http.Header{"Trailer": {"Bog-Next-Cursor"}}, chunked: true, wantError: "cursor trailer"},
+		{name: "fixed length cursor trailer declaration", body: row, headers: http.Header{"Trailer": {"Bog-Next-Cursor"}}, wantError: "cursor trailer"},
 		{name: "duplicate cursor", body: row, headers: http.Header{"Bog-Next-Cursor": {fixtureCursor, fixtureNext}}, wantError: "cursor header"},
 		{name: "empty cursor", body: row, headers: http.Header{"Bog-Next-Cursor": {""}}, wantError: "cursor header"},
 		{name: "repeated request cursor", body: row, headers: http.Header{"Bog-Next-Cursor": {fixtureCursor}}, wantError: "does not advance"},
 		{name: "repeated request cursor on empty page", headers: http.Header{"Bog-Next-Cursor": {fixtureCursor}}, wantError: "does not advance"},
-		{name: "empty page with fresh cursor", headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, wantError: "empty query page"},
-		{name: "empty chunked page with fresh cursor", headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, chunked: true, wantError: "empty query page"},
+		{name: "empty page with fresh cursor", headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, wantCursor: fixtureNext},
+		{name: "empty chunked page with fresh cursor", headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, chunked: true, wantCursor: fixtureNext},
+		{name: "empty page with malformed cursor", headers: http.Header{"Bog-Next-Cursor": {"invalid"}}, wantError: "invalid next cursor header"},
 		{name: "invalid UTF-8 after row", body: row + "{\"ts\":\"\xff\",\"line\":\"\"}\n", wantError: "UTF-8"},
 		{name: "blank record after row", body: row + "\n", wantError: "record framing"},
 		{name: "invalid timestamp after row", body: row + "{\"ts\":\"today\",\"line\":\"\"}\n", wantError: "timestamp"},
@@ -307,7 +315,12 @@ func TestQueryResponseValidation(t *testing.T) {
 		{name: "duplicate field after row", body: row + "{\"ts\":\"" + contractStamp + "\",\"line\":\"a\",\"line\":\"b\"}\n", wantError: "decode query record"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			t.Parallel()
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				if tc.rowLimit == 0 && q.Has("limit") || tc.rowLimit != 0 && q.Get("limit") != strconv.Itoa(tc.rowLimit) {
+					t.Errorf("request limit %q, configured limit %d", q["limit"], tc.rowLimit)
+				}
 				for name, values := range tc.headers {
 					for _, value := range values {
 						w.Header().Add(name, value)
@@ -337,7 +350,7 @@ func TestQueryResponseValidation(t *testing.T) {
 			c.MaxPageBytes = tc.limit
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			page, err := c.FetchPage(ctx, Query{}, fixtureCursor)
+			page, err := c.FetchPage(ctx, Query{Limit: tc.rowLimit}, fixtureCursor)
 			if tc.wantError != "" {
 				var status *HTTPError
 				if !errors.As(err, &status) || status.StatusCode != http.StatusOK || status.Retryable() ||
@@ -346,12 +359,9 @@ func TestQueryResponseValidation(t *testing.T) {
 				}
 				return
 			}
-			wantRows := 0
-			if tc.body != "" {
-				wantRows = 1
-			}
-			if err != nil || len(page.Rows) != wantRows || page.NextCursor != "" {
-				t.Fatalf("terminal page %+v, error %v, want %d rows", page, err, wantRows)
+			if err != nil || len(page.Rows) != tc.wantRows || page.NextCursor != tc.wantCursor {
+				t.Fatalf("page has %d rows and cursor %q, error %v, want %d rows and cursor %q",
+					len(page.Rows), page.NextCursor, err, tc.wantRows, tc.wantCursor)
 			}
 		})
 	}
@@ -398,50 +408,44 @@ func TestContinuationRejectionsPreserveCursor(t *testing.T) {
 }
 
 func TestWalkFromEmptyPage(t *testing.T) {
-	for _, tc := range []struct {
-		name, next string
-	}{
-		{name: "reject continuation", next: fixtureNext},
-		{name: "deliver terminal page"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				query := r.URL.Query()
-				if query.Get("cursor") != fixtureCursor || query.Has("page") {
-					t.Errorf("unexpected request %s", r.RequestURI)
-					http.Error(w, "unexpected request", http.StatusBadRequest)
-					return
-				}
-				writeContractPage(t, w, "", tc.next)
-			}))
-			t.Cleanup(server.Close)
-			c, err := New(server.URL, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(c.CloseIdleConnections)
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-			defer cancel()
-			calls := 0
-			cursor, err := c.WalkFrom(ctx, Query{}, fixtureCursor, func(p Page) error {
-				calls++
-				if len(p.Rows) != 0 || p.NextCursor != "" {
-					t.Errorf("consumer received %+v, want empty terminal page", p)
-				}
-				return nil
-			})
-			if tc.next == "" {
-				if cursor != "" || err != nil || calls != 1 {
-					t.Fatalf("terminal walk returned cursor %q and error %v after %d callbacks", cursor, err, calls)
-				}
-				return
-			}
-			var protocol *HTTPError
-			if cursor != fixtureCursor || calls != 0 || !errors.As(err, &protocol) ||
-				protocol.StatusCode != http.StatusOK || protocol.Retryable() || protocol.CursorRejected ||
-				!strings.Contains(err.Error(), "empty query page") {
-				t.Fatalf("rejected walk returned cursor %q and error %v after %d callbacks", cursor, err, calls)
-			}
-		})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch q := r.URL.Query(); {
+		case !q.Has("page") && q.Get("cursor") == fixtureCursor:
+			writeContractPage(t, w, "", fixtureNext)
+		case !q.Has("page") && q.Get("cursor") == fixtureNext:
+			writeContractPage(t, w, "", "")
+		default:
+			t.Errorf("unexpected request %s", r.RequestURI)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	c, err := New(server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	stop := errors.New("consumer stopped")
+	cursor, err := c.WalkFrom(ctx, Query{Limit: 1}, fixtureCursor, func(p Page) error {
+		if len(p.Rows) != 0 || p.NextCursor != fixtureNext {
+			t.Errorf("consumer received %+v, want empty continuation", p)
+		}
+		return stop
+	})
+	if cursor != fixtureCursor || !errors.Is(err, stop) {
+		t.Fatalf("failed consumer returned cursor %q and error %v", cursor, err)
+	}
+	var delivered []string
+	end, err := c.WalkFrom(ctx, Query{Limit: 1}, cursor, func(p Page) error {
+		if len(p.Rows) != 0 {
+			t.Errorf("consumer received rows %+v, want empty page", p.Rows)
+		}
+		delivered = append(delivered, p.NextCursor)
+		return nil
+	})
+	if end != "" || err != nil || !slices.Equal(delivered, []string{fixtureNext, ""}) {
+		t.Fatalf("resumed walk returned cursor %q and error %v after delivering %q", end, err, delivered)
 	}
 }

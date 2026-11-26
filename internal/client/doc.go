@@ -1,14 +1,23 @@
 // Package client provides a reusable Bog HTTP client. Construct a Client with
 // New, set MaxPageBytes before concurrent use if the server permits larger
 // pages, and call Walk to consume a stable snapshot. WalkFrom resumes at the
-// cursor returned when a request or page consumer fails; use the same Query.
-// FetchPage exposes a fully validated page and continuation token together.
-// A short body, incomplete chunked response, invalid NDJSON, empty page with
-// a next cursor, or repeated request cursor yields no page. Walk and WalkFrom also
-// withhold any page whose next cursor repeats an earlier cursor in that call,
-// including the starting cursor. They return the input cursor for the failed
-// page. Query HTTP 503 errors are retryable with the cursor from the failed walk.
-// The consumer must not commit partial page effects before returning an error.
+// cursor returned when a request or page consumer fails. Use the same query
+// bounds and filter when resuming.
+//
+// FetchPage validates every page for direct callers, Walk, WalkFrom, and
+// BoundedWalk. It exposes rows and the continuation together after checking
+// HTTP framing, the byte ceiling, NDJSON records, and the cursor header. A
+// positive Query.Limit caps the row count. Zero omits the limit from the
+// request and uses the server default. A fully framed empty page can carry
+// a fresh valid cursor. Only an absent cursor indicates a terminal page.
+//
+// Walk and WalkFrom withhold a page whose next cursor repeats any request
+// cursor in that call, including the starting cursor. They advance when the
+// consumer returns nil and return the failed page's request cursor on error.
+// Consumers must commit each page atomically. Query HTTP 503 errors can be
+// retried at the returned cursor. BoundedWalk keeps constant cursor history
+// and detects deterministic cycles with an anchor that can require several
+// pages to detect a repeat. Failed fetches leave its cursor and budget intact.
 //
 // # Routing and restarting a walk
 //

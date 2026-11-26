@@ -4,19 +4,13 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
-	"time"
-	"unicode/utf8"
 
 	"bog/internal/store"
 )
@@ -84,20 +78,6 @@ func (e *HTTPError) Unwrap() error { return e.Cause }
 // a work-budget rejection may require a smaller limit or a larger server budget.
 func (e *HTTPError) Retryable() bool { return e.QueryRetryable }
 
-// Query specifies the immutable bounds and filter of a snapshot walk.
-type Query struct {
-	Start, End time.Time
-	Contains   string
-	Limit      int
-}
-type Row = store.Row
-
-// Page contains a fully validated page and its opaque continuation token.
-type Page struct {
-	Rows       []Row
-	NextCursor string
-}
-
 func (c *Client) endpoint(path string) string {
 	u := *c.base
 	escaped := u.EscapedPath()
@@ -120,26 +100,6 @@ func framed(r *http.Response) bool {
 	return r.ProtoMajor >= 2 || r.ContentLength >= 0 || (len(r.TransferEncoding) == 1 && r.TransferEncoding[0] == "chunked")
 }
 
-func readQueryBody(r *http.Response, limit int64) ([]byte, error) {
-	if !framed(r) {
-		return nil, errors.New("query response has unverifiable framing")
-	}
-	encodings := r.Header.Values("Content-Encoding")
-	if r.Uncompressed || len(encodings) > 1 || (len(encodings) == 1 && !strings.EqualFold(encodings[0], "identity")) {
-		return nil, errors.New("unsupported query content encoding")
-	}
-	if r.ContentLength >= 0 && r.ContentLength > limit && limit >= 0 {
-		return nil, errors.New("response exceeds size limit")
-	}
-	body, err := readBounded(r.Body, limit)
-	if err != nil {
-		return nil, err
-	}
-	if r.ContentLength >= 0 && int64(len(body)) != r.ContentLength {
-		return nil, io.ErrUnexpectedEOF
-	}
-	return body, nil
-}
 func readBounded(r io.Reader, n int64) ([]byte, error) {
 	if n < 0 || n == math.MaxInt64 {
 		return nil, errors.New("invalid response size limit")
@@ -156,143 +116,6 @@ func readBounded(r io.Reader, n int64) ([]byte, error) {
 func statusError(r *http.Response) *HTTPError {
 	b, err := readBounded(r.Body, maxError)
 	return &HTTPError{StatusCode: r.StatusCode, Body: string(b), Cause: err}
-}
-
-// FetchPage requests a first page when cursor is empty, or a continuation
-// otherwise. No rows or cursor are returned until the entire response validates.
-func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (page Page, resultErr error) {
-	req, err := c.request(ctx, http.MethodGet, "/query", nil)
-	if err != nil {
-		return Page{}, err
-	}
-	v := req.URL.Query()
-	v.Set("start", q.Start.UTC().Format(time.RFC3339Nano))
-	v.Set("end", q.End.UTC().Format(time.RFC3339Nano))
-	v.Set("contains", q.Contains)
-	if q.Limit != 0 {
-		v.Set("limit", strconv.Itoa(q.Limit))
-	}
-	if cursor == "" {
-		v.Set("page", "1")
-	} else {
-		v.Set("cursor", cursor)
-	}
-	req.URL.RawQuery = v.Encode()
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return Page{}, err
-	}
-	defer func() {
-		if e := resp.Body.Close(); e != nil {
-			page = Page{}
-			resultErr = errors.Join(resultErr, e)
-		}
-		if resultErr != nil {
-			var e *HTTPError
-			if !errors.As(resultErr, &e) {
-				resultErr = &HTTPError{StatusCode: resp.StatusCode, Cause: resultErr}
-			}
-		}
-	}()
-	if resp.StatusCode != http.StatusOK {
-		e := statusError(resp)
-		e.QueryRetryable = resp.StatusCode == http.StatusServiceUnavailable
-		e.CursorRejected = cursor != "" && resp.StatusCode == http.StatusBadRequest && framed(resp) && e.Cause == nil && e.Body == "invalid cursor\n"
-		return Page{}, e
-	}
-	limit := c.MaxPageBytes
-	if limit == 0 {
-		limit = DefaultMaxPage
-	}
-	b, err := readQueryBody(resp, limit)
-	if err != nil {
-		return Page{}, fmt.Errorf("read query page: %w", err)
-	}
-	if _, present := resp.Trailer["Bog-Next-Cursor"]; present {
-		return Page{}, errors.New("unexpected next cursor trailer")
-	}
-	var rows []Row
-	for len(b) > 0 {
-		line, rest, found := bytes.Cut(b, []byte{'\n'})
-		if !found || len(line) == 0 || !utf8.Valid(line) {
-			return Page{}, errors.New("invalid query record framing or UTF-8")
-		}
-		b = rest
-		var record struct {
-			TS   *string `json:"ts"`
-			Line *string `json:"line"`
-		}
-		if err := jsonv2.Unmarshal(line, &record, jsonv2.RejectUnknownMembers(true)); err != nil {
-			return Page{}, fmt.Errorf("decode query record: %w", err)
-		}
-		if record.TS == nil || record.Line == nil {
-			return Page{}, errors.New("missing query record field")
-		}
-		ts, err := store.ParseTime(*record.TS)
-		if err != nil {
-			return Page{}, fmt.Errorf("decode query timestamp: %w", err)
-		}
-		rows = append(rows, Row{TS: ts, Line: *record.Line})
-	}
-	values := resp.Header.Values("Bog-Next-Cursor")
-	if len(values) > 1 || (len(values) == 1 && values[0] == "") {
-		return Page{}, errors.New("invalid next cursor header")
-	}
-	next := ""
-	if len(values) == 1 {
-		next = values[0]
-		if len(next) > base64.RawURLEncoding.EncodedLen(2048) {
-			return Page{}, errors.New("invalid next cursor header")
-		}
-		decoded, err := base64.RawURLEncoding.Strict().DecodeString(next)
-		if err != nil || len(decoded) <= sha256.Size || len(decoded) > 2048 || base64.RawURLEncoding.EncodeToString(decoded) != next {
-			return Page{}, errors.New("invalid next cursor header")
-		}
-		if next == cursor {
-			return Page{}, errors.New("next cursor does not advance pagination")
-		}
-		if len(rows) == 0 {
-			return Page{}, errors.New("empty query page with next cursor")
-		}
-	}
-	return Page{Rows: rows, NextCursor: next}, nil
-}
-
-// Walk delivers validated pages in order. It advances only after consume succeeds;
-// the returned cursor identifies the page to retry if a request or consume fails.
-func (c *Client) Walk(ctx context.Context, q Query, consume func(Page) error) (string, error) {
-	return c.WalkFrom(ctx, q, "", consume)
-}
-
-// WalkFrom resumes a walk at cursor. It rejects a page before delivery if its
-// next cursor repeats any cursor used in this invocation.
-func (c *Client) WalkFrom(ctx context.Context, q Query, cursor string, consume func(Page) error) (string, error) {
-	if consume == nil {
-		return cursor, errors.New("nil page consumer")
-	}
-	seen := make(map[string]struct{})
-	for {
-		if cursor != "" {
-			seen[cursor] = struct{}{}
-		}
-		p, err := c.FetchPage(ctx, q, cursor)
-		if err != nil {
-			return cursor, err
-		}
-		if _, repeated := seen[p.NextCursor]; repeated {
-			return cursor, &HTTPError{
-				StatusCode: http.StatusOK,
-				Cause:      errors.New("next cursor does not advance pagination: cursor cycle"),
-			}
-		}
-		if err = consume(p); err != nil {
-			return cursor, err
-		}
-		if p.NextCursor == "" {
-			return "", nil
-		}
-		cursor = p.NextCursor
-	}
 }
 
 type IngestOutcome int

@@ -34,27 +34,13 @@ func queryFile(r io.ReaderAt, size int64, q query) (matches []checkpoint.BlockRo
 	return matches, reads, peak, nil
 }
 
-func verifyResult(got, want []checkpoint.BlockRow) error {
-	if len(got) != len(want) {
-		return fmt.Errorf("exact oracle row count: got %d, want %d", len(got), len(want))
-	}
-	for i, row := range got {
-		expected := want[i]
-		if row.Ordinal != expected.Ordinal || !row.Row.TS.Equal(expected.Row.TS) || row.Row.Line != expected.Row.Line {
-			return fmt.Errorf("exact oracle mismatch at row %d: got timestamp %s ordinal %d, want timestamp %s ordinal %d", i,
-				row.Row.TS, row.Ordinal, expected.Row.TS, expected.Ordinal)
-		}
-	}
-	return nil
-}
-
-func measureQuery(r io.ReaderAt, size int64, q query, want []checkpoint.BlockRow, totalRows, runs int, beforeSample func() error) (measurement, error) {
-	if runs < 1 || runs > maxRuns || totalRows < 1 || len(want) > totalRows {
+func measureQuery(r io.ReaderAt, size int64, q query, expected *oracleReader, runs int, beforeSample func() error) (measurement, error) {
+	if runs < 1 || runs > maxRuns || expected.totalRows < 1 {
 		return measurement{}, fmt.Errorf("invalid sample or row count")
 	}
 	m := measurement{
 		Name: q.name, Literal: q.literal, Start: q.start, End: q.end,
-		MatchingRows: len(want), MatchingFraction: float64(len(want)) / float64(totalRows),
+		MatchingRows: expected.matches, MatchingFraction: float64(expected.matches) / float64(expected.totalRows),
 		ColdSamplesNS: make([]int64, 0, runs),
 	}
 	for sample := range runs {
@@ -65,7 +51,7 @@ func measureQuery(r io.ReaderAt, size int64, q query, want []checkpoint.BlockRow
 		got, reads, peak, err := queryFile(r, size, q)
 		elapsed := time.Since(start)
 		if err == nil {
-			err = verifyResult(got, want)
+			err = expected.verify(got)
 		}
 		if err != nil {
 			return measurement{}, fmt.Errorf("sample %d: %w", sample+1, err)
@@ -78,5 +64,6 @@ func measureQuery(r io.ReaderAt, size int64, q query, want []checkpoint.BlockRow
 		m.ColdSamplesNS = append(m.ColdSamplesNS, elapsed.Nanoseconds())
 	}
 	m.ColdP95NS = p95(m.ColdSamplesNS)
+	m.OrderedParity = true
 	return m, nil
 }

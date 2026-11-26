@@ -163,8 +163,9 @@ func indexTime(b []byte) (time.Time, bool) {
 }
 
 type payloadReads struct {
-	Blocks int   `json:"logical_blocks_read"`
-	Bytes  int64 `json:"payload_bytes_read"`
+	Blocks       int   `json:"logical_blocks_read"`
+	Bytes        int64 `json:"payload_bytes_read"`
+	DecodedBytes int64 `json:"decoded_bytes"`
 }
 
 func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, bufferBytes int) error) (read payloadReads, err error) {
@@ -241,6 +242,7 @@ func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, buffe
 		}
 		read.Blocks++
 		read.Bytes += int64(storedSize)
+		read.DecodedBytes += int64(rawSize)
 	}
 	if offset != size {
 		return payloadReads{}, errLayout

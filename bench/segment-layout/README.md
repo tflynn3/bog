@@ -1,24 +1,59 @@
 # Checkpoint layout benchmark
 
-Run this standalone Go module on Linux. Choose an existing directory on the
-filesystem or device under test. The runner creates and cleans up a private
-subdirectory there.
+Run this standalone module on native Linux amd64 and arm64. Coordinate
+separate runner time with Linux Release after the composed release gate's
+required runs. Use the same clean full commit and Go toolchain on both
+architectures. Choose an existing directory on the local disk under test,
+and save the binary and reports outside the checkout. Record the runner
+and local device or filesystem with the results.
+
+For the issue #73 rerun, check out
+`21502325be3c40887b4ea33aa98edb868c53dd51` on each runner. That published
+revision contains the same benchmark source and checkpoint codec inputs
+as this repair. Use Go 1.27.0 on both runners.
 
 ```sh
+set -eu
+test "$(uname -s)" = Linux
+case "$(uname -m):$(go env GOHOSTARCH)" in
+  x86_64:amd64|aarch64:arm64) ;;
+  *) exit 1 ;;
+esac
+test -z "$(git status --porcelain)"
+revision=21502325be3c40887b4ea33aa98edb868c53dd51
+test "$(git rev-parse HEAD)" = "$revision"
+test "$(go env GOVERSION)" = go1.27.0
+arch=$(go env GOHOSTARCH)
+data=/path/to/local/disk
+evidence=/path/to/evidence
+mkdir -p "$evidence"
+uname -a > "$evidence/runner-$arch.txt"
+findmnt -T "$data" > "$evidence/storage-$arch.txt"
 cd bench/segment-layout
-go run . -smoke
+GOWORK=off GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -buildvcs=true \
+  -o "$evidence/segment-layout-$arch" .
+go version -m "$evidence/segment-layout-$arch" > "$evidence/build-$arch.txt"
+grep -Eq "^[[:space:]]+build[[:space:]]+vcs.revision=$revision$" "$evidence/build-$arch.txt"
+grep -Eq '^[[:space:]]+build[[:space:]]+vcs.modified=false$' "$evidence/build-$arch.txt"
+"$evidence/segment-layout-$arch" -dir "$data" -smoke > "$evidence/smoke-$arch.json"
 for profile in mixed entropy; do
   for scale in small medium large; do
-    go run . -dir /path/to/data -fixture "$profile" -scale "$scale" -runs 21 \
-      -revision "$(git rev-parse HEAD)" > "$profile-$scale.json"
+    "$evidence/segment-layout-$arch" -dir "$data" -fixture "$profile" \
+      -scale "$scale" -runs 21 -revision "$revision" \
+      > "$evidence/$arch-$profile-$scale.json"
   done
 done
 ```
 
-Each invocation emits one schema v2 JSON report. The report records the source
-revision, fixture seed, profile and scale, sample count, Go runtime, kernel,
-filesystem and codec settings. Pass `-revision` when building without Git
-metadata. The default uses Go's embedded revision and dirty status.
+Each invocation emits one schema v3 JSON report. It records the reported
+revision, embedded build revision and binary SHA-256 alongside the fixture
+seed, profile and scale, sample count, Go runtime, kernel, filesystem and
+codec settings. For qualification, require both revisions to equal the
+pinned commit and match each phase's `oracle_sha256` across all layouts
+and both architectures. This fingerprint covers the independent oracle's
+ordered rows for every query in that generation. The benchmark records
+filesystem information and the kernel machine name. The runner operator
+confirms native execution and local storage.
 
 | Scale | Ordinary batches | Initial retained rows |
 | --- | ---: | ---: |
@@ -46,11 +81,21 @@ also includes rows outside the window.
 
 Additional probes cover case sensitivity, one-, two- and three-byte UTF-8
 literals (`x`, `é`, `€`), the oversized row's tail, and half-open time
-windows. Every timed sample, across all six layouts and all generations, is
-compared after timing to an independent exact byte-substring scan over the
-append input. A stable timestamp sort of that input preserves append-ordinal
-order for ties. Verification compares timestamps, ordinals and complete
-lines, including duplicates. Any mismatch fails the run.
+windows. The false-positive probe combines sparse and dense terms that
+co-occur with an intervening term. Their overlapping four-byte windows
+admit Bloom candidates, and exact matching rejects them all.
+
+The controller builds the fixture, packs all six layouts, and runs an
+independent exact byte-substring scan over the append input for each query.
+A stable timestamp sort preserves append-ordinal order for ties. It writes
+those expected rows once per query and generation. Each fresh Linux worker
+measures one layout across the three prepared generations, with workers
+running serially. After every timed sample, the worker streams the shared
+expected rows and compares timestamps, ordinals and complete lines,
+including duplicates. Successful queries set `ordered_parity` to true.
+Any mismatch or worker failure aborts the matrix. On completion or
+cancellation the controller reaps the active worker and removes its
+private workspace before returning.
 
 ## Layouts and backfill
 
@@ -72,8 +117,9 @@ rows at the first ordinary timestamp. The scattered batch duplicates rows
 from the early and middle ordinary timestamps and near the end of ordinary
 history, in descending timestamp order. At small custom batch counts those
 anchors can coincide. Both generations are packed using the same rules as
-the initial generation. The initial generation stays on disk through both
-scenarios. A completed rewrite is removed before the next scenario.
+the initial generation. All three generations and their shared oracle
+files stay in the workspace through worker execution. Allow space for
+both rewrites, the initial files and the oracle streams.
 
 ## Metrics
 
@@ -86,6 +132,9 @@ scenarios. A completed rewrite is removed before the next scenario.
   literal and time window. The report includes both read counts and the
   analogous difference in stored payload bytes. These counters count
   successful logical reads through the container and exclude index reads.
+  **Decoded bytes** sum the uncompressed block sizes passed to the
+  checkpoint decoder per sample, including blocks admitted by a Bloom
+  false positive. Each query also reports its same-codec baseline.
 - **Cold p95** uses nearest rank over the recorded per-query nanosecond
   samples. The runner uses Linux `FADV_RANDOM` on each query's file
   descriptor and requests `FADV_DONTNEED` on the entire file before each
@@ -100,14 +149,38 @@ scenarios. A completed rewrite is removed before the next scenario.
   per-layout `rewrite_bytes` is the clustered scenario's value. Each entry
   in `backfills` includes its own rewrite count, timestamp bounds and
   full query metrics. The model measures whole-file checkpoint layout
-  rewrites in the benchmark container.
+  rewrites in the benchmark container. `rewrite_ns` is elapsed time for
+  per-layout block sorting, encoding, optional compression and Bloom
+  construction, file writes, sync and close. Shared partitioning and
+  oracle preparation happen outside that interval.
+- **Peak worker RSS** (`peak_worker_rss_bytes`) is read from Linux
+  `/proc/self/status` (`VmHWM`, converted from KiB) after a layout's final
+  query. It includes the worker runtime, codec internals, retained results,
+  and streamed oracle verification. It covers the whole layout process
+  through measurement and excludes controller fixture construction.
 - **Peak decode bytes** is the largest accounted single-block working set
   observed across samples for a query. It counts the stored payload, any
   separate expansion buffer, decoded row structs and copied line bytes. It
   excludes codec-library internals, allocator overhead, the index and
   accumulated query results. A query with zero payload reads reports zero.
 
-From this module run `go vet ./...`, `go test ./...` and
-`go test -race ./...`. On macOS they cover the portable layout, metrics
-and configuration code. Run them on Linux for the complete fixture,
-sampling and rewrite tests with the production checkpoint codec.
+From this module run `go vet .` and `go test -race .`. On macOS the
+tests use a portable worker harness with a no-op cache policy and a
+synthetic RSS reading. On Linux they also exercise real cache advice,
+RSS collection, and the full report. Both exercise the production
+checkpoint block codec.
+
+## Production format decision
+
+The production format proposal remains deferred. The composed release gate
+has priority, and access to native Linux amd64 and arm64 runners with local
+storage has yet to be confirmed. This benchmark has no native measurements
+for the pinned revision yet.
+
+After Linux Release confirms runner time, publish the six-layout comparison
+for each architecture, profile, and scale with matching fixture fingerprints.
+Include exact ordered parity, sparse cold p95, decoded bytes, retained bytes,
+clustered and scattered rewrite bytes and time, peak worker RSS, and peak
+decode working set. Use those measurements to assess storage and sparse-query
+gains alongside Bloom metadata, backfill cost, and worker memory before
+revisiting the proposal.

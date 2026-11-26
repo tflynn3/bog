@@ -3,6 +3,8 @@
 // pages, and call Walk to consume a stable snapshot. WalkFrom resumes at the
 // cursor returned when a request or page consumer fails; use the same Query.
 // FetchPage exposes a fully validated page and continuation token together.
+// A short body, incomplete chunked response, or invalid NDJSON yields no page.
+// Query HTTP 503 errors are retryable with the cursor from the failed walk.
 // The consumer must not commit partial page effects before returning an error.
 //
 // Ingest sends one bounded batch without automatic replay. IngestCommitted

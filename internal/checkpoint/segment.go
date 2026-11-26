@@ -50,7 +50,7 @@ func (l *Legacy) prefixDigest(end int64) (string, error) {
 		return "", errors.New("invalid covered offset")
 	}
 	h := sha256.New()
-	if _, err := io.Copy(h, io.NewSectionReader(l.wal, 0, end)); err != nil {
+	if _, err := io.CopyN(h, io.NewSectionReader(l.wal, 0, end), end); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -62,30 +62,57 @@ func randomName(prefix string) (string, error) {
 	}
 	return prefix + hex.EncodeToString(b[:]), nil
 }
-func (l *Legacy) writeNew(name string, data []byte) error {
+func (l *Legacy) writeNew(name string, data []byte) (err error) {
 	f, err := l.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	// The create mode is masked by umask. Set the exact mode on the new file
+	// descriptor before syncing it, without changing the process-wide umask.
+	if err = f.Chmod(0600); err != nil {
+		return err
+	}
 	n, err := f.Write(data)
-	if err == nil && n != len(data) {
-		err = io.ErrShortWrite
+	if err != nil {
+		return err
 	}
-	if err == nil {
-		err = f.Sync()
+	if n != len(data) {
+		return io.ErrShortWrite
 	}
-	if e := f.Close(); err == nil {
-		err = e
+	return f.Sync()
+}
+
+func (l *Legacy) installSegment(name string, data []byte) error {
+	staged := "." + name
+	if err := l.writeNew(staged, data); err != nil {
+		return err
 	}
-	return err
+	// Install without replacing an existing immutable segment. The staging
+	// link must be gone before the manifest can refer to the final name.
+	if err := l.root.Link(staged, name); err != nil {
+		return err
+	}
+	return l.root.Remove(staged)
 }
 
 // Publish builds a checkpoint while the Legacy directory lock is held. Any error
-// after manifest rename is an uncertain publication: close and reopen before
-// making further progress. Inputs and unreferenced files are never removed.
+// from the manifest rename or final directory sync is uncertain. Close and
+// reopen before making further progress. Old segments and WAL inputs are retained.
 func (l *Legacy) Publish() (*Manifest, error) {
-	if l.uncertain {
-		return nil, ErrPublicationUncertain
+	if err := l.begin(); err != nil {
+		return nil, err
+	}
+	defer l.active.Done()
+
+	l.publicationMu.Lock()
+	defer l.publicationMu.Unlock()
+	if l.uncertain != nil {
+		return nil, l.uncertain
 	}
 	m := &Manifest{Version: 1, CoveredOffset: l.end, Segments: []segmentMeta{}}
 	var err error
@@ -110,7 +137,7 @@ func (l *Legacy) Publish() (*Manifest, error) {
 		if e != nil {
 			return e
 		}
-		if e = l.writeNew(name, b); e != nil {
+		if e = l.installSegment(name, b); e != nil {
 			return e
 		}
 		m.Segments = append(m.Segments, segmentMeta{Name: name, Size: int64(len(b)), SHA256: digest(b)})
@@ -118,7 +145,7 @@ func (l *Legacy) Publish() (*Manifest, error) {
 		size = blockHeaderSize
 		return nil
 	}
-	err = l.Scan(func(_, _ int64, first uint64, rows []store.Row) error {
+	err = l.scanFrom(8, 0, func(_, _ int64, first uint64, rows []store.Row) error {
 		for i, row := range rows {
 			n := blockRowSize + len(row.Line)
 			if n > MaxBlockSize-blockHeaderSize {
@@ -168,16 +195,16 @@ func (l *Legacy) Publish() (*Manifest, error) {
 		rename = l.manifestRename
 	}
 	if err = rename(tmp, manifestName); err != nil {
-		l.uncertain = true
-		return nil, fmt.Errorf("%w: %v", ErrPublicationUncertain, err)
+		l.uncertain = fmt.Errorf("%w: rename manifest: %w", ErrPublicationUncertain, err)
+		return nil, l.uncertain
 	}
 	syncDir := l.dir.Sync
 	if l.manifestDirSync != nil {
 		syncDir = l.manifestDirSync
 	}
 	if err = syncDir(); err != nil {
-		l.uncertain = true
-		return nil, fmt.Errorf("%w: %v", ErrPublicationUncertain, err)
+		l.uncertain = fmt.Errorf("%w: sync manifest directory: %w", ErrPublicationUncertain, err)
+		return nil, l.uncertain
 	}
 	return m, nil
 }
@@ -186,14 +213,30 @@ func (l *Legacy) Publish() (*Manifest, error) {
 // also validates the committed WAL and binds the checkpoint to a frame boundary.
 // Missing manifests are reported as os.ErrNotExist; corrupt checkpoints fail closed.
 func (l *Legacy) OpenPublished() (*Published, error) {
-	if l.uncertain {
-		return nil, ErrPublicationUncertain
+	if err := l.begin(); err != nil {
+		return nil, err
+	}
+	defer l.active.Done()
+	return l.openPublished()
+}
+
+// openPublished requires an accepted operation.
+func (l *Legacy) openPublished() (p *Published, err error) {
+	l.publicationMu.Lock()
+	defer l.publicationMu.Unlock()
+	if l.uncertain != nil {
+		return nil, l.uncertain
 	}
 	f, err := l.openFile(manifestName)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			p = nil
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	st, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -201,9 +244,12 @@ func (l *Legacy) OpenPublished() (*Published, error) {
 	if st.Size() <= 0 || st.Size() > maxManifestSize {
 		return nil, errors.New("invalid manifest size")
 	}
-	b, err := io.ReadAll(io.LimitReader(f, maxManifestSize+1))
+	b, err := io.ReadAll(io.LimitReader(f, st.Size()+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(b) != int(st.Size()) {
+		return nil, errors.New("invalid manifest size")
 	}
 	var env manifestEnvelope
 	if json.Unmarshal(b, &env) != nil || digest(env.Payload) != env.SHA256 {
@@ -214,12 +260,15 @@ func (l *Legacy) OpenPublished() (*Published, error) {
 		return nil, errors.New("invalid manifest")
 	}
 	hash, err := l.prefixDigest(m.CoveredOffset)
-	if err != nil || hash != m.SourceSHA256 {
+	if err != nil {
+		return nil, err
+	}
+	if hash != m.SourceSHA256 {
 		return nil, errors.New("checkpoint WAL identity mismatch")
 	}
 	boundary := m.CoveredOffset == 8
 	var ord uint64
-	if err = l.Scan(func(_, next int64, first uint64, rows []store.Row) error {
+	if err = l.scanFrom(8, 0, func(_, next int64, first uint64, rows []store.Row) error {
 		if next == m.CoveredOffset {
 			boundary = true
 			ord = first + uint64(len(rows))
@@ -231,7 +280,7 @@ func (l *Legacy) OpenPublished() (*Published, error) {
 	if !boundary || ord != m.NextOrdinal {
 		return nil, errors.New("invalid checkpoint boundary")
 	}
-	p := &Published{manifest: m, blocks: make([][]BlockRow, 0, len(m.Segments))}
+	p = &Published{manifest: m, blocks: make([][]BlockRow, 0, len(m.Segments))}
 	seen := map[string]bool{}
 	// Bound the bitmap by validated declared segment sizes before allocating it.
 	var maxRows uint64
@@ -257,19 +306,17 @@ func (l *Legacy) OpenPublished() (*Published, error) {
 		}
 		st, e := f.Stat()
 		if e != nil {
-			f.Close()
-			return nil, e
+			return nil, errors.Join(e, f.Close())
 		}
 		if st.Size() != s.Size {
-			f.Close()
-			return nil, errors.New("invalid segment size")
+			return nil, errors.Join(errors.New("invalid segment size"), f.Close())
 		}
-		b, e := io.ReadAll(io.LimitReader(f, MaxBlockSize+1))
-		f.Close()
+		b, e := io.ReadAll(io.LimitReader(f, s.Size+1))
+		e = errors.Join(e, f.Close())
 		if e != nil {
 			return nil, e
 		}
-		if digest(b) != s.SHA256 {
+		if int64(len(b)) != s.Size || digest(b) != s.SHA256 {
 			return nil, errors.New("invalid segment checksum")
 		}
 		rows, e := DecodeBlock(b)
@@ -291,6 +338,11 @@ func (l *Legacy) OpenPublished() (*Published, error) {
 	}
 	if count != m.NextOrdinal {
 		return nil, errors.New("invalid segment row count")
+	}
+	// Persist the selected namespace before exposing it, including on a
+	// reopen after a previous handle encountered an uncertain rename or sync.
+	if err = l.dir.Sync(); err != nil {
+		return nil, fmt.Errorf("sync checkpoint directory: %w", err)
 	}
 	return p, nil
 }
@@ -337,25 +389,24 @@ func (p *Published) Scan(visit func(BlockRow) error) error {
 // ScanUncovered visits committed frames after the published boundary in append
 // order. OpenPublished must have succeeded on this locked Legacy first. Each
 // callback receives a complete frame and its original append ordinal.
+// The callback follows the same lifecycle contract as a Scan visitor.
 func (l *Legacy) ScanUncovered(p *Published, visit func(firstOrdinal uint64, rows []store.Row) error) error {
-	if l.uncertain {
-		return ErrPublicationUncertain
+	if err := l.begin(); err != nil {
+		return err
 	}
+	defer l.active.Done()
 	if p == nil {
 		return errors.New("nil published checkpoint")
 	}
 	// Revalidate the current authoritative manifest before replaying any suffix.
-	current, err := l.OpenPublished()
+	current, err := l.openPublished()
 	if err != nil {
 		return err
 	}
 	if current.manifest.SourceSHA256 != p.manifest.SourceSHA256 || current.manifest.CoveredOffset != p.manifest.CoveredOffset || current.manifest.NextOrdinal != p.manifest.NextOrdinal {
 		return errors.New("checkpoint changed")
 	}
-	return l.Scan(func(offset, next int64, first uint64, rows []store.Row) error {
-		if offset >= current.manifest.CoveredOffset {
-			return visit(first, rows)
-		}
-		return nil
+	return l.scanFrom(current.manifest.CoveredOffset, current.manifest.NextOrdinal, func(_, _ int64, first uint64, rows []store.Row) error {
+		return visit(first, rows)
 	})
 }

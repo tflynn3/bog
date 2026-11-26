@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 
 	"bog/internal/store"
@@ -18,10 +19,17 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // Legacy is a read-only, exclusively locked view of a stopped legacy WAL and
 // its commit marker. Close it before starting a writer on the same directory.
 type Legacy struct {
-	root            *os.Root
-	dir, wal        *os.File
-	end             int64
-	uncertain       bool
+	root     *os.Root
+	dir, wal *os.File
+	end      int64
+
+	mu        sync.Mutex
+	active    sync.WaitGroup
+	closeDone chan struct{}
+	closeErr  error
+
+	publicationMu   sync.Mutex
+	uncertain       error
 	manifestRename  func(string, string) error
 	manifestDirSync func() error
 }
@@ -36,7 +44,9 @@ func OpenLegacy(path string) (_ *Legacy, err error) {
 	l := &Legacy{root: root}
 	defer func() {
 		if err != nil {
-			l.Close()
+			if closeErr := l.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 		}
 	}()
 	l.dir, err = root.Open(".")
@@ -66,7 +76,10 @@ func OpenLegacy(path string) (_ *Legacy, err error) {
 		return nil, err
 	}
 	var magic [8]byte
-	if _, err = l.wal.ReadAt(magic[:], 0); err != nil || string(magic[:]) != "BOGWAL01" {
+	if _, err = l.wal.ReadAt(magic[:], 0); err != nil {
+		return nil, fmt.Errorf("read WAL magic: %w", err)
+	}
+	if string(magic[:]) != "BOGWAL01" {
 		return nil, errors.New("invalid WAL magic")
 	}
 	marker, e := l.openFile("bog.commit")
@@ -80,18 +93,29 @@ func OpenLegacy(path string) (_ *Legacy, err error) {
 	if e != nil {
 		return nil, e
 	}
-	defer marker.Close()
-	var b [25]byte
-	n, e := io.ReadFull(marker, b[:])
-	if e != io.ErrUnexpectedEOF || n != 24 || string(b[:8]) != "BOGCMT01" {
-		return nil, errors.New("invalid commit marker")
+	l.end, err = readCommitMarker(marker, info.Size())
+	if closeErr := marker.Close(); closeErr != nil {
+		err = errors.Join(err, closeErr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+func readCommitMarker(r io.Reader, walSize int64) (int64, error) {
+	b, err := io.ReadAll(io.LimitReader(r, 25))
+	if err != nil {
+		return 0, fmt.Errorf("read commit marker: %w", err)
+	}
+	if len(b) != 24 || string(b[:8]) != "BOGCMT01" {
+		return 0, errors.New("invalid commit marker")
 	}
 	end := binary.LittleEndian.Uint64(b[8:16])
-	if binary.LittleEndian.Uint64(b[16:24]) != ^end || end < 8 || end > uint64(info.Size()) {
-		return nil, errors.New("invalid committed offset")
+	if binary.LittleEndian.Uint64(b[16:24]) != ^end || end < 8 || end > uint64(walSize) {
+		return 0, errors.New("invalid committed offset")
 	}
-	l.end = int64(end)
-	return l, nil
+	return int64(end), nil
 }
 
 func (l *Legacy) openFile(name string) (*os.File, error) {
@@ -103,13 +127,11 @@ func (l *Legacy) openFile(name string) (*os.File, error) {
 	f := os.NewFile(uintptr(fd), name)
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
-		return nil, err
+		return nil, errors.Join(err, f.Close())
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !info.Mode().IsRegular() || !ok || st.Nlink != 1 || st.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0022 != 0 {
-		f.Close()
-		return nil, fmt.Errorf("unsafe file %s", name)
+		return nil, errors.Join(fmt.Errorf("unsafe file %s", name), f.Close())
 	}
 	return f, nil
 }
@@ -123,11 +145,21 @@ func (l *Legacy) CommittedOffset() int64 { return l.end }
 // has ordinal firstOrdinal plus its index. The rows are only valid during visit.
 // Memory is bounded by one maximum-size frame and its decoded rows, independent
 // of WAL length. An error in a committed frame is never treated as a torn tail.
+// Concurrent scans are independent. Once Close begins, new scans return
+// os.ErrClosed. A visitor must return before calling Close on the same Legacy.
 func (l *Legacy) Scan(visit func(offset, next int64, firstOrdinal uint64, rows []store.Row) error) error {
+	if err := l.begin(); err != nil {
+		return err
+	}
+	defer l.active.Done()
+	return l.scanFrom(8, 0, visit)
+}
+
+// scanFrom requires an accepted operation and a known committed frame boundary.
+func (l *Legacy) scanFrom(pos int64, ordinal uint64, visit func(offset, next int64, firstOrdinal uint64, rows []store.Row) error) error {
 	var h [16]byte
 	var payload []byte
-	var ordinal uint64
-	for pos := int64(8); pos < l.end; {
+	for pos < l.end {
 		if l.end-pos < 16 {
 			return fmt.Errorf("incomplete committed frame at %d", pos)
 		}
@@ -169,24 +201,40 @@ func (l *Legacy) Scan(visit func(offset, next int64, firstOrdinal uint64, rows [
 	return nil
 }
 
-// Close releases the input files and directory lock.
-func (l *Legacy) Close() error {
-	var err error
-	if l.wal != nil {
-		err = l.wal.Close()
-		l.wal = nil
+func (l *Legacy) begin() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closeDone != nil || l.wal == nil {
+		return os.ErrClosed
 	}
-	if l.dir != nil {
-		if e := l.dir.Close(); err == nil {
-			err = e
-		}
-		l.dir = nil
+	l.active.Add(1)
+	return nil
+}
+
+// Close stops admitting operations and waits for accepted operations, including
+// their visitors, before releasing the files and directory lock. Concurrent and
+// repeated calls wait for the same result.
+func (l *Legacy) Close() error {
+	l.mu.Lock()
+	if done := l.closeDone; done != nil {
+		l.mu.Unlock()
+		<-done
+		return l.closeErr
+	}
+	done := make(chan struct{})
+	l.closeDone = done
+	l.mu.Unlock()
+
+	l.active.Wait()
+	if l.wal != nil {
+		l.closeErr = l.wal.Close()
 	}
 	if l.root != nil {
-		if e := l.root.Close(); err == nil {
-			err = e
-		}
-		l.root = nil
+		l.closeErr = errors.Join(l.closeErr, l.root.Close())
 	}
-	return err
+	if l.dir != nil {
+		l.closeErr = errors.Join(l.closeErr, l.dir.Close())
+	}
+	close(done)
+	return l.closeErr
 }

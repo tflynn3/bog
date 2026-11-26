@@ -2,7 +2,10 @@
 
 The legacy scanner reads `BOGWAL01` and `BOGCMT01` under the pinned directory
 lock, checks every committed frame, and leaves both files untouched. Row ordinals
-are zero-based append positions, including duplicates.
+are zero-based append positions, including duplicates. Concurrent scans have
+independent decode state. Close stops accepting operations and waits for active
+operations and visitors to finish before releasing the lock. Visitors must
+return before calling Close on the same handle.
 
 A published `bog.checkpoint` is a JSON envelope containing a version 1 JSON
 payload and the SHA-256 of its exact payload bytes. It records the SHA-256 of the
@@ -14,14 +17,16 @@ described in BLOCK_FORMAT.md. Its inclusive minimum and maximum timestamps are
 sparse time bounds. Rows within each block are sorted by timestamp then ordinal;
 blocks may overlap. The reader merges them in that order.
 
-Files are created exclusively with random names and synced, then the directory is
-synced before the manifest is written and synced. The manifest is renamed over
-the authoritative name and the directory synced again. An error from the rename attempt or the final directory sync is
-an uncertain publication and requires reopening. Old files are retained; orphan
-cleanup is not implemented. Reopening validates the manifest, source prefix,
-frame boundary and committed WAL, and every referenced segment before exposing
-rows. Missing or corrupt referenced files fail closed. Unreferenced files have no
-meaning and are ignored. The offline API can visit uncovered committed frames in append order, but does not integrate reader switching with the live store.
+Each segment is staged under an exclusive temporary name, set to mode 0600,
+synced, and linked to its final name. Once the staging links are removed, the
+directory is synced. The manifest is staged with the same mode, synced, renamed
+over the authoritative name, and followed by a second directory sync. An error
+from the rename attempt or final directory sync makes publication uncertain and
+requires reopening. Old files and any unreferenced outputs from interrupted
+publications are retained. The reader validates the authoritative manifest, WAL
+prefix and committed frames, and every referenced segment. It syncs the directory
+before exposing rows. Missing or corrupt referenced files fail closed. Uncovered
+replay starts from the validated frame boundary and its next append ordinal.
 
 The builder retains at most one decoded legacy frame, one bounded block of sorted row references,
 and one encoded block, plus at most 1024 metadata entries. The reader retains at

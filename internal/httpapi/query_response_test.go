@@ -102,7 +102,7 @@ func TestQueryResponseRollback(t *testing.T) {
 	}
 }
 
-func TestOversizeQueryRecordAfterByteLimitedPage(t *testing.T) {
+func TestOversizeQueryRecordBeforeIssuingCursor(t *testing.T) {
 	stamp := time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC)
 	first := store.Row{TS: stamp, Line: "small"}
 	oversized := store.Row{TS: stamp, Line: strings.Repeat("<", queryStringChunk)}
@@ -111,22 +111,16 @@ func TestOversizeQueryRecordAfterByteLimitedPage(t *testing.T) {
 
 	// The unescaped line could fit, but its escaped form cannot.
 	capBytes := len(oversized.Line) + len(jsonRow(t, first))
-	h := NewWithQueryMaxResponseBytes(s, nil, capBytes)
+	h := NewWithPageSource(&legacyPageSource{store: s}, nil, capBytes, DefaultQueryConcurrency, DefaultQueryWorkBudget)
 	query := func(params string) *httptest.ResponseRecorder {
 		out := httptest.NewRecorder()
 		h.ServeHTTP(out, httptest.NewRequest(http.MethodGet, queryBounds+params, nil))
 		return out
 	}
-	page := query("&page=1")
-	token := page.Header().Get("Bog-Next-Cursor")
-	if page.Code != http.StatusOK || page.Body.String() != jsonRow(t, first) || token == "" ||
-		page.Header().Get("Content-Length") != strconv.Itoa(page.Body.Len()) {
-		t.Fatalf("page: status=%d headers=%v bytes=%d", page.Code, page.Header(), page.Body.Len())
-	}
 	required := len(jsonRow(t, oversized))
 	message := fmt.Sprintf("query record exceeds response byte limit (cap %d bytes, requires %d bytes)", capBytes, required)
-	for range 2 {
-		assertQueryRejection(t, query("&cursor="+token), http.StatusUnprocessableEntity, message)
+	for _, limit := range []string{"1", "2"} {
+		assertQueryRejection(t, query("&page=1&limit="+limit), http.StatusUnprocessableEntity, message)
 	}
 }
 

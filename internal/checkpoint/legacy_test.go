@@ -3,10 +3,14 @@ package checkpoint
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 
 	"bog/internal/store"
 )
@@ -151,5 +155,125 @@ func TestOrdinalsAcrossFrames(t *testing.T) {
 	}
 	if len(ordinals) != 4 || ordinals[0] != 0 || ordinals[1] != 1 || ordinals[2] != 2 || ordinals[3] != 3 {
 		t.Fatal(ordinals)
+	}
+}
+
+func TestCloseWaitsForAcceptedScan(t *testing.T) {
+	for _, visitorFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("visitorFails=%t", visitorFails), func(t *testing.T) {
+			dir, _, _ := fixture(t)
+			l, err := OpenLegacy(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entered, release := make(chan struct{}), make(chan struct{})
+			visitorErr := errors.New("visitor failed")
+			scanDone := make(chan error, 1)
+			go func() {
+				scanDone <- l.Scan(func(_, _ int64, _ uint64, _ []store.Row) error {
+					close(entered)
+					<-release
+					if visitorFails {
+						return visitorErr
+					}
+					return nil
+				})
+			}()
+			<-entered
+			closeDone := make(chan error, 2)
+			go func() { closeDone <- l.Close() }()
+			// Observe admission closing before checking rejection or starting another close.
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				l.mu.Lock()
+				closing := l.closing
+				l.mu.Unlock()
+				if closing {
+					break
+				}
+				if time.Now().After(deadline) {
+					close(release)
+					t.Fatal("Close did not begin")
+				}
+				runtime.Gosched()
+			}
+			go func() { closeDone <- l.Close() }()
+			if err := l.Scan(nil); !errors.Is(err, os.ErrClosed) {
+				t.Errorf("scan during close: %v", err)
+			}
+			if other, err := OpenLegacy(dir); err == nil {
+				other.Close()
+				t.Error("directory lock released during scan")
+			}
+			select {
+			case err := <-closeDone:
+				t.Errorf("Close returned during scan: %v", err)
+			default:
+			}
+			close(release)
+			if err := <-scanDone; visitorFails && !errors.Is(err, visitorErr) || !visitorFails && err != nil {
+				t.Errorf("scan: %v", err)
+			}
+			for i := 0; i < 2; i++ {
+				if err := <-closeDone; err != nil {
+					t.Errorf("close: %v", err)
+				}
+			}
+			if err := l.Close(); err != nil {
+				t.Errorf("repeated close: %v", err)
+			}
+			other, err := OpenLegacy(dir)
+			if err != nil {
+				t.Fatal("reacquire lock:", err)
+			}
+			other.Close()
+		})
+	}
+}
+
+func TestScanAfterClose(t *testing.T) {
+	for _, populated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("populated=%t", populated), func(t *testing.T) {
+			var dir string
+			if populated {
+				dir, _, _ = fixture(t)
+			} else {
+				dir = t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "bog.wal"), []byte("BOGWAL01"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			l, err := OpenLegacy(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := l.Scan(nil); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("scan after close: %v", err)
+			}
+		})
+	}
+}
+
+func TestFailedOpenReleasesLocks(t *testing.T) {
+	dir, _, marker := fixture(t)
+	if err := os.WriteFile(filepath.Join(dir, "bog.commit"), []byte("bad"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := OpenLegacy(dir); err == nil {
+		l.Close()
+		t.Fatal("accepted invalid marker")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bog.commit"), marker, 0600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := OpenLegacy(dir)
+	if err != nil {
+		t.Fatal("reopen after failure:", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

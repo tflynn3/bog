@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 
 	"bog/internal/store"
@@ -21,6 +22,12 @@ type Legacy struct {
 	root     *os.Root
 	dir, wal *os.File
 	end      int64
+
+	mu       sync.Mutex
+	closing  bool
+	closed   chan struct{}
+	closeErr error
+	scans    sync.WaitGroup
 }
 
 // OpenLegacy pins and locks the data directory, and reads the committed boundary.
@@ -121,6 +128,15 @@ func (l *Legacy) CommittedOffset() int64 { return l.end }
 // Memory is bounded by one maximum-size frame and its decoded rows, independent
 // of WAL length. An error in a committed frame is never treated as a torn tail.
 func (l *Legacy) Scan(visit func(offset, next int64, firstOrdinal uint64, rows []store.Row) error) error {
+	l.mu.Lock()
+	if l.closing {
+		l.mu.Unlock()
+		return os.ErrClosed
+	}
+	l.scans.Add(1)
+	l.mu.Unlock()
+	defer l.scans.Done()
+
 	var h [16]byte
 	var payload []byte
 	var ordinal uint64
@@ -166,8 +182,21 @@ func (l *Legacy) Scan(visit func(offset, next int64, firstOrdinal uint64, rows [
 	return nil
 }
 
-// Close releases the input files and directory lock.
+// Close waits for accepted scans and releases the input files and directory lock.
+// It must be called outside a Scan visitor, since it waits for that scan to finish.
 func (l *Legacy) Close() error {
+	l.mu.Lock()
+	if l.closing {
+		done := l.closed
+		l.mu.Unlock()
+		<-done
+		return l.closeErr
+	}
+	l.closing = true
+	l.closed = make(chan struct{})
+	l.mu.Unlock()
+
+	l.scans.Wait()
 	var err error
 	if l.wal != nil {
 		err = l.wal.Close()
@@ -185,5 +214,7 @@ func (l *Legacy) Close() error {
 		}
 		l.root = nil
 	}
+	l.closeErr = err
+	close(l.closed)
 	return err
 }

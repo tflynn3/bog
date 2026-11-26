@@ -185,6 +185,87 @@ func TestDiagnosticRecoveryOfFailedGroup(t *testing.T) {
 	check(s, "acknowledged", "healthy")
 }
 
+// fullDeviceFile sends one WAL write to the kernel's full device, while keeping
+// rollback operations on the real WAL file.
+type fullDeviceFile struct {
+	file
+	full   *os.File
+	writes int
+}
+
+func (f *fullDeviceFile) Write(p []byte) (int, error) {
+	f.writes++
+	if f.writes == 2 {
+		return f.full.Write(p)
+	}
+	return f.file.Write(p)
+}
+
+func TestRealENOSPCRollbackRecovery(t *testing.T) {
+	full, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		t.Skip("/dev/full is unavailable")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer full.Close()
+	if _, err := full.Write([]byte("probe")); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("/dev/full write error = %v, want ENOSPC", err)
+	}
+
+	dir := t.TempDir()
+	s := &store.Store{}
+	l, err := Open(dir, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	appendLine := func(line string) error {
+		payload := []byte(fmt.Sprintf(`{"ts":"2025-01-01T00:00:00Z","line":%q}`, line))
+		rows, err := store.Decode(payload)
+		if err != nil {
+			return err
+		}
+		return l.Append(payload, rows)
+	}
+	if err := appendLine("acknowledged"); err != nil {
+		t.Fatal(err)
+	}
+	l.f = &fullDeviceFile{file: l.f, full: full}
+	result := make(chan error, 1)
+	go func() { result <- appendLine("failed") }()
+	select {
+	case err := <-result:
+		if !errors.Is(err, syscall.ENOSPC) {
+			t.Fatalf("append error = %v, want ENOSPC", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("append did not finish rollback")
+	}
+	go func() { result <- appendLine("after rollback") }()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("append after rollback: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WAL did not respond after rollback")
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered := &store.Store{}
+	l, err = Open(dir, recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := recovered.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10)
+	if len(rows) != 2 || rows[0].Line != "acknowledged" || rows[1].Line != "after rollback" {
+		t.Fatalf("recovered rows = %+v", rows)
+	}
+}
+
 func TestMarkerPreparationDiagnostic(t *testing.T) {
 	out := captureDiagnostics(t)
 	l, err := Open(t.TempDir(), &store.Store{})

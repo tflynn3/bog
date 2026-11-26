@@ -7,12 +7,54 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"bog/internal/store"
 )
+
+type gatedDiagnosticSink struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *gatedDiagnosticSink) Emit(DiagnosticEvent) {
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+}
+
+func TestAsyncSinkDropsWithoutBlocking(t *testing.T) {
+	consumer := &gatedDiagnosticSink{entered: make(chan struct{}), release: make(chan struct{})}
+	sink := NewAsyncSink(1, consumer)
+	defer close(consumer.release)
+	event := DiagnosticEvent{OpCode: OpWALWrite, ErrCategory: ErrCategoryENOSPC}
+	sink.Emit(event)
+	select {
+	case <-consumer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("consumer did not start")
+	}
+	sink.Emit(event) // fill the queue while the consumer is blocked
+	before := DiagnosticsDropped.Load()
+	done := make(chan struct{})
+	go func() { sink.Emit(event); sink.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("emit or stop blocked on consumer")
+	}
+	if got := DiagnosticsDropped.Load() - before; got != 1 {
+		t.Fatalf("dropped = %d, want 1", got)
+	}
+	select {
+	case <-sink.Done():
+		t.Fatal("worker exited while consumer was blocked")
+	default:
+	}
+}
 
 type diagnosticFile struct {
 	file

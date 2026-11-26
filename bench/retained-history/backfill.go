@@ -84,6 +84,8 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	}
 	p.HeldExhausted = true
 	p.boundary("held_exhausted")
+	// Terminal pages remain retryable until expiry or explicit release.
+	// Observe the predecessor independently of cursor exhaustion.
 	setPhase("pin_drain")
 	if err := p.observeDrain(ctx, drainBudget); err != nil {
 		return published, err

@@ -108,6 +108,39 @@ func TestQueryCaptureUsesEarlierDeadline(t *testing.T) {
 	}
 }
 
+func TestShippedCursorPreservesOriginalDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+		rows := []store.Row{{TS: stamp, Line: "c"}, {TS: stamp, Line: "a"}, {TS: stamp, Line: "b"}}
+		s := new(store.Store)
+		s.Publish(rows)
+		h := NewWithQueryLimits(s, nil, DefaultQueryMaxResponseBytes, 1, 50)
+		a := h.(*API)
+		defer func() {
+			if err := a.Close(t.Context()); err != nil {
+				t.Error(err)
+			}
+		}()
+		first := issueCapture(t, a)
+		time.Sleep(queryCaptureLifetime - time.Nanosecond)
+		second := assertRetainedPage(t, requestCapturePage(h, "&limit=1&cursor="+first), jsonRow(t, rows[1]))
+		if second == "" || second == first {
+			t.Fatalf("second cursor = %q", second)
+		}
+		if terminal := assertRetainedPage(t, requestCapturePage(h, "&limit=1&cursor="+second), jsonRow(t, rows[2])); terminal != "" {
+			t.Fatalf("terminal cursor = %q", terminal)
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		for _, token := range []string{first, second} {
+			assertQueryRejection(t, requestCapturePage(h, "&limit=1&cursor="+token), http.StatusGone, "query capture expired")
+		}
+		if views := len(a.captures.source.(*legacyPageSource).views); views != 0 {
+			t.Fatalf("expired walk retained %d storage views", views)
+		}
+	})
+}
+
 func TestQueryCaptureExpiryDrainsAdmittedDelivery(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		source := captureFixtureSource()

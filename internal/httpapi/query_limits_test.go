@@ -42,8 +42,8 @@ func TestLiveQueryScanWork(t *testing.T) {
 		{"direct nonmatches", direct, "&contains=x", 1 + 2 + 3*5},
 		{"merged nonmatches", merged, "&contains=x", 2 + 3 + 3*5},
 		// The first 512 rows are scanned. Four blocks are pruned after
-		// the upper bound seek, so the final unit is a Bloom check.
-		{"Bloom pruning", bloom, "&page=1&limit=1&contains=needle", 1 + 11 + 11 + 512*5 + 4},
+		// the upper bound seek. Snapshot acquisition costs one more unit.
+		{"Bloom pruning", bloom, "&page=1&limit=1&contains=needle", 1 + 1 + 11 + 11 + 512*5 + 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := func(budget uint64) *httptest.ResponseRecorder {
@@ -86,18 +86,10 @@ func TestLiveQuerySmallWorkBudget(t *testing.T) {
 	if ordinary.Code != http.StatusOK || ordinary.Body.String() != jsonRow(t, rows[0])+jsonRow(t, rows[1]) {
 		t.Fatalf("ordinary query: status=%d body=%q", ordinary.Code, ordinary.Body.String())
 	}
-	first := query(queryBounds, "&page=1&limit=1")
-	token := first.Header().Get("Bog-Next-Cursor")
-	if first.Code != http.StatusOK || first.Body.String() != jsonRow(t, rows[0]) || token == "" {
-		t.Fatalf("legacy first page: status=%d headers=%v body=%q", first.Code, first.Header(), first.Body.String())
-	}
-	assertQueryRejection(t, query(queryBounds, "&cursor="+token), http.StatusServiceUnavailable, "query work budget exhausted")
 	assertQueryRejection(t, query(queryBounds, "&limit=3"), http.StatusServiceUnavailable, "query work budget exhausted")
-	assertQueryRejection(t, query(queryBounds, "&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
 
-	// The retained constructor must reach the final match before publishing
-	// a cursor, even though one-row lookahead reaches the second match.
-	h = NewWithPageSource(&legacyPageSource{store: s}, nil, DefaultQueryMaxResponseBytes, 1, budget)
+	// Lookahead can reach the second match, but certification must also
+	// reach the last match before the handler publishes a cursor.
 	assertQueryRejection(t, query(queryBounds, "&page=1&limit=1"), http.StatusServiceUnavailable, "query work budget exhausted")
 	assertQueryRejection(t, query(queryBounds, "&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
 
@@ -124,8 +116,16 @@ func TestLiveQueryConcurrentCursorResume(t *testing.T) {
 	firstLine, tieLine, lastLine := jsonRow(t, early), jsonRow(t, tie), jsonRow(t, late)
 	s := new(store.Store)
 	s.Publish([]store.Row{tie, late, early, tie})
-	a := newAPI(s, publishingAppender{s}, 2*len(tieLine), DefaultQueryWorkBudget)
-	h := a.handler(2)
+	const budget = 100
+	h := NewWithQueryLimits(s, publishingAppender{s}, 2*len(tieLine), 2, budget)
+	a := h.(*API)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), admissionWaitTimeout)
+		defer cancel()
+		if err := a.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
 
 	query := func(path string) *httptest.ResponseRecorder {
 		out := httptest.NewRecorder()

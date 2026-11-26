@@ -14,8 +14,10 @@ producer hashes the supplied executable and writes schema-version 1 case
 evidence. A case failure produces a failing report entry and a nonzero exit.
 Run as a user who can mount and unmount a private tmpfs using either mount
 privileges or noninteractive `sudo -n`. The verifier creates fresh data
-directories and binds the candidate to loopback. The disk-full case creates
-an 8 MiB tmpfs, allocates its remaining blocks, and requires an extra write
+directories and binds the candidate to loopback. A relative `TMPDIR` is
+resolved against the verifier's launch directory before creating the fixture.
+The disk-full case creates an 8 MiB tmpfs, allocates its remaining blocks,
+and requires an extra write
 to return kernel `ENOSPC`. Bog opens a data directory through a symlink.
 The verifier then atomically retargets the symlink across filesystems while
 Bog is serving.
@@ -33,11 +35,21 @@ Bog is serving.
 
 Each retarget direction samples readiness for six seconds before ingest, with
 a ten-second deadline for each observation. This outlasts cached readiness
-evidence and spans multiple disk samples. The `enospc` case reports
+evidence and spans multiple disk samples. Each direction has its own probe
+budget. The verifier attempts cleanup of the first candidate and filler
+before starting the second probe. The `enospc` case reports
 `healthy_to_full` and `full_to_healthy` with the observed readiness status
 and reason and the ingest HTTP status. It also records replay success for
 `healthy_to_full` and the rollback reason and category for
-`full_to_healthy`. Candidate cleanup precedes unmount on every exit path.
+`full_to_healthy`. Setup, probe, and cleanup failures appear in the case
+detail and fail the producer. Candidate cleanup precedes unmount on every
+exit path. If unmount fails and the verifier cannot confirm detachment,
+the case detail identifies the retained mount directory.
+
+For release qualification, record `uname -sm` on each native Linux runner
+(`Linux x86_64` and `Linux aarch64`) alongside the producer exit status and
+`durability.json` from the same composed revision. The readiness checks
+require the descriptor-backed readiness wiring from #60.
 
 Every candidate runs in its own process group. The verifier terminates the
 group on startup failure or cancellation and before reaping an exited leader.

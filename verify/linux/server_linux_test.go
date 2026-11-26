@@ -364,3 +364,27 @@ func TestRunFailsWithoutRequiredEvidence(t *testing.T) {
 		}
 	}
 }
+
+func TestRunRecordsFixtureRootFailure(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	t.Setenv("TMPDIR", "missing")
+	path := filepath.Join(root, "durability.json")
+	err := run(t.Context(), []string{"-binary", "/bin/false", "-revision", testRevision, "-fixture", fixtureID, "-report", path})
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected missing temporary directory error, got %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got report
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"sigkill", "recovery", "enospc"} {
+		if out := got.Cases[name]; out.Status != "fail" || !strings.Contains(out.Detail, "create fixture directory") {
+			t.Errorf("missing fixture setup failure for %s: %+v", name, out)
+		}
+	}
+}

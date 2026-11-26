@@ -224,21 +224,6 @@ type Store struct {
 	blocks    []*blockFilter // immutable summaries of sealed append-ordinal blocks
 }
 
-// indexRun maps sorted ranks to append ordinals. A nil ordinal slice denotes
-// a contiguous append-ordinal range starting at base.
-type indexRun struct {
-	ordinals []int
-	base     int
-	length   int
-}
-
-func (r indexRun) ordinal(rank int) int {
-	if r.ordinals == nil {
-		return r.base + rank
-	}
-	return r.ordinals[rank]
-}
-
 // RecoveryBuilder collects validated WAL frames before the store becomes ready.
 type RecoveryBuilder struct {
 	rows    []Row
@@ -299,12 +284,17 @@ func (b *RecoveryBuilder) Install(s *Store) {
 			}
 			return a - c
 		})
+		run.buildVisibility()
 	}
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.rows, s.restored, s.runs, s.blocks = b.rows, run, nil, b.blocks
+	// The builder can keep appending to its backing arrays. Force the first
+	// live append to allocate its own arrays, preserving the shared prefix.
+	s.rows = b.rows[:len(b.rows):len(b.rows)]
+	s.blocks = b.blocks[:len(b.blocks):len(b.blocks)]
+	s.restored, s.runs = run, nil
 }
 
 // Publish serializes writers, but leaves readers free to use the previous snapshot
@@ -345,15 +335,8 @@ func (s *Store) Publish(batch []Row) {
 			break
 		}
 	}
-	for level := 0; ; level++ {
-		if level == len(runs) {
-			runs = append(runs, run)
-			break
-		}
-		if runs[level].length == 0 {
-			runs[level] = run
-			break
-		}
+	level := 0
+	for ; level < len(runs) && runs[level].length != 0; level++ {
 		old := runs[level]
 		if old.ordinals == nil && run.ordinals == nil && old.base+old.length == run.base &&
 			!rows[run.base].TS.Before(rows[old.base+old.length-1].TS) {
@@ -376,9 +359,17 @@ func (s *Store) Publish(batch []Row) {
 			for ; j < run.length; j++ {
 				merged = append(merged, run.ordinal(j))
 			}
-			run = indexRun{ordinals: merged, length: len(merged)}
+			run = indexRun{ordinals: merged, base: old.base, length: len(merged)}
 		}
 		runs[level] = indexRun{}
+	}
+	if run.ordinals != nil {
+		run.buildVisibility()
+	}
+	if level == len(runs) {
+		runs = append(runs, run)
+	} else {
+		runs[level] = run
 	}
 	s.mu.Lock()
 	s.rows, s.runs, s.blocks = rows, runs, blocks
@@ -414,8 +405,9 @@ type Position struct {
 	Ordinal int       `json:"ordinal"`
 }
 
-// QueryPage captures the published row count when snapshot is nil. A continuation
-// is valid only when its position still identifies a matching row in that snapshot.
+// QueryPage captures the published row count when both snapshot and after are nil.
+// A continuation requires both values, and after must identify a matching row
+// in the supplied snapshot.
 func (s *Store) QueryPage(start, end time.Time, contains string, limit int, snapshot *int, after *Position) ([]Row, int, *Position, bool) {
 	rows, count, next, err := s.QueryPageWithWork(start, end, contains, limit, snapshot, after, nil)
 	return rows, count, next, err == nil
@@ -430,13 +422,16 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	if err := work.Charge(); err != nil {
 		return nil, 0, nil, err
 	}
+	if (snapshot == nil) != (after == nil) {
+		return nil, 0, nil, ErrInvalidQueryCursor
+	}
 	s.mu.RLock()
 	rows, blocks, restored, levels := s.rows, s.blocks, s.restored, s.runs
 	s.mu.RUnlock()
 	count := len(rows)
 	if snapshot != nil {
 		count = *snapshot
-		if count < 1 || count > len(rows) || after == nil || after.Ordinal < 0 || after.Ordinal >= count {
+		if count < 1 || count > len(rows) || after.Ordinal < 0 || after.Ordinal >= count {
 			return nil, 0, nil, ErrInvalidQueryCursor
 		}
 		row := rows[after.Ordinal]
@@ -462,17 +457,24 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	}
 	// Seek once to the start and cursor for each run. Upper bounds are deferred
 	// until a bounded scan has had a chance to answer the query.
-	offsets := make([]int, len(runs))
-	lower := make([]int, len(runs))
-	for i, run := range runs {
+	offsets := make([]int, 0, len(runs))
+	lower := make([]int, 0, len(runs))
+	visibleRuns := runs[:0]
+	for _, run := range runs {
 		if err := work.Charge(1); err != nil {
 			return nil, 0, nil, err
+		}
+		if run.base >= count {
+			continue
+		}
+		if run.ordinals == nil {
+			run.length = min(run.length, count-run.base)
 		}
 		if err := work.seek(run.length); err != nil {
 			return nil, 0, nil, err
 		}
 		lo := sort.Search(run.length, func(j int) bool { return !rows[run.ordinal(j)].TS.Before(start) })
-		lower[i] = lo
+		lower = append(lower, lo)
 		if after != nil {
 			if err := work.seek(run.length - lo); err != nil {
 				return nil, 0, nil, err
@@ -483,8 +485,14 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 				return t.After(after.Time) || (t.Equal(after.Time) && ordinal > after.Ordinal)
 			})
 		}
-		offsets[i] = lo
+		offset, err := run.nextVisible(lo, count, work)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		offsets = append(offsets, offset)
+		visibleRuns = append(visibleRuns, run)
 	}
+	runs = visibleRuns
 	active := -1
 	for i, offset := range offsets {
 		if offset < runs[i].length && rows[runs[i].ordinal(offset)].TS.Before(end) {
@@ -516,25 +524,28 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			if scanThreshold > 0 && examined >= scanThreshold {
 				return nil, nil, false, nil
 			}
-			directOffset++
 			examined++
-			if err := work.row(row.Line, ordinal < count); err != nil {
+			if err := work.row(row.Line, true); err != nil {
 				return nil, nil, false, err
 			}
-			if ordinal >= count || !strings.Contains(row.Line, contains) {
-				continue
+			if strings.Contains(row.Line, contains) {
+				if len(directResult) == limit {
+					return directResult, &Position{rows[directLast].TS, directLast}, true, nil
+				}
+				if directResult == nil {
+					directResult = make([]Row, 0, min(limit, count))
+				}
+				directResult = append(directResult, row)
+				directLast = ordinal
+				if !lookahead && len(directResult) == limit {
+					return directResult, nil, true, nil
+				}
 			}
-			if len(directResult) == limit {
-				return directResult, &Position{rows[directLast].TS, directLast}, true, nil
+			next, err := run.nextVisible(directOffset+1, count, work)
+			if err != nil {
+				return nil, nil, false, err
 			}
-			if directResult == nil {
-				directResult = make([]Row, 0, min(limit, count))
-			}
-			directResult = append(directResult, row)
-			directLast = ordinal
-			if !lookahead && len(directResult) == limit {
-				return directResult, nil, true, nil
-			}
+			directOffset = next
 		}
 		if directResult == nil {
 			directResult = []Row{}
@@ -559,10 +570,10 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			current := h.items[0]
 			examined++
 			row := rows[current.ordinal]
-			if err := work.row(row.Line, current.ordinal < count); err != nil {
+			if err := work.row(row.Line, true); err != nil {
 				return nil, nil, false, err
 			}
-			if current.ordinal < count && strings.Contains(row.Line, contains) {
+			if strings.Contains(row.Line, contains) {
 				if len(result) == limit {
 					return result, &Position{rows[last.ordinal].TS, last.ordinal}, true, nil
 				}
@@ -575,8 +586,11 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 					return result, nil, true, nil
 				}
 			}
-			next := current.offset + 1
 			run := runs[current.run]
+			next, err := run.nextVisible(current.offset+1, count, work)
+			if err != nil {
+				return nil, nil, false, err
+			}
 			if next < run.length && rows[run.ordinal(next)].TS.Before(end) {
 				h.items[0] = candidate{run.ordinal(next), current.run, next}
 				heap.Fix(h, 0)
@@ -667,7 +681,7 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 				return nil, 0, nil, err
 			}
 			hi := lower[i] + sort.Search(run.length-lower[i], func(j int) bool { return !rows[run.ordinal(lower[i]+j)].TS.Before(end) })
-			bound += hi - lower[i]
+			bound += min(hi-lower[i], count-run.base)
 		}
 		if bound >= 32768 {
 			if active == -2 {
@@ -771,14 +785,18 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			if !row.TS.Before(end) {
 				return nil
 			}
-			if err := work.row(row.Line, ordinal < count); err != nil {
+			if err := work.row(row.Line, true); err != nil {
 				return err
 			}
-			if ordinal < count && strings.Contains(row.Line, contains) {
+			if strings.Contains(row.Line, contains) {
 				heap.Push(h, candidate{ordinal, runIndex, offset})
 				return nil
 			}
-			offset++
+			next, err := run.nextVisible(offset+1, count, work)
+			if err != nil {
+				return err
+			}
+			offset = next
 		}
 		return nil
 	}
@@ -796,7 +814,11 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		}
 		result = append(result, rows[last.ordinal])
 		if lookahead || len(result) < limit {
-			if err := advance(last.run, last.offset+1); err != nil {
+			offset, err := runs[last.run].nextVisible(last.offset+1, count, work)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if err := advance(last.run, offset); err != nil {
 				return nil, 0, nil, err
 			}
 		}

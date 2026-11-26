@@ -15,8 +15,9 @@ var (
 // A nil meter permits unlimited work for callers of the legacy Store methods.
 //
 // Each scan charges one unit per index run, up to the worst-case number of
-// comparisons for each binary seek, and one unit per block considered for Bloom
-// pruning (at most 96 bit tests). It charges one unit per candidate visited plus
+// comparisons for each binary seek, one unit per snapshot visibility probe,
+// and one unit per block considered for Bloom pruning (at most 96 bit tests).
+// It charges one unit per candidate visited plus
 // one per decoded line byte for candidates eligible for matching. Cursor anchor
 // checks and lookahead candidates use the same row and byte rate. Revisited work
 // is charged again, including after an optimization falls back to another scan.

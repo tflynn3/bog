@@ -16,7 +16,7 @@ trusted network or behind an authenticated access layer.
 ## Observed Linux production imports
 
 These are the direct imports between root-module production packages at
-`dd2b61184a115f72f77a89ae995dbfec67d46cb7`, listed for Linux amd64 with
+`5782ab3a08341cfb159a39bbf982f61482f4177c`, listed for Linux amd64 with
 cgo disabled. Arrows point from importer to dependency. Test-only packages
 are listed in the registry below. An isolated node has zero direct
 root-module production imports.
@@ -86,14 +86,18 @@ flowchart TD
 
 ## Retained-history handoff
 
-At cutover, `cmd/bog` injects the retained adapter into HTTP's consumer-owned
-`PageSource`. HTTP owns admission, cursor authentication and lifetime, and
-NDJSON framing. The adapter uses the WAL owner and history catalog to answer
-queries from a coherent capture. Checkpoint validates and durably publishes
-immutable generations. History owns generation pins, segment scans, and
-reclamation. Store owns decoded tail rows and their order. Backup consumes a
-pinned storage view. The packages providing storage, including the staged
-retry library, stay independent of HTTP, readiness, and the Go HTTP client.
+At cutover, the retained adapter lives in `cmd/bog` and implements HTTP's
+consumer-owned `PageSource`. HTTP owns admission, cursor authentication and
+lifetime, and NDJSON framing. The WAL owner selects and activates writable
+recovery state for ordinary WAL directories, retained generations, and
+verified restores. The adapter reads a coordinated capture from the owner and
+history catalog. Checkpoint validates and durably publishes immutable
+generations. History owns generation pins, segment scans, and reclamation.
+Store owns decoded tail rows and their order. Backup consumes a pinned
+storage view. Checkpoint, history, and backup receive readers, bounds, and
+pins through composition and must have no production import path to the WAL
+owner. The packages providing storage, including the staged retry library,
+stay independent of HTTP, readiness, and the Go HTTP client.
 
 The coordinated capture binds the validated generation and exact durable,
 query-visible tail under the same owner. A cursor reads the same view across
@@ -111,6 +115,7 @@ capacity control drives replacement through the same owner.
 [ADR 0004](../adr/0004-retained-history-cutover.md)
 [ADR 0005](../adr/0005-pinned-writable-recovery-authority.md)
 [ADR 0006](../adr/0006-fixed-budget-query-continuations.md)
+[ADR 0007](../adr/0007-runtime-storage-composition.md)
 
 ## Package registry
 
@@ -179,22 +184,22 @@ run records a baseline.
 
 ## Fitness and registry ownership
 
-The bog architecture specialty owns the system graph, ADR 0006, and the
-fitness registry. The bog query specialty (`bog-query`) owns #59 and the
-HTTP paging contract. `bog-storage` owns #53 and composes the retained
-adapter in `cmd/bog`. The query and storage owners coordinate replay and
-expiry behavior at the consumer seam. #61, #62, and the Linux corruption
-gate continue under their current owners. #60 follows the command lease
-handoff, and #63 follows cutover.
+The bog architecture maintainer owns the system graph, ADRs 0006 and 0007,
+and the fitness registry. The bog query specialty (`bog-query`) owns #59 and
+the HTTP paging contract. `bog-storage` owns #53 and composes the retained
+adapter in `cmd/bog`. Before composition, the architecture maintainer reviews
+commit and capture ordering, deterministic replay, expiry, and reference
+ownership with `bog-storage` and the #59 owner. #61, #62, and the Linux
+corruption gate continue under their current owners. #60 follows the command
+lease handoff, and #63 follows cutover.
 
 #61 holds a read lease on `internal/archtest/architecture_test.go`. After
 that lease clears, the architecture owner and `bog-storage` coordinate the
 registry update under the corresponding write lease in the #53 wiring merge.
 Review both sides of the current merge base and derive role promotions,
 direct edges, and retired packages or edges from the actual Linux production
-graph with #53 and #59 composed. Update the graph and registry together,
-including any adapter package the command reaches. Checkpoint, history, and
-backup are staged at this PR's base.
+graph with #53 and #59 composed. Update the graph and registry together.
+Checkpoint, history, and backup are staged at this PR's base.
 [Fitness registry](../../internal/archtest/architecture_test.go)
 
 The Architecture workflow runs `go test -count=1 ./internal/archtest` on the
@@ -213,10 +218,16 @@ registered path through an intermediate package. Its fixtures exercise
 both command-owned adapter wiring and HTTP bypasses.
 [Paging boundary check](../../internal/archtest/cutover_boundaries_test.go)
 
+The storage authority check rejects direct and transitive root-module
+production paths from checkpoint, history, or backup to `internal/wal`,
+including paths whose edges are all registered. Its fixtures cover valid
+command-local composition and bypasses through a registered intermediary.
+[Storage authority check](../../internal/archtest/storage_authority_test.go)
+
 Run
 `go test -count=1 ./internal/archtest` and
 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on this PR. Repeat both
-on the composed tree before dispatching the release gate with its full commit
+on the composed tree before dispatching the #53 release gate with its full commit
 SHA. Qualification requires the same Linux binary to pass verified restore,
 fixed-budget pagination, readiness on the active WAL filesystem, and the other
 checks in the existing gate.

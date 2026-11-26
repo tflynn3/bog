@@ -42,19 +42,8 @@ type envelope struct {
 	SHA256  string          `json:"sha256"`
 }
 
-type manifest struct {
-	Version       int           `json:"version"`
-	SourceSHA256  string        `json:"source_sha256"`
-	CoveredOffset int64         `json:"covered_offset"`
-	NextOrdinal   uint64        `json:"next_ordinal"`
-	Segments      []segmentMeta `json:"segments"`
-}
-
-type segmentMeta struct {
-	Name   string `json:"name"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
-}
+type manifest = checkpoint.Manifest
+type segmentMeta = checkpoint.Segment
 
 type seekPoint struct {
 	key    Position
@@ -123,7 +112,7 @@ func readManifest(dir *os.File) (_ manifest, _ GenerationID, err error) {
 
 func openRegular(dir *os.File, name string) (*os.File, os.FileInfo, error) {
 	// All names are either constant or checked against the v1 basename format.
-	fd, err := syscall.Openat(int(dir.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	fd, err := openat(int(dir.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, nil, &os.PathError{Op: "openat", Path: name, Err: err}
 	}
@@ -146,6 +135,23 @@ func openDirectory(path string) (*os.File, os.FileInfo, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	return checkDirectory(dir)
+}
+
+// Reopen relative to the authority descriptor so the catalog owns an
+// independent directory handle without consulting the configured path.
+func openPinnedDirectory(dir *os.File) (*os.File, os.FileInfo, error) {
+	if dir == nil {
+		return nil, nil, errors.New("missing pinned history directory")
+	}
+	fd, err := openat(int(dir.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return checkDirectory(os.NewFile(uintptr(fd), dir.Name()))
+}
+
+func checkDirectory(dir *os.File) (*os.File, os.FileInfo, error) {
 	info, err := dir.Stat()
 	if err != nil {
 		return nil, nil, errors.Join(err, dir.Close())
@@ -165,13 +171,32 @@ func loadAt(ctx context.Context, dir *os.File) (*generation, error) {
 	if err := checkpoint.CheckPublication(dir); err != nil {
 		return nil, err
 	}
+	g, _, err := loadAuthority(ctx, dir)
+	return g, err
+}
+
+// ValidatePinnedAuthority validates the manifest and every referenced segment.
+// The caller must hold the publication lock, keep dir open, and independently
+// validate the WAL boundary. Recovery can call this with staging present.
+func ValidatePinnedAuthority(ctx context.Context, dir *os.File) (*checkpoint.Manifest, error) {
+	if dir == nil {
+		return nil, errors.New("missing pinned history directory")
+	}
+	_, m, err := loadAuthority(ctx, dir)
+	return m, err
+}
+
+func loadAuthority(ctx context.Context, dir *os.File) (*generation, *checkpoint.Manifest, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	m, id, err := readManifest(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	source, ok := parseDigest(m.SourceSHA256)
 	if !ok {
-		return nil, fmt.Errorf("%w: invalid WAL prefix checksum", ErrIntegrity)
+		return nil, nil, fmt.Errorf("%w: invalid WAL prefix checksum", ErrIntegrity)
 	}
 	g := &generation{dir: dir, drained: make(chan struct{}), segments: make([]segment, len(m.Segments))}
 	g.info = Generation{
@@ -184,11 +209,11 @@ func loadAt(ctx context.Context, dir *os.File) (*generation, error) {
 	for i, s := range m.Segments {
 		if !validSegmentName(s.Name) || seen[s.Name] ||
 			s.Size < headerSize+rowHeaderSize || s.Size > checkpoint.MaxBlockSize {
-			return nil, fmt.Errorf("%w: invalid segment metadata for entry %d", ErrIntegrity, i)
+			return nil, nil, fmt.Errorf("%w: invalid segment metadata for entry %d", ErrIntegrity, i)
 		}
 		sum, ok := parseDigest(s.SHA256)
 		if !ok {
-			return nil, fmt.Errorf("%w: invalid segment checksum for entry %d", ErrIntegrity, i)
+			return nil, nil, fmt.Errorf("%w: invalid segment checksum for entry %d", ErrIntegrity, i)
 		}
 		g.segments[i] = segment{name: s.Name, digest: sum}
 		seen[s.Name] = true
@@ -196,12 +221,12 @@ func loadAt(ctx context.Context, dir *os.File) (*generation, error) {
 		maxSize = max(maxSize, int(s.Size))
 	}
 	if m.NextOrdinal < uint64(len(m.Segments)) || m.NextOrdinal > maxRows {
-		return nil, fmt.Errorf("%w: impossible checkpoint row count", ErrIntegrity)
+		return nil, nil, fmt.Errorf("%w: impossible checkpoint row count", ErrIntegrity)
 	}
 	if err := g.validate(ctx, m, make([]byte, maxSize)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return g, nil
+	return g, &m, nil
 }
 
 const segmentNameSize = len(segmentPrefix) + 32
@@ -265,7 +290,7 @@ func (s *segment) readVerified(dir *os.File, b []byte) (err error) {
 func sameSegment(a, b os.FileInfo) bool {
 	// Both stats come from openRegular, which checks their concrete type.
 	return a.Size() == b.Size() && a.ModTime().Equal(b.ModTime()) &&
-		a.Sys().(*syscall.Stat_t).Ctim == b.Sys().(*syscall.Stat_t).Ctim &&
+		changeTime(a.Sys().(*syscall.Stat_t)) == changeTime(b.Sys().(*syscall.Stat_t)) &&
 		os.SameFile(a, b)
 }
 

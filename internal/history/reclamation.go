@@ -41,13 +41,22 @@ func (c *Catalog) retiredIndex(info os.FileInfo) int {
 // validating the authoritative checkpoint under the exclusive publication lock.
 // A shared segment or one with live readers remains eligible for a later call.
 // It is safe to call after Close, including while retired readers are draining.
-func (c *Catalog) Reclaim(ctx context.Context, path string) (err error) {
+func (c *Catalog) Reclaim(ctx context.Context, path string) error {
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
+}
+
+// ReclaimPinned is Reclaim using the caller's pinned directory.
+func (c *Catalog) ReclaimPinned(ctx context.Context, dir *os.File) error {
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+}
+
+func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error) {
 	c.replace.Lock()
 	defer c.replace.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	dir, info, err := openDirectory(path)
+	dir, info, err := open()
 	if err != nil {
 		return err
 	}
@@ -133,7 +142,7 @@ func reclaimSegment(dir *os.File, name string, expected os.FileInfo) (complete b
 		}
 		return false, err
 	}
-	if err := syscall.Unlinkat(int(dir.Fd()), name); err != nil {
+	if err := unlinkat(int(dir.Fd()), name); err != nil {
 		return false, err
 	}
 	return true, nil

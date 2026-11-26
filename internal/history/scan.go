@@ -42,13 +42,23 @@ type Query struct {
 // to visit are safe to retain. A visit or I/O error stops the scan.
 func (r *Reader) Scan(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error) (err error) {
 	r.mu.Lock()
-	g := r.gen
-	if g != nil {
-		g.refs.Add(1)
+	if !r.deadline.IsZero() && !time.Now().Before(r.deadline) {
+		r.mu.Unlock()
+		return &ExpiredError{ID: r.info.ID}
 	}
-	r.mu.Unlock()
+	g := r.gen
 	if g == nil {
+		r.mu.Unlock()
 		return os.ErrClosed
+	}
+	var charge *checkpoint.Reservation
+	if r.charge != nil {
+		charge = r.charge.Retain()
+	}
+	g.refs.Add(1)
+	r.mu.Unlock()
+	if charge != nil {
+		defer charge.Release()
 	}
 	defer func() {
 		if closeErr := g.release(); closeErr != nil {

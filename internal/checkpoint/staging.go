@@ -22,7 +22,7 @@ func checkStaging(info os.FileInfo) error {
 }
 
 func openStaging(parent *os.File) (*os.File, error) {
-	fd, err := syscall.Openat(int(parent.Fd()), stageDir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	fd, err := openat(int(parent.Fd()), stageDir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}

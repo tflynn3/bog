@@ -38,7 +38,7 @@ func (g *generation) registerPin(ctx context.Context) (err error) {
 	token := hex.EncodeToString(nonce[:])
 	name, staged := pinPrefix+token, pinStagePrefix+token
 	dirFD := int(g.dir.Fd())
-	fd, err := syscall.Openat(dirFD, staged, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
+	fd, err := openat(dirFD, staged, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
 	if err != nil {
 		return &os.PathError{Op: "create generation pin", Path: staged, Err: err}
 	}
@@ -76,7 +76,7 @@ func (g *generation) registerPin(ctx context.Context) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := syscall.Renameat(dirFD, staged, dirFD, name); err != nil {
+	if err := renameat(dirFD, staged, name); err != nil {
 		return &os.LinkError{Op: "install generation pin", Old: staged, New: name, Err: err}
 	}
 	g.pin = f
@@ -98,7 +98,7 @@ func (g *generation) releasePin() (err error) {
 }
 
 func unlinkPin(dir *os.File, name string) error {
-	if err := syscall.Unlinkat(int(dir.Fd()), name); err != nil {
+	if err := unlinkat(int(dir.Fd()), name); err != nil {
 		return &os.PathError{Op: "unlink generation pin", Path: name, Err: err}
 	}
 	return nil

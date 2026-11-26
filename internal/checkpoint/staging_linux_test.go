@@ -119,7 +119,7 @@ func TestRecoverRejectsUnsafeStaging(t *testing.T) {
 				}
 				if name == "ambiguous stage with durable intent" {
 					requirePublicationOK(t, withTestPublication(l, func(p *publication) error {
-						a := publicationAttempt{pub: p}
+						a := publicationAttempt{pub: p, ctx: t.Context()}
 						installed = segmentPrefix + "55555555555555555555555555555555"
 						if err := a.stageSegment(installed, originalSegment, digest(originalSegment)); err != nil {
 							return err

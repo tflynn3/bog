@@ -1,5 +1,7 @@
 # Disk-backed v1 history
 
+The live WAL and command integration uses the [reservation contract](LIMITS.md).
+
 `Catalog.Replace` opens the authoritative `bog.checkpoint` in a pinned
 directory. A shared advisory lock on `bog.checkpoint.lock` serializes
 replacement with publication and reclamation. A competing exclusive operation

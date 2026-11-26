@@ -121,7 +121,7 @@ func readCommitMarker(r io.Reader, walSize int64) (int64, error) {
 
 func (l *Legacy) openFile(name string) (*os.File, error) {
 	// O_NOFOLLOW prevents a final-component symlink from escaping the pinned directory.
-	fd, err := syscall.Openat(int(l.dir.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	fd, err := openat(int(l.dir.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}

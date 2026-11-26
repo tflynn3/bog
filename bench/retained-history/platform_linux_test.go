@@ -12,6 +12,87 @@ import (
 	"time"
 )
 
+func TestChildOpensFixtureFromRelativeWorkDir(t *testing.T) {
+	const workDir = "local disk"
+	for _, tc := range []struct {
+		name    string
+		workDir string
+		tempDir string
+	}{
+		{name: "relative flag", workDir: workDir, tempDir: "."},
+		{name: "relative TMPDIR", tempDir: workDir},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			t.Chdir(cwd)
+			parent := filepath.Join(cwd, workDir)
+			if err := os.Mkdir(parent, 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TMPDIR", tc.tempDir)
+			root, err := createFixtureRoot(tc.workDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := os.RemoveAll(root); err != nil {
+					t.Error(err)
+				}
+			})
+			dir := filepath.Join(root, "store-0")
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			const fixture = "intended store\n"
+			if err := os.WriteFile(filepath.Join(dir, "fixture"), []byte(fixture), 0600); err != nil {
+				t.Fatal(err)
+			}
+			candidate := filepath.Join(root, "bog")
+			const script = `#!/bin/sh
+[ "$3" = -data-dir ] && [ "$4" -ef . ] || exit 11
+IFS= read -r value < "$4/fixture" || exit 12
+printf '%s\n' "$value" > observed
+`
+			if err := os.WriteFile(candidate, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			// A regular placement file lets this regression run without delegation.
+			if err := os.WriteFile(filepath.Join(cwd, "cgroup.procs"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			p, _, err := startChild(candidate, dir, cwd, "legacy")
+			if p != nil {
+				t.Cleanup(func() { testReap(t, p) })
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			if !waitChild(ctx, p.done) {
+				t.Fatal("candidate did not exit")
+			}
+			if p.waitErr != nil {
+				t.Fatalf("candidate could not open its fixture: %v", p.waitErr)
+			}
+			proof, shutdownErr, err := emptyTeardown().run(p, 0, time.Second, func() {})
+			if err != nil || proof.Status != "pass" || !proof.CandidateReaped || !proof.SubtreeEmpty || !proof.SubtreeRemoved {
+				t.Fatalf("cleanup = %+v, %v", proof, err)
+			}
+			if shutdownErr == nil || shutdownErr.Error() != "candidate exited before shutdown" {
+				t.Fatalf("unexpected shutdown result for completed fixture probe: %v", shutdownErr)
+			}
+			if filepath.Dir(root) != parent {
+				t.Fatalf("fixture root %q was not created under %q", root, parent)
+			}
+			got, err := os.ReadFile(filepath.Join(dir, "observed"))
+			if err != nil || string(got) != fixture {
+				t.Fatalf("child read %q from fixture, want %q (%v)", got, fixture, err)
+			}
+		})
+	}
+}
+
 func TestChildCapacityControlEnvironment(t *testing.T) {
 	t.Setenv("BOG_CAPACITY_TEST_SENTINEL", "preserved")
 	for _, tc := range []struct{ mode, inherited, want string }{

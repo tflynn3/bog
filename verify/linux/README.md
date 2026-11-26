@@ -1,0 +1,68 @@
+# Linux durability verifier
+
+Build the pinned Bog revision once on Linux. From the verifier checkout, pass
+its executable and commit SHA to the producer.
+
+```sh
+go run ./verify/linux \
+  -binary /absolute/path/to/bog -revision "$REVISION" \
+  -fixture linux-release-v1 -report /absolute/path/to/durability.json
+```
+
+The Linux release workflow checks the candidate's VCS build metadata. This
+producer hashes the supplied executable and writes schema-version 1 case
+evidence. A case failure produces a failing report entry and a nonzero exit.
+Run as a user who can mount and unmount a private tmpfs using either mount
+privileges or noninteractive `sudo -n`. The verifier creates fresh data
+directories and binds the candidate to loopback. The disk-full case creates
+an 8 MiB tmpfs, allocates its remaining blocks, and requires an extra write
+to return kernel `ENOSPC`. It also requires Bog to reject a valid ingest
+while full, checks replay at capacity, and verifies a new acknowledged batch
+after freeing space and restarting again.
+
+The fixture records ingest outcomes independently of Bog. A complete cursor
+walk must match its ledger, including append order within timestamp ties.
+The SIGKILL case sends a complete request after HTTP 100 and kills the server
+without reading the final response. Recovery must return that batch in full
+or omit it entirely. The recovery case injects a partial frame after the
+committed WAL, tests tied backfill and the original snapshot, and then corrupts
+a committed payload byte. Startup must fail without changing the corrupted WAL
+or the commit marker. This injection uses the `BOGWAL01` frame layout and
+`bog.commit` used by both historical candidates. Every successful restart
+checks that the previous process's cursor returns HTTP 400.
+
+## Historical correctness and benchmark
+
+All three correctness cases passed on `f727b8f676845a8058d1ecf114442d8963cbbbae`
+and on the implementation base `b797128b09c278bc547ef73e25d7d67c97315966`.
+
+Use `-benchmark` with the same four arguments and a separate report path on
+each run. Alternate the two supplied binaries on the same Linux host and
+filesystem. Each run uses seed 33003, 128,000 rows, 128 rows per ingest,
+and 256 rows per query page. Ingest timing covers HTTP request through the
+durable acknowledgement. Query p95 covers individual cursor pages after
+replay, including response decoding. Restart time covers launch through
+the first successful health probe, sampled every 5 ms. Peak RSS is the
+larger Linux process high-water mark across the two starts.
+
+Recorded on `lima-bog-final-qa`, Linux arm64 kernel `6.8.0-100-generic`, ext4,
+with Go 1.27.0 and `-trimpath` builds from the pinned sources.
+
+| Revision | Binary SHA-256 |
+| --- | --- |
+| `f727b8f` | `86cfc2016bb58b1109ed56eb2a0cdbfe2116ecc0b19a51d60d6e5a022d8b70f7` |
+| `2c26412` | `8a120cebb49946c05cfba3602b5940b59f2cafe885e1d7fe4f5b275d19da77af` |
+
+| Run | Revision | Durable rows/s | Ingest p99 (ms) | Query p95 (ms) | Restart (ms) | Peak RSS (KiB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | `f727b8f` | 100,975 | 2.335 | 0.425 | 56.258 | 45,056 |
+| 2 | `2c26412` | 115,888 | 2.367 | 0.479 | 50.882 | 41,216 |
+| 3 | `f727b8f` | 103,609 | 2.624 | 0.686 | 55.782 | 41,216 |
+| 4 | `2c26412` | 120,233 | 2.227 | 0.621 | 76.779 | 41,600 |
+| 5 | `f727b8f` | 106,743 | 4.033 | 0.401 | 56.318 | 41,600 |
+| 6 | `2c26412` | 125,292 | 1.663 | 0.561 | 51.457 | 43,264 |
+
+Durable ingest ranged from 101k to 107k rows/s on `f727b8f` and from 116k
+to 125k on `2c26412`. Ingest p99 varied by 1.698 ms and 0.704 ms respectively.
+The query p95 ranges overlapped and the longest restart, 76.779 ms, occurred
+on the fourth run.

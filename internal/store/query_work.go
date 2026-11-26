@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/bits"
+	"time"
 )
 
 var (
@@ -28,6 +29,11 @@ type QueryWork struct {
 
 func NewQueryWork(ctx context.Context, units uint64) *QueryWork {
 	return &QueryWork{ctx: ctx, remaining: units}
+}
+
+// Remaining reports unused units so a caller can record the cost of metered work.
+func (w *QueryWork) Remaining() uint64 {
+	return w.remaining
 }
 
 // Charge checks cancellation first, then reserves units before doing work.
@@ -59,4 +65,27 @@ func (w *QueryWork) row(line string, eligible bool) error {
 		return w.Charge(1)
 	}
 	return w.Charge(1, uint64(len(line)))
+}
+
+// QuerySnapshot freezes the published prefix and its query indexes together.
+// Appends can publish new indexes without changing this view or its seek work.
+type QuerySnapshot struct{ view queryView }
+
+// CaptureQuerySnapshot captures the currently published query view.
+func (s *Store) CaptureQuerySnapshot() QuerySnapshot {
+	return QuerySnapshot{s.queryView()}
+}
+
+// Page scans this snapshot at a stable work cost with an exclusive position
+// and definitive lookahead. Positions use zero-based append ordinals.
+func (s QuerySnapshot) Page(start, end time.Time, contains string, limit int, after *Position, work *QueryWork) ([]PositionedRow, bool, error) {
+	if err := work.Charge(); err != nil {
+		return nil, false, err
+	}
+	count := len(s.view.rows)
+	matches := queryMatches{limit: limit, lookahead: true, positioned: []PositionedRow{}}
+	if err := s.view.scan(start, end, contains, count, after, &matches, work); err != nil {
+		return nil, false, err
+	}
+	return matches.positioned, matches.more, nil
 }

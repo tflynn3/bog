@@ -1,4 +1,4 @@
-// Package fuzz verifies the public backup and retained-history storage boundaries.
+// Package fuzz verifies public WAL, checkpoint, history, and backup boundaries.
 package fuzz
 
 import (
@@ -236,11 +236,16 @@ func assertHistoryRows(t testing.TB, acquire func() (*history.Reader, error), ge
 
 func checkHistoryRows(t testing.TB, reader *history.Reader, generation history.Generation, want []backup.Row) {
 	t.Helper()
+	checkHistoryRowsIn(t, reader, generation, want, start, end)
+}
+
+func checkHistoryRowsIn(t testing.TB, reader *history.Reader, generation history.Generation, want []backup.Row, from, to time.Time) {
+	t.Helper()
 	if got := reader.Generation(); got != generation {
 		t.Fatalf("reader generation %+v, want %+v", got, generation)
 	}
 	var got []backup.Row
-	err := reader.Scan(t.Context(), history.Query{Start: start, End: end}, func(row checkpoint.BlockRow) error {
+	err := reader.Scan(t.Context(), history.Query{Start: from, End: to}, func(row checkpoint.BlockRow) error {
 		if len(got) == len(want) {
 			return errors.New("history scan exceeded fixture row count")
 		}
@@ -326,16 +331,25 @@ func historyFiles(content files) files {
 
 func assertChildren(t testing.TB, dir string, want ...string) {
 	t.Helper()
-	d, err := os.Open(dir)
-	must(t, err)
-	got, err := d.Readdirnames(len(want) + 1)
-	if err == io.EOF {
-		err = nil
-	}
-	must(t, errors.Join(err, d.Close()))
+	got := children(t, dir, len(want))
 	slices.Sort(got)
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Fatalf("entries in %s: got %v, want %v", dir, got, want)
 	}
+}
+
+func children(t testing.TB, path string, maxEntries int) []string {
+	t.Helper()
+	d, err := os.Open(path)
+	must(t, err)
+	names, err := d.Readdirnames(maxEntries + 1)
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	must(t, errors.Join(err, d.Close()))
+	if len(names) > maxEntries {
+		t.Fatalf("list %s: exceeded %d entries", path, maxEntries)
+	}
+	return names
 }

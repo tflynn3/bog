@@ -32,3 +32,39 @@ The architecture registry handoff is `bog/verify/fuzz` with the **test-only**
 role and no production imports. The architecture track owns the registry
 entry. Send parser regressions, with the corpus name or fuzz reproducer, to
 bog-storage.
+
+## WAL recovery and interrupted publication
+
+Run these entry points on each native Linux release runner and retain the
+verbose output with the verifier race log.
+
+```sh
+go test -race -count=1 -v -timeout=3m -run '^(TestStorageRecovery|TestInterruptedBackupRetries|TestBackupRetryRestrictiveUmask)$' ./verify/fuzz
+go test -run '^$' -fuzz '^FuzzWALRecovery$' -fuzztime 30s -timeout 1m -parallel 2 ./verify/fuzz
+go test -run '^$' -fuzz '^FuzzCheckpointPublication$' -fuzztime 30s -timeout 1m -parallel 2 ./verify/fuzz
+```
+
+The WAL fixtures come from acknowledged appends. The corpus distinguishes
+committed corruption from a suffix beyond the marker, checks recovery offsets
+and ordered rows, and checks that failed opens leave disk and query state
+intact. The checkpoint corpus covers frame and ordinal rejection, typed staging
+admission, and SIGKILL after successor segments are installed but before the
+manifest rename. Recovery validates the previous authority, removes losing
+files, and then publishes the successor. Both fuzz targets cap suffixes at
+8 KiB and share the deterministic frame seeds.
+
+Export and restore each receive three SIGKILLs during staged copying. The log
+records the staged files at the interruption point. Competing retries produce
+one verified image while preserving the source bundle, the published sibling,
+and a separate abandoned claim. These are interruption tests, separate from
+the ENOSPC verifier in `verify/linux`.
+
+The umask case runs with an unprivileged effective UID even when launched by
+root. Under umask 0777 the baseline records the #69 `EACCES` when reopening a
+mode-zero guard. It checks that the abandoned stage survives the refusal, then
+repairs the guard and verifies recovery. Once the guard reopens successfully,
+the same case verifies recovery without repair.
+
+The deterministic suites use the subprocess limits above. Each interruption
+worker has a 12-second deadline and its own address-space and per-file limits.
+The test owns the temporary root and reaps the worker after each SIGKILL.

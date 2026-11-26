@@ -1,60 +1,113 @@
-# Checkpoint block layout benchmark
+# Checkpoint layout benchmark
 
-Run on Linux from this standalone Go module. Choose a data directory on the
-filesystem or device under test. The runner creates and cleans up its own
-temporary subdirectory.
+Run this standalone Go module on Linux. Choose an existing directory on the
+filesystem or device under test. The runner creates and cleans up a private
+subdirectory there.
 
 ```sh
 cd bench/segment-layout
 go run . -smoke
-go run . -dir /path/to/data -fixture mixed -runs 21 -revision "$(git rev-parse HEAD)"
-go run . -dir /path/to/data -fixture entropy -runs 21 -revision "$(git rev-parse HEAD)"
+for profile in mixed entropy; do
+  for scale in small medium large; do
+    go run . -dir /path/to/data -fixture "$profile" -scale "$scale" -runs 21 \
+      -revision "$(git rev-parse HEAD)" > "$profile-$scale.json"
+  done
+done
 ```
 
-Each run emits one JSON report. Pass the revision of the measured source when
-building without Git metadata. By default the executable uses Go's embedded
-revision and dirty status. Smoke mode fixes the workload at 64 ordinary
-batches and one sample per query. Its rows, block counts, and byte counts are
-deterministic for the selected profile and dependency versions. Timings vary.
+Each invocation emits one schema v2 JSON report. The report records the source
+revision, fixture seed, profile and scale, sample count, Go runtime, kernel,
+filesystem and codec settings. Pass `-revision` when building without Git
+metadata. The default uses Go's embedded revision and dirty status.
 
-The mixed fixture cycles ordinary batch sizes of 1, 7, 64, and 256, using
-mostly repeated log templates with some seeded random IDs. The entropy profile
-adds 256 seeded random bits per ordinary line as hex. Both include the timestamp
-extrema, a maximum-frame-sized singleton, and late backfill with duplicate
-ties. The query suite covers dense, rare, absent, short UTF-8 literals of one
-through three bytes, the oversized line's tail, and half-open time windows.
-Each measured result is compared row-for-row with a stable timestamp sort of a
-literal scan over the original append input. Both timestamps and append
-ordinals participate in the equality check.
+| Scale | Ordinary batches | Initial retained rows |
+| --- | ---: | ---: |
+| `small` | 64 | 5,253 |
+| `medium` (default) | 2,048 | 167,941 |
+| `large` | 8,192 | 671,749 |
 
-All six layouts pack the same append rows at a 64 KiB target and sort rows
-within blocks by timestamp and append ordinal. Oversized rows get their own
-blocks. Payloads use Bog's version 1 checkpoint codec directly. The benchmark
-container stores a versioned, CRC32C-checked header and an index in front of the
-payloads. Index entries have inclusive time bounds, raw and stored lengths, an
-optional 1 KiB four-byte Bloom filter, and a CRC32C. LZ4 and single-threaded
-Zstd compress each block independently, storing the raw block if compression
-would expand it. The filters only skip blocks. Every returned line is matched
-using the original literal.
+Use `-batches` for a custom size of 1–10,000 ordinary batches in place of
+`-scale`. Smoke mode fixes the size at 64 batches and uses one sample per
+query. Fixture rows, block counts and file byte counts are reproducible for
+the same profile, size and dependency versions. Timings vary.
 
-- **Retained bytes** include the complete initial file, including index and
-  summary overhead. **Rewrite bytes** count the full output of rebuilding
-  after appending one late duplicate, with both generations present. The
-  rewritten file is also compared with the oracle on the all-rows query.
-  These are file bytes and exclude filesystem or device write amplification.
-- **Logical blocks read** counts payload reads. Index entries are read for every
-  query. Linux receives per-file `FADV_RANDOM` and `FADV_DONTNEED` advice before
-  timing. The timed interval includes metadata and payload I/O, decoding,
-  filtering, and sorting. Advice is best effort and operates on the Linux
-  page cache. Storage-controller or host caches may still affect samples.
-- **Peak decode bytes** is the largest accounted block working set in the
-  query. It includes the stored payload, a separate expansion buffer when
-  needed, decoded row structs, and copied line bytes. It excludes index bytes,
-  codec-library internals, allocation overhead, and accumulated query results.
-  It measures block decode buffers independently of process RSS.
+## Fixture and queries
 
-The standalone container and rewrite model are for comparing checkpoint
-layouts. Bog's production checkpoint publication and recovery are outside the
-benchmark. Run `go vet ./...` and `go test -race ./...` from this directory
-for the portable summary and format tests. On Linux the same commands also
-cover the end-to-end fixture with the production codec.
+The mixed profile cycles ordinary batch sizes of 1, 7, 64 and 256 with
+repeated log templates and seeded random IDs. The entropy profile adds 256
+seeded random bits per ordinary line as hex. Both include timestamp extrema,
+a maximum-frame-sized singleton, exact duplicate rows and tied timestamps.
+The full-range selectivity queries include absent, rare (two initial
+matches), sparse (the first row of every 31st batch), medium (every eighth
+row within a batch), dense (four out of every five rows within a batch) and
+all rows. The report gives the observed match count and its fraction of all
+retained rows in that generation. For time-bounded queries, the denominator
+also includes rows outside the window.
+
+Additional probes cover case sensitivity, one-, two- and three-byte UTF-8
+literals (`x`, `é`, `€`), the oversized row's tail, and half-open time
+windows. Every timed sample, across all six layouts and all generations, is
+compared after timing to an independent exact byte-substring scan over the
+append input. A stable timestamp sort of that input preserves append-ordinal
+order for ties. Verification compares timestamps, ordinals and complete
+lines, including duplicates. Any mismatch fails the run.
+
+## Layouts and backfill
+
+Every layout uses the same input and query workload for a given profile,
+scale and generation. The runner packs by append order with a 64 KiB target
+and sorts each block by timestamp and append ordinal. Oversized rows get
+their own block. Payloads use the production v1 checkpoint block codec.
+The benchmark's versioned container uses little-endian lengths and CRC32C
+for its header and index entries. LZ4 and single-threaded Zstd compress
+blocks independently and fall back to raw storage when compression would
+expand a block. Each codec has an unfiltered layout and a layout with a 1 KiB
+Bloom filter over overlapping four-byte windows per block. Both use the
+same time bounds. Filters can reject a payload read. A positive filter or a
+literal shorter than four bytes still requires exact matching after decode.
+
+Each backfill starts from the initial append input and appends one batch of
+four exact duplicate rows with new ordinals. The clustered batch duplicates
+rows at the first ordinary timestamp. The scattered batch duplicates rows
+from the early and middle ordinary timestamps and near the end of ordinary
+history, in descending timestamp order. At small custom batch counts those
+anchors can coincide. Both generations are packed using the same rules as
+the initial generation. The initial generation stays on disk through both
+scenarios. A completed rewrite is removed before the next scenario.
+
+## Metrics
+
+- **Retained bytes** count the entire file for the reported generation,
+  including header, index and payload. **Bloom metadata bytes** count the
+  added 1 KiB per block in the filtered layouts. The ratio divides Bloom
+  metadata bytes by the full retained size for that layout and generation.
+- **Payload reads avoided** subtracts the logical block payload reads from
+  the corresponding unfiltered layout with the same codec, generation,
+  literal and time window. The report includes both read counts and the
+  analogous difference in stored payload bytes. These counters count
+  successful logical reads through the container and exclude index reads.
+- **Cold p95** uses nearest rank over the recorded per-query nanosecond
+  samples. The runner uses Linux `FADV_RANDOM` on each query's file
+  descriptor and requests `FADV_DONTNEED` on the entire file before each
+  timed sample. Timing covers index and payload I/O, decode, exact filtering
+  and result sorting. The Linux kernel can retain pages despite the advice,
+  and storage-controller or host caches can affect samples. Use local disk
+  for measurements intended to characterize storage latency.
+- **Rewrite bytes** count every byte of the new, synced container written
+  by the full rebuild. They include unchanged contents written into the new
+  file and exclude reads, the old file's bytes, WAL traffic, filesystem
+  metadata, and device or filesystem write amplification. The top-level
+  per-layout `rewrite_bytes` is the clustered scenario's value. Each entry
+  in `backfills` includes its own rewrite count, timestamp bounds and
+  full query metrics. The model measures whole-file checkpoint layout
+  rewrites in the benchmark container.
+- **Peak decode bytes** is the largest accounted single-block working set
+  observed across samples for a query. It counts the stored payload, any
+  separate expansion buffer, decoded row structs and copied line bytes. It
+  excludes codec-library internals, allocator overhead, the index and
+  accumulated query results. A query with zero payload reads reports zero.
+
+From this module run `go vet ./...`, `go test ./...` and
+`go test -race ./...`. On macOS they cover the portable layout, metrics
+and configuration code. Run them on Linux for the complete fixture,
+sampling and rewrite tests with the production checkpoint codec.

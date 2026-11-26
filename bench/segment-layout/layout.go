@@ -162,23 +162,31 @@ func indexTime(b []byte) (time.Time, bool) {
 	return t, t.Before(endTime)
 }
 
-func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, bufferBytes int) error) (read int, err error) {
+type payloadReads struct {
+	Blocks int   `json:"logical_blocks_read"`
+	Bytes  int64 `json:"payload_bytes_read"`
+}
+
+func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, bufferBytes int) error) (read payloadReads, err error) {
 	var header [headerSize]byte
+	if size < headerSize {
+		return payloadReads{}, errLayout
+	}
 	if err := checkedRead(r, header[:], 0); err != nil {
-		return 0, fmt.Errorf("header: %w", err)
+		return payloadReads{}, fmt.Errorf("header: %w", err)
 	}
 	l := layout{codec(header[8]), header[9] == 1}
 	count := int64(le.Uint32(header[10:]))
 	width := int64(l.indexWidth())
 	offset := headerSize + count*width
 	if string(header[:8]) != magic || l.codec > zstdCodec || header[9] > 1 || offset > size {
-		return 0, errLayout
+		return payloadReads{}, errLayout
 	}
 	var dec *zstd.Decoder
 	entry := make([]byte, width)
 	for i := range count {
 		if err := checkedRead(r, entry, headerSize+i*width); err != nil {
-			return 0, fmt.Errorf("index entry %d: %w", i, err)
+			return payloadReads{}, fmt.Errorf("index entry %d: %w", i, err)
 		}
 		rawSize, storedSize := int(le.Uint32(entry[24:])), int(le.Uint32(entry[28:]))
 		lo, loOK := indexTime(entry[:12])
@@ -186,7 +194,7 @@ func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, buffe
 		if rawSize < blockHeader || rawSize > maxBlock || storedSize <= 0 || storedSize > rawSize ||
 			int64(storedSize) > size-offset || (l.codec == rawCodec && storedSize != rawSize) ||
 			!loOK || !hiOK || hi.Before(lo) {
-			return 0, fmt.Errorf("index entry %d: %w", i, errLayout)
+			return payloadReads{}, fmt.Errorf("index entry %d: %w", i, errLayout)
 		}
 		bodyOffset := offset
 		offset += int64(storedSize)
@@ -198,7 +206,7 @@ func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, buffe
 		}
 		stored := make([]byte, storedSize)
 		if _, err := r.ReadAt(stored, bodyOffset); err != nil {
-			return 0, fmt.Errorf("block %d: %w", i, err)
+			return payloadReads{}, fmt.Errorf("block %d: %w", i, err)
 		}
 		raw, bufferBytes := stored, storedSize
 		if storedSize < rawSize {
@@ -208,33 +216,34 @@ func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, buffe
 			case lz4Codec:
 				n, err := lz4.UncompressBlock(stored, raw)
 				if err != nil || n != rawSize {
-					return 0, fmt.Errorf("lz4 block %d: %w", i, errors.Join(errLayout, err))
+					return payloadReads{}, fmt.Errorf("lz4 block %d: %w", i, errors.Join(errLayout, err))
 				}
 			case zstdCodec:
 				if dec == nil {
 					dec, err = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(zstdWindow),
 						zstd.WithDecoderMaxMemory(maxBlock), zstd.WithDecodeAllCapLimit(true))
 					if err != nil {
-						return 0, err
+						return payloadReads{}, err
 					}
 					defer dec.Close()
 				}
 				raw, err = dec.DecodeAll(stored, raw[:0])
 				if err != nil || len(raw) != rawSize {
-					return 0, fmt.Errorf("zstd block %d: %w", i, errors.Join(errLayout, err))
+					return payloadReads{}, fmt.Errorf("zstd block %d: %w", i, errors.Join(errLayout, err))
 				}
 			}
 		}
 		if !bytes.Equal(raw[12:36], entry[:24]) {
-			return 0, fmt.Errorf("block %d time bounds: %w", i, errLayout)
+			return payloadReads{}, fmt.Errorf("block %d time bounds: %w", i, errLayout)
 		}
 		if err := visit(raw, bufferBytes); err != nil {
-			return 0, fmt.Errorf("block %d: %w", i, err)
+			return payloadReads{}, fmt.Errorf("block %d: %w", i, err)
 		}
-		read++
+		read.Blocks++
+		read.Bytes += int64(storedSize)
 	}
 	if offset != size {
-		return 0, errLayout
+		return payloadReads{}, errLayout
 	}
 	return read, nil
 }

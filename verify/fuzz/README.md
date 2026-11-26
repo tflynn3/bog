@@ -39,7 +39,7 @@ Run these entry points on each native Linux release runner and retain the
 verbose output with the verifier race log.
 
 ```sh
-go test -race -count=1 -v -timeout=3m -run '^(TestStorageRecovery|TestInterruptedBackupRetries|TestBackupRetryRestrictiveUmask)$' ./verify/fuzz
+go test -race -count=1 -v -timeout=3m -run '^(TestStorageRecovery|TestInterruptedBackupRetries|TestBackupRetryRestrictiveUmask|TestRetainedExportLifecycle)$' ./verify/fuzz
 go test -run '^$' -fuzz '^FuzzWALRecovery$' -fuzztime 30s -timeout 1m -parallel 2 ./verify/fuzz
 go test -run '^$' -fuzz '^FuzzCheckpointPublication$' -fuzztime 30s -timeout 1m -parallel 2 ./verify/fuzz
 ```
@@ -68,3 +68,20 @@ the same case verifies recovery without repair.
 The deterministic suites use the subprocess limits above. Each interruption
 worker has a 12-second deadline and its own address-space and per-file limits.
 The test owns the temporary root and reaps the worker after each SIGKILL.
+
+## Pinned export across live replacement
+
+`TestRetainedExportLifecycle` runs in the Linux verifier's `verify/fuzz` race
+suite. It pauses export after the original manifest reaches staging and before
+the first segment opens. While the export holds a history reader and WAL
+capture, the owner acknowledges a tied row and a backfill, then publishes and
+activates an incremental successor. A fresh history reader sees both later
+rows. The original generation continues to occupy its budget slot until the
+export returns and the caller releases its references.
+
+The resume case verifies and restores the export, comparing the recovery point,
+manifest bytes, WAL tail bytes, and ordered rows against the original capture.
+The cancel case requires context cancellation and checks that the empty
+destination survives. Both cases check that the stage and its claim records
+are removed. The worker uses the same 45-second parent deadline and resource
+limits as the deterministic corpus.

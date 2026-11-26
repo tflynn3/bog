@@ -9,40 +9,6 @@ import (
 	"bog/internal/checkpoint"
 )
 
-// One shared lock per segment pins its name for any generation that can still
-// scan it, including generations in another catalog or process. The generation
-// holds these descriptors until its last scan and reader release their pins.
-func (g *generation) pinSegments(ctx context.Context) error {
-	for i := range g.segments {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		s := &g.segments[i]
-		f, info, err := openRegular(g.dir, s.name)
-		if err != nil {
-			return segmentError(s.name, err)
-		}
-		s.pin = f
-		if !sameSegment(s.stat, info) {
-			return corrupt(s.name, "segment file changed while pinning")
-		}
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
-			return segmentError(s.name, err)
-		}
-	}
-	return nil
-}
-
-func (g *generation) closePins() error {
-	var err error
-	for i := range g.segments {
-		if f := g.segments[i].pin; f != nil {
-			err = errors.Join(err, f.Close())
-		}
-	}
-	return err
-}
-
 type retiredDirectory struct {
 	info     os.FileInfo
 	segments map[string]os.FileInfo
@@ -99,21 +65,26 @@ func (c *Catalog) Reclaim(ctx context.Context, path string) (err error) {
 	if err != nil {
 		return err
 	}
+	candidates := c.retired[i].segments
+	protected := make(map[string]bool, len(current.segments))
+	for _, s := range current.segments {
+		if _, retired := candidates[s.name]; retired {
+			protected[s.name] = true
+		}
+	}
+	if err := protectPinned(ctx, dir, candidates, protected); err != nil {
+		return err
+	}
 	if err := dir.Sync(); err != nil {
 		return err
 	}
-	reachable := make(map[string]bool, len(current.segments))
-	for _, s := range current.segments {
-		reachable[s.name] = true
-	}
-	candidates := c.retired[i].segments
 	var finished []string
 	var reclaimErr error
 	for name, expected := range candidates {
 		if reclaimErr = ctx.Err(); reclaimErr != nil {
 			break
 		}
-		if reachable[name] {
+		if protected[name] {
 			continue
 		}
 		complete, err := reclaimSegment(dir, name, expected)
@@ -155,6 +126,7 @@ func reclaimSegment(dir *os.File, name string, expected os.FileInfo) (complete b
 	if !sameSegment(expected, info) {
 		return true, nil
 	}
+	// Older readers pin segment inodes directly.
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			return false, nil

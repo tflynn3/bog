@@ -65,7 +65,6 @@ type segment struct {
 	name   string
 	digest [sha256.Size]byte
 	stat   os.FileInfo
-	pin    *os.File
 	lo, hi time.Time // Inclusive verified timestamp bounds.
 	points []seekPoint
 
@@ -183,8 +182,7 @@ func loadAt(ctx context.Context, dir *os.File) (*generation, error) {
 	var maxRows uint64
 	var maxSize int
 	for i, s := range m.Segments {
-		if len(s.Name) != len(segmentPrefix)+32 || !strings.HasPrefix(s.Name, segmentPrefix) ||
-			strings.Trim(s.Name[len(segmentPrefix):], "0123456789abcdef") != "" || seen[s.Name] ||
+		if !validSegmentName(s.Name) || seen[s.Name] ||
 			s.Size < headerSize+rowHeaderSize || s.Size > checkpoint.MaxBlockSize {
 			return nil, fmt.Errorf("%w: invalid segment metadata for entry %d", ErrIntegrity, i)
 		}
@@ -204,6 +202,13 @@ func loadAt(ctx context.Context, dir *os.File) (*generation, error) {
 		return nil, err
 	}
 	return g, nil
+}
+
+const segmentNameSize = len(segmentPrefix) + 32
+
+func validSegmentName(name string) bool {
+	return len(name) == segmentNameSize && strings.HasPrefix(name, segmentPrefix) &&
+		strings.Trim(name[len(segmentPrefix):], "0123456789abcdef") == ""
 }
 
 func getTime(b []byte) (time.Time, bool) {

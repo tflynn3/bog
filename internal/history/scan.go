@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"math/bits"
 	"os"
 	"sort"
 	"time"
@@ -40,7 +41,17 @@ type Query struct {
 
 // Scan visits matching rows in timestamp and append-ordinal order. Lines passed
 // to visit are safe to retain. A visit or I/O error stops the scan.
-func (r *Reader) Scan(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error) (err error) {
+func (r *Reader) Scan(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error) error {
+	return r.ScanWithWork(ctx, q, visit, nil)
+}
+
+// ScanWithWork has the same ordered visitor contract as Scan. It charges one
+// unit per segment considered, a worst-case binary seek cost per overlapping
+// segment, one unit per row header examined, and one unit per byte of a line
+// eligible for literal matching. This includes nonmatches and any lookahead
+// the visitor requests by continuing the scan. A nil meter allows unlimited
+// work. On error, the caller decides whether to discard rows already visited.
+func (r *Reader) ScanWithWork(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error, work *store.QueryWork) (err error) {
 	r.mu.Lock()
 	if !r.deadline.IsZero() && !time.Now().Before(r.deadline) {
 		r.mu.Unlock()
@@ -68,16 +79,19 @@ func (r *Reader) Scan(ctx context.Context, q Query, visit func(checkpoint.BlockR
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := work.Charge(); err != nil {
+		return err
+	}
 	if !q.Start.Before(q.End) || len(q.Contains) > checkpoint.MaxBlockSize-headerSize-rowHeaderSize {
 		return nil
 	}
 	if visit == nil {
 		return errors.New("nil history visitor")
 	}
-	return g.scan(ctx, q, visit)
+	return g.scan(ctx, q, visit, work)
 }
 
-func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error) error {
+func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error, work *store.QueryWork) error {
 	lower := Position{Time: q.Start.UTC()}
 	strict := false
 	if q.After != nil {
@@ -91,20 +105,26 @@ func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.Bl
 		return nil
 	}
 
-	h := make(scanHeap, 0, len(g.segments))
+	var h scanHeap
 	for i := range g.segments {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := work.Charge(1); err != nil {
 			return err
 		}
 		s := &g.segments[i]
 		if s.hi.Before(lower.Time) || !s.lo.Before(end) {
 			continue
 		}
+		if err := work.Charge(uint64(bits.Len(uint(len(s.points))))); err != nil {
+			return err
+		}
 		j := sort.Search(len(s.points), func(i int) bool {
 			return !s.points[i].key.less(lower)
 		})
 		c := &cursor{seg: s, offset: s.points[max(j-1, 0)].offset}
-		if err := c.seek(ctx, g.dir, lower, strict, end); err != nil {
+		if err := c.seek(ctx, g.dir, lower, strict, end, work); err != nil {
 			return err
 		}
 		if c.ready {
@@ -119,6 +139,9 @@ func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.Bl
 			return err
 		}
 		c := h[0]
+		if err := work.Charge(uint64(c.lineLen)); err != nil {
+			return err
+		}
 		line, err := c.line(g.dir, &overflow)
 		if err != nil {
 			return err
@@ -130,7 +153,7 @@ func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.Bl
 			}
 		}
 		c.offset += rowHeaderSize + c.lineLen
-		if err := c.advance(g.dir, end); err != nil {
+		if err := c.advance(ctx, g.dir, end, work); err != nil {
 			return err
 		}
 		if c.ready {
@@ -139,7 +162,10 @@ func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.Bl
 			heap.Pop(&h)
 		}
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return work.Charge()
 }
 
 type cursor struct {
@@ -153,12 +179,9 @@ type cursor struct {
 	page       []byte
 }
 
-func (c *cursor) seek(ctx context.Context, dir *os.File, lower Position, strict bool, end time.Time) error {
+func (c *cursor) seek(ctx context.Context, dir *os.File, lower Position, strict bool, end time.Time, work *store.QueryWork) error {
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := c.advance(dir, end); err != nil {
+		if err := c.advance(ctx, dir, end, work); err != nil {
 			return err
 		}
 		if !c.ready || lower.less(c.key) || (!strict && !c.key.less(lower)) {
@@ -168,11 +191,17 @@ func (c *cursor) seek(ctx context.Context, dir *os.File, lower Position, strict 
 	}
 }
 
-func (c *cursor) advance(dir *os.File, end time.Time) error {
+func (c *cursor) advance(ctx context.Context, dir *os.File, end time.Time, work *store.QueryWork) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c.ready = false
 	size := c.seg.stat.Size()
 	if c.offset == size {
 		return nil
+	}
+	if err := work.Charge(1); err != nil {
+		return err
 	}
 	if c.offset < headerSize || size-c.offset < rowHeaderSize {
 		return corrupt(c.seg.name, "row header outside segment")

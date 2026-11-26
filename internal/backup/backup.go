@@ -227,21 +227,47 @@ func restoreBackup(ctx context.Context, bundle, destination string, publish publ
 }
 
 func verifyImage(ctx context.Context, root *os.Root) (image, []bounds, error) {
-	if err := ctx.Err(); err != nil {
-		return image{}, nil, err
-	}
-	img, err := inspect(root)
+	img, bounds, tail, err := verifyPinnedImage(ctx, root, nil)
 	if err != nil {
 		return image{}, nil, err
 	}
-	bounds, err := validateSegments(ctx, root, img.manifest)
-	if err != nil {
-		return image{}, nil, err
-	}
-	if err := readTail(ctx, root, img.metadata, nil); err != nil {
+	if err := tail.Close(); err != nil {
 		return image{}, nil, err
 	}
 	return img, bounds, nil
+}
+
+func verifyPinnedImage(ctx context.Context, root *os.Root, checkReplay func(start, end int64) error) (image, []bounds, *os.File, error) {
+	if err := ctx.Err(); err != nil {
+		return image{}, nil, nil, err
+	}
+	img, err := inspect(root)
+	if err != nil {
+		return image{}, nil, nil, err
+	}
+	if checkReplay != nil {
+		if err := checkReplay(img.CoveredOffset, img.CommittedEnd); err != nil {
+			return image{}, nil, nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return image{}, nil, nil, err
+	}
+	bounds, err := validateSegments(ctx, root, img.manifest)
+	if err != nil {
+		return image{}, nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return image{}, nil, nil, err
+	}
+	tail, err := openTail(root, img.metadata)
+	if err != nil {
+		return image{}, nil, nil, err
+	}
+	if err := scanTail(ctx, tail, img.metadata, nil); err != nil {
+		return image{}, nil, nil, errors.Join(err, tail.Close())
+	}
+	return img, bounds, tail, nil
 }
 
 func validateSegments(ctx context.Context, root *os.Root, m manifest) ([]bounds, error) {

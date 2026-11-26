@@ -1,0 +1,53 @@
+{
+  "binary_sha256": "f8829660be5d9b5a76bd174d2a5ba574b30f00c72e6bab826154f5dde184980b",
+  "disk_headroom_bytes_after": 13454942208,
+  "disk_headroom_bytes_before": 13456068608,
+  "errors": [],
+  "filesystem_type": "overlayfs",
+  "fixture": {
+    "disk_bytes": 102552,
+    "input_bytes": 102200,
+    "mode": "seeded",
+    "rows": 2000
+  },
+  "io_device_deltas": {
+    "253:16": {
+      "dbytes": 0,
+      "dios": 0,
+      "rbytes": 0,
+      "rios": 0,
+      "wbytes": 15032320,
+      "wios": 3691
+    }
+  },
+  "memory_events_delta": {
+    "high": 0,
+    "low": 0,
+    "max": 0,
+    "oom": 0,
+    "oom_group_kill": 0,
+    "oom_kill": 0
+  },
+  "memory_max": "536870912",
+  "memory_peak_bytes": 11403264,
+  "restart_to_ready_seconds": 0.06076894999932847,
+  "revision": "5421dc5fad38df84f1f185cd6afb89ef83d89057",
+  "server_log_tail": "",
+  "snapshot": {
+    "actual_rows": 2000,
+    "expected_rows": 2000,
+    "matches": true,
+    "pages": 2
+  },
+  "status": "ok",
+  "timeouts": [],
+  "workload": {
+    "duration_seconds": 3,
+    "ingest_p99_seconds": 0.008505709000019124,
+    "ingest_requests": 1569,
+    "query_p99_seconds": 0.004509735001192894,
+    "query_requests": 4049,
+    "query_workers": 2,
+    "writers": 2
+  }
+}

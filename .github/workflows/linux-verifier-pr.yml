@@ -1,0 +1,65 @@
+name: Linux verifier PR checks
+
+on:
+  pull_request:
+    paths:
+      - 'verify/durability/**'
+      - 'verify/release/**'
+      - '.github/workflows/linux-release.yml'
+      - '.github/workflows/linux-verifier-pr.yml'
+      - 'cmd/bog/**'
+      - 'internal/**'
+      - 'go.mod'
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOWORK: 'off'
+
+jobs:
+  durability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - name: Vet and race-test the verifier
+        timeout-minutes: 5
+        run: |
+          go vet ./verify/durability
+          go test -race -count=1 -timeout=2m ./verify/durability
+
+      - name: Build the pinned candidate and run the live fixtures
+        timeout-minutes: 8
+        run: |
+          evidence="$RUNNER_TEMP/bog-durability-evidence"
+          mkdir -p "$evidence"
+          revision=$(git rev-parse HEAD)
+          [[ -z "$(git status --porcelain)" ]]
+          binary="$RUNNER_TEMP/bog-durability-candidate"
+          go build -trimpath -buildvcs=true -o "$binary" ./cmd/bog 2>&1 | tee "$evidence/build.log"
+          go version -m "$binary" | tee "$evidence/build-info.txt"
+          sha256sum "$binary" | tee "$evidence/binary.sha256"
+          read -r binary_sha256 _ < "$evidence/binary.sha256"
+          timeout --kill-after=30s 5m go run ./verify/durability \
+            -binary "$binary" -revision "$revision" -sha256 "$binary_sha256" \
+            -fixture linux-release-v1 -report "$evidence/durability.json" 2>&1 | tee "$evidence/durability.log"
+
+      - name: Upload live durability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bog-durability-evidence
+          path: ${{ runner.temp }}/bog-durability-evidence

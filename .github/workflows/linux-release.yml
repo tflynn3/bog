@@ -81,17 +81,21 @@ jobs:
           failed=0
           producer() {
             local name=$1 directory=$2 command=$3 duration=$4
-            if (cd "$directory" && timeout --kill-after=5s "$duration" go run "$command" \
+            shift 4
+            if (sha256sum --check "$EVIDENCE/binary.sha256" &&
+              cd "$directory" && timeout --kill-after=30s "$duration" go run "$command" \
               -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
-              -report "$EVIDENCE/$name.json") 2>&1 | tee "$EVIDENCE/$name.log"; then
+              -report "$EVIDENCE/$name.json" "$@") 2>&1 | tee "$EVIDENCE/$name.log"; then
               printf '%s exit=0\n' "$name" | tee -a "$EVIDENCE/producers.txt"
             else
               printf '%s exit=%d\n' "$name" "$?" | tee -a "$EVIDENCE/producers.txt"
               failed=1
             fi
           }
+          read -r binary_sha256 _ < "$EVIDENCE/binary.sha256"
+          [[ "$binary_sha256" =~ ^[0-9a-f]{64}$ ]]
           producer admission gate ./verify/release 2m
-          producer durability candidate ./verify/linux 15m
+          producer durability candidate ./verify/durability 15m -sha256 "$binary_sha256"
           producer capacity candidate ./bench/retained-history 24m
           exit "$failed"
 

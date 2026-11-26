@@ -7,12 +7,20 @@ uses the resulting absolute binary path for every verifier. Download the
 fixture, reports, producer exit statuses, and logs.
 
 All three producers take `-binary PATH -revision SHA -fixture ID -report PATH`.
-The release fixture ID is `linux-release-v1`. The workflow runs
-`go run ./verify/release` from the workflow checkout and
-`go run ./verify/linux` (#3) and `go run ./bench/retained-history` (#32) from the
-candidate checkout. The sibling commands need to provision their Linux fixtures
-and use the supplied binary. The gate fails if any command or report is missing,
-including on revisions where only earlier harness entry points exist.
+The release fixture ID is `linux-release-v1`. The workflow checks the
+candidate against `binary.sha256` before each producer and again before final
+validation. It runs `go run ./verify/release` from the workflow checkout and
+`go run ./verify/durability` and `go run ./bench/retained-history` from the
+candidate checkout. Durability also takes `-sha256 SHA256` from the build record
+and verifies the digest and clean Git metadata of its private executable copy.
+Dispatch the gate against a revision containing both producer commands.
+Missing commands, failed cases, and missing reports fail the gate. Logs
+and available reports are uploaded even when a producer fails.
+
+The [durability fixture](../durability/README.md) requires a local temporary
+filesystem with room for a 32 MiB image, Linux loop devices, `mkfs.ext4`,
+`mount`, `umount`, and permission to mount and unmount the loopback filesystem
+either directly or through passwordless `sudo -n`.
 
 Reports have integer `schema_version` 1, string `revision`, lowercase hexadecimal
 `binary_sha256`, string `fixture`, and a `cases` object. Each case has a string

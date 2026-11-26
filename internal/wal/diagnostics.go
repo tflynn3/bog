@@ -38,14 +38,15 @@ var DiagnosticsDeliveryFailures atomic.Uint64
 var rollbackDiagnostics = newDiagnosticSink()
 
 type diagnosticSink struct {
-	events chan DiagnosticEvent
-	stop   chan struct{}
-	once   sync.Once
-	closed atomic.Bool
+	events  chan DiagnosticEvent
+	stop    chan struct{}
+	once    sync.Once
+	closed  atomic.Bool
+	deliver func(DiagnosticEvent) error
 }
 
 func newDiagnosticSink() *diagnosticSink {
-	s := &diagnosticSink{events: make(chan DiagnosticEvent, 1024), stop: make(chan struct{})}
+	s := &diagnosticSink{events: make(chan DiagnosticEvent, 1024), stop: make(chan struct{}), deliver: deliverDiagnostic}
 	go s.run()
 	return s
 }
@@ -93,25 +94,30 @@ func (s *diagnosticSink) run() {
 		case <-s.stop:
 			return
 		case event := <-s.events:
-			op := "unknown"
-			switch event.OpCode {
-			case OpWALWrite:
-				op = "wal_write"
-			case OpWALSync:
-				op = "wal_sync"
-			case OpMarkerPreparation:
-				op = "marker_preparation"
-			}
-			category := "other"
-			switch event.ErrorCategory {
-			case ErrorENOSPC:
-				category = "enospc"
-			case ErrorEIO:
-				category = "eio"
-			}
-			if err := log.Output(2, "WAL rollback confirmed operation="+op+" category="+category); err != nil {
+			if err := s.deliver(event); err != nil {
 				DiagnosticsDeliveryFailures.Add(1)
 			}
 		}
 	}
+}
+
+// deliverDiagnostic runs only on the consumer goroutine.
+func deliverDiagnostic(event DiagnosticEvent) error {
+	op := "unknown"
+	switch event.OpCode {
+	case OpWALWrite:
+		op = "wal_write"
+	case OpWALSync:
+		op = "wal_sync"
+	case OpMarkerPreparation:
+		op = "marker_preparation"
+	}
+	category := "other"
+	switch event.ErrorCategory {
+	case ErrorENOSPC:
+		category = "enospc"
+	case ErrorEIO:
+		category = "eio"
+	}
+	return log.Output(2, "WAL rollback confirmed operation="+op+" category="+category)
 }

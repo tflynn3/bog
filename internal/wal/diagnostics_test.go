@@ -215,3 +215,83 @@ func TestMarkerPreparationDiagnostic(t *testing.T) {
 		t.Fatalf("diagnostic = %q", got)
 	}
 }
+
+// A stalled delivery must not make producers wait for space or shutdown.
+func TestDiagnosticSinkSaturation(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	s := &diagnosticSink{
+		events: make(chan DiagnosticEvent, 2),
+		stop:   make(chan struct{}),
+		deliver: func(DiagnosticEvent) error {
+			close(entered)
+			<-release
+			return nil
+		},
+	}
+	go func() { defer close(done); s.run() }()
+	event := DiagnosticEvent{OpCode: OpWALWrite, ErrorCategory: ErrorENOSPC}
+	s.report(event)
+	<-entered
+	s.report(event)
+	s.report(event)
+	before := DiagnosticsDropped.Load()
+	finished := make(chan struct{})
+	go func() { s.report(event); s.shutdown(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Error("report or shutdown blocked on a full queue")
+	}
+	if got := DiagnosticsDropped.Load() - before; got != 1 {
+		t.Errorf("dropped = %d, want 1", got)
+	}
+	// Stop selection can race with queued events, so discard them before release.
+	for len(s.events) > 0 {
+		<-s.events
+	}
+	close(release)
+	<-done
+}
+
+// This exercises successful WAL operations; rollback still uses a separate synchronous hook.
+func TestSuccessfulWALProgressWithStalledDiagnosticConsumer(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	sink := &diagnosticSink{
+		events:  make(chan DiagnosticEvent, 1),
+		stop:    make(chan struct{}),
+		deliver: func(DiagnosticEvent) error { close(entered); <-release; return nil },
+	}
+	go func() { defer close(done); sink.run() }()
+	sink.report(DiagnosticEvent{OpCode: OpWALWrite})
+	<-entered
+	t.Cleanup(func() { sink.shutdown(); close(release); <-done })
+
+	l, err := Open(t.TempDir(), &store.Store{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.Decode(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		if err := l.Append(batch, rows); err != nil {
+			result <- err
+			return
+		}
+		result <- l.Close()
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("append or close blocked while diagnostic delivery was stalled")
+	}
+}

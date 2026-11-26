@@ -181,3 +181,27 @@ func TestQueryWorkCancellationAndCursor(t *testing.T) {
 		})
 	}
 }
+
+func TestQueryWorkChildLimit(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	parent := NewQueryWork(ctx, 12)
+	child := parent.WithLimit(5)
+	if err := child.Charge(2, 3); err != nil || parent.Remaining() != 7 || child.Remaining() != 0 {
+		t.Fatalf("charge: child=%d parent=%d err=%v", child.Remaining(), parent.Remaining(), err)
+	}
+	if err := child.Charge(1); !errors.Is(err, ErrQueryWorkExhausted) || parent.Remaining() != 7 {
+		t.Fatalf("child overflow: parent=%d err=%v", parent.Remaining(), err)
+	}
+	next := parent.WithLimit(10)
+	if err := parent.Charge(6); err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Charge(2); !errors.Is(err, ErrQueryWorkExhausted) || next.Remaining() != 1 || parent.Remaining() != 1 {
+		t.Fatalf("parent overflow: child=%d parent=%d err=%v", next.Remaining(), parent.Remaining(), err)
+	}
+	cancel()
+	if err := next.Charge(1); !errors.Is(err, context.Canceled) || parent.Remaining() != 1 {
+		t.Fatalf("cancelled charge: parent=%d err=%v", parent.Remaining(), err)
+	}
+}

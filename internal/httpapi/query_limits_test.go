@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"bog/internal/store"
@@ -41,9 +42,9 @@ func TestLiveQueryScanWork(t *testing.T) {
 	}{
 		{"direct nonmatches", direct, "&contains=x", 1 + 2 + 3*5},
 		{"merged nonmatches", merged, "&contains=x", 2 + 3 + 3*5},
-		// The first 512 rows are scanned. Four blocks are pruned after
-		// the upper bound seek, so the final unit is a Bloom check.
-		{"Bloom pruning", bloom, "&page=1&limit=1&contains=needle", 1 + 11 + 11 + 512*5 + 4},
+		// Capture costs one unit. The first 512 rows are scanned, then
+		// four blocks are pruned after the upper bound seek.
+		{"Bloom pruning", bloom, "&page=1&limit=1&contains=needle", 1 + 1 + 11 + 11 + 512*5 + 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := func(budget uint64) *httptest.ResponseRecorder {
@@ -86,17 +87,12 @@ func TestLiveQuerySmallWorkBudget(t *testing.T) {
 	if ordinary.Code != http.StatusOK || ordinary.Body.String() != jsonRow(t, rows[0])+jsonRow(t, rows[1]) {
 		t.Fatalf("ordinary query: status=%d body=%q", ordinary.Code, ordinary.Body.String())
 	}
-	first := query(queryBounds, "&page=1&limit=1")
-	token := first.Header().Get("Bog-Next-Cursor")
-	if first.Code != http.StatusOK || first.Body.String() != jsonRow(t, rows[0]) || token == "" {
-		t.Fatalf("legacy first page: status=%d headers=%v body=%q", first.Code, first.Header(), first.Body.String())
-	}
-	assertQueryRejection(t, query(queryBounds, "&cursor="+token), http.StatusServiceUnavailable, "query work budget exhausted")
+	assertQueryRejection(t, query(queryBounds, "&page=1&limit=1"), http.StatusServiceUnavailable, "query work budget exhausted")
 	assertQueryRejection(t, query(queryBounds, "&limit=3"), http.StatusServiceUnavailable, "query work budget exhausted")
 	assertQueryRejection(t, query(queryBounds, "&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
 
-	// The retained constructor must reach the final match before publishing
-	// a cursor, even though one-row lookahead reaches the second match.
+	// Both constructors must reach the final match before publishing a
+	// cursor, even though lookahead finds a second match at this budget.
 	h = NewWithPageSource(&legacyPageSource{store: s}, nil, DefaultQueryMaxResponseBytes, 1, budget)
 	assertQueryRejection(t, query(queryBounds, "&page=1&limit=1"), http.StatusServiceUnavailable, "query work budget exhausted")
 	assertQueryRejection(t, query(queryBounds, "&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
@@ -201,4 +197,34 @@ func TestLiveQueryConcurrentCursorResume(t *testing.T) {
 		t.Fatalf("fresh query: status=%d body=%q", fresh.Code, fresh.Body.String())
 	}
 	releaseSecond()
+}
+
+func TestLegacyCursorRetainsOriginalDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := new(store.Store)
+		stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+		rows := []store.Row{{TS: stamp, Line: "a"}, {TS: stamp, Line: "b"}, {TS: stamp, Line: "c"}}
+		s.Publish(rows)
+		h := NewWithQueryLimits(s, nil, DefaultQueryMaxResponseBytes, 1, 45)
+		first := assertRetainedPage(t, requestCapturePage(h, "&page=1&limit=1"), jsonRow(t, rows[0]))
+		if first == "" {
+			t.Fatal("expected a continuation")
+		}
+		time.Sleep(queryCaptureLifetime - time.Nanosecond)
+		second := assertRetainedPage(t, requestCapturePage(h, "&cursor="+first+"&limit=1"), jsonRow(t, rows[1]))
+		if second == "" {
+			t.Fatal("expected a continuation to the last row")
+		}
+
+		time.Sleep(time.Nanosecond)
+		for _, token := range []string{first, second} {
+			assertQueryRejection(t, requestCapturePage(h, "&cursor="+token), http.StatusGone, "query capture expired")
+		}
+		assertQueryRejection(t, requestCapturePage(h, "&cursor="+second+"&contains=b"), http.StatusBadRequest, "invalid cursor")
+		fresh := assertRetainedPage(t, requestCapturePage(h, "&page=1&limit=1"), jsonRow(t, rows[0]))
+		if fresh == "" || fresh == first {
+			t.Fatal("fresh query did not acquire a new capture")
+		}
+		time.Sleep(queryCaptureLifetime)
+	})
 }

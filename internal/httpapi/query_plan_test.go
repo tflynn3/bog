@@ -186,3 +186,94 @@ func TestQueryCertificationBoundsPlanMetadata(t *testing.T) {
 		t.Fatalf("exact plan bound failed: status=%d body=%q", out.Code, out.Body.String())
 	}
 }
+
+// Use the release verifier's fixtures and the reported failing budgets. The
+// one-row acquisition and shared certification scan keep the sparse walk
+// within its historical budget even when every continuation drops to limit 1.
+func TestFixedBudgetReleaseFixtures(t *testing.T) {
+	start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(second int, line string) store.Row {
+		return store.Row{TS: start.Add(time.Duration(second) * time.Second), Line: line}
+	}
+	tied := []store.Row{at(0, "c"), at(0, "a"), at(0, "b")}
+	sparse := []store.Row{at(0, "@last"), at(0, "@tied"), at(3, "@next")}
+	for second := 4; second <= 30; second++ {
+		sparse = append(sparse, at(second, "miss"))
+	}
+	late := at(40, "@late")
+	sparse = append(sparse, late)
+	for second := 41; second <= 55; second++ {
+		sparse = append(sparse, at(second, "miss"))
+	}
+	const bounds = "/query?start=2020-01-01T00:00:00Z&end=2020-01-01T00:10:00Z"
+
+	for _, fixture := range []struct {
+		name, literal   string
+		seed, want      []store.Row
+		firstLimit, cut int
+		byteCap         int
+		minimum         uint64
+		historical      []uint64
+	}{
+		{"tied", "", tied, tied, 1, 1, DefaultQueryMaxResponseBytes, 45, []uint64{11}},
+		{"sparse", "@", sparse, []store.Row{sparse[0], sparse[1], sparse[2], late}, 4, 2, 96, 312, []uint64{314, 512}},
+	} {
+		for _, mode := range []string{"legacy", "retained seam"} {
+			t.Run(fixture.name+"/"+mode, func(t *testing.T) {
+				newHandler := func(s *store.Store, budget uint64) http.Handler {
+					t.Helper()
+					if mode == "legacy" {
+						return NewWithQueryLimits(s, nil, fixture.byteCap, 1, budget)
+					}
+					a := NewWithPageSource(&legacyPageSource{store: s}, nil, fixture.byteCap, 1, budget)
+					t.Cleanup(func() {
+						ctx, cancel := context.WithTimeout(context.Background(), admissionWaitTimeout)
+						defer cancel()
+						if err := a.Close(ctx); err != nil {
+							t.Error(err)
+						}
+					})
+					return a
+				}
+				for _, budget := range append([]uint64{fixture.minimum - 1, fixture.minimum}, fixture.historical...) {
+					t.Run(strconv.FormatUint(budget, 10), func(t *testing.T) {
+						s := new(store.Store)
+						s.Publish(fixture.seed)
+						h := newHandler(s, budget)
+						request := func(params string) *httptest.ResponseRecorder {
+							out := httptest.NewRecorder()
+							h.ServeHTTP(out, httptest.NewRequest(http.MethodGet, bounds+"&contains="+fixture.literal+params, nil))
+							return out
+						}
+						out := request("&page=1&limit=" + strconv.Itoa(fixture.firstLimit))
+						if budget < fixture.minimum {
+							assertQueryRejection(t, out, 503, "query work budget exhausted")
+							return
+						}
+						s.Publish([]store.Row{at(0, "@backfill"), fixture.want[0], at(70, "@append")})
+						var first strings.Builder
+						for _, row := range fixture.want[:fixture.cut] {
+							first.WriteString(jsonRow(t, row))
+						}
+						token := assertRetainedPage(t, out, first.String())
+						for i, row := range fixture.want[fixture.cut:] {
+							if token == "" {
+								t.Fatalf("walk ended before row %d", fixture.cut+i)
+							}
+							path := "&cursor=" + token + "&limit=1"
+							want := jsonRow(t, row)
+							next := assertRetainedPage(t, request(path), want)
+							if retry := assertRetainedPage(t, request(path), want); retry != next || next == token {
+								t.Fatalf("row %d cursor did not advance deterministically", fixture.cut+i)
+							}
+							token = next
+						}
+						if token != "" {
+							t.Fatal("terminal page carried a cursor")
+						}
+					})
+				}
+			})
+		}
+	}
+}

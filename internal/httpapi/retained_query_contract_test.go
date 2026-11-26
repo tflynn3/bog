@@ -100,7 +100,7 @@ func TestRetainedQueryContractAcrossGenerationReplacement(t *testing.T) {
 	const budget = 4096
 	shortRecord := jsonRow(t, store.Row{TS: tie, Line: "hit z"})
 	byteCap := 2 * len(shortRecord)
-	a := NewWithPageSource(source, nil, byteCap, 1, budget)
+	a := NewWithPageSource(source, nil, byteCap, 2, budget)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), admissionWaitTimeout)
 		defer cancel()
@@ -118,7 +118,7 @@ func TestRetainedQueryContractAcrossGenerationReplacement(t *testing.T) {
 	freshCutoff := log.Append(appended)
 	source.activated.Store(true)
 
-	walk := func(first *httptest.ResponseRecorder, cutoff, initialLimit int, resumeLimits []int) {
+	walk := func(t *testing.T, first *httptest.ResponseRecorder, cutoff, initialLimit int, resumeLimits []int) {
 		t.Helper()
 		matches, err := log.Match(cutoff, filter)
 		if err != nil {
@@ -158,10 +158,18 @@ func TestRetainedQueryContractAcrossGenerationReplacement(t *testing.T) {
 			}
 		}
 	}
-	// Start both walks on the same API with the same fixed work and byte caps.
+	// Replay both captures concurrently after publication using the same caps.
 	fresh := request("&page=1&limit=3")
-	walk(first, oldCutoff, 4, []int{1, 3, 2})
-	walk(fresh, freshCutoff, 3, []int{1, 4})
+	t.Run("concurrent walks", func(t *testing.T) {
+		t.Run("prior", func(t *testing.T) {
+			t.Parallel()
+			walk(t, first, oldCutoff, 4, []int{1, 3, 2})
+		})
+		t.Run("replacement", func(t *testing.T) {
+			t.Parallel()
+			walk(t, fresh, freshCutoff, 3, []int{1, 4})
+		})
+	})
 	if old, fresh := priorSource.releases.Load(), replacementSource.releases.Load(); old != 0 || fresh != 0 {
 		t.Fatalf("terminal pages released live captures: prior=%d replacement=%d", old, fresh)
 	}

@@ -1,18 +1,44 @@
 package httpapi
 
 import (
-	"bog/internal/store"
-	"bog/internal/wal"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
+
+	"bog/internal/store"
+	"bog/internal/wal"
 )
+
+func openHTTPTestWAL(t *testing.T, dir string, s *store.Store) *wal.Log {
+	t.Helper()
+	w, err := wal.Open(dir, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+	return w
+}
+
+func readHTTPTestBody(t *testing.T, body io.ReadCloser) []byte {
+	t.Helper()
+	data, err := io.ReadAll(body)
+	if err := errors.Join(err, body.Close()); err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
 
 func TestCursorAuthenticationDomainSeparation(t *testing.T) {
 	payload, err := json.Marshal(cursorData{Version: 1})
@@ -35,11 +61,7 @@ func TestCursorAuthenticationDomainSeparation(t *testing.T) {
 
 func TestIngestAtomicAndQuery(t *testing.T) {
 	s := &store.Store{}
-	w, err := wal.Open(t.TempDir(), s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer w.Close()
+	w := openHTTPTestWAL(t, t.TempDir(), s)
 	h := New(s, w)
 	good := `{"ts":"2025-01-01T00:00:00Z","line":"a"}`
 	for _, tc := range []struct {
@@ -63,11 +85,7 @@ func TestIngestAtomicAndQuery(t *testing.T) {
 
 func TestTruncatedBodyDoesNotCommit(t *testing.T) {
 	s := &store.Store{}
-	w, err := wal.Open(t.TempDir(), s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer w.Close()
+	w := openHTTPTestWAL(t, t.TempDir(), s)
 	h := New(s, w)
 	body := `{"ts":"2025-01-01T00:00:00Z","line":"a"}`
 	r := httptest.NewRequest("POST", "/ingest", strings.NewReader(body))
@@ -87,10 +105,7 @@ func TestTruncatedBodyDoesNotCommit(t *testing.T) {
 func TestUnicodeIngestAndLegacyReplay(t *testing.T) {
 	dir := t.TempDir()
 	s := &store.Store{}
-	log, err := wal.Open(dir, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	log := openHTTPTestWAL(t, dir, s)
 	// Append through the historical decoder to create an old-format committed record.
 	legacy := []byte(`{"ts":"2025-01-01T00:00:00Z","line":"old\ud800"}`)
 	rows, err := store.Decode(legacy)
@@ -125,11 +140,7 @@ func TestUnicodeIngestAndLegacyReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	replay := &store.Store{}
-	log, err = wal.Open(dir, replay)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer log.Close()
+	log = openHTTPTestWAL(t, dir, replay)
 	out = httptest.NewRecorder()
 	New(replay, log).ServeHTTP(out, httptest.NewRequest("GET", "/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z", nil))
 	if out.Code != 200 || strings.Count(out.Body.String(), "\n") != 2 || !strings.Contains(out.Body.String(), "old�") || !strings.Contains(out.Body.String(), "😀 �") || !strings.Contains(out.Body.String(), `\\ud800`) {
@@ -140,10 +151,7 @@ func TestUnicodeIngestAndLegacyReplay(t *testing.T) {
 func TestSnapshotPagination(t *testing.T) {
 	s := &store.Store{}
 	dir := t.TempDir()
-	log, err := wal.Open(dir, s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	log := openHTTPTestWAL(t, dir, s)
 	h := New(s, log)
 	ingest := func(body string) {
 		t.Helper()
@@ -187,11 +195,7 @@ func TestSnapshotPagination(t *testing.T) {
 		t.Fatal(err)
 	}
 	replay := &store.Store{}
-	log, err = wal.Open(dir, replay)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer log.Close()
+	log = openHTTPTestWAL(t, dir, replay)
 	h = New(replay, log)
 	// Simulate a fresh process key while retaining the recovered WAL.
 	oldKey := cursorKey
@@ -225,12 +229,7 @@ func TestPaginationLargeFilterHTTP(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return resp, body
+		return resp, readHTTPTestBody(t, resp.Body)
 	}
 	first, body := get()
 	token := first.Header.Get("Bog-Next-Cursor")
@@ -269,8 +268,7 @@ func TestPaginationRawQueryCharactersHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	io.Copy(io.Discard, first.Body)
-	first.Body.Close()
+	readHTTPTestBody(t, first.Body)
 	token := first.Header.Get("Bog-Next-Cursor")
 	if first.StatusCode != 200 || token == "" {
 		t.Fatalf("first: %d", first.StatusCode)
@@ -279,24 +277,16 @@ func TestPaginationRawQueryCharactersHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	io.Copy(io.Discard, last.Body)
-	last.Body.Close()
+	readHTTPTestBody(t, last.Body)
 	if last.StatusCode != 200 || last.Header.Get("Bog-Next-Cursor") != "" {
 		t.Fatalf("last: %d", last.StatusCode)
 	}
 }
 
 func TestQueryResponseByteLimits(t *testing.T) {
-	stamp, _ := store.ParseTime("2025-01-01T00:00:01Z")
+	stamp := time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC)
 	rows := []store.Row{{TS: stamp, Line: "<&\""}, {TS: stamp, Line: "second"}}
-	encoded := func(row store.Row) string {
-		b, err := json.Marshal(row)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(b) + "\n"
-	}
-	first, second := encoded(rows[0]), encoded(rows[1])
+	first, second := jsonRow(t, rows[0]), jsonRow(t, rows[1])
 	bounds := "/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z"
 	for _, tc := range []struct {
 		name string
@@ -321,10 +311,9 @@ func TestQueryResponseByteLimits(t *testing.T) {
 }
 
 func TestSnapshotByteCutPreservesOrdinal(t *testing.T) {
-	stamp, _ := store.ParseTime("2025-01-01T00:00:01Z")
+	stamp := time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC)
 	row := store.Row{TS: stamp, Line: "same"}
-	b, _ := json.Marshal(row)
-	size := len(b) + 1
+	size := len(jsonRow(t, row))
 	s := &store.Store{}
 	s.Publish([]store.Row{row, row, row, row, row})
 	one := NewWithQueryMaxResponseBytes(s, nil, size)

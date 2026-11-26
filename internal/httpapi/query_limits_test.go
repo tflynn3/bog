@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -43,7 +44,7 @@ func TestLiveQueryScanWork(t *testing.T) {
 		{"merged nonmatches", merged, "&contains=x", 2 + 3 + 3*5},
 		// The first 512 rows are scanned. Four blocks are pruned after
 		// the upper bound seek, so the final unit is a Bloom check.
-		{"Bloom pruning", bloom, "&page=1&contains=needle", 1 + 11 + 11 + 512*5 + 4},
+		{"Bloom pruning", bloom, "&page=1&contains=needle", 1 + 1 + 11 + 11 + 512*5 + 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := func(budget uint64) *httptest.ResponseRecorder {
@@ -67,7 +68,7 @@ func TestLiveQueryScanWork(t *testing.T) {
 }
 
 func TestLiveQuerySmallWorkBudget(t *testing.T) {
-	stamp := time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC)
+	stamp := time.Date(2025, 3, 14, 12, 0, 0, 0, time.UTC)
 	const budget = 32
 	rows := make([]store.Row, 4*budget)
 	for i := range rows {
@@ -76,22 +77,62 @@ func TestLiveQuerySmallWorkBudget(t *testing.T) {
 	rows[0].Line, rows[1].Line, rows[len(rows)-1].Line = "@a", "@b", "@c"
 	s := new(store.Store)
 	s.Publish(rows)
-	h := NewWithQueryLimits(s, nil, DefaultQueryMaxResponseBytes, 1, budget)
-	query := func(params string) *httptest.ResponseRecorder {
+	filter := PageFilter{stamp, rows[len(rows)-1].TS.Add(time.Nanosecond), "@"}
+	query := func(h http.Handler, end time.Time, params string) *httptest.ResponseRecorder {
+		const timestamp = "2006-01-02T15:04:05.000000000Z"
 		out := httptest.NewRecorder()
-		h.ServeHTTP(out, httptest.NewRequest(http.MethodGet, queryBounds+"&contains=@"+params, nil))
+		path := "/query?start=" + stamp.Format(timestamp) + "&end=" + end.Format(timestamp) + "&contains=%40" + params
+		h.ServeHTTP(out, httptest.NewRequest(http.MethodGet, path, nil))
 		return out
 	}
-	ordinary := query("&limit=2")
+	h := NewWithQueryLimits(s, nil, DefaultQueryMaxResponseBytes, 1, budget)
+	ordinary := query(h, rows[1].TS.Add(time.Nanosecond), "&limit=2")
 	if ordinary.Code != http.StatusOK || ordinary.Body.String() != jsonRow(t, rows[0])+jsonRow(t, rows[1]) {
 		t.Fatalf("ordinary query: status=%d body=%q", ordinary.Code, ordinary.Body.String())
 	}
-	first := query("&page=1&limit=1")
-	if first.Code != http.StatusOK || first.Body.String() != jsonRow(t, rows[0]) || first.Header().Get("Bog-Next-Cursor") == "" {
-		t.Fatalf("first page: status=%d headers=%v body=%q", first.Code, first.Header(), first.Body.String())
+	const firstPage = "&page=1&limit=1"
+	for _, params := range []string{firstPage, "&limit=3", "&page=1&limit=2"} {
+		assertQueryRejection(t, query(h, filter.End, params), http.StatusServiceUnavailable, "query work budget exhausted")
 	}
-	assertQueryRejection(t, query("&limit=3"), http.StatusServiceUnavailable, "query work budget exhausted")
-	assertQueryRejection(t, query("&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
+
+	// The short first page alone fits at 32, but the late gap makes its
+	// cursor unusable at that budget. Find the first budget for the whole walk.
+	startWalk := func(units int) (http.Handler, *httptest.ResponseRecorder) {
+		a := newAPI(s, nil, DefaultQueryMaxResponseBytes, uint64(units))
+		h := a.handler(1)
+		first := query(h, filter.End, firstPage)
+		if first.Code == http.StatusServiceUnavailable {
+			assertQueryRejection(t, first, http.StatusServiceUnavailable, "query work budget exhausted")
+			return h, first
+		}
+		cursor, err := a.decodeCursor(first.Header().Get("Bog-Next-Cursor"), a.filterDigest(filter))
+		if first.Code != http.StatusOK || err != nil {
+			t.Fatalf("budget %d: first page status=%d body=%q cursor error=%v", units, first.Code, first.Body.String(), err)
+		}
+		t.Cleanup(func() { a.captures.retire(cursor.capture) })
+		return h, first
+	}
+	const maxBudget = 4096
+	minimum := budget + 1 + sort.Search(maxBudget-budget, func(i int) bool {
+		_, out := startWalk(budget + 1 + i)
+		return out.Code == http.StatusOK
+	})
+	if minimum > maxBudget {
+		t.Fatalf("no successful paged query at budgets up to %d", maxBudget)
+	}
+	_, below := startWalk(minimum - 1)
+	assertQueryRejection(t, below, http.StatusServiceUnavailable, "query work budget exhausted")
+	h, out := startWalk(minimum)
+	want := []store.Row{rows[0], rows[1], rows[len(rows)-1]}
+	for i, row := range want {
+		token := out.Header().Get("Bog-Next-Cursor")
+		if out.Code != http.StatusOK || out.Body.String() != jsonRow(t, row) || (token != "") != (i+1 < len(want)) {
+			t.Fatalf("budget %d page %d: status=%d body=%q cursor=%t", minimum, i+1, out.Code, out.Body.String(), token != "")
+		}
+		if token != "" {
+			out = query(h, filter.End, "&limit=1&cursor="+token)
+		}
+	}
 }
 
 type publishingAppender struct{ s *store.Store }
@@ -173,10 +214,11 @@ func TestLiveQueryConcurrentCursorResume(t *testing.T) {
 	// the older backfill nor the appended tie enters the captured snapshot.
 	second := query(path)
 	next := second.Header().Get("Bog-Next-Cursor")
-	cursor, err := a.decodeCursor(next)
-	if second.Code != http.StatusOK || second.Body.String() != tieLine+tieLine || err != nil || cursor.Count != 4 || cursor.After.Ordinal != 3 {
+	cursor, err := decodeTestCursor(a, next)
+	if second.Code != http.StatusOK || second.Body.String() != tieLine+tieLine || err != nil {
 		t.Fatalf("second page: status=%d body=%q cursor=%+v error=%v", second.Code, second.Body.String(), cursor, err)
 	}
+	checkMemoryPosition(t, cursor, stamp.Add(time.Second), 3)
 	last := query("&cursor=" + next)
 	if last.Code != http.StatusOK || last.Body.String() != lastLine || last.Header().Get("Bog-Next-Cursor") != "" {
 		t.Fatalf("last page: status=%d headers=%v body=%q", last.Code, last.Header(), last.Body.String())

@@ -86,12 +86,28 @@ func TestLiveQuerySmallWorkBudget(t *testing.T) {
 	if ordinary.Code != http.StatusOK || ordinary.Body.String() != jsonRow(t, rows[0])+jsonRow(t, rows[1]) {
 		t.Fatalf("ordinary query: status=%d body=%q", ordinary.Code, ordinary.Body.String())
 	}
-	first := query("&page=1&limit=1")
-	if first.Code != http.StatusOK || first.Body.String() != jsonRow(t, rows[0]) || first.Header().Get("Bog-Next-Cursor") == "" {
-		t.Fatalf("first page: status=%d headers=%v body=%q", first.Code, first.Header(), first.Body.String())
-	}
+	assertQueryRejection(t, query("&page=1&limit=1"), http.StatusServiceUnavailable, "query work budget exhausted")
 	assertQueryRejection(t, query("&limit=3"), http.StatusServiceUnavailable, "query work budget exhausted")
 	assertQueryRejection(t, query("&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
+
+	// This budget fits token validation and a dense continuation, while the
+	// sparse continuation must scan the gap to establish its lookahead.
+	const resumeBudget = 1024
+	h = NewWithQueryLimits(s, nil, DefaultQueryMaxResponseBytes, 1, resumeBudget)
+	assertQueryRejection(t, query("&page=1&limit=1"), http.StatusServiceUnavailable, "query work budget exhausted")
+
+	dense := new(store.Store)
+	dense.Publish(rows[:2])
+	h = NewWithQueryLimits(dense, nil, DefaultQueryMaxResponseBytes, 1, resumeBudget)
+	first := query("&page=1&limit=1")
+	token := first.Header().Get("Bog-Next-Cursor")
+	if first.Code != http.StatusOK || first.Body.String() != jsonRow(t, rows[0]) || token == "" {
+		t.Fatalf("dense first page: status=%d body=%q headers=%v", first.Code, first.Body.String(), first.Header())
+	}
+	second := query("&cursor=" + token + "&limit=1")
+	if second.Code != http.StatusOK || second.Body.String() != jsonRow(t, rows[1]) || second.Header().Get("Bog-Next-Cursor") != "" {
+		t.Fatalf("dense continuation: status=%d body=%q headers=%v", second.Code, second.Body.String(), second.Header())
+	}
 }
 
 type publishingAppender struct{ s *store.Store }
@@ -173,9 +189,9 @@ func TestLiveQueryConcurrentCursorResume(t *testing.T) {
 	// the older backfill nor the appended tie enters the captured snapshot.
 	second := query(path)
 	next := second.Header().Get("Bog-Next-Cursor")
-	cursor, err := a.decodeCursor(next)
-	if second.Code != http.StatusOK || second.Body.String() != tieLine+tieLine || err != nil || cursor.Count != 4 || cursor.After.Ordinal != 3 {
-		t.Fatalf("second page: status=%d body=%q cursor=%+v error=%v", second.Code, second.Body.String(), cursor, err)
+	count, pos, err := decodeMemoryCursor(a, next)
+	if second.Code != http.StatusOK || second.Body.String() != tieLine+tieLine || err != nil || count != 4 || pos.Ordinal != 3 {
+		t.Fatalf("second page: status=%d body=%q capture count=%d position=%+v error=%v", second.Code, second.Body.String(), count, pos, err)
 	}
 	last := query("&cursor=" + next)
 	if last.Code != http.StatusOK || last.Body.String() != lastLine || last.Header().Get("Bog-Next-Cursor") != "" {

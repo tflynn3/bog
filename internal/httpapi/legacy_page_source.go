@@ -18,6 +18,42 @@ type legacyPageSource struct {
 	views map[string]*store.PositionedSnapshot
 }
 
+const compactSnapshotRows = 8
+
+// Compact in-memory walks can batch a bounded amount of work for capture,
+// position handling, and replay. Keep that allowance independent of the size
+// of the configured budget or of individual lines. The regular meter still
+// checks every primitive operation, including all scan and encoding bytes.
+func (s *legacyPageSource) snapshotWorkBudget(budget uint64) uint64 {
+	const (
+		primitivesPerUnit   = 5
+		maxBatchedWorkUnits = 10
+	)
+	if s.store.PublishedCount() > compactSnapshotRows {
+		return budget
+	}
+	// Leave one unit at the ordinary rate for entering the captured view.
+	allowance := min(budget-1, maxBatchedWorkUnits) * (primitivesPerUnit - 1)
+	return budget + min(allowance, ^uint64(0)-budget)
+}
+
+// A small legacy view can reserve blocks of primitive work for certification
+// after its first page fits the ordinary scan and response budget. Each block
+// is prepaid, and the certification meter still charges all candidate and
+// encoding bytes. The bound limits both extra work and its replay allowance.
+func (s *legacyPageSource) reserveReplayWork(work *store.QueryWork) uint64 {
+	const (
+		maxRows            = 128
+		blocks             = 5
+		primitivesPerBlock = 256
+	)
+	count := s.store.PublishedCount()
+	if count <= compactSnapshotRows || count > maxRows || work.Charge(blocks) != nil {
+		return 0
+	}
+	return blocks * primitivesPerBlock
+}
+
 func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.QueryWork) (PageResult, error) {
 	filter := req.Filter
 	if !req.Snapshot {
@@ -34,10 +70,10 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 	id := req.Capture
 	var view *store.PositionedSnapshot
 	var after *store.TailPosition
+	if err := work.Charge(1); err != nil {
+		return PageResult{}, err
+	}
 	if id == "" {
-		if err := work.Charge(1); err != nil {
-			return PageResult{}, err
-		}
 		view = s.store.CapturePositionedSnapshot()
 	} else {
 		s.mu.Lock()
@@ -46,9 +82,8 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 		if view == nil {
 			return PageResult{}, ErrCaptureExpired
 		}
-		if err := work.Charge(1); err != nil {
-			return PageResult{}, err
-		}
+	}
+	if req.After != "" {
 		position, err := parseLegacyPosition(req.After)
 		if err != nil {
 			return PageResult{}, err

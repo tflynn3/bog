@@ -20,7 +20,7 @@ type queryParams struct {
 
 var decimal = regexp.MustCompile(`^[0-9]+$`)
 
-func parseQuery(r *http.Request, tokenSize int) (queryParams, error) {
+func parseQuery(r *http.Request) (queryParams, error) {
 	var params queryParams
 	q, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -73,7 +73,7 @@ func parseQuery(r *http.Request, tokenSize int) (queryParams, error) {
 	}
 	// Reserve room for the largest cursor and ordinary headers within the
 	// server's 1 MiB header limit, using the original request target.
-	if page && len(r.RequestURI)+tokenSize+4096 > 1<<20 {
+	if page && len(r.RequestURI)+cursorTokenSize+4096 > 1<<20 {
 		return params, errors.New("query too large for continuation")
 	}
 	return queryParams{PageFilter{start, end, q.Get("contains")}, limit, page, cursor}, nil

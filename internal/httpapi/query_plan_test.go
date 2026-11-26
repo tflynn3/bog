@@ -160,6 +160,40 @@ func TestCertifiedQueryFillsPagesAcrossShortSourceScans(t *testing.T) {
 	}
 }
 
+func TestCertifiedQueryReusesScanAfterAnExactByteCut(t *testing.T) {
+	stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	rows := []store.Row{{TS: stamp, Line: "a"}, {TS: stamp, Line: "b"}, {TS: stamp, Line: "c"}, {TS: stamp, Line: "d"}}
+	s := new(store.Store)
+	s.Publish(rows)
+	record := func(i int) string { return jsonRow(t, rows[i]) }
+	a := NewWithPageSource(&shortScanSource{legacyPageSource{store: s}}, nil, 2*len(record(0)), 1, 128)
+	defer func() {
+		if err := a.Close(t.Context()); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// The scan after "b" has one row that does not fit in the first page.
+	// Retain it at offset zero and follow its lookahead into the last scan.
+	first := requestCapturePage(a, "&page=1&limit=3")
+	token := assertRetainedPage(t, first, record(0)+record(1))
+	cursor, err := a.decodeCursor(token)
+	if err != nil || cursor.Scan != 0 || cursor.Offset != 0 ||
+		cursor.After != positionDigest(legacyPosition(store.TailPosition{Time: stamp, Ordinal: 1})) {
+		t.Fatalf("cut cursor = %+v, %v", cursor, err)
+	}
+	if token := assertRetainedPage(t, requestCapturePage(a, "&limit=2&cursor="+token), record(2)+record(3)); token != "" {
+		t.Fatalf("terminal cursor = %q", token)
+	}
+	second := assertRetainedPage(t, requestCapturePage(a, "&limit=1&cursor="+token), record(2))
+	if second == "" || second == token {
+		t.Fatalf("continuation cursor = %q", second)
+	}
+	if token := assertRetainedPage(t, requestCapturePage(a, "&limit=1&cursor="+second), record(3)); token != "" {
+		t.Fatalf("terminal cursor = %q", token)
+	}
+}
+
 func TestQueryCertificationBoundsPlanMetadata(t *testing.T) {
 	stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rows := make([]store.Row, maxCertifiedScans+2)

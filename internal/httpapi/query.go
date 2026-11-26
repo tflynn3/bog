@@ -11,38 +11,30 @@ import (
 func writeQueryError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrQueryWorkExhausted):
-		http.Error(w, "query work budget exhausted", http.StatusServiceUnavailable)
+		writeQueryRejection(w, "query work budget exhausted", http.StatusServiceUnavailable)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		http.Error(w, "request cancelled", http.StatusRequestTimeout)
+		writeQueryRejection(w, "request cancelled", http.StatusRequestTimeout)
 	case errors.Is(err, ErrCaptureExpired):
-		http.Error(w, "query capture expired", http.StatusGone)
+		writeQueryRejection(w, "query capture expired", http.StatusGone)
 	case errors.Is(err, ErrQueryCapacityExhausted):
-		http.Error(w, "query capacity exhausted", http.StatusServiceUnavailable)
+		writeQueryRejection(w, "query capacity exhausted", http.StatusServiceUnavailable)
 	case errors.Is(err, store.ErrInvalidQueryCursor):
-		http.Error(w, "invalid cursor", http.StatusBadRequest)
+		writeQueryRejection(w, "invalid cursor", http.StatusBadRequest)
 	default:
 		var oversized *oversizedQueryRecord
 		if errors.As(err, &oversized) {
-			http.Error(w, oversized.Error(), http.StatusUnprocessableEntity)
+			writeQueryRejection(w, oversized.Error(), http.StatusUnprocessableEntity)
 			return
 		}
-		http.Error(w, "query failed", http.StatusInternalServerError)
+		writeQueryRejection(w, "query failed", http.StatusInternalServerError)
 	}
 }
 
 func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	work := store.NewQueryWork(r.Context(), a.queryWorkBudget)
-	tokenSize := cursorTokenSize
-	if a.legacyQueryStore != nil {
-		tokenSize = legacyCursorReservation
-	}
-	params, err := parseQuery(r, tokenSize)
+	params, err := parseQuery(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if a.legacyQueryStore != nil && (params.page || params.cursor != "") {
-		a.legacySnapshotQuery(w, params, work)
+		writeQueryRejection(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	ctx := r.Context()

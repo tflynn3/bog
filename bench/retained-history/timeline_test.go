@@ -5,14 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -197,45 +198,129 @@ func TestLiveFixtureBackfillPlacement(t *testing.T) {
 	}
 }
 
+type statusTransport func(*http.Request) (*http.Response, error)
+
+func (f statusTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
 func TestPinDrainStatusTransitions(t *testing.T) {
+	const (
+		absent  = ""
+		missing = `,"metrics":{"reclaimable_bytes":0}`
+		null    = `,"metrics":{"retired_generation_pins":null}`
+		zero    = `,"metrics":{"retired_generation_pins":0,"reclaimable_bytes":2048}`
+		one     = `,"metrics":{"retired_generation_pins":1}`
+		two     = `,"metrics":{"retired_generation_pins":2}`
+	)
 	for _, tc := range []struct {
-		name      string
-		held      *uint64
-		counts    []string
-		want      string
-		wantError bool
+		name                string
+		before, after       []string
+		wantStatus          string
+		wantHeld, wantAfter *uint64
+		wantPolls           int
+		wantReason          string
+		wantError           string
 	}{
-		{"positive then drained", new(uint64(1)), []string{"2", "0"}, "observed", false},
-		{"zero without held sample", nil, []string{"0"}, "unavailable", false},
-		{"counter unavailable", new(uint64(1)), []string{"null"}, "unavailable", false},
-		{"still pinned", new(uint64(1)), []string{"1"}, "pending", true},
+		{"positive, missing, null, then zero", []string{one}, []string{two, missing, null, zero}, "observed", new(uint64(1)), new(uint64(0)), 4, "", ""},
+		{"retirement after two seconds", []string{one}, []string{"late"}, "observed", new(uint64(1)), new(uint64(0)), 31, "", ""},
+		{"missing first drain sample", []string{one}, []string{absent, zero}, "observed", new(uint64(1)), new(uint64(0)), 2, "", ""},
+		{"positive supersedes publication zero", []string{zero, one}, []string{zero}, "observed", new(uint64(1)), new(uint64(0)), 1, "", ""},
+		{"missing final cutoff sample preserves positive", []string{one, missing}, []string{zero}, "observed", new(uint64(1)), new(uint64(0)), 1, "", ""},
+		{"zero without held sample", []string{absent}, []string{zero}, "unavailable", nil, new(uint64(0)), 1, "positive predecessor pin count", ""},
+		{"positive only after exhaustion", []string{zero}, []string{one, zero}, "unavailable", new(uint64(0)), new(uint64(1)), 1, "positive predecessor pin count", ""},
+		{"candidate lacks instrumentation", []string{absent}, []string{absent}, "unavailable", nil, nil, 1, "candidate did not expose metrics", ""},
+		{"counter unavailable after exhaustion", []string{one}, []string{null}, "unavailable", new(uint64(1)), nil, 4, "candidate did not supply a nonnegative integer", ""},
+		{"observation ends before capture expiry", []string{one}, []string{two, "short observation"}, "pending", new(uint64(1)), new(uint64(2)), 4, "fixture observation window ended", ""},
+		{"positive through deadline", []string{one}, []string{two}, "pending", new(uint64(1)), new(uint64(2)), 4, "pins still present", "did not drain within"},
+		{"missing through deadline after positive", []string{one}, []string{two, missing}, "pending", new(uint64(1)), new(uint64(2)), 4, "pins still present", "did not drain within"},
+		{"deadline during status request", []string{one}, []string{two, "wait"}, "pending", new(uint64(1)), new(uint64(2)), 2, "pins still present", "did not drain within"},
+		{"overall fixture deadline", []string{one}, []string{two, "fixture deadline"}, "pending", new(uint64(1)), new(uint64(2)), 2, "pins still present", "context deadline exceeded"},
+		{"zero from different generation", []string{one}, []string{two, "changed"}, "pending", new(uint64(1)), new(uint64(2)), 2, "pins still present", "published state changed"},
+		{"status request fails while pending", []string{one}, []string{two, "failed"}, "pending", new(uint64(1)), new(uint64(2)), 2, "drain status unavailable", "HTTP 503"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var calls atomic.Int32
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				i := int(calls.Add(1)) - 1
-				count := tc.counts[min(i, len(tc.counts)-1)]
-				_, err := fmt.Fprintf(w, `{"state":"complete","generation":4,"covered_rows":128,"committed_rows":192,"metrics":{"retired_generation_pins":%s}}`, count)
-				if err != nil && r.Context().Err() == nil {
-					t.Error(err)
+			dir := t.TempDir()
+			synctest.Test(t, func(t *testing.T) {
+				calls := 0
+				firstPageReceived := time.Now()
+				retiredAt := firstPageReceived.Add(3 * time.Second)
+				s := newService("http://candidate")
+				s.client.Transport = statusTransport(func(req *http.Request) (*http.Response, error) {
+					i := calls
+					calls++
+					var sample string
+					if i < len(tc.before) {
+						sample = tc.before[i]
+					} else {
+						sample = tc.after[min(i-len(tc.before), len(tc.after)-1)]
+					}
+					generation, status := 4, http.StatusOK
+					switch sample {
+					case "late":
+						sample = two
+						if !time.Now().Before(retiredAt) {
+							sample = zero
+						}
+					case "wait", "fixture deadline":
+						<-req.Context().Done()
+						return nil, req.Context().Err()
+					case "changed":
+						generation, sample = 5, zero
+					case "short observation":
+						sample = null
+					case "failed":
+						status, sample = http.StatusServiceUnavailable, absent
+					}
+					body := fmt.Sprintf(`{"state":"complete","generation":%d,"covered_rows":128,"committed_rows":192%s}`, generation, sample)
+					return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
+				})
+				p := backfillProbe{backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
+					service: s, control: "/compact", dir: dir, origin: time.Now()}
+				for i := range tc.before {
+					if _, err := p.pollPublication(t.Context(), 3, i == len(tc.before)-1); err != nil {
+						t.Fatal(err)
+					}
 				}
-			}))
-			defer srv.Close()
-			s := newService(srv.URL)
-			defer s.client.CloseIdleConnections()
-			p := backfillProbe{backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
-				service: s, control: "/compact", dir: t.TempDir(), origin: time.Now()}
-			p.Publication = &publicationProof{Generation: 4}
-			p.PinDrain.Held = tc.held
-			limit := time.Second
-			if tc.wantError {
-				limit = 75 * time.Millisecond
-			}
-			err := p.observeDrain(t.Context(), limit)
-			if (err != nil) != tc.wantError || p.PinDrain.Status != tc.want ||
-				len(p.Samples) < len(tc.counts) || p.Samples[0].Event != "after_exhaustion" {
-				t.Fatalf("drain returned %v with proof %+v", err, p.PinDrain)
-			}
+				deadline := time.Now().Add(350 * time.Millisecond)
+				var observationLimit time.Duration
+				ctx := t.Context()
+				switch tc.after[len(tc.after)-1] {
+				case "late":
+					deadline = pinDrainDeadline(firstPageReceived)
+					observationLimit = 4 * time.Second
+				case "short observation":
+					deadline = pinDrainDeadline(firstPageReceived)
+					observationLimit = 350 * time.Millisecond
+				case "wait":
+					deadline = time.Now().Add(150 * time.Millisecond)
+				case "fixture deadline":
+					deadline = pinDrainDeadline(firstPageReceived)
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, 150*time.Millisecond)
+					defer cancel()
+				}
+				err := p.observeDrain(ctx, deadline, observationLimit)
+				if (err == nil) != (tc.wantError == "") || err != nil && !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("drain error = %v, want %q", err, tc.wantError)
+				}
+				if (tc.wantError == "did not drain within" || tc.wantError == "context deadline exceeded") && !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("lost drain deadline: %v", err)
+				}
+				drain := p.PinDrain
+				if drain.Status != tc.wantStatus || !reflect.DeepEqual(drain.Held, tc.wantHeld) || !reflect.DeepEqual(drain.After, tc.wantAfter) ||
+					(tc.wantReason == "" && drain.Reason != "") || !strings.Contains(drain.Reason, tc.wantReason) {
+					t.Fatalf("unexpected drain proof: %+v", drain)
+				}
+				samples := p.Samples[len(tc.before):]
+				if len(samples) != tc.wantPolls || samples[0].Event != "after_exhaustion" {
+					t.Fatalf("unexpected drain samples: %+v", samples)
+				}
+				if tc.wantStatus == "observed" {
+					last := samples[len(samples)-1].Candidate
+					if last.Reclaimable == nil || *last.Reclaimable != 2048 {
+						t.Fatalf("missing reclaimable bytes at retirement: %+v", last)
+					}
+				}
+			})
 		})
 	}
 }

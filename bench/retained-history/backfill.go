@@ -40,6 +40,7 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	if held.cursor == "" {
 		return compaction{}, errors.New("held capture did not issue a cursor")
 	}
+	drainDeadline := pinDrainDeadline(time.Now())
 	p.boundary("held_capture")
 	if err := f.appendRange(ctx, s, p.HeldCutoff, p.RequestedCutoff, &writes); err != nil {
 		return compaction{}, err
@@ -84,8 +85,12 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	}
 	p.HeldExhausted = true
 	p.boundary("held_exhausted")
+	// Terminal pages remain retryable until expiry or explicit release.
+	// Observe the predecessor independently of cursor exhaustion.
 	setPhase("pin_drain")
-	if err := p.observeDrain(ctx, drainBudget); err != nil {
+	// Both backfills at both scales share the probe timeout. Leave half of
+	// it for the workload, restart, and cleanup.
+	if err := p.observeDrain(ctx, drainDeadline, o.timeout/8); err != nil {
 		return published, err
 	}
 	setPhase("fresh_backfill")

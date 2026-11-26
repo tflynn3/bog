@@ -54,7 +54,7 @@ var registry = map[string]rule{
 	"bog/internal/ingest":        {testOnly, nil},
 	"bog/internal/archtest":      {testOnly, nil},
 	fuzzVerifier:                 {testOnly, nil},
-	"bog/verify/release":         {verifier, nil},
+	"bog/verify/release":         {verifier, []string{"bog/internal/client"}},
 	"bog/verify/linux":           {verifier, nil},
 	"bog/bench/retained-history": {verifier, nil},
 	"bog/verify/query-model":     {verifierModel, nil},

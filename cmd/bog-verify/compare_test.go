@@ -39,8 +39,19 @@ func TestCompareStreams(t *testing.T) {
 			[]queryPage{page(true, first)}, []queryPage{page(false, first)}, exitIncomplete, 1, "server walk at row 2: page 2: EOF"},
 		{"terminal evidence missing on reference",
 			[]queryPage{page(false, first)}, []queryPage{page(true, first)}, exitIncomplete, 1, "reference walk at row 2: page 2: EOF"},
-		{"empty page with continuation",
-			[]queryPage{page(true)}, []queryPage{page(false)}, exitIncomplete, 0, "empty page with continuation"},
+		{"empty continuations on both sides before later matching rows",
+			[]queryPage{page(false), page(true, first, last)},
+			[]queryPage{page(false, first), page(false), page(false), page(true, last)}, exitOK, 2, ""},
+		{"only empty pages through explicit exhaustion",
+			[]queryPage{page(true)}, []queryPage{page(false), page(false), page(true)}, exitOK, 0, ""},
+		{"terminal evidence missing after empty continuations",
+			[]queryPage{page(true)}, []queryPage{page(false), page(false)}, exitIncomplete, 0, "server walk at row 1: page 3: EOF"},
+		{"later line mismatch after an empty continuation",
+			[]queryPage{page(true, first, tie)},
+			[]queryPage{page(false, first), page(false), page(false, first)}, exitMismatch, 1, "line mismatch at row 2"},
+		{"extra row after an empty continuation",
+			[]queryPage{page(true, first)},
+			[]queryPage{page(false, first), page(false), page(true, tie)}, exitMismatch, 1, "length mismatch at row 2: reference exhausted"},
 		{"tied timestamps reordered",
 			[]queryPage{page(true, first, tie)}, []queryPage{page(true, tie, first)}, exitMismatch, 0, "line mismatch at row 1"},
 		{"ordering crosses a page boundary",
@@ -83,19 +94,22 @@ func TestCompareStreams(t *testing.T) {
 }
 
 func TestCompareCancellationAfterPageRead(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	var pulls int
 	ref := func(context.Context) (queryPage, error) {
+		pulls++
 		cancel()
-		return queryPage{terminal: true}, nil
+		return queryPage{}, nil
 	}
 	live := func(context.Context) (queryPage, error) {
 		t.Error("live stream called after cancellation")
 		return queryPage{terminal: true}, nil
 	}
 	got, status, err := compare(ctx, ref, live)
-	if got != (comparison{}) || status != exitIncomplete || err == nil || !strings.Contains(err.Error(), "context canceled") {
-		t.Fatalf("canceled comparison = %+v, %d, %v", got, status, err)
+	if pulls != 1 || got != (comparison{referencePages: 1}) || status != exitIncomplete || err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("canceled comparison = %+v, %d, %v after %d pulls", got, status, err, pulls)
 	}
 }
 

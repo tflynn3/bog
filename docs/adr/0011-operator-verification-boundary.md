@@ -19,10 +19,18 @@ must remain immutable through verification and the offline walk. A parity
 check uses a separate server restored from that image and held at the same
 recovery point for the comparison. Run the same half-open time range and
 literal filter on the image and over HTTP. Use the production Go client's
-query walker for complete NDJSON pages and opaque continuations. Compare
-the ordered timestamp and line values, preserving duplicate rows and the
-append order of equal timestamps. Confirm exhaustion on both sides, including
-when the result is empty or page boundaries differ.
+`BoundedWalk` for complete NDJSON pages and opaque continuations. Compare the
+ordered timestamp and line values in a single pass, holding up to one page
+from each side. Preserve duplicate rows and the append order of equal
+timestamps.
+
+The shipped server emits at least one row on each page carrying a cursor.
+The client transport also accepts fully framed empty pages with fresh valid
+cursors. The operator follows these continuations and charges each accepted
+page, including empty and terminal pages, against that stream's page budget.
+Report equality only after consuming all rows through both terminal pages.
+Cursor cycles, framing failures, and exhausted page, byte, or time limits
+leave the comparison incomplete. Report the first mismatch by row position.
 [Fixed-budget query continuations](0006-fixed-budget-query-continuations.md)
 
 The command opens the image read-only and uses the server's query endpoint.

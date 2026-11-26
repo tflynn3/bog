@@ -21,10 +21,14 @@ success. Comparison verifies the reference before issuing a query. It applies
 the same half-open time range and case-sensitive substring to both sides, then
 compares decoded timestamps and lines in order, including tied timestamps and
 duplicates. The page boundaries may differ. A successful comparison reports
-the matched row count and confirms both streams reached their terminal pages.
+the matched row count and both page counts after consuming both terminal pages.
+Bog emits at least one row on each page carrying a continuation. The Go client
+also accepts fully framed empty pages with fresh cursors, and comparison
+follows them within the same page budget.
 
 `-limit` defaults to 100 rows per page and accepts 1 through 1000.
-`-max-pages` defaults to 100,000 pages per stream, including the terminal page.
+`-max-pages` defaults to 100,000 pages per stream, including empty and terminal
+pages.
 `-max-page-bytes` defaults to 33,554,432 bytes (32 MiB) per live HTTP page.
 If the server sends larger pages, raise the ceiling to fit the encoded page
 or lower `-limit` to request fewer rows. The comparison holds up to one live
@@ -35,7 +39,8 @@ those rows and their merge output. The command removes its scratch files
 when the walk succeeds, fails, or is canceled.
 `-timeout` defaults to five minutes and covers verification and the full walk.
 If a walk fails or exceeds its budget, the command reports the failing side
-and row, and a new invocation starts a fresh snapshot.
+and row, with the page position for a failed fetch. A new invocation starts
+a fresh snapshot.
 
 | Exit status | Meaning |
 | --- | --- |

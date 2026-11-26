@@ -32,22 +32,19 @@ type rowStream struct {
 	pages    int
 }
 
-// take pulls only when the current page is drained. An empty terminal page
-// establishes exhaustion, including when the first page is empty.
+// take pulls only when the current page is drained. Empty continuation pages
+// still count as pages. Only a drained terminal page establishes exhaustion.
 func (s *rowStream) take(ctx context.Context) (client.Row, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return client.Row{}, false, err
-	}
-	if len(s.rows) == 0 && !s.terminal {
-		p, err := s.next(ctx)
-		if err != nil {
-			return client.Row{}, false, fmt.Errorf("page %d: %w", s.pages+1, err)
-		}
+	for {
 		if err := ctx.Err(); err != nil {
 			return client.Row{}, false, err
 		}
-		if len(p.rows) == 0 && !p.terminal {
-			return client.Row{}, false, fmt.Errorf("page %d: empty page with continuation", s.pages+1)
+		if len(s.rows) > 0 || s.terminal {
+			break
+		}
+		p, err := s.next(ctx)
+		if err != nil {
+			return client.Row{}, false, fmt.Errorf("page %d: %w", s.pages+1, err)
 		}
 		s.rows, s.terminal = p.rows, p.terminal
 		s.pages++

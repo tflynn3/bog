@@ -132,6 +132,10 @@ func compareArgs(dir, url string) []string {
 		"-contains", "keep-", "-limit", "2", "-timeout", "5s"}
 }
 
+func fixtureCursor(value byte) string {
+	return base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{value}, 33))
+}
+
 // fixtureSource gives the real HTTP paging handler an independently ordered
 // in-memory view. Its opaque positions are one-based indexes into that view.
 type fixtureSource []client.Row
@@ -214,7 +218,7 @@ func TestCLIWithRealBackupAndQueryServer(t *testing.T) {
 func TestCLIFailures(t *testing.T) {
 	t.Parallel()
 	dir, _, _ := makeBundle(t)
-	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{'a'}, 33))
+	token := fixtureCursor('a')
 	body := func(line string) string {
 		return fmt.Sprintf("{\"ts\":%q,\"line\":%q}\n", fixtureStart, line)
 	}
@@ -248,6 +252,126 @@ func TestCLIFailures(t *testing.T) {
 			if code := run(t.Context(), compareArgs(dir, server.URL), &stdout, &stderr); code != tc.code ||
 				stdout.Len() != 0 || !strings.Contains(stderr.String(), tc.want) {
 				t.Fatalf("compare exit %d, stdout %q, stderr %q", code, &stdout, &stderr)
+			}
+		})
+	}
+}
+
+func TestCLICompareEmptyContinuations(t *testing.T) {
+	t.Parallel()
+	dir, _, _ := makeBundle(t)
+	a, b, c := fixtureCursor('a'), fixtureCursor('b'), fixtureCursor('c')
+	const firstRows = `{"ts":"` + fixtureStart + `","line":"keep-z"}` + "\n" +
+		`{"ts":"` + fixtureStart + `","line":"keep-a"}` + "\n"
+	const lastRows = `{"ts":"` + fixtureStart + `","line":"keep-a"}` + "\n" +
+		`{"ts":"2026-01-01T00:00:00.000000001Z","line":"keep-later"}` + "\n"
+	type response struct {
+		body, next string
+		wait       bool
+	}
+	first := response{body: firstRows, next: a}
+	empty := response{next: b}
+	for _, tc := range []struct {
+		name      string
+		responses []response
+		extra     []string
+		status    int
+		want      string
+	}{
+		{
+			name:      "exact budget includes empty continuation and terminal pages",
+			responses: []response{first, empty, {body: lastRows, next: c}, {}},
+			extra:     []string{"-max-pages", "4"},
+			status:    exitOK,
+			want:      "rows=4 reference_pages=2 server_pages=4",
+		},
+		{
+			name:      "first mismatch after an empty continuation",
+			responses: []response{first, empty, {body: strings.Replace(lastRows, "keep-a", "keep-wrong", 1), next: c}},
+			status:    exitMismatch,
+			want:      "line mismatch at row 3",
+		},
+		{
+			name:      "cursor cycle across empty pages",
+			responses: []response{first, empty, {next: a}},
+			status:    exitIncomplete,
+			want:      "next cursor does not advance pagination: cursor cycle",
+		},
+		{
+			name:      "empty continuation consumes final page budget",
+			responses: []response{first, empty},
+			extra:     []string{"-max-pages", "2"},
+			status:    exitIncomplete,
+			want:      "server walk at row 3: page 3: after 2 pages: query page budget exhausted",
+		},
+		{
+			name:      "all rows match but terminal evidence exceeds page budget",
+			responses: []response{first, empty, {body: lastRows, next: c}},
+			extra:     []string{"-max-pages", "3"},
+			status:    exitIncomplete,
+			want:      "server walk at row 5: page 4: after 3 pages: query page budget exhausted",
+		},
+		{
+			name:      "invalid framing in later response",
+			responses: []response{first, empty, {body: strings.TrimSuffix(lastRows, "\n")}},
+			status:    exitIncomplete,
+			want:      "invalid query record framing",
+		},
+		{
+			name:      "deadline while waiting for the next response",
+			responses: []response{first, empty, {wait: true}},
+			extra:     []string{"-timeout", "2s"},
+			status:    exitIncomplete,
+			want:      "context deadline exceeded",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				i := int(requests.Add(1)) - 1
+				if i >= len(tc.responses) {
+					t.Errorf("unexpected request %d: %s %s", i+1, r.Method, r.URL)
+					http.Error(w, "unexpected request", http.StatusInternalServerError)
+					return
+				}
+				page, cursor := "1", ""
+				if i > 0 {
+					page, cursor = "", tc.responses[i-1].next
+				}
+				q := r.URL.Query()
+				if r.Method != http.MethodGet || r.URL.Path != "/query" || q.Get("page") != page || q.Get("cursor") != cursor ||
+					q.Get("start") != fixtureStart || q.Get("end") != fixtureEnd || q.Get("contains") != "keep-" || q.Get("limit") != "2" {
+					t.Errorf("unexpected request %d: %s %s", i+1, r.Method, r.URL)
+					http.Error(w, "unexpected request", http.StatusBadRequest)
+					return
+				}
+				p := tc.responses[i]
+				if p.wait {
+					select {
+					case <-r.Context().Done():
+					case <-time.After(5 * time.Second):
+						t.Error("HTTP request outlived the comparison deadline")
+					}
+					return
+				}
+				w.Header().Set("Content-Length", strconv.Itoa(len(p.body)))
+				if p.next != "" {
+					w.Header().Set("Bog-Next-Cursor", p.next)
+				}
+				if n, err := io.WriteString(w, p.body); err != nil || n != len(p.body) {
+					t.Errorf("write response %d: %d of %d bytes, %v", i+1, n, len(p.body), err)
+				}
+			}))
+			defer server.Close()
+			var stdout, stderr bytes.Buffer
+			status := run(t.Context(), append(compareArgs(dir, server.URL), tc.extra...), &stdout, &stderr)
+			if status != tc.status || !strings.Contains(stdout.String()+stderr.String(), tc.want) ||
+				(status == exitOK && stderr.Len() != 0) || (status != exitOK && stdout.Len() != 0) {
+				t.Fatalf("compare exit %d, stdout %q, stderr %q", status, &stdout, &stderr)
+			}
+			if got := int(requests.Load()); got != len(tc.responses) {
+				t.Fatalf("made %d requests, want %d", got, len(tc.responses))
 			}
 		})
 	}

@@ -60,14 +60,19 @@ func LockPublication(dir *os.File, exclusive bool) (_ *os.File, err error) {
 // CheckPublication reports whether a publication needs recovery. Hold the
 // publication lock while using this result to load or reclaim history.
 func CheckPublication(dir *os.File) error {
-	fd, err := syscall.Openat(int(dir.Fd()), stageDir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	stage, err := openStaging(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
+	}
+	if errors.Is(err, os.ErrPermission) {
+		// An interrupted mkdir under umask 0777 may be inaccessible to
+		// the service. Only exclusive recovery can validate and remove it.
+		return ErrPublicationUncertain
 	}
 	if err != nil {
 		return fmt.Errorf("%w: open publication staging directory: %w", ErrIntegrity, err)
 	}
-	if err := syscall.Close(fd); err != nil {
+	if err := stage.Close(); err != nil {
 		return err
 	}
 	return ErrPublicationUncertain

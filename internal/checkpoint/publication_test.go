@@ -1,10 +1,15 @@
 package checkpoint
 
 import (
+	"bytes"
+	"context"
+	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -72,7 +77,7 @@ func TestRecoveryPreservesCollisionAndRemovesInstalledName(t *testing.T) {
 	_, err = l.Publish()
 	requirePublicationOK(t, err)
 	requirePublicationOK(t, l.root.Mkdir(stageDir, 0700))
-	a := publicationAttempt{legacy: l}
+	a := publicationAttempt{pub: l.publication()}
 	first := segmentPrefix + "22222222222222222222222222222222"
 	collision := segmentPrefix + "33333333333333333333333333333333"
 	_, blocks := blockSeeds(t)
@@ -150,7 +155,7 @@ func TestRecoverBeforeManifestAttempt(t *testing.T) {
 			name := segmentPrefix + "44444444444444444444444444444444"
 			staged := stageDir + "/" + name
 			requirePublicationOK(t, l.root.Mkdir(stageDir, 0700))
-			a := publicationAttempt{legacy: l}
+			a := publicationAttempt{pub: l.publication()}
 			_, blocks := blockSeeds(t)
 			requirePublicationOK(t, a.stageSegment(name, blocks[0], digest(blocks[0])))
 			if phase != "staged only" {
@@ -179,5 +184,195 @@ func TestRecoverBeforeManifestAttempt(t *testing.T) {
 				t.Fatalf("retry after recovery: %v", err)
 			}
 		})
+	}
+}
+
+func capturedPublicationFixture(t *testing.T) (string, *Legacy, []byte) {
+	t.Helper()
+	dir, wal, _ := fixture(t)
+	l, err := OpenLegacy(dir)
+	requirePublicationOK(t, err)
+	closeOnCleanup(t, l)
+	return dir, l, wal[:l.CommittedOffset()]
+}
+
+func recoverCaptured(l *Legacy) error {
+	return RecoverCaptured(l.root, l.dir, func() (*Manifest, error) {
+		p, err := l.readPublished(false)
+		if err != nil {
+			return nil, err
+		}
+		m := p.Manifest()
+		return &m, nil
+	})
+}
+
+type capturedSuffix struct {
+	io.ReaderAt
+	start  int64
+	before func()
+}
+
+func (r capturedSuffix) ReadAt(b []byte, offset int64) (int, error) {
+	if offset < r.start {
+		return 0, errors.New("omitted restore prefix was read")
+	}
+	r.before()
+	return r.ReaderAt.ReadAt(b, offset)
+}
+
+func TestPublishCapturedExtendsPinnedGenerationAndSerializesPublishers(t *testing.T) {
+	dir, l, wal := capturedPublicationFixture(t)
+	ctx := t.Context()
+	start := int64(len(wal))
+	old, err := PublishCaptured(ctx, l.root, l.dir, bytes.NewReader(wal), start, nil, 2, digest(wal))
+	requirePublicationOK(t, err)
+	oldAuthority := readFixture(t, dir, manifestName)
+	full := append(bytes.Clone(wal), wal[len("BOGWAL01"):]...)
+	end, sum := int64(len(full)), digest(full)
+
+	scanning := make(chan struct{})
+	resume := make(chan struct{})
+	result := make(chan error, 1)
+	var once sync.Once
+	input := capturedSuffix{
+		ReaderAt: bytes.NewReader(full),
+		start:    start,
+		before:   func() { once.Do(func() { close(scanning); <-resume }) },
+	}
+	go func() {
+		_, err := PublishCaptured(ctx, l.root, l.dir, input, end, old, 4, sum)
+		result <- err
+	}()
+	var contention, pending error
+	var authority []byte
+	select {
+	case <-scanning:
+		_, contention = PublishCaptured(ctx, l.root, l.dir, bytes.NewReader(full), end, old, 4, sum)
+		pending = CheckPublication(l.dir)
+		authority, err = l.root.ReadFile(manifestName)
+		close(resume)
+		requirePublicationOK(t, <-result)
+	case err := <-result:
+		t.Fatalf("publisher returned before scanning: %v", err)
+	}
+	requirePublicationOK(t, err)
+	if !errors.Is(contention, syscall.EWOULDBLOCK) || !errors.Is(pending, ErrPublicationUncertain) {
+		t.Fatalf("competing publish: %v, pending check: %v", contention, pending)
+	}
+	if !bytes.Equal(authority, oldAuthority) {
+		t.Fatal("authority changed before scan finished")
+	}
+	requirePublicationOK(t, CheckPublication(l.dir))
+
+	// Reopen against the full committed prefix to check v1 compatibility.
+	requirePublicationOK(t, l.Close())
+	requirePublicationOK(t, os.WriteFile(filepath.Join(dir, "bog.wal"), full, 0600))
+	marker := make([]byte, 24)
+	copy(marker, "BOGCMT01")
+	binary.LittleEndian.PutUint64(marker[8:16], uint64(end))
+	binary.LittleEndian.PutUint64(marker[16:24], ^uint64(end))
+	requirePublicationOK(t, os.WriteFile(filepath.Join(dir, "bog.commit"), marker, 0600))
+	l, err = OpenLegacy(dir)
+	requirePublicationOK(t, err)
+	closeOnCleanup(t, l)
+	p, err := l.OpenPublished()
+	requirePublicationOK(t, err)
+	m := p.Manifest()
+	if m.CoveredOffset != end || m.SourceSHA256 != sum || m.NextOrdinal != 4 ||
+		len(m.Segments) != 2 || m.Segments[0] != old.Segments[0] {
+		t.Fatalf("unexpected successor: %+v", m)
+	}
+	var rows []BlockRow
+	requirePublicationOK(t, p.Scan(func(row BlockRow) error {
+		rows = append(rows, row)
+		return nil
+	}))
+	if len(rows) != 4 {
+		t.Fatalf("wrong row count: %d", len(rows))
+	}
+	for i, row := range rows {
+		if row.Ordinal != uint64(i) || row.Row != rows[0].Row {
+			t.Fatalf("wrong rows or ordinals: %+v", rows)
+		}
+	}
+}
+
+func TestPublishCapturedRejectsInvalidPrefix(t *testing.T) {
+	dir, l, wal := capturedPublicationFixture(t)
+	old, err := l.Publish()
+	requirePublicationOK(t, err)
+	before := checkpointNames(t, dir)
+	original := readFixture(t, dir, manifestName)
+	full := append(bytes.Clone(wal), wal[len("BOGWAL01"):]...)
+	start, end := len(wal), int64(len(full))
+	badHeader, badChecksum := bytes.Clone(full), bytes.Clone(full)
+	badHeader[start] ^= 1
+	badChecksum[start+16] ^= 1
+	for _, tt := range []struct {
+		name  string
+		input []byte
+		end   int64
+		next  uint64
+		sum   string
+		want  error
+	}{
+		{"malformed digest", full, end, 4, "bad", ErrIntegrity},
+		{"short frame header", full, int64(start + 15), 4, digest(full), ErrIntegrity},
+		{"short frame payload", full, end - 1, 4, digest(full), ErrIntegrity},
+		{"header checksum", badHeader, end, 4, digest(full), ErrIntegrity},
+		{"payload checksum", badChecksum, end, 4, digest(full), ErrIntegrity},
+		{"wrong ordinal", full, end, 3, digest(full), ErrIntegrity},
+		{"truncated reader", full[:len(full)-1], end, 4, digest(full), io.ErrUnexpectedEOF},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m, err := PublishCaptured(t.Context(), l.root, l.dir, bytes.NewReader(tt.input), tt.end, old, tt.next, tt.sum)
+			if m != nil || !errors.Is(err, tt.want) {
+				t.Fatalf("publish = %v, %v, want %v", m, err, tt.want)
+			}
+			if got := checkpointNames(t, dir); !slices.Equal(got, before) {
+				t.Fatalf("failed scan changed directory: got %v, want %v", got, before)
+			}
+			if !bytes.Equal(readFixture(t, dir, manifestName), original) {
+				t.Fatal("failed scan changed authoritative manifest")
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := PublishCaptured(ctx, l.root, l.dir, bytes.NewReader(full), end, old, 4, digest(full)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("publish with cancelled context: %v", err)
+	}
+}
+
+func TestRecoverCapturedRejectsMissingReferencedSegment(t *testing.T) {
+	dir, l, wal := capturedPublicationFixture(t)
+	m, err := l.Publish()
+	requirePublicationOK(t, err)
+	original := readFixture(t, dir, manifestName)
+	segment := m.Segments[0].Name
+	requirePublicationOK(t, l.root.Remove(segment))
+	requirePublicationOK(t, l.root.Mkdir(stageDir, 0700))
+	if err := recoverCaptured(l); !errors.Is(err, ErrIntegrity) || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recover missing referenced segment: %v", err)
+	}
+	// A wrapped ENOENT from the authority callback cannot be mistaken for an
+	// absent manifest when the manifest itself still exists.
+	err = RecoverCaptured(l.root, l.dir, func() (*Manifest, error) {
+		_, err := l.root.Lstat(segment)
+		return nil, err
+	})
+	if !errors.Is(err, ErrIntegrity) || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recover missing referenced segment reported as absent manifest: %v", err)
+	}
+	if _, err := l.root.Lstat(stageDir); err != nil {
+		t.Fatalf("failed recovery discarded staging: %v", err)
+	}
+	requirePublicationOK(t, l.root.Remove(stageDir))
+	if _, err := PublishCaptured(t.Context(), l.root, l.dir, bytes.NewReader(wal), int64(len(wal)), m, 2, digest(wal)); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("publish over missing referenced segment: %v", err)
+	}
+	if got := readFixture(t, dir, manifestName); !bytes.Equal(got, original) {
+		t.Fatal("failed recovery changed manifest")
 	}
 }

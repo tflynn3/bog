@@ -301,11 +301,9 @@ func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
 		if crc32.Checksum(payload, table) != binary.LittleEndian.Uint32(h[8:]) {
 			return fmt.Errorf("invalid WAL checksum at %d", pos)
 		}
-		rows, err := store.Decode(payload)
-		if err != nil {
+		if err := builder.DecodeFrame(payload); err != nil {
 			return fmt.Errorf("invalid WAL payload at %d: %w", pos, err)
 		}
-		builder.Add(rows)
 		pos += 16 + int64(n)
 	}
 	l.offset = pos

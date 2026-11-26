@@ -665,3 +665,33 @@ func TestOrderedRecoveryStreamingOracle(t *testing.T) {
 		})
 	}
 }
+
+func TestRecoveryDecodeFrameIsAtomic(t *testing.T) {
+	b := NewRecoveryBuilder()
+	var first strings.Builder
+	for i := 0; i < blockSize-1; i++ {
+		fmt.Fprintf(&first, "{\"ts\":\"2025-01-01T00:00:00Z\",\"line\":\"row %d\"}\n", i)
+	}
+	if err := b.DecodeFrame([]byte(first.String())); err != nil {
+		t.Fatal(err)
+	}
+	malformed := []byte("{\"ts\":\"2024-01-01T00:00:00Z\",\"line\":\"bad\"}\n{bad}")
+	if err := b.DecodeFrame(malformed); err == nil {
+		t.Fatal("accepted malformed frame")
+	}
+	if len(b.rows) != blockSize-1 || !b.ordered || len(b.blocks) != 0 {
+		t.Fatal("failed frame changed builder state")
+	}
+	if err := b.DecodeFrame([]byte(`{"ts":"2025-01-01T00:00:01Z","line":"last"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.rows) != blockSize || !b.ordered || len(b.blocks) != 1 {
+		t.Fatal("successful frame did not seal block")
+	}
+	s := &Store{}
+	b.Install(s)
+	got := s.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", blockSize+1)
+	if len(got) != blockSize || got[blockSize-1].Line != "last" {
+		t.Fatalf("unexpected recovered rows: %v", got)
+	}
+}

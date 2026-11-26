@@ -917,3 +917,80 @@ func BenchmarkReplay(b *testing.B) {
 		})
 	}
 }
+
+func TestReplayUnequalFramesAndReusedPayload(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, &store.Store{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	var want []store.Row
+	for _, size := range []int{120, 20, 3} {
+		var payload strings.Builder
+		for i := 0; i < size; i++ {
+			n := len(want)
+			line := fmt.Sprintf("plain row %03d", n)
+			if n%7 == 0 {
+				line = fmt.Sprintf("escaped \"row\"\n%d", n)
+			}
+			ts := epoch.Add(time.Duration(n) * time.Second)
+			fmt.Fprintf(&payload, "{\"ts\":%q,\"line\":%q}\n", ts.Format(time.RFC3339Nano), line)
+			want = append(want, store.Row{TS: ts, Line: line})
+		}
+		data := []byte(payload.String())
+		rows, err := store.Decode(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Append(data, rows); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered := &store.Store{}
+	l, err = Open(dir, recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	got := recovered.Query(epoch, epoch.Add(time.Hour), "", len(want)+1)
+	if !slices.Equal(got, want) {
+		t.Fatalf("recovered rows differ: got %v, want %v", got, want)
+	}
+}
+
+func TestReplayMalformedCommittedFrameDoesNotPublish(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(dir, &store.Store{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.Decode(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(batch, rows); err != nil {
+		t.Fatal(err)
+	}
+	// Append writes a valid frame and commit marker even though its payload is malformed.
+	malformed := []byte("{\"ts\":\"2025-01-01T00:00:01Z\",\"line\":\"partial\"}\n{bad}")
+	if err := l.Append(malformed, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target := &store.Store{}
+	target.Publish(rows)
+	if reopened, err := Open(dir, target); err == nil {
+		reopened.Close()
+		t.Fatal("accepted malformed committed frame")
+	}
+	got := target.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10)
+	if !slices.Equal(got, rows) {
+		t.Fatalf("failed replay published rows: %v", got)
+	}
+}

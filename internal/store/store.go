@@ -47,10 +47,15 @@ func ParseTime(s string) (time.Time, error) {
 	return t, nil
 }
 func Decode(data []byte) ([]Row, error) {
+	return decodeAppend(nil, data)
+}
+
+// decodeAppend appends a complete batch to rows, retaining Decode validation.
+func decodeAppend(rows []Row, data []byte) ([]Row, error) {
+	initialLen := len(rows)
 	if len(data) == 0 || len(data) > MaxBatch || !utf8.Valid(data) {
 		return nil, errors.New("invalid batch")
 	}
-	var rows []Row
 	for len(data) > 0 {
 		line, rest, found := bytes.Cut(data, []byte{'\n'})
 		if found {
@@ -116,7 +121,7 @@ func Decode(data []byte) ([]Row, error) {
 		}
 		rows = append(rows, Row{t, text})
 	}
-	if len(rows) == 0 {
+	if len(rows) == initialLen {
 		return nil, errors.New("empty batch")
 	}
 	return rows, nil
@@ -245,17 +250,31 @@ func NewRecoveryBuilder() *RecoveryBuilder { return &RecoveryBuilder{ordered: tr
 // Add appends decoded rows in WAL order and builds summaries of sealed blocks.
 func (b *RecoveryBuilder) Add(rows []Row) {
 	oldLen := len(b.rows)
-	if b.ordered && len(rows) > 0 {
-		if oldLen > 0 && rows[0].TS.Before(b.rows[oldLen-1].TS) {
-			b.ordered = false
-		}
-		for i := 1; i < len(rows) && b.ordered; i++ {
-			if rows[i].TS.Before(rows[i-1].TS) {
+	b.rows = append(b.rows, rows...)
+	b.finishFrame(oldLen)
+}
+
+// DecodeFrame appends a validated WAL payload only if the entire batch decodes.
+func (b *RecoveryBuilder) DecodeFrame(payload []byte) error {
+	oldLen := len(b.rows)
+	rows, err := decodeAppend(b.rows, payload)
+	if err != nil {
+		return err
+	}
+	b.rows = rows
+	b.finishFrame(oldLen)
+	return nil
+}
+
+func (b *RecoveryBuilder) finishFrame(oldLen int) {
+	if b.ordered {
+		for i := max(1, oldLen); i < len(b.rows); i++ {
+			if b.rows[i].TS.Before(b.rows[i-1].TS) {
 				b.ordered = false
+				break
 			}
 		}
 	}
-	b.rows = append(b.rows, rows...)
 	for len(b.blocks)*blockSize+blockSize <= len(b.rows) {
 		start := len(b.blocks) * blockSize
 		b.blocks = append(b.blocks, buildBlock(b.rows[start:start+blockSize]))

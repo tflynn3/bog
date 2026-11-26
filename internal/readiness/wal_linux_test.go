@@ -11,8 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"bog/internal/httpapi"
@@ -168,29 +171,21 @@ func TestReadyRecoversWithQueuedAppend(t *testing.T) {
 	}
 }
 
-type commitState33 string
-
-type commitOutcome33 struct {
-	State     commitState33
-	At        time.Time
-	Operation string
-	Category  string
+type outcomeAppender struct {
+	latest func() wal.CommitOutcome
 }
 
-type wal33 struct {
-	commit commitOutcome33
-}
-
-func (*wal33) Append([]byte, []store.Row) error {
+func (*outcomeAppender) Append([]byte, []store.Row) error {
 	return errors.New("pre-admission failure")
 }
 
-func (w *wal33) LastCommitOutcome() commitOutcome33 {
-	return w.commit
+func (w *outcomeAppender) LastCommitOutcome() wal.CommitOutcome {
+	return w.latest()
 }
 
 func TestReadyRouteWithWALOutcomeSnapshot(t *testing.T) {
-	w := &wal33{}
+	var commit wal.CommitOutcome
+	w := &outcomeAppender{latest: func() wal.CommitOutcome { return commit }}
 	m := &monitor{sample: sample{at: time.Now(), headroom: true}}
 	h := handlerForMonitor(m, w, func(appender Appender) http.Handler {
 		if appender != w {
@@ -200,33 +195,191 @@ func TestReadyRouteWithWALOutcomeSnapshot(t *testing.T) {
 	})
 	assertReady(t, h, http.StatusOK, status{Ready: true, Reason: "ready"})
 	tests := []struct {
-		state    commitState33
+		state    wal.CommitState
 		category string
 		code     int
 		want     status
 	}{
-		{"rolled_back", "enospc", http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"}},
-		{"durable", "", http.StatusOK, status{Ready: true, Reason: "ready"}},
-		{"uncertain", "private diagnostic", http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"}},
-		{"durable", "", http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"}},
+		{wal.CommitRolledBack, "enospc", http.StatusServiceUnavailable, status{Reason: "wal_rollback", Category: "enospc"}},
+		{wal.CommitDurable, "", http.StatusOK, status{Ready: true, Reason: "ready"}},
+		{wal.CommitUncertain, "private diagnostic", http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"}},
+		{wal.CommitDurable, "", http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "other"}},
 	}
 	for _, tt := range tests {
-		w.commit = commitOutcome33{State: tt.state, At: time.Now(), Category: tt.category}
+		commit = wal.CommitOutcome{State: tt.state, At: time.Now(), Category: tt.category}
 		assertReady(t, h, tt.code, tt.want)
 	}
 }
 
-func TestDiskHeadroom(t *testing.T) {
-	dir := t.TempDir()
-	if _, err := diskHeadroom(dir); err != nil {
-		t.Fatalf("stat active data directory: %v", err)
+func TestHeadroom(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		fs   syscall.Statfs_t
+		want bool
+	}{
+		{"two available blocks and one free inode", syscall.Statfs_t{Bavail: 2, Files: 10, Ffree: 1}, true},
+		{"reserved blocks are unavailable", syscall.Statfs_t{Bavail: 1, Bfree: 10}, false},
+		{"no free inodes", syscall.Statfs_t{Bavail: 2, Files: 10}, false},
+		{"inode count unreported", syscall.Statfs_t{Bavail: 2}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasHeadroom(tt.fs); got != tt.want {
+				t.Errorf("hasHeadroom(%+v) = %t, want %t", tt.fs, got, tt.want)
+			}
+		})
 	}
-	if _, err := diskHeadroom(dir + "/missing"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stat missing data directory: %v", err)
+}
+
+func TestReadySamplesOpenedDirectoryAfterRetarget(t *testing.T) {
+	active := filepath.Join(t.TempDir(), "active")
+	if err := os.Mkdir(active, 0700); err != nil {
+		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	if h := NewHandler(ctx, dir, appendFunc(nil), func(Appender) http.Handler { return http.NotFoundHandler() }); h == nil {
-		t.Fatal("missing handler")
+	var activeFS, targetFS syscall.Statfs_t
+	if err := syscall.Statfs(active, &activeFS); err != nil {
+		t.Fatal(err)
 	}
+	// procfs reports zero allocatable blocks without requiring a mount or
+	// filling another filesystem to distinguish the two readiness results.
+	if err := syscall.Statfs("/proc", &targetFS); err != nil {
+		t.Skipf("procfs unavailable: %v", err)
+	}
+	if activeFS.Type == targetFS.Type || !hasHeadroom(activeFS) || hasHeadroom(targetFS) {
+		t.Skip("test requires a writable temp filesystem and procfs with no allocatable blocks")
+	}
+	link := filepath.Join(t.TempDir(), "data")
+	if err := os.Symlink(active, link); err != nil {
+		t.Fatal(err)
+	}
+	log, err := wal.Open(link, &store.Store{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := log.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	dir, err := os.Open(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := dir.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	replacement := link + ".new"
+	if err := os.Symlink("/proc", replacement); err != nil {
+		t.Fatal(err)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		newAPI := func(appender Appender) http.Handler {
+			if appender != log {
+				t.Fatal("WAL with typed outcomes was wrapped")
+			}
+			return http.NotFoundHandler()
+		}
+		pinned := NewHandlerForDirectory(ctx, dir, log, newAPI)
+		byPath := NewHandler(ctx, link, log, newAPI)
+		synctest.Wait()
+		ready := status{Ready: true, Reason: "ready"}
+		assertReady(t, pinned, http.StatusOK, ready)
+		assertReady(t, byPath, http.StatusOK, ready)
+
+		if err := os.Rename(replacement, link); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(maxEvidenceAge + sampleInterval)
+		synctest.Wait()
+		assertReady(t, pinned, http.StatusOK, ready)
+		assertReady(t, byPath, http.StatusServiceUnavailable, status{Reason: "low_disk_headroom"})
+	})
+}
+
+func TestReadyReportsClosedDirectory(t *testing.T) {
+	dir, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.Close(); err != nil {
+		t.Fatal(err)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		h := NewHandlerForDirectory(t.Context(), dir, appendFunc(nil), func(Appender) http.Handler { return http.NotFoundHandler() })
+		synctest.Wait()
+		assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "sample_unavailable"})
+	})
+}
+
+func TestHTTPDuringBlockedProbeAndCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		release := make(chan struct{}, 1)
+		defer close(release)
+		defer cancel()
+		var calls atomic.Int32
+		h := newHandler(ctx, func(fs *syscall.Statfs_t) error {
+			calls.Add(1)
+			<-release
+			fs.Bavail = 2
+			return nil
+		}, &outcomeAppender{latest: func() wal.CommitOutcome { return wal.CommitOutcome{} }}, func(Appender) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+		})
+		synctest.Wait()
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("initial probe calls = %d, want 1", got)
+		}
+		pending := status{Reason: "sampling_pending"}
+		assertReady(t, h, http.StatusServiceUnavailable, pending)
+		if got := request(h, http.MethodGet, "/healthz", "").Code; got != http.StatusNoContent {
+			t.Fatalf("delegated HTTP status = %d", got)
+		}
+		cancel()
+		assertReady(t, h, http.StatusServiceUnavailable, pending)
+		release <- struct{}{}
+		time.Sleep(2 * sampleInterval)
+		synctest.Wait()
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("probe calls after cancellation = %d, want 1", got)
+		}
+		assertReady(t, h, http.StatusServiceUnavailable, pending)
+	})
+}
+
+func TestConcurrentWALObservationsKeepUncertainty(t *testing.T) {
+	now := time.Now()
+	var calls atomic.Int32
+	captured := make(chan struct{})
+	release := make(chan struct{}, 1)
+	defer close(release)
+	w := &outcomeAppender{latest: func() wal.CommitOutcome {
+		if calls.Add(1) == 1 {
+			close(captured)
+			<-release
+			return wal.CommitOutcome{State: wal.CommitUncertain, At: now.Add(-time.Second), Category: "eio"}
+		}
+		return wal.CommitOutcome{State: wal.CommitDurable, At: now}
+	}}
+	h := handlerForMonitor(&monitor{}, w, func(Appender) http.Handler { return http.NotFoundHandler() })
+	uncertainResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() { uncertainResponse <- request(h, http.MethodGet, "/ready", "") }()
+	<-captured
+	assertReady(t, h, http.StatusOK, status{Ready: true, Reason: "ready"})
+
+	var readers sync.WaitGroup
+	for range 32 {
+		readers.Go(func() { request(h, http.MethodGet, "/ready", "") })
+	}
+	release <- struct{}{}
+	if rec := <-uncertainResponse; rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("uncertain outcome returned %d %s", rec.Code, rec.Body)
+	}
+	readers.Wait()
+	assertReady(t, h, http.StatusServiceUnavailable, status{Reason: "recovery_required", Category: "eio"})
 }

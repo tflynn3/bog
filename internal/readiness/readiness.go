@@ -65,10 +65,11 @@ func start(ctx context.Context, interval time.Duration, probe func() (bool, erro
 			}
 			at := time.Now()
 			headroom, err := probe()
+			m.mu.Lock()
 			if ctx.Err() != nil {
+				m.mu.Unlock()
 				return
 			}
-			m.mu.Lock()
 			m.sample = sample{at: at, headroom: headroom, failed: err != nil}
 			m.mu.Unlock()
 			timer.Reset(interval)

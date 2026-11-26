@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"hash/crc32"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -145,4 +146,127 @@ func TestBlockEncodeRejectsInvalid(t *testing.T) {
 			t.Fatal("accepted invalid input")
 		}
 	}
+}
+
+func blockSeeds(t testing.TB) ([][]BlockRow, [][]byte) {
+	t.Helper()
+	lo, hi := time.Unix(-1, 999999999).UTC(), time.Unix(10, 7).UTC()
+	fixtures := [][]BlockRow{
+		{{Row: store.Row{TS: minBlockTime}, Ordinal: ^uint64(0)}},
+		{
+			{Row: store.Row{TS: hi, Line: "same é"}, Ordinal: 10},
+			{Row: store.Row{TS: lo, Line: "backfill"}, Ordinal: 2},
+			{Row: store.Row{TS: hi, Line: "same é"}, Ordinal: 11},
+		},
+		{{Row: store.Row{TS: maxBlockTime.Add(-time.Nanosecond), Line: "\x00literal"}}},
+	}
+	encoded := make([][]byte, 0, len(fixtures))
+	for _, rows := range fixtures {
+		b, err := EncodeBlock(rows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded = append(encoded, b)
+	}
+	return fixtures, encoded
+}
+
+type malformedBlock struct {
+	name string
+	data []byte
+}
+
+func malformedBlocks(b []byte) []malformedBlock {
+	u32 := binary.LittleEndian.PutUint32
+	mutations := []struct {
+		name   string
+		change func([]byte)
+	}{
+		{"zero count", func(b []byte) { u32(b[4:], 0) }},
+		{"oversized count", func(b []byte) { u32(b[4:], ^uint32(0)) }},
+		{"plausible short count", func(b []byte) { u32(b[4:], 2) }},
+		{"oversized payload", func(b []byte) { u32(b[8:], ^uint32(0)) }},
+		{"oversized line", func(b []byte) { u32(b[blockHeaderSize+20:], ^uint32(0)) }},
+		{"inverted time range", func(b []byte) { putBlockTime(b[12:24], time.Unix(12, 0)) }},
+		{"lower bound inside actual range", func(b []byte) { putBlockTime(b[12:24], time.Unix(0, 0)) }},
+		{"upper bound outside actual range", func(b []byte) { putBlockTime(b[24:36], time.Unix(11, 0)) }},
+		{"invalid row timestamp", func(b []byte) { putBlockTime(b[blockHeaderSize:], maxBlockTime) }},
+	}
+	malformed := make([]malformedBlock, 0, len(mutations))
+	for _, m := range mutations {
+		c := bytes.Clone(b)
+		m.change(c)
+		u32(c[36:], crc32.Checksum(c[blockHeaderSize:], castagnoli))
+		u32(c[40:], crc32.Checksum(c[:40], castagnoli))
+		malformed = append(malformed, malformedBlock{m.name, c})
+	}
+	return malformed
+}
+
+func TestBlockRejectsMalformedWithValidChecksums(t *testing.T) {
+	_, blocks := blockSeeds(t)
+	for _, tc := range malformedBlocks(blocks[1]) {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(10, func() {
+				if rows, err := DecodeBlock(tc.data); err == nil || len(rows) != 0 {
+					t.Fatalf("malformed block returned %d rows and error %v", len(rows), err)
+				}
+			})
+			if allocs != 0 {
+				t.Fatalf("malformed block allocated %.1f objects", allocs)
+			}
+		})
+	}
+}
+
+// Run a bounded campaign with go test ./internal/checkpoint -run '^$' -fuzz '^FuzzDecodeBlock$' -fuzztime 10s.
+func FuzzDecodeBlock(f *testing.F) {
+	fixtures, blocks := blockSeeds(f)
+	malformed := malformedBlocks(blocks[1])
+	for _, b := range blocks {
+		f.Add(b)
+	}
+	for _, tc := range malformed {
+		f.Add(tc.data)
+	}
+	f.Add([]byte{})
+	f.Add(blocks[1][:len(blocks[1])-1])
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		rows, err := checkBlockDecode(t, b)
+		for i, seed := range blocks {
+			if bytes.Equal(b, seed) && (err != nil || !slices.Equal(rows, fixtures[i])) {
+				t.Fatalf("valid seed %d lost timestamps, ordinals or duplicates: %v", i, err)
+			}
+		}
+		for _, tc := range malformed {
+			if bytes.Equal(b, tc.data) && err == nil {
+				t.Fatalf("accepted malformed seed %q", tc.name)
+			}
+		}
+		// Exercise structural checks even when a mutation changes the payload.
+		if len(b) >= blockHeaderSize && len(b) <= MaxBlockSize {
+			c := bytes.Clone(b)
+			binary.LittleEndian.PutUint32(c[36:], crc32.Checksum(c[blockHeaderSize:], castagnoli))
+			binary.LittleEndian.PutUint32(c[40:], crc32.Checksum(c[:40], castagnoli))
+			checkBlockDecode(t, c)
+		}
+	})
+}
+
+func checkBlockDecode(t *testing.T, b []byte) ([]BlockRow, error) {
+	t.Helper()
+	rows, err := DecodeBlock(b)
+	if err != nil {
+		if len(rows) != 0 {
+			t.Fatalf("rejection exposed %d rows", len(rows))
+		}
+		return nil, err
+	}
+	// Re-encoding recomputes the exact extrema and preserves row order.
+	encoded, encodeErr := EncodeBlock(rows)
+	if encodeErr != nil || !bytes.Equal(encoded, b) {
+		t.Fatalf("decoded block did not round trip: %v", encodeErr)
+	}
+	return rows, nil
 }

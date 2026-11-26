@@ -1,15 +1,12 @@
 package checkpoint
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"sort"
 	"strings"
 
 	"bog/internal/store"
@@ -23,6 +20,13 @@ const manifestName = "bog.checkpoint"
 
 var ErrIntegrity = errors.New("checkpoint integrity error")
 var ErrPublicationUncertain = errors.New("checkpoint publication uncertain; reopen required")
+
+const segmentPrefix = "bog-segment-"
+
+func validSegmentName(name string) bool {
+	return strings.HasPrefix(name, segmentPrefix) && len(name) == len(segmentPrefix)+32 &&
+		strings.Trim(name[len(segmentPrefix):], "0123456789abcdef") == ""
+}
 
 type segmentMeta struct {
 	Name   string `json:"name"`
@@ -55,159 +59,6 @@ func (l *Legacy) prefixDigest(end int64) (string, error) {
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
-func randomName(prefix string) (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return prefix + hex.EncodeToString(b[:]), nil
-}
-func (l *Legacy) writeNew(name string, data []byte) (err error) {
-	f, err := l.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
-			err = errors.Join(err, closeErr)
-		}
-	}()
-	// The create mode is masked by umask. Set the exact mode on the new file
-	// descriptor before syncing it, without changing the process-wide umask.
-	if err = f.Chmod(0600); err != nil {
-		return err
-	}
-	n, err := f.Write(data)
-	if err != nil {
-		return err
-	}
-	if n != len(data) {
-		return io.ErrShortWrite
-	}
-	return f.Sync()
-}
-
-func (l *Legacy) installSegment(name string, data []byte) error {
-	staged := "." + name
-	if err := l.writeNew(staged, data); err != nil {
-		return err
-	}
-	// Install without replacing an existing immutable segment. The staging
-	// link must be gone before the manifest can refer to the final name.
-	if err := l.root.Link(staged, name); err != nil {
-		return err
-	}
-	return l.root.Remove(staged)
-}
-
-// Publish builds a checkpoint while the Legacy directory lock is held. Any error
-// from the manifest rename or final directory sync is uncertain. Close and
-// reopen before making further progress. Old segments and WAL inputs are retained.
-func (l *Legacy) Publish() (*Manifest, error) {
-	if err := l.begin(); err != nil {
-		return nil, err
-	}
-	defer l.active.Done()
-
-	l.publicationMu.Lock()
-	defer l.publicationMu.Unlock()
-	if l.uncertain != nil {
-		return nil, l.uncertain
-	}
-	m := &Manifest{Version: 1, CoveredOffset: l.end, Segments: []segmentMeta{}}
-	var err error
-	if m.SourceSHA256, err = l.prefixDigest(l.end); err != nil {
-		return nil, err
-	}
-	var run []BlockRow
-	size := blockHeaderSize
-	flush := func() error {
-		if len(run) == 0 {
-			return nil
-		}
-		sort.Slice(run, func(i, j int) bool { return lessRow(run[i], run[j]) })
-		if len(m.Segments) >= MaxSegments {
-			return errors.New("checkpoint segment limit exceeded")
-		}
-		b, e := EncodeBlock(run)
-		if e != nil {
-			return e
-		}
-		name, e := randomName("bog-segment-")
-		if e != nil {
-			return e
-		}
-		if e = l.installSegment(name, b); e != nil {
-			return e
-		}
-		m.Segments = append(m.Segments, segmentMeta{Name: name, Size: int64(len(b)), SHA256: digest(b)})
-		run = nil
-		size = blockHeaderSize
-		return nil
-	}
-	err = l.scanFrom(8, 0, func(_, _ int64, first uint64, rows []store.Row) error {
-		for i, row := range rows {
-			n := blockRowSize + len(row.Line)
-			if n > MaxBlockSize-blockHeaderSize {
-				return errors.New("row exceeds block limit")
-			}
-			if size+n > MaxBlockSize {
-				if e := flush(); e != nil {
-					return e
-				}
-			}
-			run = append(run, BlockRow{Row: row, Ordinal: first + uint64(i)})
-			size += n
-		}
-		m.NextOrdinal = first + uint64(len(rows))
-		return nil
-	})
-	if err == nil {
-		err = flush()
-	}
-	if err != nil {
-		return nil, err
-	}
-	// Sync installed segment names before the manifest can refer to them.
-	if err = l.dir.Sync(); err != nil {
-		return nil, err
-	}
-	payload, err := json.Marshal(m)
-	if err != nil {
-		return nil, err
-	}
-	b, err := json.Marshal(manifestEnvelope{Payload: payload, SHA256: digest(payload)})
-	if err != nil {
-		return nil, err
-	}
-	if len(b) > maxManifestSize {
-		return nil, errors.New("manifest too large")
-	}
-	tmp, err := randomName("bog-manifest-")
-	if err != nil {
-		return nil, err
-	}
-	if err = l.writeNew(tmp, b); err != nil {
-		return nil, err
-	}
-	rename := l.root.Rename
-	if l.manifestRename != nil {
-		rename = l.manifestRename
-	}
-	if err = rename(tmp, manifestName); err != nil {
-		l.uncertain = fmt.Errorf("%w: rename manifest: %w", ErrPublicationUncertain, err)
-		return nil, l.uncertain
-	}
-	syncDir := l.dir.Sync
-	if l.manifestDirSync != nil {
-		syncDir = l.manifestDirSync
-	}
-	if err = syncDir(); err != nil {
-		l.uncertain = fmt.Errorf("%w: sync manifest directory: %w", ErrPublicationUncertain, err)
-		return nil, l.uncertain
-	}
-	return m, nil
-}
 
 // OpenPublished validates all referenced blocks before returning a reader. It
 // also validates the committed WAL and binds the checkpoint to a frame boundary.
@@ -227,6 +78,22 @@ func (l *Legacy) openPublished() (p *Published, err error) {
 	if l.uncertain != nil {
 		return nil, l.uncertain
 	}
+	lock, err := LockPublication(l.dir, true)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); closeErr != nil {
+			p = nil
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	return l.resolvePublication(true)
+}
+
+// readPublished requires the publication lock. Recovery can validate and
+// discard one decoded block at a time when no checkpoint reader is requested.
+func (l *Legacy) readPublished(keepRows bool) (p *Published, err error) {
 	f, err := l.openFile(manifestName)
 	if err != nil {
 		return nil, err
@@ -280,7 +147,10 @@ func (l *Legacy) openPublished() (p *Published, err error) {
 	if !boundary || ord != m.NextOrdinal {
 		return nil, errors.New("invalid checkpoint boundary")
 	}
-	p = &Published{manifest: m, blocks: make([][]BlockRow, 0, len(m.Segments))}
+	p = &Published{manifest: m}
+	if keepRows {
+		p.blocks = make([][]BlockRow, 0, len(m.Segments))
+	}
 	seen := map[string]bool{}
 	// Bound the bitmap by validated declared segment sizes before allocating it.
 	var maxRows uint64
@@ -296,7 +166,7 @@ func (l *Legacy) openPublished() (p *Published, err error) {
 	ordinals := make([]byte, (m.NextOrdinal+7)/8)
 	var count uint64
 	for _, s := range m.Segments {
-		if !strings.HasPrefix(s.Name, "bog-segment-") || len(s.Name) != len("bog-segment-")+32 || strings.Trim(s.Name[len("bog-segment-"):], "0123456789abcdef") != "" || seen[s.Name] || s.Size < blockHeaderSize || s.Size > MaxBlockSize {
+		if !validSegmentName(s.Name) || seen[s.Name] || s.Size < blockHeaderSize || s.Size > MaxBlockSize {
 			return nil, errors.New("invalid segment metadata")
 		}
 		seen[s.Name] = true
@@ -334,15 +204,12 @@ func (l *Legacy) openPublished() (p *Published, err error) {
 			ordinals[r.Ordinal/8] |= mask
 		}
 		count += uint64(len(rows))
-		p.blocks = append(p.blocks, rows)
+		if keepRows {
+			p.blocks = append(p.blocks, rows)
+		}
 	}
 	if count != m.NextOrdinal {
 		return nil, errors.New("invalid segment row count")
-	}
-	// Persist the selected namespace before exposing it, including on a
-	// reopen after a previous handle encountered an uncertain rename or sync.
-	if err = l.dir.Sync(); err != nil {
-		return nil, fmt.Errorf("sync checkpoint directory: %w", err)
 	}
 	return p, nil
 }

@@ -65,6 +65,7 @@ type segment struct {
 	name   string
 	digest [sha256.Size]byte
 	stat   os.FileInfo
+	pin    *os.File
 	lo, hi time.Time // Inclusive verified timestamp bounds.
 	points []seekPoint
 
@@ -141,26 +142,29 @@ func openRegular(dir *os.File, name string) (*os.File, os.FileInfo, error) {
 	return f, info, nil
 }
 
-func load(ctx context.Context, path string) (_ *generation, err error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+func openDirectory(path string) (*os.File, os.FileInfo, error) {
 	dir, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, dir.Close())
-		}
-	}()
 	info, err := dir.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, errors.Join(err, dir.Close())
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !info.IsDir() || !ok || st.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0022 != 0 {
-		return nil, fmt.Errorf("%w: unsafe checkpoint directory", ErrIntegrity)
+		return nil, nil, errors.Join(fmt.Errorf("%w: unsafe checkpoint directory", ErrIntegrity), dir.Close())
+	}
+	return dir, info, nil
+}
+
+// loadAt requires the publication lock and does not take ownership of dir.
+func loadAt(ctx context.Context, dir *os.File) (*generation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := checkpoint.CheckPublication(dir); err != nil {
+		return nil, err
 	}
 	m, id, err := readManifest(dir)
 	if err != nil {
@@ -199,7 +203,6 @@ func load(ctx context.Context, path string) (_ *generation, err error) {
 	if err := g.validate(ctx, m, make([]byte, maxSize)); err != nil {
 		return nil, err
 	}
-	g.refs.Store(1)
 	return g, nil
 }
 

@@ -9,6 +9,8 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+
+	"bog/internal/checkpoint"
 )
 
 var (
@@ -53,6 +55,7 @@ type Catalog struct {
 	mu      sync.Mutex
 	current *generation
 	closed  bool
+	retired []retiredDirectory
 }
 
 type generation struct {
@@ -60,6 +63,7 @@ type generation struct {
 	drained  chan struct{}
 	refs     atomic.Int64
 	dir      *os.File
+	dirInfo  os.FileInfo
 	segments []segment
 }
 
@@ -67,27 +71,44 @@ func (g *generation) release() error {
 	if g.refs.Add(-1) != 0 {
 		return nil
 	}
-	err := g.dir.Close()
+	err := errors.Join(g.closePins(), g.dir.Close())
 	close(g.drained)
 	return err
 }
 
 // Replace validates the authoritative bog.checkpoint in dir and installs it
-// atomically for new readers. The caller coordinates with the publisher and
-// calls Replace only after durable publication. A validation or cancellation
+// atomically for new readers. A shared publication lock keeps the manifest
+// stable until the new generation is pinned. A validation or cancellation
 // failure leaves the current generation available. If closing the retired
 // directory fails, Replace returns the installed generation and that error.
-func (c *Catalog) Replace(ctx context.Context, dir string) (Generation, error) {
+func (c *Catalog) Replace(ctx context.Context, path string) (_ Generation, err error) {
 	c.replace.Lock()
 	defer c.replace.Unlock()
 	// Close and Replace are serialized, so closed is stable here.
 	if c.closed {
 		return Generation{}, os.ErrClosed
 	}
-	next, err := load(ctx, dir)
+	if err := ctx.Err(); err != nil {
+		return Generation{}, err
+	}
+	dir, info, err := openDirectory(path)
 	if err != nil {
 		return Generation{}, err
 	}
+	lock, err := checkpoint.LockPublication(dir, false)
+	if err != nil {
+		return Generation{}, errors.Join(err, dir.Close())
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	next, err := loadAt(ctx, dir)
+	if err != nil {
+		return Generation{}, errors.Join(err, dir.Close())
+	}
+	next.dirInfo = info
+	if err := next.pinSegments(ctx); err != nil {
+		return Generation{}, errors.Join(err, next.closePins(), dir.Close())
+	}
+	next.refs.Store(1)
 	c.mu.Lock()
 	if err := ctx.Err(); err != nil {
 		c.mu.Unlock()
@@ -97,6 +118,7 @@ func (c *Catalog) Replace(ctx context.Context, dir string) (Generation, error) {
 	c.current = next
 	c.mu.Unlock()
 	if prev != nil {
+		c.trackRetired(prev)
 		err = prev.release()
 	}
 	return next.info, err
@@ -139,6 +161,7 @@ func (c *Catalog) Close() error {
 	c.current = nil
 	c.mu.Unlock()
 	if g != nil {
+		c.trackRetired(g)
 		return g.release()
 	}
 	return nil

@@ -1,10 +1,13 @@
 # Disk-backed v1 history
 
 `Catalog.Replace` opens the authoritative `bog.checkpoint` in a pinned
-directory. The caller coordinates with the checkpoint publisher and installs
-only after the manifest rename and directory sync succeed. An uncertain
-publication requires the publisher's reopen and recovery procedure before
-replacement. History uses the manifest and block formats in
+directory. A shared advisory lock on `bog.checkpoint.lock` serializes
+replacement with publication and reclamation. A competing exclusive operation
+returns `EWOULDBLOCK`. An unfinished attempt in `.bog-checkpoint-stage`
+requires reopening the legacy checkpoint and calling `OpenPublished` or
+retrying `Publish`. The publisher validates and syncs the authoritative
+namespace before removing any unreachable files whose ownership it recorded.
+Keep the coordination file in place while the directory is in use. History uses the manifest and block formats in
 [checkpoint/FORMAT.md](../checkpoint/FORMAT.md) and
 [checkpoint/BLOCK_FORMAT.md](../checkpoint/BLOCK_FORMAT.md).
 
@@ -46,9 +49,18 @@ Acquire captures one generation. A reader can scan it after a swap, including
 when its first scan begins after the swap. A request for an ID other than the
 current ID returns `*ExpiredError`. Readers and in-flight scans hold separate
 references. `Generation.Drained` closes once the generation has been retired
-and all of those references are gone. Retention may use that signal together
-with the authoritative manifest and other generations' references to decide
-when files are safe to remove.
+and all of those references are gone. A generation holds one shared advisory
+lock and one open descriptor per segment until it drains, including for
+segments shared by several generations.
+
+Call `Catalog.Reclaim(ctx, dir)` to reclaim segments observed by that
+catalog in retired generations. It validates the current on-disk checkpoint
+under the exclusive publication lock, checks the recorded file identity, and
+requires an exclusive segment lock before unlinking. Shared segments and
+segments pinned by any participating catalog, including another process,
+remain eligible for later calls. Reclamation preserves unknown files and can
+be retried after `Catalog.Close`. Use the same locking protocol for all
+publishers and readers of a directory where reclamation is enabled.
 
 The merge uses at most one cursor per overlapping segment. Its heap key is
 `(timestamp, append ordinal)`, preserving duplicate lines and backfill.

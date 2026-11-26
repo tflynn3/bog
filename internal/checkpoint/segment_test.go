@@ -235,7 +235,7 @@ func TestRejectDuplicateOrdinalWithValidChecksums(t *testing.T) {
 }
 
 func TestInterruptedReplacement(t *testing.T) {
-	for _, scenario := range []string{"before rename", "rename succeeded but returned error", "final directory sync"} {
+	for _, scenario := range []string{"before rename", "rename succeeded but returned error", "final directory sync", "final directory sync with old authority"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir, wal, marker := fixture(t)
 			l, err := OpenLegacy(dir)
@@ -247,6 +247,7 @@ func TestInterruptedReplacement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			oldManifest := readFixture(t, dir, manifestName)
 			injected := &os.PathError{Op: scenario, Path: manifestName, Err: syscall.EIO}
 			switch scenario {
 			case "before rename":
@@ -258,7 +259,7 @@ func TestInterruptedReplacement(t *testing.T) {
 					}
 					return injected
 				}
-			case "final directory sync":
+			case "final directory sync", "final directory sync with old authority":
 				l.manifestDirSync = func() error { return injected }
 			}
 			if _, err = l.Publish(); !errors.Is(err, ErrPublicationUncertain) || !errors.Is(err, syscall.EIO) {
@@ -271,6 +272,12 @@ func TestInterruptedReplacement(t *testing.T) {
 			if err = l.Close(); err != nil {
 				t.Fatal(err)
 			}
+			wantOld := scenario == "before rename" || scenario == "final directory sync with old authority"
+			if scenario == "final directory sync with old authority" {
+				// Model a crash in which the unsynced rename was lost.
+				requirePublicationOK(t, os.WriteFile(filepath.Join(dir, manifestName), oldManifest, 0600))
+			}
+			intentEntries := checkpointNames(t, dir)
 			l, err = OpenLegacy(dir)
 			if err != nil {
 				t.Fatal(err)
@@ -281,8 +288,18 @@ func TestInterruptedReplacement(t *testing.T) {
 				t.Fatal(err)
 			}
 			selected := p.Manifest()
-			if (selected.Segments[0].Name == old.Segments[0].Name) != (scenario == "before rename") {
+			if (selected.Segments[0].Name == old.Segments[0].Name) != wantOld {
 				t.Fatalf("wrong generation: %+v", selected)
+			}
+			wantRemoved := 1 // Staging directory.
+			if wantOld {
+				wantRemoved++ // Candidate segment.
+			}
+			if got := checkpointNames(t, dir); len(got) != len(intentEntries)-wantRemoved {
+				t.Fatalf("incorrect cleanup: before %v, after %v", intentEntries, got)
+			}
+			if _, err := l.OpenPublished(); err != nil {
+				t.Fatalf("recovery was not idempotent: %v", err)
 			}
 			var rows []BlockRow
 			if err = p.Scan(func(r BlockRow) error { rows = append(rows, r); return nil }); err != nil {

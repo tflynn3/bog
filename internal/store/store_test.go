@@ -782,3 +782,97 @@ func TestLiveRangeRunsAndSnapshot(t *testing.T) {
 		t.Fatal("snapshot changed after backfill")
 	}
 }
+
+func TestLiveBloomRunsOracle(t *testing.T) {
+	epoch := time.Unix(1700000000, 0)
+	for _, mode := range []string{"single", "multiple", "recovered", "explicit"} {
+		t.Run(mode, func(t *testing.T) {
+			var s Store
+			var all []Row
+			add := func(rows []Row) { s.Publish(rows); all = append(all, rows...) }
+			if mode == "recovered" {
+				rows := make([]Row, 34001)
+				for i := range rows {
+					rows[i] = Row{epoch.Add(time.Duration(i/2) * time.Second), fmt.Sprintf("ordinary %d", i)}
+				}
+				rows[32000].Line = "needle recovered cursor"
+				rows[33999].Line = "needle recovered end"
+				b := NewRecoveryBuilder()
+				b.Add(rows)
+				b.Install(&s)
+				all = append(all, rows...)
+			} else {
+				add([]Row{{epoch, "prefix"}})
+			}
+			batches := 1
+			if mode != "single" {
+				batches = 3
+			}
+			for batch := 0; batch < batches; batch++ {
+				rows := make([]Row, 12001)
+				for i := range rows {
+					// Overlap timestamps between runs, including the recovered run.
+					ts := i/2 + 1
+					if mode == "single" {
+						ts += batch * 12000
+					}
+					rows[i] = Row{epoch.Add(time.Duration(ts) * time.Second), fmt.Sprintf("ordinary %d %d", batch, i)}
+				}
+				for _, i := range []int{600, 9000, 11999, 12000} {
+					rows[i].Line = fmt.Sprintf("needle %d %d", batch, i)
+				}
+				// This makes its sealed append block unfilterable.
+				rows[9000].Line += strings.Repeat("x", blockBudget)
+				if mode == "explicit" && batch == 2 {
+					rows[1].TS = epoch
+				}
+				add(rows)
+			}
+			count := len(all)
+			// Seal the snapshot's partial block after capturing the count.
+			add(make([]Row, blockSize))
+			start, end := epoch, epoch.Add(24*time.Hour)
+			sorted := make([]int, count)
+			for i := range sorted {
+				sorted[i] = i
+			}
+			sort.Slice(sorted, func(i, j int) bool { return rowLess(all, sorted[i], sorted[j]) })
+			var matches []int
+			for _, i := range sorted {
+				if strings.Contains(all[i].Line, "needle") {
+					matches = append(matches, i)
+				}
+			}
+			for _, limit := range []int{1, 2, len(matches), len(matches) - 1} {
+				page, snap, next, ok := s.QueryPage(start, end, "needle", limit, nil, nil)
+				// The added rows have no matching lines.
+				if !ok || snap != len(all) || len(page) != min(limit, len(matches)) || (next != nil) != (len(matches) > limit) {
+					t.Fatalf("limit %d: got %d cursor %v", limit, len(page), next)
+				}
+				for i := range page {
+					if page[i] != all[matches[i]] {
+						t.Fatalf("limit %d row %d", limit, i)
+					}
+				}
+			}
+			// Late snapshot continuation also tests a block shared with later appends.
+			cursorIndex := len(matches) - 3
+			after := &Position{all[matches[cursorIndex]].TS, matches[cursorIndex]}
+			page, _, next, ok := s.QueryPage(start, end, "needle", 2, &count, after)
+			if !ok || next != nil || len(page) != 2 {
+				t.Fatalf("late page: %d %v %v", len(page), next, ok)
+			}
+			for i := range page {
+				if page[i] != all[matches[cursorIndex+1+i]] {
+					t.Fatalf("late row %d", i)
+				}
+			}
+			ordinary := s.Query(start, end, "needle", 2)
+			for i := range ordinary {
+				if ordinary[i] != all[matches[i]] {
+					t.Fatalf("ordinary row %d", i)
+				}
+			}
+		})
+	}
+}

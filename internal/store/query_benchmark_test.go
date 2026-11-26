@@ -173,3 +173,46 @@ func BenchmarkRecoveryRange(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkLiveImplicitBloom(b *testing.B) {
+	epoch := time.Unix(1700000000, 0)
+	var s Store
+	var all []Row
+	for batch := 0; batch < 3; batch++ {
+		rows := make([]Row, 40000)
+		for i := range rows {
+			line := "dense ordinary log message"
+			if (i < 30000 && i%128 == 0) || i == 30000 || i == 39999 {
+				line += " raretoken"
+			}
+			ts := i / 2
+			if batch == 1 {
+				ts += 20000
+			}
+			rows[i] = Row{epoch.Add(time.Duration(ts) * time.Second), line}
+		}
+		s.Publish(rows)
+		all = append(all, rows...)
+	}
+	count := len(all)
+	after := Position{all[30000].TS, 30000}
+	for _, tc := range []struct {
+		name, literal string
+		end           time.Time
+		snapshot      *int
+		after         *Position
+	}{
+		{"sparse", "raretoken", epoch.Add(24 * time.Hour), nil, nil},
+		{"absent", "absenttoken", epoch.Add(24 * time.Hour), nil, nil},
+		{"late", "raretoken", epoch.Add(24 * time.Hour), &count, &after},
+		{"dense", "dense", epoch.Add(24 * time.Hour), nil, nil},
+		{"narrow", "dense", epoch.Add(100 * time.Second), nil, nil},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				s.QueryPage(epoch, tc.end, tc.literal, 100, tc.snapshot, tc.after)
+			}
+		})
+	}
+}

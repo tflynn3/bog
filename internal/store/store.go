@@ -564,6 +564,8 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		}
 		return result, nil, true
 	}
+	var runProbes []uint64
+	var runEnds []int
 	if len(contains) >= 4 {
 		// Bound work even for absent literals and runs containing newer rows.
 		budget := max(512, limit)
@@ -576,18 +578,19 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		// the merge. A single run can answer dense pages without that estimate.
 		bound := 0
 		intervalStart, intervalEnd := 0, count
-		implicit := active == 0 && hasRestored && runs[active].ordinals == nil
+		implicit := active >= 0 && runs[active].ordinals == nil
 		if active >= 0 {
 			if result, next, complete := direct(budget); complete {
 				return result, count, next, true
 			}
 		}
 		if implicit {
-			// The recovered run is already in append order. Resume the bounded
+			// An implicit run is already in append order. Resume the bounded
 			// scan and inspect only blocks that may contain the literal.
 			run := runs[active]
-			hi := sort.Search(run.length, func(i int) bool { return !rows[i].TS.Before(end) })
+			hi := run.base + sort.Search(run.length, func(i int) bool { return !rows[run.base+i].TS.Before(end) })
 			hi = min(hi, count)
+			directOffset += run.base
 			probes := literalProbes(contains)
 			for directOffset < hi {
 				block := directOffset / blockSize
@@ -631,23 +634,41 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 					return result, count, next, true
 				}
 			}
-			probes := literalProbes(contains)
-			possible := make([]int, 0)
-			possibleRows := 0
-			for first := intervalStart / blockSize * blockSize; first < intervalEnd; first += blockSize {
-				block := first / blockSize
-				if block < len(blocks) && !blocks[block].mayContainProbes(probes) {
-					continue
-				}
-				possibleRows += min(first+blockSize, intervalEnd) - max(first, intervalStart)
-				if possibleRows > bound/4 {
+			allImplicit := active == -2
+			for i, run := range runs {
+				if offsets[i] < run.length && rows[run.ordinal(offsets[i])].TS.Before(end) && run.ordinals != nil {
+					allImplicit = false
 					break
 				}
-				possible = append(possible, first)
 			}
-			if possibleRows <= bound/4 {
-				result, next := queryBlocks(rows, possible, count, start, end, contains, limit, after, lookahead)
-				return result, count, next, true
+			if allImplicit {
+				runProbes = literalProbes(contains)
+				runEnds = make([]int, len(runs))
+				for i, run := range runs {
+					if run.ordinals == nil {
+						hi := sort.Search(run.length, func(j int) bool { return !rows[run.base+j].TS.Before(end) })
+						runEnds[i] = max(0, min(hi, count-run.base))
+					}
+				}
+			} else {
+				probes := literalProbes(contains)
+				possible := make([]int, 0)
+				possibleRows := 0
+				for first := intervalStart / blockSize * blockSize; first < intervalEnd; first += blockSize {
+					block := first / blockSize
+					if block < len(blocks) && !blocks[block].mayContainProbes(probes) {
+						continue
+					}
+					possibleRows += min(first+blockSize, intervalEnd) - max(first, intervalStart)
+					if possibleRows > bound/4 {
+						break
+					}
+					possible = append(possible, first)
+				}
+				if possibleRows <= bound/4 {
+					result, next := queryBlocks(rows, possible, count, start, end, contains, limit, after, lookahead)
+					return result, count, next, true
+				}
 			}
 		}
 	}
@@ -660,6 +681,26 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	h := &candidates{rows: rows, items: make([]candidate, 0, len(runs))}
 	advance := func(runIndex, offset int) {
 		run := runs[runIndex]
+		if runProbes != nil && run.ordinals == nil {
+			for offset < runEnds[runIndex] {
+				ordinal := run.base + offset
+				block := ordinal / blockSize
+				blockEnd := min((block+1)*blockSize-run.base, runEnds[runIndex])
+				if block < len(blocks) && !blocks[block].mayContainProbes(runProbes) {
+					offset = blockEnd
+					continue
+				}
+				for offset < blockEnd {
+					ordinal = run.base + offset
+					if strings.Contains(rows[ordinal].Line, contains) {
+						heap.Push(h, candidate{ordinal, runIndex, offset})
+						return
+					}
+					offset++
+				}
+			}
+			return
+		}
 		for offset < run.length {
 			ordinal := run.ordinal(offset)
 			row := rows[ordinal]

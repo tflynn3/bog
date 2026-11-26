@@ -3,6 +3,7 @@ package wal
 import (
 	"errors"
 	"log"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -41,7 +42,7 @@ type diagnosticSink struct {
 	events  chan DiagnosticEvent
 	stop    chan struct{}
 	once    sync.Once
-	closed  atomic.Bool
+	state   atomic.Uint64 // high bit means stopped; remaining bits count active producers
 	deliver func(DiagnosticEvent) error
 }
 
@@ -65,7 +66,10 @@ func ReportRollback(op OpCode, err error) {
 }
 
 func (s *diagnosticSink) report(event DiagnosticEvent) {
-	if s.closed.Load() {
+	const stopped = uint64(1) << 63
+	state := s.state.Add(1)
+	defer s.state.Add(^uint64(0))
+	if state&stopped != 0 {
 		DiagnosticsDropped.Add(1)
 		return
 	}
@@ -84,7 +88,7 @@ func ShutdownDiagnostics() {
 
 func (s *diagnosticSink) shutdown() {
 	s.once.Do(func() {
-		s.closed.Store(true)
+		s.state.Or(uint64(1) << 63)
 		close(s.stop)
 	})
 }
@@ -93,11 +97,33 @@ func (s *diagnosticSink) run() {
 	for {
 		select {
 		case <-s.stop:
+			s.discardQueued()
+			return
+		default:
+		}
+		select {
+		case <-s.stop:
+			s.discardQueued()
 			return
 		case event := <-s.events:
 			if err := s.deliver(event); err != nil {
 				DiagnosticsDeliveryFailures.Add(1)
 			}
+		}
+	}
+}
+
+func (s *diagnosticSink) discardQueued() {
+	// Producers admitted before shutdown may still be enqueueing.
+	for s.state.Load()&^(uint64(1)<<63) != 0 {
+		runtime.Gosched()
+	}
+	for {
+		select {
+		case <-s.events:
+			DiagnosticsDropped.Add(1)
+		default:
+			return
 		}
 	}
 }

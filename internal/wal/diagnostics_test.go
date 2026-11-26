@@ -247,12 +247,15 @@ func TestDiagnosticSinkSaturation(t *testing.T) {
 	if got := DiagnosticsDropped.Load() - before; got != 1 {
 		t.Errorf("dropped = %d, want 1", got)
 	}
-	// Stop selection can race with queued events, so discard them before release.
-	for len(s.events) > 0 {
-		<-s.events
-	}
 	close(release)
 	<-done
+	if got := DiagnosticsDropped.Load() - before; got != 3 {
+		t.Errorf("dropped after shutdown = %d, want 3", got)
+	}
+	s.report(event)
+	if got := DiagnosticsDropped.Load() - before; got != 4 {
+		t.Errorf("dropped after stopped report = %d, want 4", got)
+	}
 }
 
 // This exercises successful WAL operations; rollback still uses a separate synchronous hook.

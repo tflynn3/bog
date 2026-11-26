@@ -1,0 +1,136 @@
+package archtest
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+	"testing"
+)
+
+const (
+	releaseVerifier = "bog/verify/release"
+	linuxVerifier   = "bog/verify/linux"
+	retainedBench   = "bog/bench/retained-history"
+)
+
+func TestReleaseEvidenceBoundary(t *testing.T) {
+	t.Parallel()
+	for _, problem := range releaseEvidenceBoundaryProblems(registry) {
+		t.Error(problem)
+	}
+}
+
+// TestLinuxArchitecture checks the registry against Linux production imports
+// on both architectures. Test imports stay outside that graph, so release
+// tests can construct WAL and HTTP fixtures in process.
+func releaseEvidenceBoundaryProblems(rules map[string]rule) []string {
+	var problems []string
+	for _, root := range []string{releaseVerifier, linuxVerifier, retainedBench} {
+		if entry, ok := rules[root]; !ok || entry.role != verifier {
+			problems = append(problems, fmt.Sprintf("%s must be registered as a %s", root, verifier))
+		}
+		reached := registeredReachability(rules, root)
+		for _, path := range []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/wal"} {
+			if reached[path] {
+				problems = append(problems, fmt.Sprintf("forbidden release evidence dependency: %s reaches %s", root, path))
+			}
+		}
+	}
+	return problems
+}
+
+func TestReleaseEvidenceBoundaryFixtures(t *testing.T) {
+	t.Parallel()
+	const (
+		httpapi   = "bog/internal/httpapi"
+		readiness = "bog/internal/readiness"
+		store     = "bog/internal/store"
+		wal       = "bog/internal/wal"
+		relay     = "bog/verify/evidencehelper"
+	)
+	base := map[string]rule{
+		server:          {serverCommand, []string{httpapi, readiness, wal}},
+		httpapi:         {runtimeLibrary, []string{store, wal}},
+		readiness:       {runtimeLibrary, []string{store, wal}},
+		store:           {runtimeLibrary, nil},
+		wal:             {runtimeLibrary, []string{store}},
+		goClient:        {standalone, []string{store}},
+		releaseVerifier: {verifier, []string{goClient, store}},
+		linuxVerifier:   {verifier, nil},
+		retainedBench:   {verifier, nil},
+	}
+	t.Run("production client and shared rows", func(t *testing.T) {
+		t.Parallel()
+		requireValidCommandFixture(t, base)
+		if got := releaseEvidenceBoundaryProblems(base); len(got) != 0 {
+			t.Errorf("releaseEvidenceBoundaryProblems() = %q, want no problems", got)
+		}
+	})
+
+	paths := []struct {
+		destination string
+		reached     []string
+	}{
+		{httpapi, []string{httpapi, wal}},
+		{readiness, []string{readiness, wal}},
+		{wal, []string{wal}},
+	}
+	for _, root := range []string{releaseVerifier, linuxVerifier, retainedBench} {
+		for _, path := range paths {
+			for _, mode := range []string{"direct", "transitive"} {
+				t.Run(root+"/"+mode+"/"+path.destination, func(t *testing.T) {
+					t.Parallel()
+					rules := maps.Clone(base)
+					imported := path.destination
+					if mode == "transitive" {
+						rules[relay] = rule{verifierModel, []string{imported}}
+						imported = relay
+					}
+					entry := rules[root]
+					entry.imports = append(slices.Clone(entry.imports), imported)
+					rules[root] = entry
+					requireValidCommandFixture(t, rules)
+
+					var want []string
+					for _, destination := range path.reached {
+						want = append(want, "forbidden release evidence dependency: "+root+" reaches "+destination)
+					}
+					if got := releaseEvidenceBoundaryProblems(rules); !slices.Equal(got, want) {
+						t.Errorf("releaseEvidenceBoundaryProblems() = %q, want %q", got, want)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestReleaseEvidenceRootRegistration(t *testing.T) {
+	t.Parallel()
+	for _, root := range []string{releaseVerifier, linuxVerifier, retainedBench} {
+		for _, tt := range []struct {
+			name    string
+			present bool
+		}{
+			{name: "missing"},
+			{name: "reclassified as library", present: true},
+		} {
+			t.Run(root+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				rules := map[string]rule{
+					releaseVerifier: {role: verifier},
+					linuxVerifier:   {role: verifier},
+					retainedBench:   {role: verifier},
+				}
+				if tt.present {
+					rules[root] = rule{role: standalone}
+				} else {
+					delete(rules, root)
+				}
+				want := []string{root + " must be registered as a verifier command"}
+				if got := releaseEvidenceBoundaryProblems(rules); !slices.Equal(got, want) {
+					t.Errorf("releaseEvidenceBoundaryProblems() = %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}

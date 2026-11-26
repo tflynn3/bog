@@ -21,6 +21,13 @@ type Store struct {
 	blocks    []*blockFilter // immutable summaries of sealed append-ordinal blocks
 }
 
+// PublishedCount returns the current append count for use as a query prefix.
+func (s *Store) PublishedCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.rows)
+}
+
 // RecoveryBuilder collects validated WAL frames before the store becomes ready.
 type RecoveryBuilder struct {
 	rows    []Row

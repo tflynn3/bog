@@ -10,9 +10,6 @@ const operatorCommand = "bog/cmd/bog-verify"
 
 func TestOperatorVerificationBoundary(t *testing.T) {
 	t.Parallel()
-	if _, registered := registry[operatorCommand]; !registered {
-		t.Skip("operator verification command registration is pending in #67")
-	}
 	for _, problem := range operatorBoundaryProblems(registry) {
 		t.Error(problem)
 	}
@@ -21,11 +18,10 @@ func TestOperatorVerificationBoundary(t *testing.T) {
 // TestLinuxArchitecture checks that the registry matches the Linux production
 // imports. Enforce the operator boundary even when every edge is registered.
 func operatorBoundaryProblems(rules map[string]rule) []string {
-	packages := make(map[string]listedPackage, len(rules))
-	for path, entry := range rules {
-		packages[path] = listedPackage{Imports: entry.imports}
+	if entry, ok := rules[operatorCommand]; !ok || entry.role != verifier {
+		return []string{fmt.Sprintf("%s must be registered as a %s", operatorCommand, verifier)}
 	}
-	reached := reachableImports(packages, operatorCommand)
+	reached := registeredReachability(rules, operatorCommand)
 
 	var problems []string
 	for _, path := range []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/wal"} {
@@ -34,6 +30,25 @@ func operatorBoundaryProblems(rules map[string]rule) []string {
 		}
 	}
 	return problems
+}
+
+func TestOperatorCommandRegistration(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name  string
+		rules map[string]rule
+	}{
+		{name: "missing"},
+		{name: "reclassified as library", rules: map[string]rule{operatorCommand: {role: standalone}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			want := []string{"bog/cmd/bog-verify must be registered as a verifier command"}
+			if got := operatorBoundaryProblems(tt.rules); !slices.Equal(got, want) {
+				t.Errorf("operatorBoundaryProblems() = %q, want %q", got, want)
+			}
+		})
+	}
 }
 
 func TestOperatorVerificationBoundaryFixtures(t *testing.T) {
@@ -111,17 +126,7 @@ func TestOperatorVerificationBoundaryFixtures(t *testing.T) {
 			if len(tt.relayImports) > 0 {
 				rules[relay] = rule{standalone, tt.relayImports}
 			}
-			packages := make(map[string]listedPackage, len(rules))
-			for path, entry := range rules {
-				name := "library"
-				if entry.role == serverCommand || entry.role == verifier {
-					name = "main"
-				}
-				packages[path] = productionPackage(name, entry.imports...)
-			}
-			if problems := architectureProblems(packages, rules); len(problems) != 0 {
-				t.Fatalf("fixture violates the existing architecture rules: %v", problems)
-			}
+			requireValidCommandFixture(t, rules)
 			var want []string
 			for _, path := range tt.forbidden {
 				want = append(want, "forbidden operator verification dependency: "+operatorCommand+" reaches "+path)

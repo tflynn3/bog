@@ -1,7 +1,7 @@
 # ADR 0011 — Read-only operator verification
 
-**Status** — Accepted for Cycle 10. The command and its Linux production
-registration are pending in [issue #67](https://github.com/tflynn3/bog/issues/67).
+**Status** — Accepted and implemented. The command added in #67 is registered
+as a verifier command in the Linux production graph.
 
 ## Context
 
@@ -43,12 +43,14 @@ the packages it imports. [Operator boundary fitness tests](../../internal/archte
 
 ## Registration and release
 
-#67 owns the command's role and measured direct imports in the Linux
-architecture registry. The companion reachability check runs against that
-entry as soon as it is registered. Until then, constructed graphs exercise
-allowed verification and direct and transitive violations whose imports all
-pass the existing exact-import, cycle, and reachability rules.
-[Linux architecture registry](../../internal/archtest/architecture_test.go)
+Core engineering maintains the command's role and measured direct imports
+in the Linux architecture registry. The operator boundary check requires
+the registration and rejects direct and transitive paths to the excluded
+packages. Its fixtures exercise shared read-side dependencies and
+violations with fully registered edges that pass the existing exact-import,
+cycle, and reachability checks.
+[Linux architecture registry](../../internal/archtest/architecture_test.go),
+[Command root boundaries](0012-command-root-boundaries.md)
 
 #53 remains the release gate. Operator parity uses the verified image as
 its reference. Release parity uses fixture inputs and the independent

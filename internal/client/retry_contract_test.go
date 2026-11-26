@@ -32,6 +32,62 @@ func writeContractPage(t *testing.T, w http.ResponseWriter, body, cursor string)
 	}
 }
 
+func TestWalkStopsAtRepeatedCursor(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := r.URL.Query().Get("cursor")
+		n := calls.Add(1)
+		var want, line, next string
+		switch n {
+		case 1:
+			line, next = "first", fixtureCursor
+		case 2:
+			want, line, next = fixtureCursor, "rejected", fixtureCursor
+		case 3:
+			want, line, next = fixtureCursor, "resumed", fixtureNext
+		case 4:
+			want, line = fixtureNext, "last"
+		default:
+			t.Errorf("unexpected request %d: %s", n, r.RequestURI)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		if request != want {
+			t.Errorf("request %d used cursor %q, want %q", n, request, want)
+		}
+		writeContractPage(t, w, contractRow(line), next)
+	}))
+	defer server.Close()
+	c, err := New(server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.http.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var received []string
+	consume := func(p Page) error {
+		for _, row := range p.Rows {
+			received = append(received, row.Line)
+		}
+		return nil
+	}
+	cursor, err := c.Walk(ctx, Query{}, consume)
+	var protocol *HTTPError
+	if cursor != fixtureCursor || !errors.As(err, &protocol) || protocol.StatusCode != http.StatusOK ||
+		protocol.Retryable() || protocol.CursorRejected || !strings.Contains(err.Error(), "does not advance") {
+		t.Fatalf("walk returned cursor %q and error %v", cursor, err)
+	}
+	if calls.Load() != 2 || !slices.Equal(received, []string{"first"}) {
+		t.Fatalf("walk made %d requests and delivered %q before retry", calls.Load(), received)
+	}
+	end, err := c.WalkFrom(ctx, Query{}, cursor, consume)
+	if err != nil || end != "" || calls.Load() != 4 || !slices.Equal(received, []string{"first", "resumed", "last"}) {
+		t.Fatalf("resumed walk returned cursor %q and error %v after %d requests and rows %q", end, err, calls.Load(), received)
+	}
+}
+
 func TestInterruptedHTTP10Continuation(t *testing.T) {
 	first := contractRow("first")
 	prefix := contractRow("tie")
@@ -240,6 +296,8 @@ func TestQueryResponseValidation(t *testing.T) {
 		{name: "trailing cursor", body: row, headers: http.Header{"Trailer": {"Bog-Next-Cursor"}}, chunked: true, wantError: "cursor trailer"},
 		{name: "duplicate cursor", body: row, headers: http.Header{"Bog-Next-Cursor": {fixtureCursor, fixtureNext}}, wantError: "cursor header"},
 		{name: "empty cursor", body: row, headers: http.Header{"Bog-Next-Cursor": {""}}, wantError: "cursor header"},
+		{name: "repeated request cursor", body: row, headers: http.Header{"Bog-Next-Cursor": {fixtureCursor}}, wantError: "does not advance"},
+		{name: "repeated request cursor on empty page", headers: http.Header{"Bog-Next-Cursor": {fixtureCursor}}, wantError: "does not advance"},
 		{name: "invalid UTF-8 after row", body: row + "{\"ts\":\"\xff\",\"line\":\"\"}\n", wantError: "UTF-8"},
 		{name: "blank record after row", body: row + "\n", wantError: "record framing"},
 		{name: "invalid timestamp after row", body: row + "{\"ts\":\"today\",\"line\":\"\"}\n", wantError: "timestamp"},

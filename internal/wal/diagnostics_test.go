@@ -1,12 +1,9 @@
 package wal
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"log"
 	"os"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -42,15 +39,38 @@ func (f *diagnosticFile) Truncate(n int64) error {
 	return f.file.Truncate(n)
 }
 
-func captureDiagnostics(t *testing.T) *bytes.Buffer {
+func captureDiagnostics(l *Log) <-chan rollbackDiagnostic {
+	out := make(chan rollbackDiagnostic, 2)
+	l.diagnosticQueue = out
+	return out
+}
+
+func checkDiagnostic(t *testing.T, out <-chan rollbackDiagnostic, want rollbackDiagnostic) {
 	t.Helper()
-	var out bytes.Buffer
-	oldWriter, oldFlags, oldPrefix := log.Writer(), log.Flags(), log.Prefix()
-	log.SetOutput(&out)
-	log.SetFlags(0)
-	log.SetPrefix("")
-	t.Cleanup(func() { log.SetOutput(oldWriter); log.SetFlags(oldFlags); log.SetPrefix(oldPrefix) })
-	return &out
+	select {
+	case event := <-out:
+		if event != want {
+			t.Fatalf("diagnostic = %+v, want %+v", event, want)
+		}
+	default:
+		t.Fatalf("missing diagnostic, want %+v", want)
+	}
+}
+
+func checkNoDiagnostic(t *testing.T, out <-chan rollbackDiagnostic) {
+	t.Helper()
+	select {
+	case event := <-out:
+		t.Fatalf("unexpected diagnostic: %+v", event)
+	default:
+	}
+}
+
+func closeLog(t *testing.T, l *Log) {
+	t.Helper()
+	if err := l.Close(); err != nil {
+		t.Error(err)
+	}
 }
 
 func TestRecoverableDiagnostics(t *testing.T) {
@@ -65,17 +85,17 @@ func TestRecoverableDiagnostics(t *testing.T) {
 		{"uncertain", "", "", errors.New("private error"), false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out := captureDiagnostics(t)
 			f, err := os.CreateTemp(t.TempDir(), "wal")
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer f.Close()
 			ff := &diagnosticFile{file: f, failure: tc.failure, syncFail: tc.sync, truncateFail: tc.uncertain}
 			if !tc.sync {
 				ff.writeAt = 1
 			}
 			l := &Log{f: ff, s: &store.Store{}}
+			t.Cleanup(func() { closeLog(t, l) })
+			out := captureDiagnostics(l)
 			payload := []byte(`{"ts":"2025-01-01T00:00:00Z","line":"secret payload"}`)
 			rows, err := store.Decode(payload)
 			if err != nil {
@@ -83,43 +103,45 @@ func TestRecoverableDiagnostics(t *testing.T) {
 			}
 			err = l.Append(payload, rows)
 			if tc.uncertain {
-				if !errors.Is(err, ErrUncertain) || out.Len() != 0 {
-					t.Fatalf("error=%v log=%q", err, out.String())
+				if !errors.Is(err, ErrUncertain) || !errors.Is(err, tc.failure) {
+					t.Fatalf("append error = %v", err)
 				}
+				checkNoDiagnostic(t, out)
 				return
 			}
 			if err != tc.failure {
 				t.Fatalf("original error lost: %v", err)
 			}
-			want := "WAL rollback confirmed operation=" + tc.operation + " category=" + tc.category + "\n"
-			if out.String() != want {
-				t.Fatalf("diagnostic = %q, want %q", out.String(), want)
-			}
+			checkDiagnostic(t, out, rollbackDiagnostic{tc.operation, tc.category})
+			checkNoDiagnostic(t, out)
 		})
 	}
 }
 
 func TestDiagnosticRateLimit(t *testing.T) {
-	out := captureDiagnostics(t)
 	l := &Log{}
+	out := captureDiagnostics(l)
 	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	l.diagnoseRollback("wal_write", syscall.ENOSPC, now)
 	l.diagnoseRollback("wal_sync", syscall.EIO, now.Add(time.Second))
 	l.diagnoseRollback("marker_preparation", errors.New("private"), now.Add(time.Minute))
-	want := "WAL rollback confirmed operation=wal_write category=enospc\nWAL rollback confirmed operation=marker_preparation category=other\n"
-	if out.String() != want {
-		t.Fatalf("diagnostics = %q", out.String())
+	checkDiagnostic(t, out, rollbackDiagnostic{"wal_write", "enospc"})
+	checkDiagnostic(t, out, rollbackDiagnostic{"marker_preparation", "other"})
+	checkNoDiagnostic(t, out)
+	if got := l.DroppedDiagnostics(); got != 0 {
+		t.Fatalf("rate-limited event counted as queue drop: %d", got)
 	}
 }
 
 func TestDiagnosticRecoveryOfFailedGroup(t *testing.T) {
-	out := captureDiagnostics(t)
 	dir := t.TempDir()
 	s := &store.Store{}
 	l, err := Open(dir, s)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeLog(t, l)
+	out := captureDiagnostics(l)
 	appendLine := func(line string) error {
 		payload := []byte(fmt.Sprintf(`{"ts":"2025-01-01T00:00:00Z","line":%q}`, line))
 		rows, e := store.Decode(payload)
@@ -146,9 +168,8 @@ func TestDiagnosticRecoveryOfFailedGroup(t *testing.T) {
 	if err = l.appendGroup(group); err != failure {
 		t.Fatalf("error = %v", err)
 	}
-	if got := out.String(); got != "WAL rollback confirmed operation=wal_write category=enospc\n" || strings.Contains(got, "secret") || strings.Contains(got, "private") {
-		t.Fatalf("diagnostic = %q", got)
-	}
+	checkDiagnostic(t, out, rollbackDiagnostic{"wal_write", "enospc"})
+	checkNoDiagnostic(t, out)
 	if err = l.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -169,6 +190,7 @@ func TestDiagnosticRecoveryOfFailedGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer closeLog(t, l)
 	check(s, "acknowledged")
 	if err = appendLine("healthy"); err != nil {
 		t.Fatal(err)
@@ -181,17 +203,17 @@ func TestDiagnosticRecoveryOfFailedGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer closeLog(t, l)
 	check(s, "acknowledged", "healthy")
 }
 
 func TestMarkerPreparationDiagnostic(t *testing.T) {
-	out := captureDiagnostics(t)
 	l, err := Open(t.TempDir(), &store.Store{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer closeLog(t, l)
+	out := captureDiagnostics(l)
 	// An invalid directory descriptor makes marker creation fail before rename.
 	badDir, err := os.Open(l.dir.Name())
 	if err != nil {
@@ -211,7 +233,5 @@ func TestMarkerPreparationDiagnostic(t *testing.T) {
 	if err == nil || errors.Is(err, ErrUncertain) {
 		t.Fatalf("error = %v", err)
 	}
-	if got := out.String(); got != "WAL rollback confirmed operation=marker_preparation category=other\n" {
-		t.Fatalf("diagnostic = %q", got)
-	}
+	checkDiagnostic(t, out, rollbackDiagnostic{"marker_preparation", "other"})
 }

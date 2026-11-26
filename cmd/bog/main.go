@@ -19,7 +19,11 @@ func main() {
 	dir := flag.String("data-dir", ".", "existing data directory")
 	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
 	maxResponseBytes := flag.Int("query-max-response-bytes", httpapi.DefaultQueryMaxResponseBytes, "maximum encoded NDJSON query response bytes")
+	queryConcurrency := flag.Int("query-concurrency", httpapi.DefaultQueryConcurrency, "maximum concurrent queries")
 	flag.Parse()
+	if *queryConcurrency <= 0 {
+		log.Fatal("query-concurrency must be positive")
+	}
 	if *maxResponseBytes <= 0 {
 		log.Fatal("query-max-response-bytes must be positive")
 	}
@@ -28,7 +32,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	server := &http.Server{Addr: *addr, Handler: httpapi.NewWithQueryMaxResponseBytes(s, w, *maxResponseBytes), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	server := &http.Server{Addr: *addr, Handler: httpapi.NewWithQueryLimits(s, w, *maxResponseBytes, *queryConcurrency), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)

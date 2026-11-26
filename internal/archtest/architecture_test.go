@@ -40,8 +40,9 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
+// Every staged role also has a declaration in stagedPackages, removed on promotion.
 var registry = map[string]rule{
-	"bog/cmd/bog-verify":         {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
+	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
 	server:                       {serverCommand, []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
 	"bog/internal/httpapi":       {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
 	"bog/internal/readiness":     {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
@@ -51,7 +52,7 @@ var registry = map[string]rule{
 	"bog/internal/history":       {staged, []string{"bog/internal/checkpoint", "bog/internal/store"}},
 	"bog/internal/backup":        {staged, []string{"bog/internal/store"}},
 	"bog/internal/idempotency":   {staged, nil},
-	"bog/internal/client":        {standalone, []string{"bog/internal/store"}},
+	goClient:                     {standalone, []string{"bog/internal/store"}},
 	"bog/internal/ingest":        {testOnly, nil},
 	"bog/internal/archtest":      {testOnly, nil},
 	fuzzVerifier:                 {testOnly, nil},

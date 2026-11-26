@@ -1,7 +1,8 @@
 package httpapi
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/json/jsontext"
 	"unicode/utf8"
 
 	"bog/internal/store"
@@ -12,72 +13,91 @@ const (
 	queryDeliveryBytesPerUnit = 16
 )
 
-// queryResponse buffers complete records so a rejection can be sent before
-// committing any NDJSON or cursor. Its capacity is capped at the body limit.
+// queryResponse buffers complete records until the status and cursor can be
+// committed. Each record's allocation is exact and never copies earlier rows.
 type queryResponse struct {
-	body     []byte
+	rows     [][]byte
+	size     int
 	maxBytes int
+	scratch  bytes.Buffer
+	encoder  jsontext.Encoder
 }
 
-func (b *queryResponse) append(data string) {
-	b.grow(len(data))
-	b.body = append(b.body, data...)
-}
-
-func (b *queryResponse) grow(size int) {
-	needed := len(b.body) + size
-	if needed > cap(b.body) {
-		capacity := cap(b.body)
-		capacity += min(capacity, b.maxBytes-capacity)
-		grown := make([]byte, len(b.body), max(needed, capacity))
-		copy(grown, b.body)
-		b.body = grown
-	}
-}
-
-// appendRow adds one record using encoding/json's escaping on bounded pieces
-// of the line. If the record cannot fit, it restores the previous body.
-func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, error) {
+// appendRow reports the exact encoded size when the first row doesn't fit.
+// For later rows, the encoder can stop as soon as it proves the row won't fit.
+func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, int, error) {
 	if err := work.Charge(); err != nil {
-		return false, err
+		return false, 0, err
 	}
 	const prefix, field, suffix = `{"ts":`, `,"line":"`, "\"}\n"
 	stamp, err := row.TS.MarshalJSON()
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	mark := len(b.body)
-	remaining := b.maxBytes - mark - len(prefix) - len(stamp) - len(field) - len(suffix)
-	// JSON escaping can only expand the byte length.
-	if len(row.Line) > remaining {
-		return false, nil
-	}
-	b.append(prefix)
-	b.append(string(stamp))
-	b.append(field)
-	for line := row.Line; len(line) > 0; {
+
+	remaining := b.maxBytes - b.size
+	size := len(prefix) + len(stamp) + len(field) + len(suffix)
+	for line := row.Line; ; {
+		// Escaping can only expand the remaining input.
+		if b.size != 0 && len(line) > remaining-size {
+			return false, 0, nil
+		}
+		if len(line) == 0 {
+			break
+		}
 		n := queryChunkEnd(line)
 		if err := work.Charge(uint64(n)); err != nil {
-			b.body = b.body[:mark]
-			return false, err
+			return false, 0, err
 		}
-		quoted, err := json.Marshal(line[:n])
+		payload, err := b.escapeChunk(line[:n])
 		if err != nil {
-			b.body = b.body[:mark]
-			return false, err
+			return false, 0, err
 		}
-		payload := quoted[1 : len(quoted)-1]
-		remaining -= len(payload)
+		size += len(payload)
 		line = line[n:]
-		if len(line) > remaining {
-			b.body = b.body[:mark]
-			return false, nil
-		}
-		b.grow(len(payload))
-		b.body = append(b.body, payload...)
 	}
-	b.append(suffix)
-	return true, nil
+	if size > remaining {
+		return false, size, nil
+	}
+
+	record := make([]byte, 0, size)
+	record = append(record, prefix...)
+	record = append(record, stamp...)
+	record = append(record, field...)
+	for line := row.Line; len(line) > 0; {
+		// The measurement pass reserved the work for these bytes.
+		if err := work.Charge(); err != nil {
+			return false, 0, err
+		}
+		n := queryChunkEnd(line)
+		payload, err := b.escapeChunk(line[:n])
+		if err != nil {
+			return false, 0, err
+		}
+		record = append(record, payload...)
+		line = line[n:]
+	}
+	record = append(record, suffix...)
+	b.rows = append(b.rows, record)
+	b.size += len(record)
+	return true, 0, nil
+}
+
+// escapeChunk returns the escaped payload without the quotes and newline
+// written by the encoder. The buffer is reused across chunks and rows.
+// The payload is valid until the next call.
+func (b *queryResponse) escapeChunk(line string) ([]byte, error) {
+	b.scratch.Reset()
+	// An input byte can expand to six bytes. Leave room for the quotes,
+	// newline, and the encoder's buffer growth threshold.
+	maxEncoded := 6*len(line) + 3
+	b.scratch.Grow(maxEncoded + maxEncoded/4)
+	b.encoder.Reset(&b.scratch, jsontext.EscapeForHTML(true), jsontext.EscapeForJS(true), jsontext.AllowInvalidUTF8(true))
+	if err := b.encoder.WriteToken(jsontext.String(line)); err != nil {
+		return nil, err
+	}
+	quoted := b.scratch.Bytes()
+	return quoted[1 : len(quoted)-2], nil
 }
 
 // queryChunkEnd avoids splitting a valid UTF-8 rune. Malformed bytes must

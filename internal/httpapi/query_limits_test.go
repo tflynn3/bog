@@ -109,7 +109,8 @@ func TestLiveQueryConcurrentCursorResume(t *testing.T) {
 	firstLine, tieLine, lastLine := jsonRow(t, early), jsonRow(t, tie), jsonRow(t, late)
 	s := new(store.Store)
 	s.Publish([]store.Row{tie, late, early, tie})
-	h := NewWithQueryLimits(s, publishingAppender{s}, 2*len(tieLine), 2, DefaultQueryWorkBudget)
+	a := newAPI(s, publishingAppender{s}, 2*len(tieLine), DefaultQueryWorkBudget)
+	h := a.handler(2)
 
 	query := func(path string) *httptest.ResponseRecorder {
 		out := httptest.NewRecorder()
@@ -172,7 +173,7 @@ func TestLiveQueryConcurrentCursorResume(t *testing.T) {
 	// the older backfill nor the appended tie enters the captured snapshot.
 	second := query(path)
 	next := second.Header().Get("Bog-Next-Cursor")
-	cursor, err := decodeCursor(next)
+	cursor, err := a.decodeCursor(next)
 	if second.Code != http.StatusOK || second.Body.String() != tieLine+tieLine || err != nil || cursor.Count != 4 || cursor.After.Ordinal != 3 {
 		t.Fatalf("second page: status=%d body=%q cursor=%+v error=%v", second.Code, second.Body.String(), cursor, err)
 	}

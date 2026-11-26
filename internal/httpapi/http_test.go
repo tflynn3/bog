@@ -41,20 +41,21 @@ func readHTTPTestBody(t *testing.T, body io.ReadCloser) []byte {
 }
 
 func TestCursorAuthenticationDomainSeparation(t *testing.T) {
+	a := newAPI(nil, nil, DefaultQueryMaxResponseBytes, DefaultQueryWorkBudget)
 	payload, err := json.Marshal(cursorData{Version: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := containsDigest(string(payload))
+	digest := a.containsDigest(string(payload))
 	forged := base64.RawURLEncoding.EncodeToString(append(payload, digest[:]...))
-	if _, err := decodeCursor(forged); err == nil {
+	if _, err := a.decodeCursor(forged); err == nil {
 		t.Fatal("filter digest authenticated a cursor payload")
 	}
-	token, err := encodeCursor(cursorData{Version: 1})
+	token, err := a.encodeCursor(cursorData{Version: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := decodeCursor(token); err != nil {
+	if _, err := a.decodeCursor(token); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -197,10 +198,6 @@ func TestSnapshotPagination(t *testing.T) {
 	replay := &store.Store{}
 	log = openHTTPTestWAL(t, dir, replay)
 	h = New(replay, log)
-	// Simulate a fresh process key while retaining the recovered WAL.
-	oldKey := cursorKey
-	cursorKey = make([]byte, 32)
-	defer func() { cursorKey = oldKey }()
 	if out := query(bounds + "&cursor=" + token); out.Code != 400 {
 		t.Fatalf("old token: %d", out.Code)
 	}
@@ -316,14 +313,16 @@ func TestSnapshotByteCutPreservesOrdinal(t *testing.T) {
 	size := len(jsonRow(t, row))
 	s := &store.Store{}
 	s.Publish([]store.Row{row, row, row, row, row})
-	one := NewWithQueryMaxResponseBytes(s, nil, size)
+	oneAPI := newAPI(s, nil, size, DefaultQueryWorkBudget)
+	one := oneAPI.handler(DefaultQueryConcurrency)
 	oneOut := httptest.NewRecorder()
 	one.ServeHTTP(oneOut, httptest.NewRequest("GET", "/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&page=1&limit=5", nil))
-	oneCursor, err := decodeCursor(oneOut.Header().Get("Bog-Next-Cursor"))
+	oneCursor, err := oneAPI.decodeCursor(oneOut.Header().Get("Bog-Next-Cursor"))
 	if oneOut.Code != 200 || oneOut.Body.Len() != size || err != nil || oneCursor.After.Ordinal != 0 {
 		t.Fatalf("one-row cut: %d cursor=%+v error=%v", oneOut.Code, oneCursor, err)
 	}
-	h := NewWithQueryMaxResponseBytes(s, nil, size*2)
+	a := newAPI(s, nil, size*2, DefaultQueryWorkBudget)
+	h := a.handler(DefaultQueryConcurrency)
 	bounds := "/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z"
 	query := func(params string) *httptest.ResponseRecorder {
 		out := httptest.NewRecorder()
@@ -335,7 +334,7 @@ func TestSnapshotByteCutPreservesOrdinal(t *testing.T) {
 	if first.Code != 200 || first.Body.Len() != size*2 || token == "" {
 		t.Fatalf("first: %d %q", first.Code, first.Body.String())
 	}
-	c, err := decodeCursor(token)
+	c, err := a.decodeCursor(token)
 	if err != nil || c.After.Ordinal != 1 || c.Count != 5 {
 		t.Fatalf("cursor: %+v %v", c, err)
 	}
@@ -345,7 +344,7 @@ func TestSnapshotByteCutPreservesOrdinal(t *testing.T) {
 	if second.Code != 200 || second.Body.Len() != size*2 || token == "" {
 		t.Fatalf("second: %d %q", second.Code, second.Body.String())
 	}
-	c, err = decodeCursor(token)
+	c, err = a.decodeCursor(token)
 	if err != nil || c.After.Ordinal != 3 || c.Count != 5 {
 		t.Fatalf("cursor: %+v %v", c, err)
 	}
@@ -358,5 +357,58 @@ func TestSnapshotByteCutPreservesOrdinal(t *testing.T) {
 	tiny.ServeHTTP(out, httptest.NewRequest("GET", bounds+"&page=1", nil))
 	if out.Code != 422 || out.Header().Get("Bog-Next-Cursor") != "" {
 		t.Fatalf("oversized: %d %v", out.Code, out.Header())
+	}
+}
+
+func TestQueryCursorIssuerIsolation(t *testing.T) {
+	stamp := time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC)
+	first := store.Row{TS: stamp, Line: "same filter, first"}
+	last := store.Row{TS: stamp, Line: "same filter, last"}
+	s := new(store.Store)
+	s.Publish([]store.Row{first, last})
+	issuer, other := New(s, nil), New(s, nil)
+	query := func(h http.Handler, params string) *httptest.ResponseRecorder {
+		out := httptest.NewRecorder()
+		h.ServeHTTP(out, httptest.NewRequest(http.MethodGet, queryBounds+"&contains=filter&limit=1"+params, nil))
+		return out
+	}
+	for _, pair := range [][2]http.Handler{{issuer, other}, {other, issuer}} {
+		page := query(pair[0], "&page=1")
+		cursor := page.Header().Get("Bog-Next-Cursor")
+		if page.Code != http.StatusOK || page.Body.String() != jsonRow(t, first) || cursor == "" {
+			t.Fatalf("first page: status=%d headers=%v body=%q", page.Code, page.Header(), page.Body.String())
+		}
+		path := "&cursor=" + cursor
+		assertQueryRejection(t, query(pair[1], path), http.StatusBadRequest, "invalid cursor")
+		resumed := query(pair[0], path)
+		if resumed.Code != http.StatusOK || resumed.Body.String() != jsonRow(t, last) || resumed.Header().Get("Bog-Next-Cursor") != "" {
+			t.Fatalf("continuation: status=%d headers=%v body=%q", resumed.Code, resumed.Header(), resumed.Body.String())
+		}
+	}
+}
+
+func TestMethodNotAllowedAdvertisesSupportedMethod(t *testing.T) {
+	h := New(new(store.Store), nil)
+	for _, tc := range []struct {
+		path, method, allow string
+	}{
+		{"/healthz", http.MethodHead, http.MethodGet},
+		{"/query", http.MethodPost, http.MethodGet},
+		{"/ingest", http.MethodGet, http.MethodPost},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			out := httptest.NewRecorder()
+			h.ServeHTTP(out, httptest.NewRequest(tc.method, tc.path, nil))
+			if out.Code != http.StatusMethodNotAllowed || out.Header().Get("Allow") != tc.allow {
+				t.Fatalf("status=%d Allow=%q", out.Code, out.Header().Get("Allow"))
+			}
+		})
+	}
+	for _, path := range []string{"/healthz", queryBounds, queryBounds + "&page=1"} {
+		out := httptest.NewRecorder()
+		h.ServeHTTP(out, httptest.NewRequest(http.MethodGet, path, nil))
+		if out.Code != http.StatusOK || out.Body.Len() != 0 || out.Header().Get("Content-Length") != "0" {
+			t.Fatalf("GET %s: status=%d headers=%v body=%q", path, out.Code, out.Header(), out.Body.String())
+		}
 	}
 }

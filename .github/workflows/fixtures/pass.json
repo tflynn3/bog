@@ -1,0 +1,21 @@
+{
+  "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "binary_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "common": {
+    "schema_version": 1,
+    "verifier": {"name": "fixture-verifier", "version": "1"},
+    "fixture": {"id": "seeded-example-v1", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+  },
+  "reports": {
+    "durability": {
+      "acknowledged_writes_survive_sigkill": {"status": "pass"},
+      "torn_suffix_recovery": {"status": "pass"},
+      "committed_corruption_blocks_startup": {"status": "pass"},
+      "backfill_cursor_walk": {"status": "pass"},
+      "stale_cursors_after_restart": {"status": "pass"},
+      "real_enospc_recovery": {"status": "pass", "disposable_local_filesystem": true, "observed_enospc": true, "recovered_after_space_freed": true}
+    },
+    "capacity": {"retained_history_capacity": {"status": "pass"}},
+    "admission": {"one_slot_admission": {"status": "pass", "prompt_503": true, "zero_ndjson_rows": true, "no_cursor": true, "health_responsive_during_hold": true, "ingest_responsive_during_hold": true, "original_cursor_retry_succeeded_after_disconnect": true}}
+  }
+}

@@ -1,0 +1,59 @@
+name: Revision-pinned release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full candidate commit SHA
+        required: true
+        type: string
+      baseline:
+        description: Optional comparison baseline commit SHA
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validator-fixtures:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise report validator
+        run: python3 .github/workflows/test_release_gate.py
+
+  release-verification:
+    needs: validator-fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Validate requested revisions
+        env:
+          REVISION: ${{ inputs.revision }}
+          BASELINE: ${{ inputs.baseline }}
+        run: |
+          [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo 'revision must be a full lowercase SHA' >&2; exit 1; }
+          [[ -z "$BASELINE" || "$BASELINE" =~ ^[0-9a-f]{40}$ ]] || { echo 'baseline must be empty or a full lowercase SHA' >&2; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision }}
+          fetch-depth: 1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache: false
+      - name: Build and verify candidate; run evidence producers
+        env:
+          REVISION: ${{ inputs.revision }}
+          BASELINE: ${{ inputs.baseline }}
+          GOTOOLCHAIN: local
+        run: bash .github/workflows/run-release-gate.sh
+      - name: Publish reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-verification-${{ inputs.revision }}
+          path: release-evidence/
+          if-no-files-found: warn
+          retention-days: 30

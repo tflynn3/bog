@@ -13,9 +13,17 @@ const (
 	compactionPollInterval = 30 * time.Millisecond
 	timelineSampleInterval = 100 * time.Millisecond
 	timelineSampleLimit    = 64
-	drainBudget            = 2 * time.Second
 	diagnosticRequestLimit = 250 * time.Millisecond
+
+	queryCaptureLifetime = 15 * time.Minute // ADR 0006
+	pinReleaseGrace      = 30 * time.Second // allow release and observation after expiry
 )
+
+func pinDrainDeadline(firstPageReceived time.Time) time.Time {
+	// The first page arrives after the lifetime starts. A source may expire
+	// earlier, and polling can finish as soon as retirement is observed.
+	return firstPageReceived.Add(queryCaptureLifetime + pinReleaseGrace)
+}
 
 type runtimeSample struct {
 	PublicationLag *uint64           `json:"publication_lag_ns"`
@@ -297,7 +305,8 @@ func (p *backfillProbe) pollPublication(ctx context.Context, previous uint64, af
 		if event == "publication" && err == nil {
 			p.Publication = &publicationProof{c.Generation, p.lastRunning.Sub(p.startSent), received.Sub(p.startSent)}
 		}
-		if err == nil && p.Publication != nil && p.PinDrain.Held == nil {
+		if err == nil && p.Publication != nil && metrics.RetiredPins != nil &&
+			(p.PinDrain.Held == nil || *p.PinDrain.Held == 0) {
 			p.PinDrain.Held = metrics.RetiredPins
 		}
 	}
@@ -328,13 +337,14 @@ func (p *backfillProbe) validateRunning(c compaction, previous uint64, committed
 	return nil
 }
 
-func (p *backfillProbe) observeDrain(ctx context.Context, limit time.Duration) error {
+func (p *backfillProbe) observeDrain(ctx context.Context, deadline time.Time) error {
 	p.PinDrain.Reason = "candidate did not expose a positive predecessor pin count while the cursor was held"
-	budget, cancel := context.WithTimeout(ctx, limit)
+	positiveHeld := p.PinDrain.Held != nil && *p.PinDrain.Held > 0
+	budget, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	ticker := time.NewTicker(timelineSampleInterval)
 	defer ticker.Stop()
-	for event := "after_exhaustion"; ; event = "drain_poll" {
+	for event := "after_exhaustion"; budget.Err() == nil; event = "drain_poll" {
 		request, stop := context.WithTimeout(budget, diagnosticRequestLimit)
 		c, sent, received, err := p.request(request, "status")
 		stop()
@@ -348,33 +358,47 @@ func (p *backfillProbe) observeDrain(ctx context.Context, limit time.Duration) e
 		if metrics.RetiredPins != nil {
 			p.PinDrain.After = metrics.RetiredPins
 		}
-		switch {
-		case ctx.Err() != nil:
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case err != nil:
+		}
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && budget.Err() != nil && p.PinDrain.Status == "pending" {
+				break
+			}
 			p.PinDrain.Reason = "drain status unavailable: " + diagnosticError(err)
 			if errors.Is(err, context.DeadlineExceeded) && p.PinDrain.Status != "pending" {
 				return nil
 			}
 			return err
+		}
+		switch {
 		case metrics.RetiredPins == nil:
-			p.PinDrain.Reason = metrics.Unavailable["retired_generation_pins"]
-			return nil
-		case p.PinDrain.Held == nil || *p.PinDrain.Held == 0:
+			// A gap in instrumentation cannot clear the last positive sample.
+			if p.PinDrain.Status != "pending" {
+				p.PinDrain.Reason = metrics.Unavailable["retired_generation_pins"]
+			}
+			if !positiveHeld {
+				return nil
+			}
+		case !positiveHeld:
 			return nil
 		case *metrics.RetiredPins == 0:
 			p.PinDrain.Status, p.PinDrain.Reason = "observed", ""
 			return nil
+		default:
+			p.PinDrain.Status = "pending"
+			p.PinDrain.Reason = "predecessor pins still present at the last available drain sample"
 		}
-		p.PinDrain.Status = "pending"
-		p.PinDrain.Reason = "predecessor pins still present at the last drain sample"
 		select {
 		case <-budget.Done():
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return fmt.Errorf("predecessor pins did not drain within %s", limit)
 		case <-ticker.C:
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.PinDrain.Status == "pending" {
+		return fmt.Errorf("predecessor pins did not drain within the capture expiry and release window: %w", budget.Err())
+	}
+	return nil
 }

@@ -35,7 +35,8 @@ type Client struct {
 }
 
 // New creates a client for a Bog server URL. A nil transport uses a private,
-// reusable clone of the default transport.
+// reusable clone of the default transport. A supplied transport is used
+// directly and may be shared with other clients.
 func New(base string, transport *http.Transport) (*Client, error) {
 	u, err := url.Parse(base)
 	if err != nil {
@@ -52,6 +53,14 @@ func New(base string, transport *http.Transport) (*Client, error) {
 		}
 	}
 	return &Client{base: u, http: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+}
+
+// CloseIdleConnections closes idle connections on the underlying transport.
+// It is safe to call concurrently with requests and leaves active requests
+// alone. If the transport is shared, this also closes its other idle connections.
+// The client remains usable afterward.
+func (c *Client) CloseIdleConnections() {
+	c.http.CloseIdleConnections()
 }
 
 // HTTPError retains an HTTP status and a bounded diagnostic body.
@@ -252,15 +261,26 @@ func (c *Client) Walk(ctx context.Context, q Query, consume func(Page) error) (s
 	return c.WalkFrom(ctx, q, "", consume)
 }
 
-// WalkFrom resumes a walk at cursor.
+// WalkFrom resumes a walk at cursor. It rejects a page before delivery if its
+// next cursor repeats any cursor used in this invocation.
 func (c *Client) WalkFrom(ctx context.Context, q Query, cursor string, consume func(Page) error) (string, error) {
 	if consume == nil {
 		return cursor, errors.New("nil page consumer")
 	}
+	seen := make(map[string]struct{})
 	for {
+		if cursor != "" {
+			seen[cursor] = struct{}{}
+		}
 		p, err := c.FetchPage(ctx, q, cursor)
 		if err != nil {
 			return cursor, err
+		}
+		if _, repeated := seen[p.NextCursor]; repeated {
+			return cursor, &HTTPError{
+				StatusCode: http.StatusOK,
+				Cause:      errors.New("next cursor does not advance pagination: cursor cycle"),
+			}
 		}
 		if err = consume(p); err != nil {
 			return cursor, err

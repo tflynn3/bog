@@ -21,12 +21,13 @@ type row struct {
 }
 
 type service struct {
-	base   string
-	client *http.Client
+	base        string
+	client      *http.Client
+	queryPhases map[string]*queryPhase
 }
 
 func newService(base string) service {
-	return service{base, &http.Client{
+	return service{base: base, client: &http.Client{
 		Timeout:       10 * time.Second,
 		Transport:     &http.Transport{MaxIdleConnsPerHost: 4},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -34,6 +35,19 @@ func newService(base string) service {
 }
 
 func (s service) request(ctx context.Context, method, path string, body io.Reader) (res *http.Response, data []byte, err error) {
+	return s.requestObserved(ctx, method, path, body, nil)
+}
+
+func (s service) requestObserved(ctx context.Context, method, path string, body io.Reader, q *queryAttempt) (res *http.Response, data []byte, err error) {
+	start := time.Now()
+	if q != nil {
+		budget := s.client.Timeout
+		if deadline, ok := ctx.Deadline(); ok && (budget == 0 || deadline.Sub(start) < budget) {
+			budget = max(0, deadline.Sub(start))
+		}
+		*q = queryAttempt{Admission: "unknown", Phase: "headers", Budget: budget}
+		defer func() { q.Elapsed = time.Since(start) }()
+	}
 	req, err := http.NewRequestWithContext(ctx, method, s.base+path, body)
 	if err != nil {
 		return nil, nil, err
@@ -45,11 +59,23 @@ func (s service) request(ctx context.Context, method, path string, body io.Reade
 	if err != nil {
 		return nil, nil, err
 	}
+	if q != nil {
+		q.observeHeaders(res, time.Since(start))
+	}
 	defer func() { err = errors.Join(err, res.Body.Close()) }()
 	const maxBody = 8 << 20
 	data, err = io.ReadAll(io.LimitReader(res.Body, maxBody+1))
 	if err == nil && len(data) > maxBody {
 		err = errors.New("response exceeds 8 MiB")
+	}
+	if q != nil {
+		q.BodyBytes = len(data)
+		if err == nil {
+			elapsed := time.Since(start)
+			q.Body = &elapsed
+			q.observeRejection(data)
+			q.Phase = "close"
+		}
 	}
 	return res, data, err
 }
@@ -110,9 +136,12 @@ type walk struct {
 	pages  int
 	cursor string
 	seen   map[string]bool
+	phase  string
 }
 
-func (w *walk) page(ctx context.Context, s service, f fixture) (time.Duration, error) {
+func (w *walk) page(ctx context.Context, s service, f fixture) (_ time.Duration, err error) {
+	var attempt queryAttempt
+	defer func() { recordQuery(s.queryPhases, w.phase, attempt, err) }()
 	limit := [...]int{1, 193, 509}[w.pages%3]
 	q := url.Values{"start": {w.filter.start.Format(time.RFC3339Nano)}, "end": {w.filter.end.Format(time.RFC3339Nano)},
 		"contains": {w.filter.literal}, "limit": {strconv.Itoa(limit)}}
@@ -122,13 +151,14 @@ func (w *walk) page(ctx context.Context, s service, f fixture) (time.Duration, e
 		q.Set("cursor", w.cursor)
 	}
 	start := time.Now()
-	res, data, err := s.request(ctx, http.MethodGet, "/query?"+q.Encode(), nil)
+	res, data, err := s.requestObserved(ctx, http.MethodGet, "/query?"+q.Encode(), nil, &attempt)
 	elapsed := time.Since(start)
 	if err != nil {
 		return elapsed, err
 	}
+	attempt.Phase = "validation"
 	if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "application/x-ndjson" {
-		return elapsed, fmt.Errorf("query HTTP %d: %.200s", res.StatusCode, data)
+		return elapsed, fmt.Errorf("query HTTP %d (%s)", res.StatusCode, attempt.Admission)
 	}
 	if len(data) != 0 && data[len(data)-1] != '\n' {
 		return elapsed, errors.New("query ended with an unterminated NDJSON row")
@@ -200,16 +230,20 @@ func (s service) compact(ctx context.Context, path, action string, cutoff int) (
 	return c, nil
 }
 
-func (s service) waitCompaction(ctx context.Context, path string, cutoff int, generation uint64) (compaction, error) {
+func (s service) waitCompaction(ctx context.Context, path string, cutoff int, generation uint64, observeRunning func(time.Time)) (compaction, error) {
 	ticker := time.NewTicker(30 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		sent := time.Now()
 		c, err := s.compact(ctx, path, "status", cutoff)
 		if err != nil {
 			return c, err
 		}
 		switch c.State {
 		case "running":
+			if observeRunning != nil && c.Generation == generation {
+				observeRunning(sent)
+			}
 		case "complete":
 			if c.Generation <= generation || c.CoveredRows != cutoff || c.CommittedRows < cutoff {
 				return c, fmt.Errorf("unexpected compaction cutoff or generation: %+v", c)

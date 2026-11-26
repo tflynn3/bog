@@ -35,10 +35,29 @@ type child struct {
 	groupErr error
 }
 
-type limitedLog struct{ buf bytes.Buffer }
+type limitedLog struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (l *limitedLog) snapshot() (string, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String(), l.truncated
+}
+
+func (l *limitedLog) text() string {
+	log, _ := l.snapshot()
+	return log
+}
 
 func (l *limitedLog) Write(p []byte) (int, error) {
-	_, err := l.buf.Write(p[:min(len(p), 32<<10-l.buf.Len())])
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := min(len(p), 32<<10-l.buf.Len())
+	l.truncated = l.truncated || n < len(p)
+	_, err := l.buf.Write(p[:n])
 	return len(p), err
 }
 
@@ -119,7 +138,7 @@ func (p *child) stop(sig syscall.Signal) (err error) {
 			return nil
 		}
 		if p.result != nil {
-			return fmt.Errorf("stop candidate: %w: %s", p.result, p.logs.buf.String())
+			return fmt.Errorf("stop candidate: %w: %s", p.result, p.logs.text())
 		}
 		if sig == syscall.SIGKILL {
 			return errors.New("candidate exited before SIGKILL")
@@ -152,6 +171,8 @@ type server struct {
 	binary, dir, addr string
 	client            *http.Client
 	process           *child
+	diagnostics       *caseDiagnostics
+	current           *processEvidence
 }
 
 func newServer(binary, dir string) (*server, error) {
@@ -175,13 +196,22 @@ func newServer(binary, dir string) (*server, error) {
 	return &server{binary: binary, dir: dir, addr: addr, client: client}, nil
 }
 
-func (s *server) launch() error {
+func (s *server) launch() error { return s.launchFor("direct") }
+
+func (s *server) launchFor(probe string) error {
 	if err := s.close(); err != nil {
 		return fmt.Errorf("clean up previous candidate: %w", err)
+	}
+	if s.diagnostics != nil {
+		s.current = &processEvidence{StartupProbe: probe, start: time.Now()}
+		s.diagnostics.Candidates = append(s.diagnostics.Candidates, s.current)
 	}
 	p, err := spawn(s.binary, s.dir, "-addr", s.addr, "-data-dir", s.dir)
 	if err == nil {
 		s.process = p
+	} else {
+		s.process = nil
+		s.recordStartupError(err)
 	}
 	return err
 }
@@ -190,18 +220,41 @@ func (s *server) close() error {
 	if s.process == nil {
 		return nil
 	}
-	return s.process.reap()
+	err := s.process.reap()
+	if e := s.current; e != nil {
+		p := s.process
+		e.Log, e.LogTruncated = p.logs.snapshot()
+		select {
+		case <-p.done:
+			e.Reaped = true
+			code := p.cmd.ProcessState.ExitCode()
+			if ws, ok := p.cmd.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				e.Signal = ws.Signal().String()
+			} else if code >= 0 {
+				e.ExitCode = &code
+			}
+			if rss := peakRSS(p); rss > 0 {
+				e.PeakRSSKiB = &rss
+			}
+			if waitErr := errors.Join(p.result, p.observeErr); waitErr != nil {
+				e.WaitError = diagnosticError(waitErr)
+			}
+		default:
+		}
+	}
+	return err
 }
 
 func (s *server) start(ctx context.Context) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.launch(); err != nil {
+	if err := s.launchFor("/healthz"); err != nil {
 		return err
 	}
 	defer func() {
 		if err != nil {
+			s.recordStartupError(err)
 			err = errors.Join(err, s.close())
 		}
 	}()
@@ -226,6 +279,10 @@ func (s *server) start(ctx context.Context) (err error) {
 			case <-s.process.done:
 				return s.startupExit()
 			default:
+				if s.current != nil {
+					elapsed := time.Since(s.current.start)
+					s.current.Health = &elapsed
+				}
 				return nil
 			}
 		}
@@ -239,11 +296,35 @@ func (s *server) start(ctx context.Context) (err error) {
 	}
 }
 
-func (s *server) startupExit() error {
-	return fmt.Errorf("candidate exited before health (%v): %s", s.process.result, s.process.logs.buf.String())
+func (s *server) recordStartupError(err error) {
+	if err != nil && s.current != nil {
+		s.current.StartupError = diagnosticError(err)
+	}
 }
 
-func (s *server) request(ctx context.Context, method, path string, data []byte, status int) ([]byte, http.Header, error) {
+func (s *server) startupExit() error {
+	return fmt.Errorf("candidate exited before health (%v): %s", s.process.result, s.process.logs.text())
+}
+
+func (s *server) request(ctx context.Context, method, path string, data []byte, status int) (_ []byte, _ http.Header, err error) {
+	kind := "fresh_page"
+	switch {
+	case !strings.HasPrefix(path, "/query?"):
+		kind = ""
+	case status == http.StatusBadRequest:
+		kind = "stale_cursor"
+	case strings.Contains(path, "?cursor=") || strings.Contains(path, "&cursor="):
+		kind = "continuation"
+	}
+	start := time.Now()
+	q := queryResponse{Admission: "unknown", Phase: "headers"}
+	if s.diagnostics != nil && kind != "" {
+		q.Lifetime = len(s.diagnostics.Candidates)
+		defer func() {
+			q.Elapsed = time.Since(start)
+			s.diagnostics.observeQuery(kind, q, err)
+		}()
+	}
 	req, err := http.NewRequestWithContext(ctx, method, "http://"+s.addr+path, bytes.NewReader(data))
 	if err != nil {
 		return nil, nil, err
@@ -252,12 +333,24 @@ func (s *server) request(ctx context.Context, method, path string, data []byte, 
 	if err != nil {
 		return nil, nil, err
 	}
+	q.observeHeaders(resp, time.Since(start))
 	const maxBody = 4 << 20
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
-	if err := errors.Join(err, resp.Body.Close()); err != nil {
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	q.Bytes = len(body)
+	if readErr == nil && len(body) <= maxBody {
+		elapsed := time.Since(start)
+		q.Body = &elapsed
+		q.observeRejection(body)
+		q.Phase = "close"
+	}
+	if err := errors.Join(readErr, resp.Body.Close()); err != nil {
 		return nil, nil, err
 	}
-	if len(body) > maxBody || resp.StatusCode != status {
+	if len(body) > maxBody {
+		return nil, nil, errors.New("response exceeds 4 MiB")
+	}
+	q.Phase = "validation"
+	if resp.StatusCode != status {
 		return nil, nil, fmt.Errorf("%s %s: HTTP %d, expected %d (response %.200q)", method, strings.SplitN(path, "?", 2)[0], resp.StatusCode, status, body)
 	}
 	return body, resp.Header, nil

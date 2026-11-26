@@ -15,9 +15,20 @@ import (
 )
 
 type child struct {
-	cmd     *exec.Cmd
-	done    chan struct{}
-	waitErr error // read after done closes
+	cmd         *exec.Cmd
+	done        chan struct{}
+	waitErr     error // read after done closes
+	logDrainErr error
+	logs        candidateLog
+}
+
+func (p *child) exited() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
 }
 
 const capacityControlEnv = "BOG_CAPACITY_CONTROL"
@@ -47,7 +58,9 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 		cmd.Env = append(cmd.Env, capacityControlEnv+"=1")
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	p := &child{cmd: cmd, done: make(chan struct{})}
+	cmd.Stdout, cmd.Stderr = &p.logs, &p.logs
+	cmd.WaitDelay = 500 * time.Millisecond
 	readGate, gate, err := os.Pipe()
 	if err != nil {
 		return nil, "", err
@@ -56,12 +69,16 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, "", errors.Join(err, readGate.Close(), gate.Close())
 	}
-	p := &child{cmd: cmd, done: make(chan struct{})}
 	defer func() {
 		// Keep the PID reserved until placement finishes, even if the
 		// shell exits before we release the gate.
 		go func() {
 			p.waitErr = cmd.Wait()
+			if errors.Is(p.waitErr, exec.ErrWaitDelay) {
+				// The leader exited successfully. An inherited writer kept
+				// its logging pipe open. Cgroup teardown still owns drainage.
+				p.logDrainErr, p.waitErr = p.waitErr, nil
+			}
 			close(p.done)
 		}()
 	}()
@@ -175,12 +192,13 @@ func (r *resources) disk(dir string) {
 	}
 }
 
-func (r *resources) sample(ctx context.Context, p *child, dir string) <-chan struct{} {
+func (r *result) sample(ctx context.Context, p *child, dir string, live bool) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
+		var nextStorageSample time.Time
 		for {
 			select {
 			case <-p.done:
@@ -197,6 +215,12 @@ func (r *resources) sample(ctx context.Context, p *child, dir string) <-chan str
 				r.unavailable("peak_descriptors", err)
 			}
 			r.disk(dir)
+			if now := time.Now(); live && !now.Before(nextStorageSample) {
+				nextStorageSample = now.Add(100 * time.Millisecond)
+				if err := r.Diagnostics.sampleStorage(dir); err != nil {
+					r.Diagnostics.Unavailable["storage_sample_error"] = diagnosticError(err)
+				}
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -232,7 +256,9 @@ func (r *resources) collect(group string) {
 
 func measure(ctx context.Context, o options, binary, dir string, f fixture) (r result) {
 	r = result{Fixture: f, Phase: "provision", Status: "fail", Workload: "fail",
-		Cleanup: cleanupProof{Status: "not_started"}, resources: resources{Unavailable: make(map[string]string)}}
+		Cleanup: cleanupProof{Status: "not_started"}, Diagnostics: &capacityDiagnostics{
+			Queries: make(map[string]*queryPhase), Unavailable: make(map[string]string),
+		}, resources: resources{Unavailable: make(map[string]string)}}
 	err := func() (err error) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -244,16 +270,32 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 		r.disk(dir)
 		group, err := openGroup(o.cgroupParent, f.MemoryBytes)
 		var p *child
+		var candidate *candidateEvidence
 		var earlyCleanupErr error
 		if group != "" {
 			defer func() {
+				if candidate != nil && p != nil {
+					candidate.ExitedBeforeCleanup = p.exited()
+				}
 				var shutdownErr, cleanupErr error
-				r.Cleanup, shutdownErr, cleanupErr = teardownGroup(group, p, func() { r.collect(group) })
+				r.Cleanup, shutdownErr, cleanupErr = teardownGroup(group, p, func() {
+					r.collect(group)
+					data, err := os.ReadFile(filepath.Join(group, "memory.events"))
+					if err == nil {
+						r.Diagnostics.MemoryEvents, err = memoryEvents(string(data))
+					}
+					if err != nil {
+						r.Diagnostics.Unavailable["cgroup_memory_events"] = diagnosticError(err)
+					}
+				})
 				cleanupErr = errors.Join(earlyCleanupErr, cleanupErr)
 				if cleanupErr != nil {
 					r.Cleanup.Status, r.Cleanup.Detail = "fail", cleanupErr.Error()
 				}
 				r.collectRSS(p)
+				if candidate != nil {
+					candidate.finish(p)
+				}
 				err = errors.Join(err, shutdownErr)
 			}()
 		}
@@ -261,24 +303,31 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 			return fmt.Errorf("create delegated cgroup v2 subtree: %w", err)
 		}
 
-		p, err = r.exercise(ctx, o, binary, dir, group, f, false)
+		candidate = &candidateEvidence{Lifetime: "startup"}
+		r.Diagnostics.Candidates = append(r.Diagnostics.Candidates, candidate)
+		p, err = r.exercise(ctx, o, binary, dir, group, f, candidate)
 		if err != nil {
 			return err
 		}
 		// Drain the first lifetime before restarting with the same data and
 		// measurement cgroup. Final teardown also removes the subtree.
 		var stopped cleanupProof
+		candidate.ExitedBeforeCleanup = p.exited()
 		stopped, err, earlyCleanupErr = teardownGroup(group, p, nil)
 		r.collectRSS(p)
+		candidate.finish(p)
 		if stopped.CandidateReaped {
 			p = nil
 		}
 		if err != nil || earlyCleanupErr != nil {
 			return err
 		}
-		p, err = r.exercise(ctx, o, binary, dir, group, f, true)
+		candidate = &candidateEvidence{Lifetime: "restart"}
+		r.Diagnostics.Candidates = append(r.Diagnostics.Candidates, candidate)
+		p, err = r.exercise(ctx, o, binary, dir, group, f, candidate)
 		return err
 	}()
+	r.Diagnostics.markMissing(o.mode)
 	for key, missing := range map[string]bool{
 		"cgroup_peak_memory": r.CgroupPeak == nil, "peak_rss": r.PeakRSS == nil, "peak_descriptors": r.PeakFDs == nil,
 		"device_io": len(r.DeviceIO) == 0, "disk_headroom": r.InitialFree == nil || r.MinFree == nil,
@@ -308,32 +357,34 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 	return r
 }
 
-func (r *result) exercise(ctx context.Context, o options, binary, dir, group string, f fixture, restart bool) (*child, error) {
-	r.Phase = "startup"
-	if restart {
-		r.Phase = "restart"
-	}
+func (r *result) exercise(ctx context.Context, o options, binary, dir, group string, f fixture, candidate *candidateEvidence) (*child, error) {
+	r.Phase = candidate.Lifetime
 	if err := ctx.Err(); err != nil {
+		candidate.StartupError = diagnosticError(err)
 		return nil, err
 	}
 	start := time.Now()
 	p, base, err := startChild(binary, dir, group, o.mode)
 	if err != nil {
+		candidate.StartupError = diagnosticError(err)
 		return p, err
 	}
 	sampling, stopSampling := context.WithCancel(ctx)
-	sampled := r.sample(sampling, p, dir)
+	sampled := r.sample(sampling, p, dir, o.mode == "live")
 	defer func() {
 		stopSampling()
 		<-sampled
 	}()
 	probe := newService(base)
+	probe.queryPhases = r.Diagnostics.Queries
 	defer probe.client.CloseIdleConnections()
 	if err := probe.ready(ctx, p.done); err != nil {
+		candidate.StartupError = diagnosticError(err)
 		return p, err
 	}
 	elapsed := time.Since(start)
-	if restart {
+	candidate.Ready = &elapsed
+	if candidate.Lifetime == "restart" {
 		r.RestartReady = &elapsed
 		r.Phase = "recovery_walk"
 		r.RecoveredRows, err = f.recover(ctx, probe)

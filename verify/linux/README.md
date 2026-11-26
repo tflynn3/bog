@@ -90,3 +90,35 @@ Durable ingest ranged from 101k to 107k rows/s on `f727b8f` and from 116k
 to 125k on `2c26412`. Ingest p99 varied by 1.698 ms and 0.704 ms respectively.
 The query p95 ranges overlapped and the longest restart, 76.779 ms, occurred
 on the fourth run.
+
+## Cutover diagnostics
+
+The AgentSet/bog Linux qualification owner owns the producer evidence and
+triages the pinned #53 run in Slipway. Match the revision, binary SHA-256,
+and fixture across the admission, durability, capacity, and parity reports.
+
+The durability report's additive `diagnostics` object is keyed by case.
+Candidate entries are in launch order, including failed starts and the
+intentional corruption refusal. They include start-to-`/healthz` time,
+exit code or signal, peak RSS where available, and the first 32 KiB of
+combined candidate output. A null start-to-health time means the probe
+never succeeded or the case expected the candidate to refuse startup.
+Replay-only duration is unavailable because the candidate has no separate
+replay timing signal. Query evidence groups fresh pages, continuations,
+and stale-cursor checks. It retains counts by client-observed admission,
+maximum phase durations, the latest attempt, and the first HTTP failure
+when present. Case evidence still carries the ledger and retarget checks.
+
+For a fresh backfill deadline, read the pinned admission report in sequence.
+The release probe holds a continuation at zero receive window, verifies
+prompt rejection of a competing query and HTTP 204 for ingest, then
+releases the slow connection. It retries the held cursor before issuing a
+fresh query for the acknowledged row. Both of those last steps share the
+same 12-second context. Compare the capacity report's
+`after_publication_continuation` and `fresh_backfill` phases to determine
+whether the held walk completed and how far the fresh request progressed
+under its own budget. Missing headers leave admission unknown. Headers
+without a complete body place the interruption in response delivery.
+A completed rejection identifies the HTTP refusal when available. Use
+candidate exit, logs, and memory counters to correlate process failure
+with the query. [Release admission fixture](../release/README.md#admission-fixture)

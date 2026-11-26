@@ -28,9 +28,13 @@ func TestPageFraming(t *testing.T) {
 	}{
 		{"comma joined cursor", fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(row), row), false},
 		{"length", fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(row), row), true},
+		{"identity encoding", fmt.Sprintf("Content-Encoding: Identity\r\nContent-Length: %d\r\n\r\n%s", len(row), row), true},
+		{"multiple encodings", fmt.Sprintf("Content-Encoding: identity\r\nContent-Encoding: gzip\r\nContent-Length: %d\r\n\r\n%s", len(row), row), false},
 		{"truncated boundary", fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(row)+1, row), false},
 		{"chunked", fmt.Sprintf("Transfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n", len(row), row), true},
 		{"broken chunk", fmt.Sprintf("Transfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n", len(row), row), false},
+		{"broken trailers", fmt.Sprintf("Transfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\nX-Test: incomplete\r\n", len(row), row), false},
+		{"cursor trailer", fmt.Sprintf("Transfer-Encoding: chunked\r\nTrailer: Bog-Next-Cursor\r\n\r\n%x\r\n%s\r\n0\r\nBog-Next-Cursor: %s\r\n\r\n", len(row), row, fixtureNext), false},
 		{"close delimited", "\r\n" + row, false},
 		{"missing newline", fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(row)-1, strings.TrimSuffix(row, "\n")), false},
 		{"malformed", "Content-Length: 2\r\n\r\n{\n", false},
@@ -76,6 +80,7 @@ func TestPageFraming(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(c.CloseIdleConnections)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			p, err := c.FetchPage(ctx, Query{}, "")
@@ -102,14 +107,13 @@ func TestPageFraming(t *testing.T) {
 }
 
 func TestWalkAndStatuses(t *testing.T) {
-	var calls int
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
 		q := r.URL.Query()
 		if q.Get("start") != "2025-01-01T00:00:00Z" || q.Get("end") != "2025-01-02T00:00:00Z" || q.Get("contains") != "needle" {
 			t.Errorf("query: %v", q)
 		}
-		switch calls {
+		switch calls.Add(1) {
 		case 1:
 			if q.Get("page") != "1" {
 				t.Errorf("first: %v", q)
@@ -124,7 +128,9 @@ func TestWalkAndStatuses(t *testing.T) {
 			if q.Get("cursor") != fixtureNext {
 				t.Errorf("third: %v", q)
 			}
-			fmt.Fprint(w, "{\"ts\":\"2025-01-01T00:00:00Z\",\"line\":\"x\"}\n")
+			if _, err := fmt.Fprint(w, "{\"ts\":\"2025-01-01T00:00:00Z\",\"line\":\"x\"}\n"); err != nil {
+				t.Error(err)
+			}
 		}
 	}))
 	defer srv.Close()
@@ -132,7 +138,7 @@ func TestWalkAndStatuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start, _ := time.Parse(time.RFC3339, "2025-01-01T00:00:00Z")
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	end := start.Add(24 * time.Hour)
 	pages := 0
 	cursor, err := c.Walk(context.Background(), Query{Start: start, End: end, Contains: "needle"}, func(Page) error { pages++; return nil })

@@ -69,7 +69,10 @@ func (e *HTTPError) Error() string {
 	}
 	return fmt.Sprintf("Bog HTTP %d: %s", e.StatusCode, e.Body)
 }
-func (e *HTTPError) Unwrap() error   { return e.Cause }
+func (e *HTTPError) Unwrap() error { return e.Cause }
+
+// Retryable reports whether a query returned a transient HTTP 503. Callers
+// can retry from the cursor returned by Walk or WalkFrom.
 func (e *HTTPError) Retryable() bool { return e.QueryRetryable }
 
 // Query specifies the immutable bounds and filter of a snapshot walk.
@@ -88,10 +91,17 @@ type Page struct {
 
 func (c *Client) endpoint(path string) string {
 	u := *c.base
-	u.Path = strings.TrimRight(u.Path, "/") + path
-	u.RawPath = ""
+	escaped := u.EscapedPath()
+	prefix := strings.TrimRight(escaped, "/")
+	// Trim only literal separators. An escaped slash is part of its segment.
+	u.Path = u.Path[:len(u.Path)-(len(escaped)-len(prefix))] + path
+	u.RawPath = prefix + path
 	return u.String()
 }
+
+// CloseIdleConnections closes idle connections in the client's transport.
+func (c *Client) CloseIdleConnections() { c.http.CloseIdleConnections() }
+
 func (c *Client) request(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.endpoint(path), body)
 	if err != nil {
@@ -101,6 +111,8 @@ func (c *Client) request(ctx context.Context, method, path string, body io.Reade
 	return req, nil
 }
 func framed(r *http.Response) bool {
+	// net/http checks chunk terminators and HTTP/2 stream termination while
+	// reading the body. An HTTP/1.x connection close alone proves no length.
 	return r.ProtoMajor >= 2 || r.ContentLength >= 0 || (len(r.TransferEncoding) == 1 && r.TransferEncoding[0] == "chunked")
 }
 func readBounded(r io.Reader, n int64) ([]byte, error) {
@@ -117,8 +129,25 @@ func readBounded(r io.Reader, n int64) ([]byte, error) {
 	return b, nil
 }
 func statusError(r *http.Response) *HTTPError {
-	b, err := readBounded(r.Body, maxError)
+	b, err := readResponseBody(r, maxError)
 	return &HTTPError{StatusCode: r.StatusCode, Body: string(b), Cause: err}
+}
+
+func readResponseBody(r *http.Response, limit int64) ([]byte, error) {
+	if r.ContentLength > limit && limit >= 0 {
+		return nil, errors.New("response exceeds size limit")
+	}
+	b, err := readBounded(r.Body, limit)
+	if err != nil {
+		return nil, err
+	}
+	if r.ContentLength >= 0 && int64(len(b)) != r.ContentLength {
+		if int64(len(b)) < r.ContentLength {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return nil, errors.New("response exceeds declared Content-Length")
+	}
+	return b, nil
 }
 
 // FetchPage requests a first page when cursor is empty, or a continuation
@@ -166,19 +195,28 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (page Pa
 	if !framed(resp) {
 		return Page{}, errors.New("query response has unverifiable framing")
 	}
-	if resp.Uncompressed || (resp.Header.Get("Content-Encoding") != "" && resp.Header.Get("Content-Encoding") != "identity") {
+	encodings := resp.Header.Values("Content-Encoding")
+	if resp.Uncompressed || len(encodings) > 1 || (len(encodings) == 1 && !strings.EqualFold(encodings[0], "identity")) {
 		return Page{}, errors.New("unsupported query content encoding")
 	}
 	limit := c.MaxPageBytes
 	if limit == 0 {
 		limit = DefaultMaxPage
 	}
-	if limit < 0 {
-		return Page{}, errors.New("invalid page size limit")
-	}
-	b, err := readBounded(resp.Body, limit)
+	b, err := readResponseBody(resp, limit)
 	if err != nil {
 		return Page{}, fmt.Errorf("read query page: %w", err)
+	}
+	if _, ok := resp.Trailer["Bog-Next-Cursor"]; ok {
+		return Page{}, errors.New("unexpected next cursor trailer")
+	}
+	return decodePage(b, resp.Header.Values("Bog-Next-Cursor"))
+}
+
+func decodePage(b []byte, cursorValues []string) (Page, error) {
+	next, err := decodeNextCursor(cursorValues)
+	if err != nil {
+		return Page{}, err
 	}
 	var rows []Row
 	for len(b) > 0 {
@@ -203,22 +241,21 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (page Pa
 		}
 		rows = append(rows, Row{TS: ts, Line: *record.Line})
 	}
-	values := resp.Header.Values("Bog-Next-Cursor")
-	if len(values) > 1 || (len(values) == 1 && values[0] == "") {
-		return Page{}, errors.New("invalid next cursor header")
-	}
-	next := ""
-	if len(values) == 1 {
-		next = values[0]
-		if len(next) > base64.RawURLEncoding.EncodedLen(2048) {
-			return Page{}, errors.New("invalid next cursor header")
-		}
-		decoded, err := base64.RawURLEncoding.Strict().DecodeString(next)
-		if err != nil || len(decoded) <= sha256.Size || len(decoded) > 2048 || base64.RawURLEncoding.EncodeToString(decoded) != next {
-			return Page{}, errors.New("invalid next cursor header")
-		}
-	}
 	return Page{Rows: rows, NextCursor: next}, nil
+}
+
+func decodeNextCursor(values []string) (string, error) {
+	if len(values) == 0 {
+		return "", nil
+	}
+	if len(values) == 1 && len(values[0]) <= base64.RawURLEncoding.EncodedLen(2048) {
+		next := values[0]
+		decoded, err := base64.RawURLEncoding.Strict().DecodeString(next)
+		if err == nil && len(decoded) > sha256.Size && len(decoded) <= 2048 && base64.RawURLEncoding.EncodeToString(decoded) == next {
+			return next, nil
+		}
+	}
+	return "", errors.New("invalid next cursor header")
 }
 
 // Walk delivers validated pages in order. It advances only after consume succeeds;

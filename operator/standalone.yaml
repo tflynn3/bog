@@ -1,0 +1,57 @@
+# Single-node deployment only. Replace the image with your pinned Bog image.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bog
+spec:
+  clusterIP: None
+  selector:
+    app: bog
+  ports:
+    - name: http
+      port: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bog
+spec:
+  serviceName: bog
+  replicas: 1
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: bog
+  template:
+    metadata:
+      labels:
+        app: bog
+    spec:
+      terminationGracePeriodSeconds: 40
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+        - name: bog
+          image: bog:replace-with-pinned-image
+          args: ["-addr", "0.0.0.0:8080", "-data-dir", "/data"]
+          ports:
+            - containerPort: 8080
+          startupProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 10
+            failureThreshold: 360
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi

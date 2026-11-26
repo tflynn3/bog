@@ -3,8 +3,8 @@
 One Linux process, one HTTP listener, one WAL owner, and one pinned local data
 directory form Bog's deployment and consistency unit. `cmd/bog` acquires the
 exclusive directory lock, recovers storage, and then opens the listener.
-Shutdown stops readiness probes and drains HTTP before closing the WAL. The
-lock remains held while handlers can use the directory.
+The owner holds the lock through shutdown while handlers can use the
+directory.
 
 The WAL owner controls append order and when a complete batch becomes durable
 and query-visible. The service requires a trusted, service-owned local
@@ -15,12 +15,14 @@ on a trusted network or behind an authenticated access layer.
 ## Observed Linux production imports
 
 These are the direct imports between root-module production packages at
-`efb5f059f5ad7ab04e3321f33c4c7a4b2f7ea605`, listed for Linux amd64 with
-cgo disabled. An isolated node has zero direct root-module production imports.
+`c30b28e9ecabff9776c3cdf289d3873005e2343e`, listed for Linux amd64 with
+cgo disabled. The target at `3d771f3` adds Linux-only tests and has the same
+production graph. An isolated node has zero direct root-module production
+imports.
 
 ```mermaid
 flowchart TD
-    subgraph Runtime["Server and runtime libraries"]
+    subgraph Runtime["Server and wired libraries"]
         Cmd["cmd/bog"]
         HTTP["internal/httpapi"]
         Ready["internal/readiness"]
@@ -46,7 +48,10 @@ flowchart TD
     Checkpoint --> Store
     History --> Store
     Backup --> Store
-    Client["internal/client"] --> Store
+    subgraph Standalone["Standalone library"]
+        Client["internal/client"]
+    end
+    Client --> Store
     subgraph Evidence["Verifier commands and support"]
         Admission["verify/release"]
         Durability["verify/linux"]
@@ -75,44 +80,49 @@ flowchart TD
   [ADR 0003](../adr/0003-wal-capture-and-restored-image-startup.md) records
   the startup guard and capture design.
 
-## Retained-history integration
+## Retained-history handoff
 
-At cutover, the composition root wires HTTP's consumer-owned paging seam to
-the WAL owner and history catalog. That is a runtime interface call from HTTP
-to the supplied implementation. Checkpoint validates and durably publishes
+At cutover, `cmd/bog` injects the retained adapter into HTTP's consumer-owned
+`PageSource`. HTTP owns admission, cursor authentication and lifetime, and
+NDJSON framing. The adapter uses the WAL owner and history catalog to answer
+queries from a coherent capture. Checkpoint validates and durably publishes
 immutable generations. History owns generation pins, segment scans, and
 reclamation. Store owns decoded tail rows and their order. Backup consumes a
-pinned storage view. Keep these storage packages independent of HTTP and
-readiness.
+pinned storage view. The packages providing storage, including the staged
+retry library, stay independent of HTTP, readiness, and the Go HTTP client.
 
 The coordinated capture binds the validated generation and exact durable,
 query-visible tail under the same owner. A cursor reads the same view across
-generation replacement. Writable restore establishes checkpoint and tail
-recovery authority before listening. The loopback capacity control drives
-generation replacement through the same owner. See the interface, activation,
-and launch contracts in [ADR 0004](../adr/0004-retained-history-cutover.md).
+generation replacement. A fresh walk sees later committed appends. Writable
+restore establishes checkpoint and tail recovery authority before listening,
+and restart selects that writable authority. The opt-in loopback capacity
+control drives replacement through the same owner.
+[ADR 0004](../adr/0004-retained-history-cutover.md)
+[ADR 0005](../adr/0005-pinned-writable-recovery-authority.md)
 
 ## Package registry
 
-Runtime libraries are reachable from `bog/cmd/bog` in the Linux production
+Wired libraries are reachable from `bog/cmd/bog` in the Linux production
 graph. Staged libraries await runtime wiring. Standalone libraries have
-independent consumers. Test-only packages contain test files. Verifier
-commands and support live outside the server dependency tree.
+independent consumers. Test-only packages have Linux test files and no Linux
+production files. Verifier commands and support live outside the server
+dependency tree.
 
-| Package or entry point | Role at the pinned revision | Responsibility |
+| Package or entry point | Role | Responsibility |
 | --- | --- | --- |
 | `cmd/bog` | Server command | Recovery, listener, and lifecycle |
-| `internal/httpapi` | Runtime | HTTP validation, admission, cursors, and response framing |
-| `internal/readiness` | Runtime | Disk headroom and write outcome observation |
-| `internal/wal` | Runtime | Directory locking, commit, replay, and WAL capture |
-| `internal/store` | Runtime | Row decoding, publication, and ordered queries |
+| `internal/httpapi` | Wired | HTTP validation, admission, cursors, and response framing |
+| `internal/readiness` | Wired | Disk headroom and write outcome observation |
+| `internal/wal` | Wired | Directory locking, commit, replay, and WAL capture |
+| `internal/store` | Wired | Row decoding, publication, and ordered queries |
 | `internal/checkpoint` | Staged | Legacy WAL scans, checkpoint format, and publication |
 | `internal/history` | Staged | Generation validation, scans, pins, and reclamation |
 | `internal/backup` | Staged | Pinned export, verification, restore, and offline reads |
-| `internal/idempotency` | Staged | Backend-mediated keyed ingest retries |
+| `internal/idempotency` | Intentionally staged | bog-storage owns the durable keyed-ingest backend. Activate with the HTTP ingest wiring once the production WAL commits retry records and their batches together and passes the restart retry contract. |
 | `internal/client` | Standalone | HTTP client, page validation, and ingest outcomes |
 | `internal/ingest` | Test-only | Reference decoder and fuzz tests |
 | `internal/archtest` | Test-only | Linux dependency fitness suite |
+| `verify/fuzz` | Test-only on target (`3d771f3`) | Bounded backup and history corruption harness (#58) |
 | `verify/release` | Verifier command | Admission probe and report validator, plus the restored-parity test entry point |
 | `verify/linux` | Verifier command | Linux crash recovery and ENOSPC producer (#3) |
 | `bench/retained-history` | Verifier command | Legacy baseline and live capacity producer (#32) |
@@ -120,20 +130,19 @@ commands and support live outside the server dependency tree.
 | `bench/segment-layout` | Nested-module benchmark | Checkpoint layout experiment outside the root-module graph |
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs the producers, and publishes evidence |
 
-#54 registered both Linux verifier commands and hardened release process
-lifecycle in `3afefb5`. Its Slipway review and black-box verdict cover that
-change. The release qualification for a composed candidate requires its own
-pinned Linux run.
+The activation criteria for keyed retries include concurrent same-key
+submissions, conflicting bodies, and retries after an ambiguous response and
+process restart. [Ingest retry contract](../ingest-retries.md)
 
 ## Ranked quality attributes
 
 | Rank | Property | Consequence |
 | --- | --- | --- |
 | 1 | Durability | Wait for durable whole-batch commit before acknowledging. Stop on uncertain writes or committed corruption, even when availability suffers. |
-| 2 | Exact queries | Preserve ordered membership through compaction, restart, and verified restore. Fail incompletely prepared pages before advancing their cursors. |
-| 3 | Bounded resources | Bound captures, concurrent scans, work, response bytes, and tail size. Use per-row positions for byte-trimmed pages and reclaim only after pins drain. |
-| 4 | Recovery time | Validate the authority and replay its committed suffix before opening the listener. Bound the tail to reduce recovery work. |
-| 5 | Throughput | Share syncs across admitted writes and prune provably irrelevant scan work within the guarantees above. |
+| 2 | Exact queries | Preserve ordered membership through compaction, restart, and verified restore. Spend work before issuing a continuation and keep old generation pins through the cursor lifetime. |
+| 3 | Bounded resources | Limit captures, concurrent scans, request work, response bytes, and tail size. Pins defer disk reclamation. Retaining the v1 WAL prefix preserves format compatibility at a disk cost. |
+| 4 | Recovery time | Bound tail replay by checkpointing. Pay upfront validation cost before opening the listener. |
+| 5 | Throughput | Share syncs across admitted writes and prune provably irrelevant scan work. Prefix hashing for v1 publication and export consumes disk bandwidth. |
 
 ## Release evidence
 
@@ -146,8 +155,8 @@ must match the revision, binary SHA-256, and `linux-release-v1` fixture.
 | --- | --- | --- |
 | `verify/release` | `admission.json` | Saturated query slot, concurrent ingest, cursor resume, and clean work-budget failure |
 | `verify/linux` | `durability.json` | SIGKILL recovery, committed-prefix checks, and observed ENOSPC on a disposable local filesystem |
-| `bench/retained-history` | `capacity.json` | Live compaction and full query walks across restart at both fixture sizes, with bounded cgroup and process cleanup required for cutover under #57 |
-| `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Fresh HTTP walks on a verified restore, a durable append, and parity after restart |
+| `bench/retained-history` | `capacity.json` | Confirm a newer durable generation at the exact requested cutoff, resume a held cursor across replacement during acknowledged backfill, and verify fresh ordered history including after restart. Run at both fixture sizes with bounded cgroup and process cleanup. |
+| `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Start the shipped binary on a verified restore, compare fresh HTTP walks, observe 204 for a new append, and recover the exact augmented history after restart. |
 
 The `linux-release-evidence` artifact contains build identity, fixture and
 runner details, reports, exit statuses, and logs. The legacy capacity run
@@ -155,14 +164,19 @@ records a baseline. See the [release verifier contract](../../verify/release/REA
 
 ## Fitness and registry ownership
 
-The architecture PR is the sole writer of the [fitness registry](../../internal/archtest/architecture_test.go).
-At integration, use `git merge-base HEAD origin/main` with the current target
-ref and review package changes on both sides. Inspect the composed Linux
-production graph with #53 and #13 together. Promote checkpoint, history,
-and backup when the command first reaches them, register any extracted
-adapter with its observed role and imports, and remove retired entries
-and edges in that same change. The composed-cutover fixture exercises
-these rules ahead of wiring.
+The architecture track owns the sole fitness-registry edits. The merge base
+with the current target is `c30b28e`. The target side adds only `verify/fuzz`
+as a Linux test-only package. The candidate side starts from the pinned base.
+The suite checks the harness as test-only when present on the target, and the
+composed merge should make that inventory entry unconditional.
+
+At integration, review both sides of the current merge base again. Inspect the
+Linux production graph with bog-storage's #53 and #59 together. Checkpoint,
+history, and backup stay staged until reachable from `cmd/bog`. In the
+merge containing that wiring, promote the packages actually reached,
+register any extracted adapter and its direct imports, and remove retired
+entries and edges. The composed-cutover fixture exercises these transitions
+ahead of wiring. [Fitness registry](../../internal/archtest/architecture_test.go)
 
 The Architecture workflow runs `go test -count=1 ./internal/archtest` on the
 host. The suite lists packages with `GOOS=linux GOARCH=amd64 GOAMD64=v1
@@ -171,6 +185,9 @@ production imports within the root module and follows all listed dependencies
 for server reachability. Host-only files, test imports, and nested modules
 are outside the production import registry. Package loading errors, cycles,
 unregistered packages, incorrect roles, forbidden imports, and stale
-registered imports fail the suite. Run it on the composed tree and compile
-that tree with `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` before
-dispatching release qualification.
+registered imports fail the suite. A storage dependency on HTTP, readiness,
+or the Go HTTP client fails even when it is transitive or all direct edges
+are registered. Direct HTTP imports of checkpoint, history, or backup also
+fail, keeping retained paging behind the consumer seam. Run the suite and
+`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on the composed tree
+before dispatching release qualification.

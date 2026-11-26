@@ -103,6 +103,20 @@ func TestArchitectureRules(t *testing.T) {
 			want: []string{ingest + " must contain Linux test files only"},
 		},
 		{
+			name: "unregistered test-only package",
+			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+				pkgs[extra] = pkgs[ingest]
+			},
+			want: []string{"unregistered test-only package " + extra},
+		},
+		{
+			name: "test import cannot be registered as a production import",
+			change: func(_ map[string]listedPackage, rules map[string]rule) {
+				rules[ingest] = rule{testOnly, []string{store}}
+			},
+			want: []string{ingest + " must register no production imports"},
+		},
+		{
 			name: "verifier cannot import runtime storage",
 			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
 				pkgs[release] = productionPackage("main", store)
@@ -195,32 +209,51 @@ func TestComposedCutoverRules(t *testing.T) {
 			},
 		},
 		{
-			name: "checkpoint cannot depend on HTTP",
-			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+			name: "registered checkpoint import still violates storage direction",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
 				pkgs[checkpoint] = productionPackage("checkpoint", store, httpapi)
+				rules[checkpoint] = rule{runtimeLibrary, []string{store, httpapi}}
 			},
-			want: []string{"forbidden production import: " + checkpoint + " -> " + httpapi},
+			want: []string{
+				"forbidden storage dependency: " + checkpoint + " -> " + httpapi,
+				"forbidden storage dependency: " + history + " -> " + httpapi,
+			},
 		},
 		{
-			name: "history cannot depend on readiness",
-			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+			name: "registered history import still cannot depend on readiness",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
 				pkgs[history] = productionPackage("history", checkpoint, store, readiness)
+				rules[history] = rule{runtimeLibrary, []string{checkpoint, store, readiness}}
 			},
-			want: []string{"forbidden production import: " + history + " -> " + readiness},
+			want: []string{"forbidden storage dependency: " + history + " -> " + readiness},
 		},
 		{
-			name: "backup cannot depend on HTTP",
+			name: "backup cannot reach HTTP through a registered adapter",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[backup] = productionPackage("backup", store, adapter)
+				pkgs[adapter] = productionPackage("retained", httpapi)
+				rules[backup] = rule{runtimeLibrary, []string{store, adapter}}
+				rules[adapter] = rule{runtimeLibrary, []string{httpapi}}
+			},
+			want: []string{"forbidden storage dependency: " + backup + " -> " + httpapi},
+		},
+		{
+			name: "unregistered backup import violates both rules",
 			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
 				pkgs[backup] = productionPackage("backup", store, httpapi)
 			},
-			want: []string{"forbidden production import: " + backup + " -> " + httpapi},
+			want: []string{
+				"forbidden production import: " + backup + " -> " + httpapi,
+				"forbidden storage dependency: " + backup + " -> " + httpapi,
+			},
 		},
 		{
-			name: "HTTP cannot bypass the consumer seam",
-			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+			name: "registered HTTP import still cannot bypass the consumer seam",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
 				pkgs[httpapi] = productionPackage("httpapi", store, wal, history)
+				rules[httpapi] = rule{runtimeLibrary, []string{store, wal, history}}
 			},
-			want: []string{"forbidden production import: " + httpapi + " -> " + history},
+			want: []string{"HTTP must use the page source seam: " + httpapi + " -> " + history},
 		},
 		{
 			name: "extracted runtime adapter requires registration",
@@ -276,6 +309,74 @@ func TestComposedCutoverRules(t *testing.T) {
 				t.Errorf("architectureProblems() = [%s], want [%s]", strings.Join(got, "\n"), strings.Join(tt.want, "\n"))
 			}
 		})
+	}
+}
+
+func TestStorageDirection(t *testing.T) {
+	const (
+		httpapi   = "bog/internal/httpapi"
+		readiness = "bog/internal/readiness"
+		client    = "bog/internal/client"
+		external  = "example.com/bridge"
+	)
+	for _, from := range []string{
+		"bog/internal/backup",
+		"bog/internal/checkpoint",
+		"bog/internal/history",
+		"bog/internal/idempotency",
+		"bog/internal/store",
+		"bog/internal/wal",
+	} {
+		for _, to := range []string{httpapi, readiness, client} {
+			t.Run(from+" -> "+to, func(t *testing.T) {
+				t.Parallel()
+				// All local edges and roles agree with the registry. A
+				// staged or detached library still cannot reach transport,
+				// even when an external dependency provides the path.
+				pkgs := map[string]listedPackage{
+					server:   productionPackage("main"),
+					from:     productionPackage("storage", external),
+					to:       productionPackage("service"),
+					external: {Imports: []string{to}},
+				}
+				rules := map[string]rule{
+					server: {serverCommand, nil},
+					from:   {staged, nil},
+					to:     {standalone, nil},
+				}
+				want := []string{"forbidden storage dependency: " + from + " -> " + to}
+				if got := architectureProblems(pkgs, rules); !slices.Equal(got, want) {
+					t.Errorf("architectureProblems() = %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestLinuxRegistryCorruptionHarness(t *testing.T) {
+	if _, registered := linuxRegistry(nil)[fuzzVerifier]; registered {
+		t.Fatal("corruption harness registered on the pinned base")
+	}
+	for _, production := range []bool{false, true} {
+		pkg := productionPackage("fuzz")
+		pkg.TestGoFiles = []string{"harness_linux_test.go"}
+		var want []string
+		if production {
+			want = []string{fuzzVerifier + " must contain Linux test files only"}
+		} else {
+			pkg.GoFiles = nil
+		}
+		pkgs := map[string]listedPackage{fuzzVerifier: pkg}
+		entry, present := linuxRegistry(pkgs)[fuzzVerifier]
+		if !present || entry.role != testOnly || len(entry.imports) != 0 {
+			t.Fatalf("corruption harness registration = %+v, present = %t", entry, present)
+		}
+		if got := architectureProblems(pkgs, map[string]rule{fuzzVerifier: entry}); !slices.Equal(got, want) {
+			t.Errorf("architectureProblems() = %q, want %q", got, want)
+		}
+	}
+	if _, registered := linuxRegistry(nil)[fuzzVerifier]; registered {
+		t.Fatal("composed inventory mutated the pinned base registry")
 	}
 }
 

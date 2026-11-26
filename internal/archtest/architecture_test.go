@@ -16,7 +16,10 @@ import (
 	"time"
 )
 
-const server = "bog/cmd/bog"
+const (
+	server       = "bog/cmd/bog"
+	fuzzVerifier = "bog/verify/fuzz"
+)
 
 type role string
 
@@ -104,9 +107,20 @@ func TestLinuxArchitecture(t *testing.T) {
 		}
 		packages[pkg.ImportPath] = pkg
 	}
-	for _, problem := range architectureProblems(packages, registry) {
+	for _, problem := range architectureProblems(packages, linuxRegistry(packages)) {
 		t.Error(problem)
 	}
+}
+
+func linuxRegistry(packages map[string]listedPackage) map[string]rule {
+	// The corruption harness landed on the target after this change's base.
+	// Make this entry unconditional once the target and cutover are composed.
+	if _, present := packages[fuzzVerifier]; !present {
+		return registry
+	}
+	rules := maps.Clone(registry)
+	rules[fuzzVerifier] = rule{testOnly, nil}
+	return rules
 }
 
 func architectureProblems(packages map[string]listedPackage, rules map[string]rule) []string {
@@ -123,20 +137,7 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 		}
 	}
 
-	// Walk all dependencies for reachability, even through packages outside
-	// the root module. Only root-module packages need registry entries.
-	reachable := make(map[string]bool)
-	var visit func(string)
-	visit = func(path string) {
-		if reachable[path] {
-			return
-		}
-		reachable[path] = true
-		for _, imported := range packages[path].Imports {
-			visit(imported)
-		}
-	}
-	visit(server)
+	reachable := reachableImports(packages, server)
 
 	for _, path := range slices.Sorted(maps.Keys(rules)) {
 		r := rules[path]
@@ -147,6 +148,9 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 		case r.role == testOnly:
 			if pkg.production() || len(pkg.TestGoFiles)+len(pkg.XTestGoFiles) == 0 {
 				problems = append(problems, fmt.Sprintf("%s must contain Linux test files only", path))
+			}
+			if len(r.imports) != 0 {
+				problems = append(problems, fmt.Sprintf("%s must register no production imports", path))
 			}
 		case !pkg.production():
 			problems = append(problems, fmt.Sprintf("stale %s registration: %s has no Linux production files", r.role, path))
@@ -159,6 +163,13 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 			if reachable[path] != wantReachable {
 				problems = append(problems, fmt.Sprintf("%s is registered as %s but reachability from %s is %t", path, r.role, server, reachable[path]))
 			}
+		}
+	}
+
+	for _, path := range slices.Sorted(maps.Keys(local)) {
+		pkg := local[path]
+		if _, registered := rules[path]; !registered && !pkg.production() && len(pkg.TestGoFiles)+len(pkg.XTestGoFiles) > 0 {
+			problems = append(problems, "unregistered test-only package "+path)
 		}
 	}
 
@@ -186,6 +197,54 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 
 	if cycle := importCycle(production); len(cycle) > 0 {
 		problems = append(problems, "production import cycle: "+strings.Join(cycle, " -> "))
+	}
+	problems = append(problems, storageDirectionProblems(packages, production)...)
+	return problems
+}
+
+// Follow production imports through dependencies outside the root module too.
+func reachableImports(packages map[string]listedPackage, root string) map[string]bool {
+	reached := make(map[string]bool)
+	var visit func(string)
+	visit = func(path string) {
+		if reached[path] {
+			return
+		}
+		reached[path] = true
+		for _, imported := range packages[path].Imports {
+			visit(imported)
+		}
+	}
+	visit(root)
+	return reached
+}
+
+// Direction is an architectural invariant independent of the observed registry.
+func storageDirectionProblems(packages map[string]listedPackage, production map[string][]string) []string {
+	const httpapi = "bog/internal/httpapi"
+	var problems []string
+	for _, from := range []string{
+		"bog/internal/backup",
+		"bog/internal/checkpoint",
+		"bog/internal/history",
+		"bog/internal/idempotency",
+		"bog/internal/store",
+		"bog/internal/wal",
+	} {
+		if _, exists := production[from]; !exists {
+			continue
+		}
+		reached := reachableImports(packages, from)
+		for _, to := range []string{httpapi, "bog/internal/readiness", "bog/internal/client"} {
+			if reached[to] {
+				problems = append(problems, fmt.Sprintf("forbidden storage dependency: %s -> %s", from, to))
+			}
+		}
+	}
+	for _, to := range []string{"bog/internal/backup", "bog/internal/checkpoint", "bog/internal/history"} {
+		if slices.Contains(production[httpapi], to) {
+			problems = append(problems, fmt.Sprintf("HTTP must use the page source seam: %s -> %s", httpapi, to))
+		}
 	}
 	return problems
 }

@@ -11,7 +11,7 @@ mkdir ./data
 `-data-dir` must be an existing directory; `-addr` defaults to `127.0.0.1:8080`. A process holds an exclusive lock on the directory until exit. `GET /healthz` returns 200 once the WAL has been replayed and the server is listening.
 
 ```sh
-curl -X POST localhost:8080/ingest --data-binary $'{"ts":"2025-01-01T00:00:00.123456789Z","line":"hello"}\n'
+printf '%s\n' '{"ts":"2025-01-01T00:00:00.123456789Z","line":"hello"}' | curl -X POST localhost:8080/ingest --data-binary @-
 curl 'localhost:8080/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&contains=hello&limit=10'
 ```
 
@@ -32,7 +32,7 @@ curl -i 'localhost:8080/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00
 curl -i 'localhost:8080/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&cursor=TOKEN&limit=20'
 ```
 
-The cursor captures published rows at the first request; later appends do not appear in that walk. Rows with identical timestamps retain append order, including duplicates. Bounds may use equivalent time zones, `contains` must be identical (omission means empty), and `limit` may change between requests. The final page has no cursor header. Cursors are authenticated, expire when the process restarts, and invalid or mismatched cursors return 400. `page` accepts only `1`, and cannot be combined with `cursor`; an empty cursor is invalid. First-page requests must leave room within the 1 MiB request header limit for a continuation cursor and ordinary headers; oversized queries return 400. Requests without either parameter retain the original query behavior.
+The cursor captures published rows at the first request; later appends do not appear in that walk. Rows with identical timestamps retain append order, including duplicates. Bounds may use equivalent time zones, `contains` must be identical (omission means empty), and `limit` may change between requests. The final page has no cursor header. Cursors are authenticated, expire when the process restarts, and invalid or mismatched cursors return 400. `page` accepts only `1`, and cannot be combined with `cursor`; an empty cursor is invalid. First-page requests must leave room within the 1 MiB request header limit for a continuation cursor and ordinary headers; oversized queries return 400. The encoded NDJSON body is limited to 32 MiB by default; set `-query-max-response-bytes` to change it. The limit includes JSON escaping and each record’s newline. An ordinary query may return a short 200 response without a cursor when the byte limit is reached. If the first matching record cannot fit, the server returns 422; increase the limit to retrieve it. Use `page=1` and follow `Bog-Next-Cursor` as shown above to retrieve the full snapshot. See [query response limits](docs/query-response-limits.md).
 
 A same-host Linux comparison against `25d0c0a` used the verifier's seeded 1M-row backfill fixture (500 rows per batch, four writers; one run per version). Live query p95 was 44.95 → 5.66 ms for dense wide ranges and 385.19 → 374.94 ms for rare/absent matches; ingest request p99 was 414.56 → 314.63 ms, peak RSS 316,660 → 317,280 KiB, and restart-to-health 8,874 → 7,883 ms. These single-run measurements are workload- and host-dependent.
 

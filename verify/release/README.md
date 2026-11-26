@@ -107,7 +107,9 @@ queries with `limit=1`. It starts a fresh candidate for each budget in order
 from 1 through 2048. Each budget below the first cursor must return only the
 work-budget error (HTTP 503 with no NDJSON or cursor). The candidate that issues
 the first cursor must serve all three rows in append order through a terminal
-page at that budget.
+page at that budget. The production Go client's `FetchPage` validates the HTTP
+body framing, NDJSON records, and continuation header before the probe checks
+fixture rows and cursor progress.
 
 The sparse fixture filters four matches among 42 interior and trailing nonmatches.
 The first request asks for four rows under a 96-byte response cap, which fits
@@ -130,12 +132,21 @@ budgets that returned a clean initial rejection.
 The Linux test `TestReleaseRestoredParity` publishes a checkpoint and appends
 a WAL tail with overlapping times, ties, duplicates, and backfill. It exports,
 verifies, and restores that capture before starting the pinned candidate.
-Fresh HTTP cursors must reproduce the exact append-order model across page
-sizes and literal filters with a 256-byte response cap. After the candidate
+Fresh walks use `FetchPage` and must reproduce the exact append-order model
+across page sizes and literal filters with a 256-byte response cap. After the candidate
 acknowledges an ingest on the restored image, a fresh walk must return the
 augmented model before shutdown, and another must return it after restart.
+On restart, a raw request using a cursor from the old process must receive
+a framed HTTP 400 with the exact `invalid cursor\n` body and no continuation
+header or trailer.
 The `restored_parity` evidence records their row counts in `post_append_rows`
 and `restart_rows`. The report is bound to the same candidate identity.
 
 The workflow passes `-parity parity.json` when validating the collected reports
 and runs the verifier tests with the race detector on Linux.
+
+## Architecture handoff for #61
+
+The Linux production graph gains the direct import
+`bog/verify/release` → `bog/internal/client`. Register that edge in
+`internal/archtest` and the system architecture diagram in the composed PR.

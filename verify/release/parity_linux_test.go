@@ -22,7 +22,10 @@ import (
 	"bog/internal/wal"
 )
 
-const restoredParityCase = "restored_parity"
+const (
+	restoredParityCase = "restored_parity"
+	restoredPageCap    = 256
+)
 
 // The release gate supplies the already-built candidate. Ordinary unit runs
 // exercise the fixture independently without building or launching a server.
@@ -84,11 +87,16 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	defer client.CloseIdleConnections()
-	flags := []string{"-query-max-response-bytes=256"}
+	flags := []string{fmt.Sprintf("-query-max-response-bytes=%d", restoredPageCap)}
 	added := row{rows[1].TS, "after restore [match]"}
 	augmented := append(slices.Clone(rows), added)
+	var staleCursor string
 	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
-		if err := checkRestoredWalks(ctx, client, base, rows); err != nil {
+		pager, err := newReleasePager(base, client, restoredPageCap)
+		if err != nil {
+			return err
+		}
+		if err := checkRestoredWalks(ctx, pager, rows); err != nil {
 			return err
 		}
 		proof.CapturedRows = len(rows)
@@ -97,17 +105,32 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 			return fmt.Errorf("append to restored image: %w", err)
 		}
 		proof.PostRestore204 = status == http.StatusNoContent
-		if err := checkRestoredWalks(ctx, client, base, augmented); err != nil {
+		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
 			return fmt.Errorf("walk after acknowledged post-restore write: %w", err)
 		}
 		proof.PostAppendRows = len(augmented)
+		page, _, err := pager.fetch(ctx, "", 1, "")
+		if err != nil {
+			return fmt.Errorf("capture cursor before restart: %w", err)
+		}
+		if len(page.Rows) != 1 || page.NextCursor == "" {
+			return errors.New("expected one row and a continuation before restart")
+		}
+		staleCursor = page.NextCursor
 		return nil
 	})
 	if err != nil {
 		return proof, fmt.Errorf("serve restored image: %w", err)
 	}
 	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
-		if err := checkRestoredWalks(ctx, client, base, augmented); err != nil {
+		if err := requireStaleCursorRejection(ctx, client, base, staleCursor); err != nil {
+			return fmt.Errorf("resume cursor from before restart: %w", err)
+		}
+		pager, err := newReleasePager(base, client, restoredPageCap)
+		if err != nil {
+			return err
+		}
+		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
 			return err
 		}
 		proof.RestartRows = len(augmented)
@@ -119,7 +142,7 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 	return proof, err
 }
 
-func checkRestoredWalks(ctx context.Context, client *http.Client, base string, appendOrder []row) error {
+func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []row) error {
 	for _, filter := range []string{"", "[match]", "absent"} {
 		var want []row
 		for _, r := range appendOrder {
@@ -129,7 +152,7 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
 		}
 		slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
 		for _, limit := range []int{1, 3, 10} {
-			if err := checkRestoredWalk(ctx, client, base, filter, limit, want); err != nil {
+			if err := checkRestoredWalk(ctx, pager, filter, limit, want); err != nil {
 				return fmt.Errorf("filter %q, page size %d: %w", filter, limit, err)
 			}
 		}
@@ -137,35 +160,32 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
 	return nil
 }
 
-func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter string, limit int, want []row) error {
+func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string, limit int, want []row) error {
 	seen := make(map[string]bool)
 	cursor := ""
-	for {
-		res, err := request(ctx, client, http.MethodGet, base+queryPath(cursor, limit, filter), nil)
+	for number := 1; ; number++ {
+		page, _, err := pager.fetch(ctx, filter, limit, cursor)
 		if err != nil {
-			return err
+			return fmt.Errorf("page %d: %w", number, err)
 		}
-		if len(res.body) > 256 || len(res.body) > 0 && res.body[len(res.body)-1] != '\n' {
-			return errors.New("invalid NDJSON framing or response byte count")
-		}
-		n, err := checkRows(res, want)
-		if err != nil {
-			return err
-		}
+		n := len(page.Rows)
 		if n > limit {
-			return errors.New("page exceeded row limit")
+			return fmt.Errorf("page %d exceeded row limit", number)
+		}
+		if err := checkPageRows(page.Rows, want); err != nil {
+			return fmt.Errorf("page %d: %w", number, err)
 		}
 		want = want[n:]
-		if !res.cursorHeader {
+		cursor = page.NextCursor
+		if cursor == "" {
 			if len(want) != 0 {
-				return fmt.Errorf("walk ended with %d rows missing", len(want))
+				return fmt.Errorf("page %d ended walk with %d rows missing", number, len(want))
 			}
 			return nil
 		}
-		if res.cursor == "" || seen[res.cursor] || n == 0 || len(want) == 0 {
-			return errors.New("invalid or repeated continuation")
+		if seen[cursor] || len(want) == 0 {
+			return fmt.Errorf("page %d returned a repeated cursor or continued past the final row", number)
 		}
-		cursor = res.cursor
 		seen[cursor] = true
 	}
 }

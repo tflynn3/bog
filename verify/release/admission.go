@@ -42,6 +42,7 @@ type response struct {
 	contentType  string
 	cursor       string
 	cursorHeader bool
+	framed       bool
 	body         []byte
 }
 
@@ -67,11 +68,15 @@ func request(ctx context.Context, client *http.Client, method, target string, bo
 		return result, errors.New("oversized HTTP response")
 	}
 	cursors, header := res.Header[nextCursor]
-	_, trailer := res.Trailer[nextCursor]
-	if len(cursors) > 1 || trailer {
+	if len(cursors) > 1 || hasCursorTrailer(res) {
 		return result, errors.New("multiple cursor headers or unexpected cursor trailer")
 	}
-	return response{res.StatusCode, res.Header.Get("Content-Type"), res.Header.Get(nextCursor), header, data}, nil
+	return response{
+		status: res.StatusCode, contentType: res.Header.Get("Content-Type"), cursor: res.Header.Get(nextCursor),
+		cursorHeader: header, body: data,
+		framed: res.ProtoMajor >= 2 || res.ContentLength >= 0 ||
+			(len(res.TransferEncoding) == 1 && res.TransferEncoding[0] == "chunked"),
+	}, nil
 }
 
 func queryPath(cursor string, limit int, filter string) string {
@@ -128,6 +133,24 @@ func requireRejection(ctx context.Context, client *http.Client, target string) (
 		return evidence, fmt.Errorf("expected HTTP 503 with no NDJSON or cursor within two seconds, got %+v", evidence)
 	}
 	return evidence, nil
+}
+
+func requireStaleCursorRejection(ctx context.Context, client *http.Client, base, cursor string) error {
+	if cursor == "" {
+		return errors.New("missing cursor from previous candidate")
+	}
+	ctx, cancel := context.WithTimeout(ctx, queryDeadline)
+	defer cancel()
+	res, err := request(ctx, client, http.MethodGet, base+queryPath(cursor, 1, ""), nil)
+	if err != nil {
+		return err
+	}
+	if res.status != http.StatusBadRequest || !res.framed || res.cursorHeader ||
+		strings.HasPrefix(strings.ToLower(res.contentType), "application/x-ndjson") || string(res.body) != "invalid cursor\n" {
+		return fmt.Errorf("expected framed HTTP 400 invalid cursor without continuation, got HTTP %d (framed=%t, cursor header=%t, content type=%q): %.200q",
+			res.status, res.framed, res.cursorHeader, res.contentType, res.body)
+	}
+	return nil
 }
 
 func checkRows(res response, want []row) (int, error) {

@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"bog/internal/client"
 )
 
 const (
@@ -134,28 +136,19 @@ func findSparseBudgetWalk(ctx context.Context, client *http.Client, maxBudget in
 
 const budgetRejectionBody = "query work budget exhausted\n"
 
-func tryBudgetWalk(ctx context.Context, client *http.Client, launch budgetLaunch, budget int, fixture budgetFixture, proof *budgetWalkStats) error {
+func tryBudgetWalk(ctx context.Context, raw *http.Client, launch budgetLaunch, budget int, fixture budgetFixture, proof *budgetWalkStats) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("fixed-budget search at budget %d: %w", budget, err)
 	}
 	err := launch(ctx, budget, func(base string) error {
-		if _, err := ingest(ctx, client, base, fixture.seed); err != nil {
+		if _, err := ingest(ctx, raw, base, fixture.seed); err != nil {
 			return fmt.Errorf("seed budget fixture: %w", err)
 		}
-		first, err := requestBudgetPage(ctx, client, base, "", fixture.firstLimit, fixture.filter)
+		pager, err := newReleasePager(base, raw, fixture.byteCap)
 		if err != nil {
-			return fmt.Errorf("first page: %w", err)
+			return err
 		}
-		if first.status == http.StatusServiceUnavailable {
-			if first.cursorHeader || strings.HasPrefix(first.contentType, "application/x-ndjson") ||
-				string(first.body) != budgetRejectionBody {
-				return fmt.Errorf("unclean HTTP 503 budget rejection (cursor header=%t, content type=%q): %.200q",
-					first.cursorHeader, first.contentType, first.body)
-			}
-			proof.RejectedBudgets++
-			return nil
-		}
-		return checkBudgetWalk(ctx, client, base, budget, first, fixture, proof)
+		return checkBudgetWalk(ctx, pager, budget, fixture, proof)
 	})
 	if err := errors.Join(err, ctx.Err()); err != nil {
 		return fmt.Errorf("fixed-budget walk at budget %d: %w", budget, err)
@@ -163,52 +156,62 @@ func tryBudgetWalk(ctx context.Context, client *http.Client, launch budgetLaunch
 	return nil
 }
 
-func requestBudgetPage(ctx context.Context, client *http.Client, base, cursor string, limit int, filter string) (response, error) {
-	ctx, cancel := context.WithTimeout(ctx, queryDeadline)
-	defer cancel()
-	return request(ctx, client, http.MethodGet, base+queryPath(cursor, limit, filter), nil)
+func checkBudgetRejection(res *http.Response, err error) error {
+	httpErr, ok := err.(*client.HTTPError)
+	contentType := res.Header.Get("Content-Type")
+	_, cursorHeader := res.Header[nextCursor]
+	cursorTrailer := hasCursorTrailer(res)
+	if !ok || httpErr.Cause != nil || httpErr.Body != budgetRejectionBody ||
+		cursorHeader || cursorTrailer || strings.HasPrefix(strings.ToLower(contentType), "application/x-ndjson") {
+		return fmt.Errorf("unclean HTTP 503 budget rejection (cursor header=%t, cursor trailer=%t, content type=%q): %w",
+			cursorHeader, cursorTrailer, contentType, err)
+	}
+	return nil
 }
 
-func checkBudgetWalk(ctx context.Context, client *http.Client, base string, budget int, res response, fixture budgetFixture, proof *budgetWalkStats) error {
+func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, proof *budgetWalkStats) error {
 	seen := make(map[string]bool)
-	for page, offset := 1, 0; offset < len(fixture.want); page++ {
-		count := fixture.firstRows
-		if page > 1 {
-			count = min(fixture.resumeLimit, len(fixture.want)-offset)
-			var err error
-			res, err = requestBudgetPage(ctx, client, base, res.cursor, fixture.resumeLimit, fixture.filter)
-			if err != nil {
-				return fmt.Errorf("continue page %d: %w", page, err)
+	cursor := ""
+	for number, offset := 1, 0; offset < len(fixture.want); number++ {
+		limit := fixture.resumeLimit
+		count := min(limit, len(fixture.want)-offset)
+		if number == 1 {
+			limit, count = fixture.firstLimit, fixture.firstRows
+		}
+		page, res, err := pager.fetch(ctx, fixture.filter, limit, cursor)
+		if number == 1 && res != nil && res.StatusCode == http.StatusServiceUnavailable {
+			if err := checkBudgetRejection(res, err); err != nil {
+				return fmt.Errorf("page %d: %w", number, err)
 			}
+			proof.RejectedBudgets++
+			return nil
 		}
-		if fixture.byteCap > 0 && res.status == http.StatusOK && len(res.body) > fixture.byteCap {
-			return fmt.Errorf("page %d exceeded response byte cap %d", page, fixture.byteCap)
-		}
-		if len(res.body) > 0 && res.body[len(res.body)-1] != '\n' {
-			return fmt.Errorf("page %d has incomplete NDJSON framing", page)
-		}
-		n, err := checkRows(res, fixture.want[offset:offset+count])
 		if err != nil {
-			return fmt.Errorf("page %d: %w", page, err)
+			return fmt.Errorf("page %d: %w", number, err)
 		}
+		if err := checkPageRows(page.Rows, fixture.want[offset:offset+count]); err != nil {
+			return fmt.Errorf("page %d: %w", number, err)
+		}
+		n := len(page.Rows)
 		if n != count {
-			return fmt.Errorf("page %d returned %d rows, want %d", page, n, count)
+			return fmt.Errorf("page %d: returned %d rows, want %d", number, n, count)
 		}
 		offset += n
+		cursor = page.NextCursor
 		if offset == len(fixture.want) {
-			if res.cursorHeader {
-				return fmt.Errorf("page %d issued a cursor after the final row", page)
+			if cursor != "" {
+				return fmt.Errorf("page %d: issued a cursor after the final row", number)
 			}
 		} else {
-			if res.cursor == "" {
-				return fmt.Errorf("page %d missing continuation cursor", page)
+			if cursor == "" {
+				return fmt.Errorf("page %d: missing continuation cursor", number)
 			}
-			if seen[res.cursor] {
-				return fmt.Errorf("page %d repeated a continuation cursor", page)
+			if seen[cursor] {
+				return fmt.Errorf("page %d: repeated a continuation cursor", number)
 			}
-			seen[res.cursor] = true
+			seen[cursor] = true
 		}
-		if page == 1 {
+		if number == 1 {
 			proof.FirstCursorBudget = budget
 		}
 		proof.Pages++

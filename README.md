@@ -34,6 +34,64 @@ curl -i 'localhost:8080/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00
 
 The cursor captures published rows at the first request; later appends do not appear in that walk. Rows with identical timestamps retain append order, including duplicates. Bounds may use equivalent time zones, `contains` must be identical (omission means empty), and `limit` may change between requests. The final page has no cursor header. Cursors are authenticated, expire when the process restarts, and invalid or mismatched cursors return 400. `page` accepts only `1`, and cannot be combined with `cursor`; an empty cursor is invalid. First-page requests must leave room within the 1 MiB request header limit for a continuation cursor and ordinary headers; oversized queries return 400. The encoded NDJSON body is limited to 32 MiB by default; set `-query-max-response-bytes` to change it. The limit includes JSON escaping and each record’s newline. An ordinary query may return a short 200 response without a cursor when the byte limit is reached. If the first matching record cannot fit, the server returns 422; increase the limit to retrieve it. Use `page=1` and follow `Bog-Next-Cursor` as shown above to retrieve the full snapshot. See [query response limits](docs/query-response-limits.md).
 
+## Retained-history cutover
+
+The [cutover decision](docs/adr/0004-retained-history-cutover.md) specifies
+the behavior planned for the integrated release. The legacy binary rejects
+restored images before opening the legacy WAL.
+
+### Activate a verified restore
+
+Use the backup engine's `Verify` and `Restore` operations to check the
+bundle and publish a separate, service-owned directory on a trusted local
+filesystem. Keep the original bundle for recovery. The restored directory
+contains `bog.backup`, `bog.checkpoint`, its referenced segments, and
+`bog.wal.tail`. Point a cutover-capable binary at that directory using the
+usual startup command. See the [backup format](internal/backup/FORMAT.md).
+
+```sh
+./bog -data-dir /path/to/restored-data -addr 127.0.0.1:8080
+```
+
+The server locks the directory, validates the restored checkpoint and
+committed suffix, and durably activates writable recovery before opening
+the listener. An incomplete, corrupt, or ambiguous layout fails startup.
+Keep legacy WAL and commit files out of the unactivated image. After
+activation, start the server on the same directory on restart and use a
+fresh `page=1` request to walk the recovered view. New acknowledged
+appends survive restart alongside the restored rows.
+
+### Page through retained history
+
+A first page pins one generation and its committed tail. Its cursor keeps
+reading that view through generation replacement while the capture is live.
+After expiry or restart, start a fresh walk. A byte-limited page resumes
+just after its last emitted row. If the work
+budget prevents the server from establishing and preparing a page, it
+returns 503 with no rows or next cursor. Retry a continuation with the
+cursor from the original request while its capture is live. Lowering
+`limit` can help when a page has many matches. A sparse scan may require a
+larger server work budget.
+
+### Opt in to capacity verification
+
+The proposed `-enable-capacity-control` switch enables
+`/_capacity/compaction` on an explicitly loopback-bound server. It defaults
+to off. Use it with a disposable data directory for the live Linux capacity
+fixture.
+
+```sh
+./bog -data-dir /path/to/disposable-data -addr 127.0.0.1:8080 -enable-capacity-control
+```
+
+The fixture drives asynchronous checkpoint replacement while
+ingesting and resuming a pinned cursor. It checks the observed generation,
+checkpoint coverage, and committed row count. The legacy baseline runs
+with the control off. See the [capacity runner](bench/retained-history/README.md)
+and [Linux release gate](verify/release/README.md).
+
+## Legacy performance measurements
+
 A same-host Linux comparison against `25d0c0a` used the verifier's seeded 1M-row backfill fixture (500 rows per batch, four writers; one run per version). Live query p95 was 44.95 → 5.66 ms for dense wide ranges and 385.19 → 374.94 ms for rare/absent matches; ingest request p99 was 414.56 → 314.63 ms, peak RSS 316,660 → 317,280 KiB, and restart-to-health 8,874 → 7,883 ms. These single-run measurements are workload- and host-dependent.
 
 A paired Linux arm64 Docker smoke run against `4ff49aa` used the verifier's seeded 1M-row backfill fixture (500 rows per batch, four writers, one run per version). Baseline → filtered live query p95 was 0.835 → 0.582 ms for broad, 0.329 → 0.142 ms for narrow, and 44.578 → 0.987 ms for rare/absent queries; after restart it was 0.649 → 0.577, 0.257 → 0.162, and 44.803 → 0.963 ms respectively. Durable ingest was 651,832 → 596,752 rows/s with request p99 8.406 → 8.551 ms; peak RSS was 319,848 → 421,100 KiB and restart-to-health 1,569 → 1,784 ms. These are single-run, host- and workload-dependent measurements.

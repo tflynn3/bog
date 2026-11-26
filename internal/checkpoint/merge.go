@@ -5,7 +5,6 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
-	"io"
 	"slices"
 	"sort"
 
@@ -15,8 +14,7 @@ import (
 const (
 	// The local packing window holds at most four old inputs. If the
 	// suffix fits only across more blocks, fillSlack visits them one at a
-	// time. An attempt stages final blocks only and replaces each old
-	// input at most once.
+	// time. Each original can be replaced once per attempt.
 	mergeFanIn   = 4
 	blockPayload = MaxBlockSize - blockHeaderSize
 )
@@ -27,11 +25,9 @@ type segmentBuilder struct {
 	attempt       *publicationAttempt
 	old           []Segment
 	oldOrdinal    uint64
-	outputs       []Segment
 	candidates    []int // Unused old segments, smallest payload first.
 	replaced      []bool
 	replacedCount int
-	scratch       []byte
 }
 
 func (a *publicationAttempt) buildSegments(m *Manifest, next *uint64, scan func(func(uint64, []store.Row) error) error) error {
@@ -55,6 +51,11 @@ func (a *publicationAttempt) buildSegments(m *Manifest, next *uint64, scan func(
 			return fmt.Errorf("%w: invalid checkpoint batch ordinals", ErrIntegrity)
 		}
 		for i, row := range rows {
+			if i%1024 == 0 {
+				if err := a.ctx.Err(); err != nil {
+					return err
+				}
+			}
 			if len(row.Line) > blockPayload-blockRowSize {
 				return errors.New("row exceeds block limit")
 			}
@@ -83,14 +84,11 @@ func (a *publicationAttempt) buildSegments(m *Manifest, next *uint64, scan func(
 }
 
 func (b *segmentBuilder) flush(run []BlockRow, payload int) error {
-	if len(b.old)-b.replacedCount+len(b.outputs) < MaxSegments {
+	if len(b.old)-b.replacedCount+len(b.attempt.files) < MaxSegments {
 		return b.write(run)
 	}
 	if b.candidates == nil {
 		b.rankCandidates()
-	}
-	if len(b.candidates) == 0 {
-		return errSegmentCapacity
 	}
 	window := b.candidates[:min(mergeFanIn, len(b.candidates))]
 	// Prefer one staged output containing the suffix and as many small
@@ -166,13 +164,16 @@ func (b *segmentBuilder) consume(count int) {
 }
 
 func (b *segmentBuilder) manifestSegments() []Segment {
-	segments := make([]Segment, 0, len(b.old)-b.replacedCount+len(b.outputs))
+	segments := make([]Segment, 0, len(b.old)-b.replacedCount+len(b.attempt.files))
 	for i, old := range b.old {
 		if b.replaced == nil || !b.replaced[i] {
 			segments = append(segments, old)
 		}
 	}
-	return append(segments, b.outputs...)
+	for _, file := range b.attempt.files {
+		segments = append(segments, file.segment())
+	}
+	return segments
 }
 
 func (b *segmentBuilder) write(run []BlockRow) error {
@@ -180,12 +181,7 @@ func (b *segmentBuilder) write(run []BlockRow) error {
 		return err
 	}
 	slices.SortFunc(run, compareMergeRows)
-	output, err := b.attempt.stageBlock(run)
-	if err != nil {
-		return err
-	}
-	b.outputs = append(b.outputs, output)
-	return nil
+	return b.attempt.stageBlock(run)
 }
 
 func compareMergeRows(a, b BlockRow) int {
@@ -202,7 +198,7 @@ func (b *segmentBuilder) readInputs(indices []int, extraRows int) ([]BlockRow, e
 	var inputs [mergeFanIn][]BlockRow
 	total := extraRows
 	for j, i := range indices {
-		rows, err := b.decodeInput(i)
+		rows, err := b.attempt.readOriginal(b.old[i], b.oldOrdinal)
 		if err != nil {
 			return nil, err
 		}
@@ -217,56 +213,6 @@ func (b *segmentBuilder) readInputs(indices []int, extraRows int) ([]BlockRow, e
 		joined = append(joined, rows...)
 	}
 	return joined, nil
-}
-
-func (b *segmentBuilder) decodeInput(index int) ([]BlockRow, error) {
-	if err := b.attempt.ctx.Err(); err != nil {
-		return nil, err
-	}
-	s := b.old[index]
-	if s.Size < blockHeaderSize+blockRowSize || s.Size > MaxBlockSize {
-		return nil, fmt.Errorf("%w: invalid merge input size for %s", ErrIntegrity, s.Name)
-	}
-	size := int(s.Size)
-	if cap(b.scratch) < size {
-		b.scratch = make([]byte, size)
-	}
-	rows, err := b.readInput(s, b.scratch[:size])
-	if err != nil {
-		return nil, fmt.Errorf("%w: merge input %s: %v", ErrIntegrity, s.Name, err)
-	}
-	return rows, nil
-}
-
-func (b *segmentBuilder) readInput(s Segment, data []byte) (rows []BlockRow, err error) {
-	f, err := openPublicationFile(b.attempt.pub.dir, s.Name)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { err = errors.Join(err, f.Close()) }()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() != s.Size {
-		return nil, errors.New("segment size changed")
-	}
-	if _, err := io.ReadFull(f, data); err != nil {
-		return nil, err
-	}
-	if digest(data) != s.SHA256 {
-		return nil, errors.New("segment checksum changed")
-	}
-	rows, err = DecodeBlock(data)
-	if err != nil {
-		return nil, err
-	}
-	for i, row := range rows {
-		if row.Ordinal >= b.oldOrdinal || (i != 0 && !lessRow(rows[i-1], row)) {
-			return nil, errors.New("invalid segment row order or ordinal")
-		}
-	}
-	return rows, nil
 }
 
 // repack handles blocks that cannot be coalesced whole. First check the
@@ -289,7 +235,7 @@ func (b *segmentBuilder) repack(window []int, run []BlockRow, payload int) error
 	rows := slices.Clone(run)
 	total := payload
 	for i, index := range window {
-		old, err := b.decodeInput(index)
+		old, err := b.attempt.readOriginal(b.old[index], b.oldOrdinal)
 		if err != nil {
 			return err
 		}
@@ -387,39 +333,73 @@ func groupMergeRows(rows []BlockRow, bins []uint16, counts []int) [][]BlockRow {
 	return layout
 }
 
-// fillSlack handles a suffix that can fit into free space spread across a
-// larger number of old blocks. It plans a partition of only the suffix in
-// memory, and rewrites each selected block individually. The number of
-// rewritten inputs is bounded by the remaining originals and the staging
-// budget still applies to every output.
+// fillSlack partitions only the suffix across eligible gaps. It decodes one
+// block at a time and uses the same placement rule for originals and staged
+// blocks. The attempt seals a staged slot after replacing it once.
 func (b *segmentBuilder) fillSlack(run []BlockRow, payload int) error {
+	candidates := make([]slackInput, 0, len(b.candidates)+len(b.attempt.files))
 	var totalRoom int64
 	for _, i := range b.candidates {
-		totalRoom += int64(blockPayload - payloadSize(b.old[i]))
+		room := blockPayload - payloadSize(b.old[i])
+		if room > 0 {
+			candidates = append(candidates, slackInput{index: i, room: room})
+			totalRoom += int64(room)
+		}
+	}
+	for i, file := range b.attempt.files {
+		if room := file.reusableRoom(); room > 0 {
+			candidates = append(candidates, slackInput{index: i, room: room, staged: true})
+			totalRoom += int64(room)
+		}
 	}
 	if int64(payload) > totalRoom {
 		return errSegmentCapacity
 	}
-
-	// Place large rows before smaller ones so a small row cannot consume
-	// space needed by a large row. The free space queue tracks the largest
-	// remaining gap and is bounded by the original manifest size.
+	// Preserve the ranking of originals with equal slack and break staged
+	// ties by slot order, independent of the new file names.
+	slices.SortStableFunc(candidates, func(a, b slackInput) int {
+		return cmp.Compare(b.room, a.room)
+	})
+	// The run arrives in ordinal order. Remember its lower bound before
+	// changing that order so staged inputs can be checked independently.
+	first := run[0].Ordinal
 	sortByMergeSize(run)
-	layout, err := b.placeInSlack(run)
+	layout, err := b.placeInSlack(run, candidates)
 	if err != nil {
 		return err
 	}
-	for c, suffix := range layout {
-		old, err := b.readInputs(b.candidates[c:c+1], len(suffix))
-		if err != nil {
-			return err
-		}
-		if err := b.write(append(old, suffix...)); err != nil {
-			return err
+	originals := 0
+	for i, suffix := range layout {
+		input := candidates[i]
+		if input.staged {
+			rows, err := b.attempt.readStaged(input.index, first)
+			if err != nil {
+				return err
+			}
+			rows = append(rows, suffix...)
+			slices.SortFunc(rows, compareMergeRows)
+			if err := b.attempt.replaceBlock(input.index, rows); err != nil {
+				return err
+			}
+		} else {
+			rows, err := b.attempt.readOriginal(b.old[input.index], b.oldOrdinal)
+			if err != nil {
+				return err
+			}
+			if err := b.write(append(rows, suffix...)); err != nil {
+				return err
+			}
+			originals++
 		}
 	}
-	b.consume(len(layout))
+	b.consume(originals)
 	return nil
+}
+
+type slackInput struct {
+	index  int
+	room   int
+	staged bool
 }
 
 func sortByMergeSize(rows []BlockRow) {
@@ -455,11 +435,11 @@ func (q *slackQueue) Pop() any {
 	return last
 }
 
-func (b *segmentBuilder) placeInSlack(run []BlockRow) ([][]BlockRow, error) {
-	q := make(slackQueue, 0, len(b.candidates))
+func (b *segmentBuilder) placeInSlack(run []BlockRow, candidates []slackInput) ([][]BlockRow, error) {
+	q := make(slackQueue, 0, len(candidates))
 	// Avoid spreading small backfills across more blocks than necessary.
 	// Add a new candidate only when all previously used gaps are too small.
-	counts := make([]int, 0, len(b.candidates))
+	counts := make([]int, 0, len(candidates))
 	assignments := make([]uint16, len(run))
 	for i, row := range run {
 		if i%1024 == 0 {
@@ -470,10 +450,10 @@ func (b *segmentBuilder) placeInSlack(run []BlockRow) ([][]BlockRow, error) {
 		size := blockRowSize + len(row.Row.Line)
 		if len(q) == 0 || q[0].room < size {
 			next := len(counts)
-			if next == len(b.candidates) {
+			if next == len(candidates) {
 				return nil, errSegmentCapacity
 			}
-			room := blockPayload - payloadSize(b.old[b.candidates[next]])
+			room := candidates[next].room
 			if room < size {
 				return nil, errSegmentCapacity
 			}

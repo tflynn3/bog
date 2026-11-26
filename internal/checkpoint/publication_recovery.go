@@ -31,83 +31,13 @@ type publicationIntent struct {
 	Segments    []ownedSegment
 }
 
-func (a *publicationAttempt) writeNew(name string, b []byte) error {
-	if err := a.pub.stage.reserve(a.ctx, len(b)); err != nil {
-		return err
-	}
-	return a.pub.writeNew(name, b)
-}
-
-// stageBlock admits the exact encoded bytes before allocating the output
-// block. The attempt retains the charge through installation or cleanup.
-func (a *publicationAttempt) stageBlock(rows []BlockRow) (Segment, error) {
-	if len(rows) == 0 || len(rows) > (MaxBlockSize-blockHeaderSize)/blockRowSize {
-		return Segment{}, errBlock
-	}
-	size := blockHeaderSize
-	for _, row := range rows {
-		if len(row.Row.Line) > MaxBlockSize-size-blockRowSize {
-			return Segment{}, errBlock
-		}
-		size += blockRowSize + len(row.Row.Line)
-	}
-	if err := a.reserveSegment(size); err != nil {
-		return Segment{}, err
-	}
-	data, err := EncodeBlock(rows)
-	if err != nil {
-		return Segment{}, err
-	}
-	if len(data) != size {
-		return Segment{}, fmt.Errorf("%w: encoded block size differs from staging reservation", ErrIntegrity)
-	}
-	name, err := randomName(segmentPrefix)
-	if err != nil {
-		return Segment{}, err
-	}
-	sum := digest(data)
-	if err := a.writeSegment(name, data, sum); err != nil {
-		return Segment{}, err
-	}
-	return Segment{Name: name, Size: int64(size), SHA256: sum}, nil
-}
-
-func (a *publicationAttempt) reserveSegment(size int) error {
-	if len(a.files) >= MaxSegments {
-		return fmt.Errorf("%w: too many staged segments", ErrIntegrity)
-	}
-	return a.pub.stage.reserve(a.ctx, size)
-}
-
-func (a *publicationAttempt) stageSegment(name string, b []byte, sum string) error {
-	if err := a.reserveSegment(len(b)); err != nil {
-		return err
-	}
-	return a.writeSegment(name, b, sum)
-}
-
-func (a *publicationAttempt) writeSegment(name string, b []byte, sum string) error {
-	p := a.pub
-	path := stageDir + "/" + name
-	if err := p.writeNew(path, b); err != nil {
-		return err
-	}
-	info, err := p.root.Lstat(path)
-	if err != nil {
-		return err
-	}
-	st := info.Sys().(*syscall.Stat_t)
-	a.files = append(a.files, ownedSegment{Name: name, Inode: st.Ino, Size: info.Size(), SHA256: sum})
-	return nil
-}
-
 func (a *publicationAttempt) recordIntent() error {
 	p := a.pub
 	previous, err := p.root.Lstat(manifestName)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	intent := publicationIntent{Segments: a.files}
+	intent := publicationIntent{Segments: a.ownedFiles()}
 	if previous != nil {
 		intent.HadManifest = previous.Mode().IsRegular()
 	}

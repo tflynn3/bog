@@ -133,12 +133,15 @@ func TestPublisherCleanupAndRecoveryKeepStagingCharges(t *testing.T) {
 
 func TestMergeAtCeilingWithLargeBlocks(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		oldBlocks int
-		oldParts  []int
-		tailParts []int
-		replaced  int
-		reject    bool
+		name       string
+		oldBlocks  int
+		oldParts   []int
+		extraParts []int
+		tailParts  []int
+		laterParts []int
+		replaced   int
+		rewritten  int
+		reject     bool
 	}{
 		{
 			name: "repack rows into two blocks", oldBlocks: 2,
@@ -157,13 +160,22 @@ func TestMergeAtCeilingWithLargeBlocks(t *testing.T) {
 			oldParts: []int{15}, tailParts: []int{90}, replaced: 2,
 		},
 		{
+			name: "reuse a coalesced output on the next flush", oldBlocks: 2,
+			oldParts: []int{30}, tailParts: []int{80}, laterParts: []int{25}, replaced: 2, rewritten: 1,
+		},
+		{
+			name: "partition suffix across staged and original slack", oldBlocks: 3,
+			oldParts: []int{30}, extraParts: []int{83}, tailParts: []int{80},
+			laterParts: []int{25, 19, 16}, replaced: 3, rewritten: 2,
+		},
+		{
 			name: "refuse a row that cannot fit in a full generation", oldBlocks: 5,
 			oldParts: []int{85}, tailParts: []int{30}, reject: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, l, _ := capturedPublicationFixture(t)
-			budget := NewBudget(Limits{StagingBytes: uint64(tc.oldBlocks) * MaxBlockSize})
+			budget := NewBudget(Limits{StagingBytes: uint64(tc.oldBlocks+tc.rewritten) * MaxBlockSize})
 			account := &stagingAccount{budget: budget}
 			defer account.settle()
 			p := l.publication()
@@ -188,7 +200,11 @@ func TestMergeAtCeilingWithLargeBlocks(t *testing.T) {
 			var expected []BlockRow
 			var inputs []Segment
 			for i := 0; i < tc.oldBlocks; i++ {
-				rows := largeRows(tc.oldParts, stamp)
+				parts := tc.oldParts
+				if i == tc.oldBlocks-1 && tc.extraParts != nil {
+					parts = tc.extraParts
+				}
+				rows := largeRows(parts, stamp)
 				expected = append(expected, rows...)
 				data, err := EncodeBlock(rows)
 				requirePublicationOK(t, err)
@@ -216,6 +232,15 @@ func TestMergeAtCeilingWithLargeBlocks(t *testing.T) {
 				return
 			}
 			requirePublicationOK(t, err)
+			if tc.laterParts != nil {
+				run = largeRows(tc.laterParts, stamp)
+				expected = append(expected, run...)
+				size = 0
+				for _, row := range run {
+					size += blockRowSize + len(row.Row.Line)
+				}
+				requirePublicationOK(t, b.flush(run, size))
+			}
 			if len(b.manifestSegments()) != MaxSegments || b.replacedCount != tc.replaced {
 				t.Fatalf("repack used %d slots and replaced %d old blocks", len(b.manifestSegments()), b.replacedCount)
 			}
@@ -230,7 +255,11 @@ func TestMergeAtCeilingWithLargeBlocks(t *testing.T) {
 					actual = append(actual, rows...)
 				}
 			}
-			for _, s := range b.outputs {
+			rewritten := 0
+			for _, s := range a.files {
+				if s.rewritten {
+					rewritten++
+				}
 				data, err := l.root.ReadFile(stageDir + "/" + s.Name)
 				requirePublicationOK(t, err)
 				rows, err := DecodeBlock(data)
@@ -240,6 +269,9 @@ func TestMergeAtCeilingWithLargeBlocks(t *testing.T) {
 				}
 				actual = append(actual, rows...)
 				written += uint64(len(data))
+			}
+			if rewritten != tc.rewritten {
+				t.Fatalf("rewrote %d staged slots, want %d", rewritten, tc.rewritten)
 			}
 			slices.SortFunc(actual, compareMergeRows)
 			slices.SortFunc(expected, compareMergeRows)
@@ -364,4 +396,232 @@ func TestCeilingMergeRecoversBothManifestRenameOutcomes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCeilingStagedReplacementSettlement(t *testing.T) {
+	for _, mode := range []string{"overlap refused", "exact overlap", "cancel before publish", "rename lost"} {
+		t.Run(mode, func(t *testing.T) {
+			path, legacy, _ := capturedPublicationFixture(t)
+			previous, err := legacy.Publish()
+			requirePublicationOK(t, err)
+			previousBytes := readFixture(t, path, manifestName)
+
+			stamp := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			size := func(percent int) int { return percent * blockPayload / 100 }
+			row := func(percent int, ts time.Time) store.Row {
+				return store.Row{TS: ts, Line: strings.Repeat("a", size(percent)-blockRowSize)}
+			}
+			original := row(30, stamp)
+			suffix := []store.Row{row(80, stamp), row(25, stamp.Add(-time.Second))}
+			base := legacy.publication()
+			old := []Segment{}
+			for i := range 2 {
+				data, err := EncodeBlock([]BlockRow{{Row: original, Ordinal: uint64(i)}})
+				requirePublicationOK(t, err)
+				name := fmt.Sprintf("%s%032x", segmentPrefix, i)
+				requirePublicationOK(t, base.writeNew(name, data))
+				old = append(old, Segment{Name: name, Size: int64(len(data)), SHA256: digest(data)})
+			}
+			// Model full, untouched segments by metadata. Publication's
+			// attempt is the unit under test here. The public entry point
+			// checks all referenced bytes before calling it.
+			for i := len(old); i < MaxSegments; i++ {
+				old = append(old, Segment{Name: fmt.Sprintf("%s%032x", segmentPrefix, i), Size: MaxBlockSize, SHA256: previous.SourceSHA256})
+			}
+			before := checkpointNames(t, path)
+			liveBeforeReplace := uint64(2*blockHeaderSize + 2*size(30) + size(80))
+			replacement := uint64(blockHeaderSize + 2*size(30) + size(25))
+			overlap := liveBeforeReplace + replacement
+			limit := overlap
+			if mode == "overlap refused" {
+				limit--
+			}
+			budget := NewBudget(Limits{StagingBytes: limit})
+			publisher := NewPublisher(legacy.root, legacy.dir, budget)
+			base.stage = &publisher.stage
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			scan := func(visit func(uint64, []store.Row) error) error { return visit(2, suffix) }
+			attempt := func(p *publication, ctx context.Context) (*Manifest, error) {
+				m := newManifest(previous.CoveredOffset+64, previous.SourceSHA256)
+				m.Segments = old
+				m.NextOrdinal = 2
+				next := uint64(4)
+				return p.publish(ctx, m, &next, scan)
+			}
+
+			if mode == "cancel before publish" {
+				base.segmentDirSync = func() error { cancel(); return legacy.dir.Sync() }
+			}
+			var intent publicationIntent
+			if mode == "rename lost" {
+				base.manifestRename = func(_, _ string) error {
+					stage, err := openStaging(legacy.dir)
+					if err != nil {
+						return err
+					}
+					intent, err = readIntent(stage)
+					return errors.Join(err, stage.Close(), syscall.EIO)
+				}
+			}
+			got, err := attempt(base, ctx)
+			switch mode {
+			case "overlap refused":
+				requireExhaustion(t, err, StagingBytes, limit, liveBeforeReplace, replacement)
+				if got != nil || budget.Usage().Peak[StagingBytes] != liveBeforeReplace {
+					t.Fatalf("rejected replacement changed authority or peak: %v, %+v", got != nil, budget.Usage())
+				}
+			case "exact overlap":
+				requirePublicationOK(t, err)
+				assertCeilingReplacement(t, legacy, got, old, original, suffix)
+			case "cancel before publish":
+				if got != nil || !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancelled publication returned manifest %v and error %v", got != nil, err)
+				}
+			case "rename lost":
+				if got != nil || !errors.Is(err, ErrPublicationUncertain) || !errors.Is(err, syscall.EIO) {
+					t.Fatalf("uncertain publication returned manifest %v and error %v", got != nil, err)
+				}
+				if !intent.HadManifest || len(intent.Segments) != 2 {
+					t.Fatalf("unexpected intent: %+v", intent)
+				}
+				intentData := readFixture(t, path, intentName)
+				manifestData := readFixture(t, path, stagedManifest)
+				var installedBytes uint64
+				for _, file := range intent.Segments {
+					data := readFixture(t, path, file.Name)
+					if digest(data) != file.SHA256 {
+						t.Fatalf("intent names wrong bytes for %s", file.Name)
+					}
+					installedBytes += uint64(len(data))
+				}
+				current := installedBytes + uint64(len(intentData)+len(manifestData))
+				if installedBytes != replacement+uint64(blockHeaderSize+size(80)) ||
+					budget.Usage().InUse[StagingBytes] != current {
+					t.Fatalf("charges did not track live outputs and intent: %+v", budget.Usage())
+				}
+				requirePublicationOK(t, publisher.RecoverCaptured(func() (*Manifest, error) {
+					return previous, base.checkPrevious(t.Context(), previous)
+				}))
+			}
+			if mode != "overlap refused" && budget.Usage().Peak[StagingBytes] != overlap {
+				t.Fatalf("replacement peak missed overlap: %+v, want %d", budget.Usage(), overlap)
+			}
+			if budget.Usage().InUse[StagingBytes] != 0 {
+				t.Fatalf("staging leaked: %+v", budget.Usage())
+			}
+			requirePublicationOK(t, CheckPublication(legacy.dir))
+			if got == nil {
+				if !slices.Equal(before, checkpointNames(t, path)) || !bytes.Equal(previousBytes, readFixture(t, path, manifestName)) {
+					t.Fatal("failed attempt changed authority or left files")
+				}
+			}
+			if mode == "rename lost" {
+				retry, err := attempt(&publication{root: legacy.root, dir: legacy.dir, stage: &publisher.stage}, t.Context())
+				requirePublicationOK(t, err)
+				assertCeilingReplacement(t, legacy, retry, old, original, suffix)
+			}
+		})
+	}
+}
+
+func assertCeilingReplacement(t *testing.T, legacy *Legacy, m *Manifest, old []Segment, original store.Row, suffix []store.Row) {
+	t.Helper()
+	if m == nil || m.NextOrdinal != 4 || len(m.Segments) != MaxSegments || !slices.Equal(m.Segments[:MaxSegments-2], old[2:]) {
+		t.Fatal("publication failed to pack the successor at the ceiling")
+	}
+	for _, s := range old[:2] {
+		data, err := legacy.root.ReadFile(s.Name)
+		requirePublicationOK(t, err)
+		if digest(data) != s.SHA256 {
+			t.Fatalf("publication changed immutable original %s", s.Name)
+		}
+	}
+	var actual []BlockRow
+	for _, s := range m.Segments[MaxSegments-2:] {
+		data, err := legacy.root.ReadFile(s.Name)
+		requirePublicationOK(t, err)
+		rows, err := DecodeBlock(data)
+		requirePublicationOK(t, err)
+		if digest(data) != s.SHA256 || !slices.IsSortedFunc(rows, compareMergeRows) {
+			t.Fatalf("invalid successor segment %s", s.Name)
+		}
+		actual = append(actual, rows...)
+	}
+	slices.SortFunc(actual, compareMergeRows)
+	expected := []BlockRow{
+		{Row: suffix[1], Ordinal: 3},
+		{Row: original, Ordinal: 0},
+		{Row: original, Ordinal: 1},
+		{Row: suffix[0], Ordinal: 2},
+	}
+	if !slices.Equal(actual, expected) {
+		t.Fatal("staged replacement changed backfill, duplicates or tie order")
+	}
+}
+
+func TestStagedBlockSlotCapAndReuse(t *testing.T) {
+	_, legacy, _ := capturedPublicationFixture(t)
+	p := legacy.publication()
+	budget := NewBudget(Limits{StagingBytes: 1 << 20})
+	p.stage = &stagingAccount{budget: budget}
+	requirePublicationOK(t, p.root.Mkdir(stageDir, 0700))
+	a := publicationAttempt{pub: p, ctx: t.Context()}
+	stamp := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	row := BlockRow{Row: store.Row{TS: stamp, Line: "tied duplicate"}}
+	for i := range MaxSegments {
+		row.Ordinal = uint64(i)
+		requirePublicationOK(t, a.stageBlock([]BlockRow{row}))
+	}
+	old := a.files[0]
+	replacement := []BlockRow{
+		{Row: row.Row, Ordinal: 0},
+		{Row: row.Row, Ordinal: MaxSegments},
+	}
+	used := budget.Usage().InUse[StagingBytes]
+	if err := a.stageBlock(replacement); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("extra live slot returned %v", err)
+	}
+	requirePublicationOK(t, a.replaceBlock(0, replacement))
+	current := a.files[0]
+	if current.Name == old.Name || current.reusableRoom() != 0 || len(a.files) != MaxSegments {
+		t.Fatal("replacement did not update and seal the staged slot")
+	}
+	if _, err := p.root.Lstat(stageDir + "/" + old.Name); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("superseded staging file still present: %v", err)
+	}
+	after := budget.Usage()
+	if after.InUse[StagingBytes] != used-uint64(old.Size)+uint64(current.Size) ||
+		after.Peak[StagingBytes] != used+uint64(current.Size) {
+		t.Fatalf("unexpected staging usage after replacement: %+v", after)
+	}
+	if err := a.replaceBlock(0, replacement); !errors.Is(err, ErrIntegrity) || budget.Usage() != after {
+		t.Fatalf("second replacement changed staging: %v, %+v", err, budget.Usage())
+	}
+	rows, err := a.readStaged(0, MaxSegments+1)
+	requirePublicationOK(t, err)
+	if !slices.Equal(rows, replacement) {
+		t.Fatal("replacement lost rows")
+	}
+	if _, err := a.readStaged(0, MaxSegments); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("accepted a row outside the staged ordinal bound: %v", err)
+	}
+	data, err := p.root.ReadFile(stageDir + "/" + current.Name)
+	requirePublicationOK(t, err)
+	data[len(data)-1] ^= 1
+	requirePublicationOK(t, p.root.WriteFile(stageDir+"/"+current.Name, data, 0600))
+	if _, err := a.readStaged(0, MaxSegments+1); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("accepted corrupt staged bytes: %v", err)
+	}
+
+	// Simulate interruption after writing the single overlap file and
+	// before unlinking the replaced slot or recording the intent.
+	_, err = a.writeBlock(replacement)
+	requirePublicationOK(t, err)
+	err = recoverCapturedWithBudget(legacy.root, legacy.dir,
+		func() (*Manifest, error) { return nil, os.ErrNotExist }, p.stage)
+	if !errors.Is(err, os.ErrNotExist) || budget.Usage().InUse[StagingBytes] != 0 {
+		t.Fatalf("interrupted overlap did not settle: %v, %+v", err, budget.Usage())
+	}
+	requirePublicationOK(t, CheckPublication(legacy.dir))
 }

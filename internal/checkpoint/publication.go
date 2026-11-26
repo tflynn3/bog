@@ -52,7 +52,8 @@ func (p *publication) writeNew(name string, data []byte) (err error) {
 type publicationAttempt struct {
 	pub        *publication
 	ctx        context.Context
-	files      []ownedSegment
+	files      []stagedBlock
+	scratch    []byte
 	installing bool
 }
 
@@ -268,7 +269,7 @@ func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, sc
 		}
 		if published == nil && a.installing {
 			// Leave the durable intent available if cleanup fails.
-			if cleanupErr := p.removeOwned(a.files, nil); cleanupErr != nil {
+			if cleanupErr := p.removeOwned(a.ownedFiles(), nil); cleanupErr != nil {
 				err = errors.Join(err, ErrPublicationUncertain, cleanupErr)
 				return
 			}

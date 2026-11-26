@@ -412,16 +412,13 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	if !start.Before(end) || limit <= 0 {
 		return []Row{}, count, nil, true
 	}
-	// Retain the full timestamp range for Bloom selectivity, while using the
-	// cursor-relative offset for scans. Both share the initial lower seek.
+	// Seek once to the start and cursor for each run. Upper bounds are deferred
+	// until a bounded scan has had a chance to answer the query.
 	offsets := make([]int, len(runs))
-	bound := 0
+	lower := make([]int, len(runs))
 	for i, run := range runs {
 		lo := sort.Search(run.length, func(j int) bool { return !rows[run.ordinal(j)].TS.Before(start) })
-		if len(contains) >= 4 {
-			hi := lo + sort.Search(run.length-lo, func(j int) bool { return !rows[run.ordinal(lo+j)].TS.Before(end) })
-			bound += hi - lo
-		}
+		lower[i] = lo
 		if after != nil {
 			lo += sort.Search(run.length-lo, func(j int) bool {
 				ordinal := run.ordinal(lo + j)
@@ -431,7 +428,6 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		}
 		offsets[i] = lo
 	}
-	wide := len(contains) >= 4 && bound >= 32768
 	active := -1
 	for i, offset := range offsets {
 		if offset < runs[i].length && rows[runs[i].ordinal(offset)].TS.Before(end) {
@@ -441,6 +437,9 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 			}
 			active = i
 		}
+	}
+	if active == -1 {
+		return []Row{}, count, nil, true
 	}
 	var directResult []Row
 	var directLast int
@@ -527,7 +526,7 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		}
 		return result, nil, true
 	}
-	if wide {
+	if len(contains) >= 4 {
 		// Bound work even for absent literals and runs containing newer rows.
 		budget := max(512, limit)
 		if limit <= int(^uint(0)>>1)/2 {
@@ -535,34 +534,51 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		} else {
 			budget = int(^uint(0) >> 1)
 		}
-		attempt := ordered
+		// The multi-run policy uses the full-window estimate before attempting
+		// the merge. A single run can answer dense pages without that estimate.
+		bound := 0
+		intervalStart, intervalEnd := 0, count
+		implicit := active >= 0 && runs[active].ordinals == nil
 		if active >= 0 {
-			attempt = direct
-		}
-		if result, next, complete := attempt(budget); complete {
-			return result, count, next, true
-		}
-		probes := literalProbes(contains)
-		possible := make([]int, 0)
-		possibleRows := 0
-		for first := 0; first < count; first += blockSize {
-			block := first / blockSize
-			if block < len(blocks) && !blocks[block].mayContainProbes(probes) {
-				continue
+			if result, next, complete := direct(budget); complete {
+				return result, count, next, true
 			}
-			n := blockSize
-			if count-first < n {
-				n = count - first
-			}
-			possibleRows += n
-			if possibleRows > bound/4 {
-				break
-			}
-			possible = append(possible, first)
 		}
-		if possibleRows <= bound/4 {
-			result, next := queryBlocks(rows, possible, count, start, end, contains, limit, after, lookahead)
-			return result, count, next, true
+		for i, run := range runs {
+			hi := lower[i] + sort.Search(run.length-lower[i], func(j int) bool { return !rows[run.ordinal(lower[i]+j)].TS.Before(end) })
+			bound += hi - lower[i]
+			if implicit && i == active {
+				intervalStart = min(offsets[i], count)
+				intervalEnd = min(hi, count)
+			}
+		}
+		if implicit {
+			bound = max(0, intervalEnd-intervalStart)
+		}
+		if bound >= 32768 || (implicit && bound > 0) {
+			if active == -2 {
+				if result, next, complete := ordered(budget); complete {
+					return result, count, next, true
+				}
+			}
+			probes := literalProbes(contains)
+			possible := make([]int, 0)
+			possibleRows := 0
+			for first := intervalStart / blockSize * blockSize; first < intervalEnd; first += blockSize {
+				block := first / blockSize
+				if block < len(blocks) && !blocks[block].mayContainProbes(probes) {
+					continue
+				}
+				possibleRows += min(first+blockSize, intervalEnd) - max(first, intervalStart)
+				if possibleRows > bound/4 {
+					break
+				}
+				possible = append(possible, first)
+			}
+			if possibleRows <= bound/4 {
+				result, next := queryBlocks(rows, possible, count, start, end, contains, limit, after, lookahead)
+				return result, count, next, true
+			}
 		}
 	}
 	if active >= 0 {

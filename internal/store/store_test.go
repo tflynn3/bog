@@ -557,3 +557,64 @@ func TestRecoveredDirectScanResumesAfterBloomDeclines(t *testing.T) {
 		t.Fatalf("got %d rows, want %d, cursor %v", len(got), len(want), next)
 	}
 }
+
+func TestOrderedRecoveryBoundaryOracle(t *testing.T) {
+	epoch := time.Unix(1700000000, 0)
+	rows := make([]Row, 34000+37)
+	for i := range rows {
+		line := fmt.Sprintf("ordinary-%d", i)
+		if i%4096 == 0 || i >= 33990 {
+			line += " needle"
+		}
+		rows[i] = Row{epoch.Add(time.Duration(i/3) * time.Second), line}
+	}
+	builder := NewRecoveryBuilder()
+	builder.Add(rows)
+	var s Store
+	builder.Install(&s)
+	count := len(rows)
+	// Seal the snapshot's partial block with rows that sort into its interior.
+	s.Publish([]Row{{epoch.Add(10 * time.Second), "needle backfill"}, {epoch.Add(11 * time.Second), strings.Repeat("x", blockBudget)}})
+	extra := make([]Row, blockSize)
+	for i := range extra {
+		extra[i] = Row{epoch.Add(12 * time.Second), "backfill"}
+	}
+	s.Publish(extra)
+	for _, tc := range []struct{ start, end, after, limit int }{
+		{0, 33000, 4096, 1}, {0, len(rows), 32768, 3}, {0, len(rows), 4096, 11}, {0, 8194, 4096, 1},
+	} {
+		start, end := rows[tc.start].TS, epoch.Add(time.Duration((tc.end+2)/3)*time.Second)
+		var after *Position
+		if tc.after > 0 { // cursor must itself match
+			ordinal := tc.after
+			after = &Position{rows[ordinal].TS, ordinal}
+		}
+		var want []Row
+		for i, row := range rows {
+			if row.TS.Before(start) || !row.TS.Before(end) || !strings.Contains(row.Line, "needle") || (after != nil && (row.TS.Before(after.Time) || (row.TS.Equal(after.Time) && i <= after.Ordinal))) {
+				continue
+			}
+			want = append(want, row)
+		}
+		sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+		// Use a valid matching cursor even for the initial snapshot query.
+		if after == nil {
+			continue
+		}
+		var got []Row
+		for {
+			page, _, next, ok := s.QueryPage(start, end, "needle", tc.limit, &count, after)
+			if !ok {
+				t.Fatal("invalid cursor")
+			}
+			got = append(got, page...)
+			if next == nil {
+				break
+			}
+			after = next
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("case %+v: got %d want %d", tc, len(got), len(want))
+		}
+	}
+}

@@ -119,3 +119,48 @@ func BenchmarkRestoredSingleRun(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkRecoveryRange(b *testing.B) {
+	epoch := time.Unix(1700000000, 0)
+	for _, form := range []string{"ordered", "sorted", "mixed"} {
+		rows := make([]Row, 100000)
+		for i := range rows {
+			n := i
+			if form == "sorted" {
+				n = len(rows) - 1 - i
+			}
+			line := "dense ordinary"
+			if n%10000 == 0 {
+				line += " raretoken"
+			}
+			rows[i] = Row{epoch.Add(time.Duration(n) * time.Second), line}
+		}
+		builder := NewRecoveryBuilder()
+		builder.Add(rows)
+		var s Store
+		builder.Install(&s)
+		if form == "mixed" {
+			s.Publish([]Row{{epoch.Add(500 * time.Second), "dense ordinary"}})
+		}
+		count := len(rows)
+		cursorOrdinal := 80000
+		if form == "sorted" {
+			cursorOrdinal = len(rows) - 1 - 80000
+		}
+		after := Position{rows[cursorOrdinal].TS, cursorOrdinal}
+		for _, tc := range []struct {
+			name, literal string
+			snapshot      *int
+			after         *Position
+		}{
+			{"dense", "dense", nil, nil}, {"rare", "raretoken", nil, nil}, {"absent", "absenttoken", nil, nil}, {"late", "raretoken", &count, &after},
+		} {
+			b.Run(form+"/"+tc.name, func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					s.QueryPage(epoch, epoch.Add(48*time.Hour), tc.literal, 100, tc.snapshot, tc.after)
+				}
+			})
+		}
+	}
+}

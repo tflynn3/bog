@@ -13,9 +13,8 @@ const (
 	cursorVersion     = 1
 	cursorPayloadSize = 1 + 8 + sha256.Size + 2 + 2 + sha256.Size
 	cursorSize        = cursorPayloadSize + sha256.Size
+	cursorTokenSize   = (cursorSize*8 + 5) / 6 // Unpadded base64 length.
 )
-
-var cursorTokenSize = base64.RawURLEncoding.EncodedLen(cursorSize)
 
 // Cursor encoding and authentication process bounded tokens and positions in
 // blocks. The base token charge covers fixed setup, including HMAC padding.
@@ -31,6 +30,11 @@ type cursorData struct {
 	Scan    uint16
 	Offset  uint16
 	After   [sha256.Size]byte
+}
+
+// Issuance reserves both token operations and the filter hash up front.
+func cursorAuthenticationWork(filter PageFilter) uint64 {
+	return cursorTokenWork + uint64(len(filter.Contains))
 }
 
 func positionDigest(position PagePosition) [sha256.Size]byte {

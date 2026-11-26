@@ -273,6 +273,8 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixtu
 				probe.Outcome = probeRejected
 				return probe
 			}
+		} else if err == nil && len(page.Rows) == 0 && (cursor != "" || page.NextCursor != "") {
+			err = errors.New("empty query page made no pagination progress")
 		} else if err == nil {
 			err = checkBudgetPage(page, fixture.want[offset:offset+count], offset+count == len(fixture.want), seen)
 		}

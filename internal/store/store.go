@@ -220,20 +220,21 @@ type Store struct {
 	mu        sync.RWMutex
 	rows      []Row
 	restored  indexRun       // immutable run for the recovered WAL prefix
-	runs      [][]int        // immutable sorted ordinal runs, one per occupied level
+	runs      []indexRun     // immutable sorted ordinal runs, one per occupied level
 	blocks    []*blockFilter // immutable summaries of sealed append-ordinal blocks
 }
 
 // indexRun maps sorted ranks to append ordinals. A nil ordinal slice denotes
-// the ordered recovered prefix, whose rank is its ordinal.
+// a contiguous append-ordinal range starting at base.
 type indexRun struct {
 	ordinals []int
+	base     int
 	length   int
 }
 
 func (r indexRun) ordinal(rank int) int {
 	if r.ordinals == nil {
-		return rank
+		return r.base + rank
 	}
 	return r.ordinals[rank]
 }
@@ -316,7 +317,7 @@ func (s *Store) Publish(batch []Row) {
 	defer s.publishMu.Unlock()
 	s.mu.RLock()
 	rows := s.rows
-	runs := append([][]int(nil), s.runs...)
+	runs := append([]indexRun(nil), s.runs...)
 	// The captured length is the immutable published prefix. Only the serialized
 	// writer appends beyond it, so readers may retain this slice without copying.
 	blocks := s.blocks
@@ -327,42 +328,57 @@ func (s *Store) Publish(batch []Row) {
 		start := len(blocks) * blockSize
 		blocks = append(blocks, buildBlock(rows[start:start+blockSize]))
 	}
-	run := make([]int, len(batch))
-	for i := range run {
-		run[i] = base + i
-	}
+	run := indexRun{base: base, length: len(batch)}
 	less := func(a, b int) bool {
 		if rows[a].TS.Equal(rows[b].TS) {
 			return a < b
 		}
 		return rows[a].TS.Before(rows[b].TS)
 	}
-	sort.Slice(run, func(i, j int) bool { return less(run[i], run[j]) })
+	for i := 1; i < len(batch); i++ {
+		if batch[i].TS.Before(batch[i-1].TS) {
+			run.ordinals = make([]int, len(batch))
+			for j := range run.ordinals {
+				run.ordinals[j] = base + j
+			}
+			sort.Slice(run.ordinals, func(i, j int) bool { return less(run.ordinals[i], run.ordinals[j]) })
+			break
+		}
+	}
 	for level := 0; ; level++ {
 		if level == len(runs) {
 			runs = append(runs, run)
 			break
 		}
-		if runs[level] == nil {
+		if runs[level].length == 0 {
 			runs[level] = run
 			break
 		}
 		old := runs[level]
-		merged := make([]int, 0, len(old)+len(run))
-		i, j := 0, 0
-		for i < len(old) && j < len(run) {
-			if less(old[i], run[j]) {
-				merged = append(merged, old[i])
-				i++
-			} else {
-				merged = append(merged, run[j])
-				j++
+		if old.ordinals == nil && run.ordinals == nil && old.base+old.length == run.base &&
+			!rows[run.base].TS.Before(rows[old.base+old.length-1].TS) {
+			run = indexRun{base: old.base, length: old.length + run.length}
+		} else {
+			merged := make([]int, 0, old.length+run.length)
+			i, j := 0, 0
+			for i < old.length && j < run.length {
+				if less(old.ordinal(i), run.ordinal(j)) {
+					merged = append(merged, old.ordinal(i))
+					i++
+				} else {
+					merged = append(merged, run.ordinal(j))
+					j++
+				}
 			}
+			for ; i < old.length; i++ {
+				merged = append(merged, old.ordinal(i))
+			}
+			for ; j < run.length; j++ {
+				merged = append(merged, run.ordinal(j))
+			}
+			run = indexRun{ordinals: merged, length: len(merged)}
 		}
-		merged = append(merged, old[i:]...)
-		merged = append(merged, run[j:]...)
-		runs[level] = nil
-		run = merged
+		runs[level] = indexRun{}
 	}
 	s.mu.Lock()
 	s.rows, s.runs, s.blocks = rows, runs, blocks
@@ -408,11 +424,14 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 	s.mu.RLock()
 	rows, blocks := s.rows, s.blocks
 	runs := make([]indexRun, 0, len(s.runs)+1)
-	if s.restored.length > 0 {
+	hasRestored := s.restored.length > 0
+	if hasRestored {
 		runs = append(runs, s.restored)
 	}
 	for _, run := range s.runs {
-		runs = append(runs, indexRun{ordinals: run, length: len(run)})
+		if run.length > 0 {
+			runs = append(runs, run)
+		}
 	}
 	count := len(rows)
 	if snapshot != nil {
@@ -557,7 +576,7 @@ func (s *Store) query(start, end time.Time, contains string, limit int, snapshot
 		// the merge. A single run can answer dense pages without that estimate.
 		bound := 0
 		intervalStart, intervalEnd := 0, count
-		implicit := active >= 0 && runs[active].ordinals == nil
+		implicit := active == 0 && hasRestored && runs[active].ordinals == nil
 		if active >= 0 {
 			if result, next, complete := direct(budget); complete {
 				return result, count, next, true

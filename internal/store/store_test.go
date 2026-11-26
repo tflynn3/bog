@@ -695,3 +695,90 @@ func TestRecoveryDecodeFrameIsAtomic(t *testing.T) {
 		t.Fatalf("unexpected recovered rows: %v", got)
 	}
 }
+
+func TestLiveRangeRunsAndSnapshot(t *testing.T) {
+	var s Store
+	epoch := time.Unix(1000, 0)
+	var all []Row
+	publish := func(batch []Row) { s.Publish(batch); all = append(all, batch...) }
+	// Establish a recovered prefix, followed by enough live rows to exercise
+	// the literal scan budget on an implicit run with a nonzero base.
+	builder := NewRecoveryBuilder()
+	prefix := []Row{{epoch, "recovered needle"}}
+	builder.Add(prefix)
+	builder.Install(&s)
+	all = append(all, prefix...)
+	for b := 0; b < 8; b++ {
+		batch := make([]Row, 128)
+		for i := range batch {
+			batch[i] = Row{epoch.Add(time.Duration(b*64+i/2+1) * time.Second), fmt.Sprintf("row %d-%d", b, i)}
+		}
+		publish(batch)
+	}
+	if len(s.runs) != 4 || s.runs[3].ordinals != nil || s.runs[3].base != 1 || s.runs[3].length != 1024 {
+		t.Fatalf("ordered batches did not coalesce: %+v", s.runs)
+	}
+	// A sparse literal forces the bounded direct scan to resume on the live run.
+	if got := s.Query(epoch.Add(time.Second), epoch.Add(2000*time.Second), "absent", 2); len(got) != 0 {
+		t.Fatalf("unexpected matches in live range: %v", got)
+	}
+	// Add an inversion, then force a carry into the existing range.
+	publish([]Row{{epoch.Add(3 * time.Second), "inverted needle"}, {epoch.Add(2 * time.Second), "inverted other"}})
+	for i := 0; i < 7; i++ {
+		publish([]Row{{epoch.Add(time.Duration(1100+i) * time.Second), fmt.Sprintf("needle %d", i)}})
+	}
+	if len(s.runs) <= 4 || s.runs[4].ordinals == nil {
+		t.Fatal("inversion did not produce an explicit merge")
+	}
+	start, end := epoch, epoch.Add(2000*time.Second)
+	oracle := func(rows []Row, literal string) []Row {
+		want := append([]Row(nil), rows...)
+		sort.SliceStable(want, func(i, j int) bool { return want[i].TS.Before(want[j].TS) })
+		out := []Row{}
+		for _, row := range want {
+			if strings.Contains(row.Line, literal) {
+				out = append(out, row)
+			}
+		}
+		return out
+	}
+	for _, literal := range []string{"", "needle", "absent"} {
+		want := oracle(all, literal)
+		if got := s.Query(start, end, literal, 5000); !slices.Equal(got, want) {
+			t.Fatalf("query %q mismatch", literal)
+		}
+		var got []Row
+		page, count, cursor, ok := s.QueryPage(start, end, literal, 3, nil, nil)
+		if !ok {
+			t.Fatal("initial page invalid")
+		}
+		got = append(got, page...)
+		for cursor != nil {
+			page, _, cursor, ok = s.QueryPage(start, end, literal, 3, &count, cursor)
+			if !ok {
+				t.Fatal("continuation invalid")
+			}
+			got = append(got, page...)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("cursor %q mismatch", literal)
+		}
+	}
+	want := oracle(all, "")
+	page, count, cursor, ok := s.QueryPage(start, end, "", 3, nil, nil)
+	if !ok || cursor == nil {
+		t.Fatal("missing initial cursor")
+	}
+	got := append([]Row(nil), page...)
+	publish([]Row{{epoch.Add(time.Second), "backfill"}})
+	for cursor != nil {
+		page, _, cursor, ok = s.QueryPage(start, end, "", 3, &count, cursor)
+		if !ok {
+			t.Fatal("snapshot invalid")
+		}
+		got = append(got, page...)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatal("snapshot changed after backfill")
+	}
+}

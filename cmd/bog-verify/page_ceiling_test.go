@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"bog/internal/client"
@@ -44,12 +45,29 @@ func TestCLIComparePageAboveDefaultCeiling(t *testing.T) {
 	}{
 		{"default ceiling rejects page", 0, exitIncomplete, "increase -max-page-bytes or reduce -limit"},
 		{"configured ceiling rejects page", totalBytes - 1, exitIncomplete, fmt.Sprintf("exceeds -max-page-bytes=%d", totalBytes-1)},
-		{"exact elevated ceiling matches", totalBytes, exitOK, "rows=12 reference_pages=5 server_pages=1"},
+		{"exact elevated ceiling matches", totalBytes, exitOK, "rows=12 reference_pages=5 server_pages=2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			cursor := fixtureCursor('a')
+			var requests atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodGet || r.URL.Path != "/query" || r.URL.Query().Get("page") != "1" {
+				n := requests.Add(1)
+				q := r.URL.Query()
+				if r.Method != http.MethodGet || r.URL.Path != "/query" {
 					t.Errorf("unexpected request %s %s", r.Method, r.URL)
+					http.Error(w, "unexpected request", http.StatusBadRequest)
+					return
+				}
+				if n == 1 && q.Get("page") == "1" && q.Get("cursor") == "" {
+					w.Header().Set("Content-Length", "0")
+					w.Header().Set("Bog-Next-Cursor", cursor)
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if n != 2 || q.Get("page") != "" || q.Get("cursor") != cursor {
+					t.Errorf("unexpected request %d: %s %s", n, r.Method, r.URL)
+					http.Error(w, "unexpected request", http.StatusBadRequest)
+					return
 				}
 				w.Header().Set("Content-Length", strconv.Itoa(totalBytes))
 				w.WriteHeader(http.StatusOK)
@@ -78,6 +96,12 @@ func TestCLIComparePageAboveDefaultCeiling(t *testing.T) {
 			if status != tc.exit || !strings.Contains(stdout.String()+stderr.String(), tc.want) ||
 				(status == exitOK && stderr.Len() != 0) || (status != exitOK && stdout.Len() != 0) {
 				t.Fatalf("compare exit %d, stdout %q, stderr %q", status, &stdout, &stderr)
+			}
+			if got := requests.Load(); got != 2 {
+				t.Fatalf("made %d requests, want 2", got)
+			}
+			if status == exitIncomplete && !strings.Contains(stderr.String(), "server walk at row 1: page 2:") {
+				t.Fatalf("missing failed page position in %q", &stderr)
 			}
 			assertEmptyScratch(t, scratch)
 		})

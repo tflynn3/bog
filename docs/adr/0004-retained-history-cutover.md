@@ -99,6 +99,10 @@ bytes. #53 owns any export adaptation for an active tail-only layout.
 
 ## Paging and delivery
 
+The immediate continuation probe below records the #13 handoff. The
+shipped server follows the certification-through-exhaustion contract in
+[ADR 0006](0006-fixed-budget-query-continuations.md).
+
 - Start a walk with `page=1`. The continuation binds the capture, canonical
   time bounds, literal, and exclusive last emitted position. Equivalent time
   zones are allowed and clients may vary `limit`. A malformed or mismatched
@@ -131,14 +135,15 @@ bytes. #53 owns any export adaptation for an active tail-only layout.
   preserve the request cursor for retry while the capture is live. A
   smaller `limit` may help a dense walk. Sparse or absent matches may
   still require more work to prove exhaustion.
-- The Go client validates framing, rows, and continuation before callback
-  delivery. Reject an empty page carrying a continuation and any next
-  cursor already seen in the current walk, including the starting cursor of
-  `WalkFrom`. This catches both self-loops and cycles such as A → B → A.
-  Return a protocol error and the cursor used to request the rejected page.
-  Advance only after a successful callback. Cycle tracking is scoped to one
-  walk invocation, with one entry per accepted continuation. A separate
-  `WalkFrom` starts with its supplied cursor.
+- The Go client validates framing, rows, and continuation before delivery.
+  It accepts a fully framed empty page with a fresh valid cursor. The
+  shipped server's progress contract requires at least one row on a page
+  with a cursor. `Walk` and `WalkFrom` track seen cursors for the duration
+  of the call, including the starting cursor. A failed fetch or callback
+  returns the request cursor for that page. Operator comparison uses
+  `BoundedWalk` with constant cursor history and a finite page budget. It
+  counts empty pages and follows their continuations through explicit
+  exhaustion. [ADR 0011](0011-operator-verification-boundary.md)
 
 ## Writable activation and capacity control
 

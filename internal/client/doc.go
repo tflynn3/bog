@@ -1,15 +1,17 @@
 // Package client provides a reusable Bog HTTP client. Construct a Client with
 // New, set MaxPageBytes before concurrent use if the server permits larger
-// pages, and call Walk to consume a stable snapshot. WalkFrom resumes at the
-// cursor returned when a request or page consumer fails. Use the same query
-// bounds and filter when resuming.
+// pages, and use Walk or BoundedWalk to consume a stable snapshot. WalkFrom
+// resumes at the cursor returned when a request or page consumer fails. Use
+// the same query bounds and filter when resuming.
 //
 // FetchPage validates every page for direct callers, Walk, WalkFrom, and
 // BoundedWalk. It exposes rows and the continuation together after checking
 // HTTP framing, the byte ceiling, NDJSON records, and the cursor header. A
 // positive Query.Limit caps the row count. Zero omits the limit from the
 // request and uses the server default. A fully framed empty page can carry
-// a fresh valid cursor. Only an absent cursor indicates a terminal page.
+// a fresh valid cursor under the client transport contract. The shipped Bog
+// server emits at least one row on every page carrying a cursor. Continue
+// through accepted empty pages until a page arrives without a cursor.
 //
 // Walk and WalkFrom withhold a page whose next cursor repeats any request
 // cursor in that call, including the starting cursor. They advance when the
@@ -17,7 +19,9 @@
 // Consumers must commit each page atomically. Query HTTP 503 errors can be
 // retried at the returned cursor. BoundedWalk keeps constant cursor history
 // and detects deterministic cycles with an anchor that can require several
-// pages to detect a repeat. Failed fetches leave its cursor and budget intact.
+// pages to detect a repeat. Its page budget includes every accepted page,
+// including empty and terminal pages. Failed fetches leave its cursor and
+// budget intact.
 //
 // # Routing and restarting a walk
 //

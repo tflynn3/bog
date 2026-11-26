@@ -35,6 +35,8 @@ type Log struct {
 	f         file
 	s         *store.Store
 	offset    int64
+	committed captureBoundary // protected by mu after recovery
+	captures  *captureFile
 	poisoned  error
 	closed    bool
 	closeDone bool
@@ -158,6 +160,12 @@ func (l *Log) run() {
 		operation, err := l.appendGroup(group)
 		outcome := newCommitOutcome(operation, err)
 		l.mu.Lock()
+		if err == nil {
+			l.committed.end = l.offset
+			for _, req := range group {
+				l.committed.nextOrdinal += uint64(len(req.rows))
+			}
+		}
 		l.lastOutcome.Store(&outcome)
 		if outcome.State == CommitUncertain {
 			l.poisoned = err
@@ -228,28 +236,36 @@ func (l *Log) rollback(cause error) error {
 
 func (l *Log) Close() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.initCond()
 	if l.closed {
 		for !l.closeDone {
 			l.cond.Wait()
 		}
-		return l.closeErr
+		err := l.closeErr
+		l.mu.Unlock()
+		return err
 	}
 	l.closed = true
 	l.cond.Broadcast()
 	for l.running {
 		l.cond.Wait()
 	}
+	l.mu.Unlock()
+
 	err := l.f.Close()
+	if l.captures != nil {
+		err = errors.Join(err, l.captures.release())
+	}
 	if l.dir != nil {
 		err = errors.Join(err, l.dir.Close())
 	}
 	if l.root != nil {
 		err = errors.Join(err, l.root.Close())
 	}
+	l.mu.Lock()
 	l.closeErr = err
 	l.closeDone = true
 	l.cond.Broadcast()
+	l.mu.Unlock()
 	return err
 }

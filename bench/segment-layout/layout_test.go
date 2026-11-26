@@ -79,7 +79,7 @@ func TestLayoutRoundTripAndRejection(t *testing.T) {
 				return nil
 			}
 			n, err := scanBlocks(bytes.NewReader(data), int64(len(data)), q, visit)
-			if err != nil || n.Blocks != 1 || n.Bytes != int64(stored) || visits != 1 {
+			if err != nil || n.Blocks != 1 || n.Bytes != int64(stored) || n.DecodedBytes != int64(len(raw)) || visits != 1 {
 				t.Fatalf("scan returned %+v reads, %d visits, %v", n, visits, err)
 			}
 			reject := func(data []byte, q query) {

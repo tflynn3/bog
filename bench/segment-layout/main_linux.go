@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"log"
 	"os"
+	"os/signal"
 	"runtime/debug"
+	"syscall"
 )
 
 func sourceRevision() string {
@@ -32,6 +35,13 @@ func sourceRevision() string {
 
 func main() {
 	log.SetFlags(0)
+	if len(os.Args) > 1 && os.Args[1] == workerArgument {
+		if err := workerMain(os.Args[1:], os.Stdout, coldCache, peakWorkerRSS); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfg, err := parseConfig(os.Args[1:], sourceRevision(), os.Stderr)
 	if errors.Is(err, flag.ErrHelp) {
 		return
@@ -40,8 +50,18 @@ func main() {
 		log.Print(err)
 		os.Exit(2)
 	}
-	if err := run(cfg, os.Stdout); err != nil {
+	if err := runController(cfg); err != nil {
 		log.Print(err)
 		os.Exit(1)
 	}
+}
+
+func runController(cfg config) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return run(ctx, cfg, executable, os.Stdout)
 }

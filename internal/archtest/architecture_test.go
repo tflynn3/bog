@@ -45,6 +45,7 @@ var registry = map[string]rule{
 	"bog/internal/store":       {runtimeLibrary, nil},
 	"bog/internal/checkpoint":  {staged, []string{"bog/internal/store"}},
 	"bog/internal/history":     {staged, []string{"bog/internal/checkpoint", "bog/internal/store"}},
+	"bog/internal/backup":      {staged, []string{"bog/internal/store"}},
 	"bog/internal/idempotency": {staged, nil},
 	"bog/internal/client":      {standalone, []string{"bog/internal/store"}},
 	"bog/internal/ingest":      {testOnly, nil},

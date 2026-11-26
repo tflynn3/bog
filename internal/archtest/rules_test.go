@@ -11,6 +11,8 @@ func TestArchitectureRules(t *testing.T) {
 		store      = "bog/internal/store"
 		checkpoint = "bog/internal/checkpoint"
 		history    = "bog/internal/history"
+		backup     = "bog/internal/backup"
+		wal        = "bog/internal/wal"
 		ingest     = "bog/internal/ingest"
 		release    = "bog/verify/release"
 		extra      = "bog/internal/extra"
@@ -21,7 +23,22 @@ func TestArchitectureRules(t *testing.T) {
 		change func(map[string]listedPackage, map[string]rule)
 		want   []string
 	}{
-		{name: "registered graph with test-only ingest"},
+		{name: "registered graph with offline backup and test-only ingest"},
+		{
+			name: "offline backup cannot import the live writer",
+			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+				pkgs[backup] = productionPackage("backup", store, wal)
+			},
+			want: []string{"forbidden production import: " + backup + " -> " + wal},
+		},
+		{
+			name: "server wiring requires promoting offline backup",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[server] = productionPackage("main", store, wal, backup)
+				rules[server] = rule{serverCommand, []string{store, wal, backup}}
+			},
+			want: []string{backup + " is registered as staged but reachability from " + server + " is true"},
+		},
 		{
 			name: "unregistered unreachable production package",
 			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
@@ -33,7 +50,7 @@ func TestArchitectureRules(t *testing.T) {
 			name: "unregistered reachable production package",
 			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
 				pkgs[extra] = productionPackage("extra")
-				pkgs[server] = productionPackage("main", store, extra)
+				pkgs[server] = productionPackage("main", store, wal, extra)
 			},
 			want: []string{
 				"forbidden production import: " + server + " -> " + extra,
@@ -60,7 +77,7 @@ func TestArchitectureRules(t *testing.T) {
 		{
 			name: "staged packages become transitively reachable",
 			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
-				pkgs[server] = productionPackage("main", store, external)
+				pkgs[server] = productionPackage("main", store, wal, external)
 				pkgs[external] = listedPackage{Imports: []string{history}}
 			},
 			want: []string{
@@ -71,7 +88,7 @@ func TestArchitectureRules(t *testing.T) {
 		{
 			name: "runtime package detached",
 			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
-				pkgs[server] = productionPackage("main")
+				pkgs[server] = productionPackage("main", wal)
 			},
 			want: []string{store + " is registered as runtime library but reachability from " + server + " is false"},
 		},
@@ -112,18 +129,22 @@ func TestArchitectureRules(t *testing.T) {
 			ingestPackage.GoFiles = nil
 			ingestPackage.XTestGoFiles = []string{"reference_test.go"}
 			pkgs := map[string]listedPackage{
-				server:     productionPackage("main", store),
+				server:     productionPackage("main", store, wal),
 				store:      productionPackage("store"),
+				wal:        productionPackage("wal"),
 				checkpoint: productionPackage("checkpoint", store),
 				history:    productionPackage("history", checkpoint, store),
+				backup:     productionPackage("backup", store),
 				ingest:     ingestPackage,
 				release:    productionPackage("main"),
 			}
 			rules := map[string]rule{
-				server:     {serverCommand, []string{store}},
+				server:     {serverCommand, []string{store, wal}},
 				store:      {runtimeLibrary, nil},
+				wal:        {runtimeLibrary, nil},
 				checkpoint: {staged, []string{store}},
 				history:    {staged, []string{checkpoint, store}},
+				backup:     {staged, []string{store}},
 				ingest:     {testOnly, nil},
 				release:    {verifier, nil},
 			}

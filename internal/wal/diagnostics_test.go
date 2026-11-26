@@ -298,3 +298,64 @@ func TestSuccessfulWALProgressWithStalledDiagnosticConsumer(t *testing.T) {
 		t.Fatal("append or close blocked while diagnostic delivery was stalled")
 	}
 }
+
+// TestRealENOSPC requires a dedicated, size-limited filesystem supplied by the caller.
+func TestRealENOSPC(t *testing.T) {
+	base := os.Getenv("BOG_ENOSPC_TEST_DIR")
+	if base == "" {
+		t.Skip("set BOG_ENOSPC_TEST_DIR to a dedicated, size-limited filesystem")
+	}
+	dir, err := os.MkdirTemp(base, "wal-enospc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	l, err := Open(dir, &store.Store{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	filler, err := os.CreateTemp(base, "wal-fill-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(filler.Name())
+	defer filler.Close()
+	block := make([]byte, 64*1024)
+	for i := 0; i < 4096; i++ {
+		_, err = filler.Write(block)
+		if err != nil {
+			break
+		}
+	}
+	if !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("filling filesystem: %v", err)
+	}
+	rows, err := store.Decode(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = l.Append(batch, rows); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("append error = %v, want ENOSPC", err)
+	}
+	if err = l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = filler.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Remove(filler.Name()); err != nil {
+		t.Fatal(err)
+	}
+	s := &store.Store{}
+	l, err = Open(dir, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if got := s.Query(time.Time{}, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), "", 10); len(got) != 0 {
+		t.Fatalf("failed append recovered rows: %+v", got)
+	}
+	if err = l.Append(batch, rows); err != nil {
+		t.Fatalf("append after reopen: %v", err)
+	}
+}

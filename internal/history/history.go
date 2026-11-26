@@ -64,6 +64,7 @@ type generation struct {
 	refs     atomic.Int64
 	dir      *os.File
 	dirInfo  os.FileInfo
+	pin      *os.File
 	segments []segment
 }
 
@@ -71,14 +72,15 @@ func (g *generation) release() error {
 	if g.refs.Add(-1) != 0 {
 		return nil
 	}
-	err := errors.Join(g.closePins(), g.dir.Close())
+	err := errors.Join(g.releasePin(), g.dir.Close())
 	close(g.drained)
 	return err
 }
 
 // Replace validates the authoritative bog.checkpoint in dir and installs it
 // atomically for new readers. A shared publication lock keeps the manifest
-// stable until the new generation is pinned. A validation or cancellation
+// stable until the new generation is pinned. Pinning requires permission to
+// create a coordination file in the directory. A validation or cancellation
 // failure leaves the current generation available. If closing the retired
 // directory fails, Replace returns the installed generation and that error.
 func (c *Catalog) Replace(ctx context.Context, path string) (_ Generation, err error) {
@@ -105,8 +107,8 @@ func (c *Catalog) Replace(ctx context.Context, path string) (_ Generation, err e
 		return Generation{}, errors.Join(err, dir.Close())
 	}
 	next.dirInfo = info
-	if err := next.pinSegments(ctx); err != nil {
-		return Generation{}, errors.Join(err, next.closePins(), dir.Close())
+	if err := next.registerPin(ctx); err != nil {
+		return Generation{}, errors.Join(err, dir.Close())
 	}
 	next.refs.Store(1)
 	c.mu.Lock()

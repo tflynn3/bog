@@ -114,17 +114,17 @@ func TestWalkAndStatuses(t *testing.T) {
 			if q.Get("page") != "1" {
 				t.Errorf("first: %v", q)
 			}
-			w.Header().Set("Bog-Next-Cursor", fixtureCursor)
+			writeContractPage(t, w, contractRow("first"), fixtureCursor)
 		case 2:
 			if q.Get("cursor") != fixtureCursor || q.Has("page") {
 				t.Errorf("second: %v", q)
 			}
-			w.Header().Set("Bog-Next-Cursor", fixtureNext)
+			writeContractPage(t, w, contractRow("second"), fixtureNext)
 		case 3:
 			if q.Get("cursor") != fixtureNext {
 				t.Errorf("third: %v", q)
 			}
-			fmt.Fprint(w, "{\"ts\":\"2025-01-01T00:00:00Z\",\"line\":\"x\"}\n")
+			writeContractPage(t, w, contractRow("x"), "")
 		}
 	}))
 	defer srv.Close()
@@ -243,11 +243,11 @@ func TestWalkRetryAndConsumption(t *testing.T) {
 		requests = append(requests, r.URL.RawQuery)
 		switch len(requests) {
 		case 1:
-			w.Header().Set("Bog-Next-Cursor", fixtureCursor)
+			writeContractPage(t, w, contractRow("first"), fixtureCursor)
 		case 2:
 			http.Error(w, "busy", 503)
 		case 3:
-			w.Header().Set("Bog-Next-Cursor", fixtureNext)
+			writeContractPage(t, w, contractRow("resumed"), fixtureNext)
 		}
 	}))
 	defer s.Close()

@@ -298,6 +298,8 @@ func TestQueryResponseValidation(t *testing.T) {
 		{name: "empty cursor", body: row, headers: http.Header{"Bog-Next-Cursor": {""}}, wantError: "cursor header"},
 		{name: "repeated request cursor", body: row, headers: http.Header{"Bog-Next-Cursor": {fixtureCursor}}, wantError: "does not advance"},
 		{name: "repeated request cursor on empty page", headers: http.Header{"Bog-Next-Cursor": {fixtureCursor}}, wantError: "does not advance"},
+		{name: "empty page with fresh cursor", headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, wantError: "empty query page"},
+		{name: "empty chunked page with fresh cursor", headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, chunked: true, wantError: "empty query page"},
 		{name: "invalid UTF-8 after row", body: row + "{\"ts\":\"\xff\",\"line\":\"\"}\n", wantError: "UTF-8"},
 		{name: "blank record after row", body: row + "\n", wantError: "record framing"},
 		{name: "invalid timestamp after row", body: row + "{\"ts\":\"today\",\"line\":\"\"}\n", wantError: "timestamp"},
@@ -390,6 +392,55 @@ func TestContinuationRejectionsPreserveCursor(t *testing.T) {
 			if cursor != fixtureCursor || !errors.As(err, &rejection) || rejection.StatusCode != tc.status ||
 				rejection.Body != tc.body+"\n" || rejection.Retryable() != tc.retryable || rejection.CursorRejected != tc.cursorRejected {
 				t.Fatalf("cursor %q, rejection %+v, error %v", cursor, rejection, err)
+			}
+		})
+	}
+}
+
+func TestWalkFromEmptyPage(t *testing.T) {
+	for _, tc := range []struct {
+		name, next string
+	}{
+		{name: "reject continuation", next: fixtureNext},
+		{name: "deliver terminal page"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				query := r.URL.Query()
+				if query.Get("cursor") != fixtureCursor || query.Has("page") {
+					t.Errorf("unexpected request %s", r.RequestURI)
+					http.Error(w, "unexpected request", http.StatusBadRequest)
+					return
+				}
+				writeContractPage(t, w, "", tc.next)
+			}))
+			t.Cleanup(server.Close)
+			c, err := New(server.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(c.CloseIdleConnections)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			calls := 0
+			cursor, err := c.WalkFrom(ctx, Query{}, fixtureCursor, func(p Page) error {
+				calls++
+				if len(p.Rows) != 0 || p.NextCursor != "" {
+					t.Errorf("consumer received %+v, want empty terminal page", p)
+				}
+				return nil
+			})
+			if tc.next == "" {
+				if cursor != "" || err != nil || calls != 1 {
+					t.Fatalf("terminal walk returned cursor %q and error %v after %d callbacks", cursor, err, calls)
+				}
+				return
+			}
+			var protocol *HTTPError
+			if cursor != fixtureCursor || calls != 0 || !errors.As(err, &protocol) ||
+				protocol.StatusCode != http.StatusOK || protocol.Retryable() || protocol.CursorRejected ||
+				!strings.Contains(err.Error(), "empty query page") {
+				t.Fatalf("rejected walk returned cursor %q and error %v after %d callbacks", cursor, err, calls)
 			}
 		})
 	}

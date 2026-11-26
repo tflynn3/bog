@@ -251,6 +251,9 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (page Pa
 		if next == cursor {
 			return Page{}, errors.New("next cursor does not advance pagination")
 		}
+		if len(rows) == 0 {
+			return Page{}, errors.New("empty query page with next cursor")
+		}
 	}
 	return Page{Rows: rows, NextCursor: next}, nil
 }

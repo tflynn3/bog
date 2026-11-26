@@ -74,8 +74,7 @@ func request(ctx context.Context, client *http.Client, method, target string, bo
 	return response{
 		status: res.StatusCode, contentType: res.Header.Get("Content-Type"), cursor: res.Header.Get(nextCursor),
 		cursorHeader: header, body: data,
-		framed: res.ProtoMajor >= 2 || res.ContentLength >= 0 ||
-			(len(res.TransferEncoding) == 1 && res.TransferEncoding[0] == "chunked"),
+		framed: responseFramed(res),
 	}, nil
 }
 
@@ -123,16 +122,22 @@ func requireRejection(ctx context.Context, client *http.Client, target string) (
 		return rejection{}, err
 	}
 	evidence := rejection{HTTPStatus: res.status, NextCursor: res.cursorHeader, ElapsedMS: time.Since(start).Milliseconds()}
-	for line := range bytes.SplitSeq(res.body, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if len(line) > 0 && (line[0] == '{' || strings.HasPrefix(res.contentType, "application/x-ndjson")) {
-			evidence.NDJSONRows++
-		}
-	}
+	evidence.NDJSONRows = countNDJSONRows(string(res.body), res.contentType)
 	if res.status != http.StatusServiceUnavailable || evidence.NDJSONRows != 0 || evidence.NextCursor || time.Since(start) >= queryDeadline {
 		return evidence, fmt.Errorf("expected HTTP 503 with no NDJSON or cursor within two seconds, got %+v", evidence)
 	}
 	return evidence, nil
+}
+
+func countNDJSONRows(body, contentType string) int {
+	n := 0
+	for line := range strings.SplitSeq(body, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) > 0 && (line[0] == '{' || strings.HasPrefix(contentType, "application/x-ndjson")) {
+			n++
+		}
+	}
+	return n
 }
 
 func requireStaleCursorRejection(ctx context.Context, client *http.Client, base, cursor string) error {
@@ -366,7 +371,7 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
 		if _, err := ingest(ctx, client, base, seed[:batchRows]); err != nil {
 			return err
 		}
-		result, err := requireRejection(ctx, client, base+queryPath("", 1, budgetFilter))
+		result, err := requireBudgetRejection(ctx, client, base)
 		budgetProof.rejection = result
 		return err
 	})

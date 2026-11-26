@@ -112,6 +112,12 @@ func TestFixedBudgetWireVerdict(t *testing.T) {
 			fmt.Sprintf("Content-Length: %d\r\n", len(middle)+1), middle), status: 200, problem: "unexpected EOF"},
 		{name: "unterminated chunk stream", failPage: 3, wire: wireResponse(200, ndjson+chunked, chunk(last)), status: 200, problem: "unexpected EOF"},
 		{name: "unterminated record", failPage: 3, wire: lengthResponse(200, ndjson, strings.TrimSuffix(last, "\n")), status: 200, problem: "invalid query record framing"},
+		{name: "malformed first record", failPage: 1, wire: lengthResponse(200, ndjson+header1, "{\"ts\":]\n"), status: 200, problem: "decode query record"},
+		{name: "blank record after valid row", failPage: 1, wire: lengthResponse(200, ndjson+header1, first+"\n"), status: 200, problem: "invalid query record framing"},
+		{name: "invalid UTF-8 continuation", failPage: 2, wire: lengthResponse(200, ndjson+header2, strings.Replace(middle, "\"a\"", "\"\xff\"", 1)), status: 200, problem: "invalid query record framing"},
+		{name: "incomplete continuation object", failPage: 2, wire: lengthResponse(200, ndjson+header2, fmt.Sprintf("{\"ts\":%q}\n", fixtureStart)), status: 200, problem: "missing query record field"},
+		{name: "valid terminal row followed by partial JSON", failPage: 3, wire: lengthResponse(200, ndjson, last+"{\"ts\":"), status: 200, problem: "invalid query record framing"},
+		{name: "duplicate terminal field", failPage: 3, wire: lengthResponse(200, ndjson, strings.Replace(last, "\"line\":\"b\"", "\"line\":\"b\",\"line\":\"b\"", 1)), status: 200, problem: "decode query record"},
 		{name: "malformed cursor", failPage: 1, wire: lengthResponse(200, ndjson+nextCursor+": bad+/=\r\n", first), status: 200, problem: "invalid next cursor header"},
 		{name: "duplicate cursor", failPage: 2, wire: lengthResponse(200, ndjson+header2+header1, middle), status: 200, problem: "invalid next cursor header"},
 		{name: "cursor trailer", failPage: 3, wire: wireResponse(200, ndjson+chunked+"Trailer: "+nextCursor+"\r\n",
@@ -161,7 +167,7 @@ func TestFixedBudgetWireVerdict(t *testing.T) {
 			verdictErr := record(cases, "work_budget", stats, err)
 			verdict := cases["work_budget"]
 			if tc.failPage == 0 {
-				if verdictErr != nil || verdict.Status != "pass" || stats != (budgetWalkStats{1, 0, 3, 3}) || calls.Load() != 4 {
+				if verdictErr != nil || verdict.Status != "pass" || legacyBudgetCounts(stats) != ([4]int{1, 0, 3, 3}) || stats.ExactThresholdBudget != 1 || calls.Load() != 4 {
 					t.Fatalf("verdict=%+v, stats=%+v, requests=%d, error=%v", verdict, stats, calls.Load(), verdictErr)
 				}
 				return
@@ -174,6 +180,17 @@ func TestFixedBudgetWireVerdict(t *testing.T) {
 			if stats.Pages != tc.failPage-1 || stats.Rows != tc.failPage-1 || stats.RejectedBudgets != 0 ||
 				calls.Load() != int32(tc.failPage+1) {
 				t.Errorf("failed page affected evidence or allowed progress: stats=%+v, requests=%d", stats, calls.Load())
+			}
+			failure := stats.FirstFailure
+			if failure == nil || failure.Budget != 1 || failure.Page != tc.failPage || failure.Limit != 1 {
+				t.Fatalf("bad first failure: %+v", failure)
+			}
+			if tc.failPage == 1 {
+				if stats.FirstCursorBudget != 0 || stats.ExactThresholdBudget != 0 || stats.FirstBrokenContinuation != nil {
+					t.Errorf("invalid first page established issuance: %+v", stats)
+				}
+			} else if stats.FirstCursorBudget != 1 || stats.ExactThresholdBudget != 1 || stats.FirstBrokenContinuation != failure {
+				t.Errorf("invalid continuation lost first-page evidence: %+v", stats)
 			}
 			if tc.status != 0 {
 				var httpErr *client.HTTPError

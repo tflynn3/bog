@@ -167,3 +167,53 @@ func writeFixture(t *testing.T, path string, data []byte) {
 		t.Fatal(err)
 	}
 }
+
+func TestBudgetEvidenceKeepsLegacyFields(t *testing.T) {
+	t.Parallel()
+	failure := &budgetProbeFailure{
+		Budget: 4, Page: 2, Limit: 1, HTTPStatus: 503, Detail: "page 2: Bog HTTP 503",
+	}
+	stats := budgetWalkStats{
+		FirstCursorBudget: 4, RejectedBudgets: 1, Pages: 1, Rows: 2,
+		FirstFailure: failure, FirstBrokenContinuation: failure,
+		Probes: []budgetProbe{
+			{Budget: 4, Outcome: probeIssued, Pages: 1, Rows: 2, Failure: failure},
+			{Budget: 2, Outcome: probeRejected},
+		},
+	}
+	cases := make(map[string]outcome)
+	if err := record(cases, "work_budget", stats, failure); err == nil {
+		t.Fatal("record passed a broken continuation")
+	}
+	evidence := cases["work_budget"].Evidence
+	var legacy struct {
+		FirstCursorBudget int `json:"first_cursor_budget"`
+		RejectedBudgets   int `json:"rejected_budgets"`
+		Pages             int `json:"pages"`
+		Rows              int `json:"rows"`
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(evidence, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(evidence, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if values := [4]int{legacy.FirstCursorBudget, legacy.RejectedBudgets, legacy.Pages, legacy.Rows}; values != [4]int{4, 1, 1, 2} {
+		t.Fatalf("legacy fields = %v", values)
+	}
+	if _, hasExact := fields["exact_threshold_budget"]; hasExact {
+		t.Errorf("claimed exact threshold without a clean rejection at budget 3: %s", evidence)
+	}
+	for _, field := range []string{"first_failure", "first_broken_continuation"} {
+		var got budgetProbeFailure
+		if err := json.Unmarshal(fields[field], &got); err != nil || got != *failure {
+			t.Errorf("%s = %+v, error = %v", field, got, err)
+		}
+	}
+	var probes []budgetProbe
+	if err := json.Unmarshal(fields["probes"], &probes); err != nil || len(probes) != 2 ||
+		probes[0].Budget != 4 || probes[0].Outcome != probeIssued || probes[1].Budget != 2 || probes[1].Outcome != probeRejected {
+		t.Errorf("probe evidence = %+v, error = %v", probes, err)
+	}
+}

@@ -99,7 +99,9 @@ and checks every remaining row, in order, through the terminal page. A
 fresh query confirms that the acknowledged concurrent backfill, timestamped
 inside the original snapshot range, is visible. A separate server with
 `-query-work-budget=1` receives 32 fixture rows and must return a clean HTTP
-503 on a scan for an absent string.
+503 on a scan for an absent string. All work-budget rejections must carry
+the complete `query work budget exhausted\n` body with explicit HTTP
+framing and no cursor header or trailer.
 
 The fixed-budget probe has a one-minute deadline for both searches and walks.
 The tied-row fixture uses three distinct rows with the same timestamp and
@@ -116,16 +118,25 @@ The first request asks for four rows under a 96-byte response cap, which fits
 exactly two of the matching records. Continuations lower the row limit to one
 and must return the omitted match and the late match in order, with no cursor
 on the terminal page. The probe bisects budgets 1 through 2048, assuming
-monotone work metering on the fixed snapshot. It checks the immediate
-predecessor of the issuing budget when one exists and walks every trial that
-issues a cursor at its own budget. A later HTTP 503 fails either walk.
+monotone first-page work metering on the fixed snapshot. Each trial that
+issues a cursor must reach exhaustion at its own budget. When a continuation
+breaks, the case fails and the sparse search can still narrow the issuing
+budget using the valid first page. An invalid first page stops the search.
 
 The `work_budget` case keeps the budget-1 rejection evidence. Its
-`fixed_budget_walk` object includes `first_cursor_budget`, `rejected_budgets`,
-`pages`, and `rows` for the tied-row walk. Its nested `sparse_walk` includes
-the same fields plus `response_byte_cap`, `first_limit`, `first_rows`, and
-`resume_limit`. For the sparse walk, `rejected_budgets` counts the sampled
-budgets that returned a clean initial rejection.
+`fixed_budget_walk` object keeps `first_cursor_budget` as the lowest observed
+issuing budget, with `pages` and `rows` counting verified progress at that
+budget. `rejected_budgets` counts clean first-page rejections among the sampled
+budgets. Its nested `sparse_walk` includes the same fields plus
+`response_byte_cap`, `first_limit`, `first_rows`, and `resume_limit`.
+
+Both walks include `probes` in execution order. Each probe records a budget,
+verified page and row counts, and an outcome of `clean_rejection`,
+`issued_cursor`, `exhausted`, or `indeterminate`. The report includes
+`exact_threshold_budget` when the issuing budget is 1 or the search observed
+a clean rejection at its immediate predecessor. `first_failure` and
+`first_broken_continuation` retain the first observed failures in execution
+order, with the budget, page, requested limit, and HTTP status where available.
 
 ## Restored parity fixture
 

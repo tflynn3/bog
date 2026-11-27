@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const ordinaryWALCase = "ordinary_wal_reopen"
-
 func run(ctx context.Context, args []string) error {
 	validate := len(args) > 0 && args[0] == "validate"
 	if validate {
@@ -27,11 +25,11 @@ func run(ctx context.Context, args []string) error {
 	var opts validationOptions
 	if validate {
 		opts.requireRetarget = os.Getenv("BOG_RELEASE_REQUIRE_RETARGET") == "1"
-		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require live capacity publication, memory, and retired pin drain evidence")
+		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require live capacity and recovery parity evidence")
 		flags.StringVar(&admission, "admission", "", "admission report")
 		flags.StringVar(&durability, "durability", "", "durability report")
 		flags.StringVar(&capacity, "capacity", "", "capacity report")
-		flags.StringVar(&parity, "parity", "", "restored parity report")
+		flags.StringVar(&parity, "parity", "", "recovery parity report (required with -require-cutover)")
 	} else {
 		flags.StringVar(&output, "report", "", "admission report output path")
 	}
@@ -61,8 +59,10 @@ func run(ctx context.Context, args []string) error {
 				err = errors.Join(err, fmt.Errorf("%s report: %w", check.name, checkErr))
 			}
 		}
-		if parity != "" {
-			cases := []string{"restored_parity"}
+		if parity == "" && opts.requireCutover {
+			err = errors.Join(err, errors.New("restored parity report: -parity is required with -require-cutover"))
+		} else if parity != "" {
+			cases := []string{restoredParityCase}
 			if opts.requireCutover {
 				cases = append(cases, ordinaryWALCase)
 			}

@@ -127,7 +127,7 @@ func validateReportWithOptions(data []byte, expected identity, required []string
 	for _, name := range slices.Sorted(maps.Keys(cases)) {
 		raw := cases[name]
 		mandatory := slices.Contains(required, name) || name == saturationFixtureCase
-		if err := validateOutcome(raw, mandatory, mandatory && name == "enospc", opts.requireRetarget); err != nil {
+		if err := validateOutcome(raw, name, mandatory, opts); err != nil {
 			problem := fmt.Errorf("case %q: %w", name, err)
 			if errors.Is(err, errSkippedCase) {
 				skips = append(skips, problem)
@@ -147,7 +147,7 @@ func validateReportWithOptions(data []byte, expected identity, required []string
 
 var errSkippedCase = errors.New("expected pass, got \"skip\"")
 
-func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC, requireRetarget bool) error {
+func validateOutcome(raw jsontext.Value, name string, mandatory bool, opts validationOptions) error {
 	var status string
 	fields, err := decodeFields(raw, map[string]any{"status": &status})
 	if err != nil {
@@ -175,11 +175,27 @@ func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC, requireRetarg
 	default:
 		return fmt.Errorf("unknown status %q", status)
 	}
-	if !requireENOSPC {
+	if !mandatory {
 		return nil
 	}
+	switch name {
+	case "enospc":
+		return validateENOSPC(fields["evidence"], opts.requireRetarget)
+	case ordinaryWALCase:
+		if opts.requireCutover {
+			return validateOrdinaryWAL(fields["evidence"])
+		}
+	case restoredParityCase:
+		if opts.requireCutover {
+			return validateRestoredParity(fields["evidence"])
+		}
+	}
+	return nil
+}
+
+func validateENOSPC(raw jsontext.Value, requireRetarget bool) error {
 	var proof enospcEvidence
-	evidence, err := decodeFields(fields["evidence"], map[string]any{
+	evidence, err := decodeFields(raw, map[string]any{
 		"errno": &proof.Errno, "disposable_local_filesystem": &proof.DisposableLocalFilesystem,
 		"observed_enospc": &proof.ObservedENOSPC, "recovered_after_space_freed": &proof.RecoveredAfterSpaceFreed,
 	})

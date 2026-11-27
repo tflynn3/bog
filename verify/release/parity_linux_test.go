@@ -25,10 +25,9 @@ import (
 )
 
 const (
-	restoredParityCase = "restored_parity"
-	restoredPageCap    = 256
-	restoredMaxPages   = 32
-	restoredWalkTime   = 8 * time.Second
+	restoredPageCap  = 256
+	restoredMaxPages = 32
+	restoredWalkTime = 8 * time.Second
 )
 
 // The release gate supplies the already-built candidate. Ordinary unit runs
@@ -76,16 +75,10 @@ type parityProof struct {
 	RestartRows    int          `json:"restart_rows"`
 }
 
-type ordinaryWALProof struct {
-	ReopenedRows int `json:"reopened_rows"`
-	AppendStatus int `json:"append_status"`
-	RestartRows  int `json:"restart_rows"`
-}
-
 func ordinaryWALParity(ctx context.Context, binary, dir string) (proof ordinaryWALProof, err error) {
 	rows := parityRows()
 	// Write a committed legacy WAL before launching the candidate.
-	if err := appendParityBatch(dir, rows[:3]); err != nil {
+	if err := appendParityBatch(dir, rows[:paritySeedRows]); err != nil {
 		return proof, fmt.Errorf("prepare ordinary WAL: %w", err)
 	}
 	client := &http.Client{
@@ -95,7 +88,7 @@ func ordinaryWALParity(ctx context.Context, binary, dir string) (proof ordinaryW
 	defer client.CloseIdleConnections()
 	flags := []string{fmt.Sprintf("-query-max-response-bytes=%d", restoredPageCap)}
 	var log querymodel.Log
-	log.Append(rows[:3])
+	log.Append(rows[:paritySeedRows])
 	if err := serveDirectory(ctx, binary, dir, client, flags, func(ctx context.Context, base string) error {
 		pager, err := newReleasePager(base, client, restoredPageCap)
 		if err != nil {
@@ -105,15 +98,16 @@ func ordinaryWALParity(ctx context.Context, binary, dir string) (proof ordinaryW
 			return err
 		}
 		proof.ReopenedRows = log.HighWater()
-		batch := make([]row, 0, len(rows[3:]))
-		for _, item := range rows[3:] {
+		appendRows := rows[paritySeedRows:]
+		batch := make([]row, 0, len(appendRows))
+		for _, item := range appendRows {
 			batch = append(batch, parityWireRow(item))
 		}
 		proof.AppendStatus, err = ingest(ctx, client, base, batch)
 		if err != nil {
 			return err
 		}
-		log.Append(rows[3:])
+		log.Append(appendRows)
 		return checkParityWalks(ctx, pager, &log)
 	}); err != nil {
 		return proof, fmt.Errorf("reopen and write ordinary WAL: %w", err)
@@ -319,7 +313,7 @@ func makeRestoredFixture(ctx context.Context, root string, rows []querymodel.Row
 	if err := os.Mkdir(source, 0700); err != nil {
 		return "", point, err
 	}
-	if err := appendParityBatch(source, rows[:3]); err != nil {
+	if err := appendParityBatch(source, rows[:paritySeedRows]); err != nil {
 		return "", point, err
 	}
 	legacy, err := checkpoint.OpenLegacy(source)
@@ -330,7 +324,7 @@ func makeRestoredFixture(ctx context.Context, root string, rows []querymodel.Row
 	if err := errors.Join(err, legacy.Close()); err != nil {
 		return "", point, err
 	}
-	if err := appendParityBatch(source, rows[3:]); err != nil {
+	if err := appendParityBatch(source, rows[paritySeedRows:]); err != nil {
 		return "", point, err
 	}
 	legacy, err = checkpoint.OpenLegacy(source)
@@ -372,11 +366,15 @@ func makeRestoredFixture(ctx context.Context, root string, rows []querymodel.Row
 }
 
 func TestReleaseRestoredFixture(t *testing.T) {
-	dir, point, err := makeRestoredFixture(t.Context(), t.TempDir(), parityRows())
+	rows := parityRows()
+	if len(rows) != parityFixtureRows {
+		t.Fatalf("fixture has %d rows, want %d", len(rows), parityFixtureRows)
+	}
+	dir, point, err := makeRestoredFixture(t.Context(), t.TempDir(), rows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if point.NextOrdinal != 3 || point.CoveredOffset >= point.CommittedEnd {
+	if point.NextOrdinal != paritySeedRows || point.CoveredOffset >= point.CommittedEnd {
 		t.Fatalf("fixture requires checkpoint and WAL tail rows: %+v", point)
 	}
 	got, err := backup.Verify(t.Context(), dir)

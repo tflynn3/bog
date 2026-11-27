@@ -32,7 +32,7 @@ additional evidence. The following cases must pass.
 | Admission | `one_slot_saturation`, `ingest_during_saturation`, `cursor_resume`, `work_budget` |
 | Durability | `sigkill`, `recovery`, `enospc` |
 | Capacity | `retained_history_capacity` |
-| Recovery parity | `restored_parity`, `ordinary_wal_reopen` in cutover mode |
+| Recovery parity | `restored_parity` when supplied, plus `ordinary_wal_reopen` in cutover mode |
 
 Admission also records the full saturation fixture verdict as
 `saturation_fixture`. Validation accepts archived admission reports with
@@ -190,8 +190,18 @@ batch, and compares the exact augmented ledger before shutdown and after
 restart. The `ordinary_wal_reopen` case records the row counts and append
 status.
 
-The workflow passes `-parity parity.json` when validating the collected reports
-and runs the verifier tests with the race detector on Linux.
+The native workflow uses `-require-cutover -parity parity.json` and runs the
+verifier tests with the race detector on Linux. Strict validation requires
+both recovery cases to pass and checks these exact evidence fields for
+`linux-release-v1`.
+
+| Case | Required evidence |
+| --- | --- |
+| `ordinary_wal_reopen` | `reopened_rows` = 3, `append_status` = 204, `restart_rows` = 6 |
+| `restored_parity` | `captured_rows` = 6, `held_capture_rows` = 6, `post_restore_204` = true, `post_append_rows` = 7, `restart_rows` = 7 |
+
+Historical validation without `-require-cutover` accepts an omitted parity
+report or a schema-v1 report with a passing `restored_parity` outcome.
 
 ## Architecture handoff for #61
 

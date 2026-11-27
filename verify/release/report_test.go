@@ -20,6 +20,9 @@ const proofJSON = `{"errno":"ENOSPC","disposable_local_filesystem":true,"observe
 const healthyToFullJSON = `"healthy_to_full":{"readiness_status":200,"readiness_reason":"ready","ingest_status":204,"replayed_after_restart":true}`
 const fullToHealthyJSON = `"full_to_healthy":{"readiness_status":503,"readiness_reason":"low_disk_headroom","ingest_status":503,"post_ingest_reason":"wal_rollback","post_ingest_category":"enospc"}`
 
+const ordinaryWALJSON = `{"reopened_rows":3,"append_status":204,"restart_rows":6}`
+const restoredParityJSON = `{"captured_rows":6,"held_capture_rows":6,"post_restore_204":true,"post_append_rows":7,"restart_rows":7}`
+
 func TestValidateReport(t *testing.T) {
 	t.Parallel()
 	id := identity{1, testRevision, strings.Repeat("a", 64), "test-fixture"}
@@ -134,6 +137,73 @@ func TestValidateRetargetEvidence(t *testing.T) {
 	}
 }
 
+func TestValidateRecoveryEvidence(t *testing.T) {
+	t.Parallel()
+	id := identity{1, testRevision, strings.Repeat("a", 64), capacityFixtureID}
+	required := []string{restoredParityCase, ordinaryWALCase}
+	for _, tc := range []struct {
+		name, probe, from, to, problem string
+	}{
+		{name: "valid"},
+		{"producer extensions", restoredParityCase, `{"captured_rows"`, `{"verified_point":{},"held_capture_pages":3,"captured_rows"`, ""},
+		{"ordinary case missing", ordinaryWALCase, "", "", "missing required case"},
+		{"restored case missing", restoredParityCase, "", "", "missing required case"},
+		{"ordinary status only", ordinaryWALCase, ordinaryWALJSON, "", "evidence"},
+		{"restored status only", restoredParityCase, restoredParityJSON, "", "evidence"},
+		{"null proof", ordinaryWALCase, ordinaryWALJSON, "null", "expected JSON object"},
+		{"array proof", restoredParityCase, restoredParityJSON, "[]", "malformed JSON object"},
+		{"missing reopen count", ordinaryWALCase, `"reopened_rows":3,`, "", "reopened_rows"},
+		{"wrong field spelling", ordinaryWALCase, `"append_status"`, `"Append_Status"`, "append_status"},
+		{"null restart count", ordinaryWALCase, `"restart_rows":6`, `"restart_rows":null`, "restart_rows"},
+		{"wrong reopen count", ordinaryWALCase, `"reopened_rows":3`, `"reopened_rows":2`, "reopened_rows=2"},
+		{"wrong append status", ordinaryWALCase, `"append_status":204`, `"append_status":200`, "append_status=200"},
+		{"wrong ordinary restart count", ordinaryWALCase, `"restart_rows":6`, `"restart_rows":7`, "restart_rows=7"},
+		{"duplicate field", ordinaryWALCase, `"append_status":204`, `"append_status":200,"append_status":204`, "duplicate"},
+		{"missing captured count", restoredParityCase, `"captured_rows":6,`, "", "captured_rows"},
+		{"missing held count", restoredParityCase, `"held_capture_rows":6,`, "", "held_capture_rows"},
+		{"missing restore acknowledgment", restoredParityCase, `"post_restore_204":true,`, "", "post_restore_204"},
+		{"missing post-append count", restoredParityCase, `"post_append_rows":7,`, "", "post_append_rows"},
+		{"missing restored restart count", restoredParityCase, `,"restart_rows":7`, "", "restart_rows"},
+		{"string count", restoredParityCase, `"captured_rows":6`, `"captured_rows":"6"`, "captured_rows"},
+		{"fractional count", restoredParityCase, `"held_capture_rows":6`, `"held_capture_rows":6.5`, "held_capture_rows"},
+		{"numeric restore acknowledgment", restoredParityCase, `"post_restore_204":true`, `"post_restore_204":204`, "post_restore_204"},
+		{"wrong captured count", restoredParityCase, `"captured_rows":6`, `"captured_rows":5`, "captured_rows=5"},
+		{"wrong held count", restoredParityCase, `"held_capture_rows":6`, `"held_capture_rows":7`, "held_capture_rows=7"},
+		{"false restore acknowledgment", restoredParityCase, `"post_restore_204":true`, `"post_restore_204":false`, "post_restore_204=false"},
+		{"wrong post-append count", restoredParityCase, `"post_append_rows":7`, `"post_append_rows":6`, "post_append_rows=6"},
+		{"wrong restored restart count", restoredParityCase, `"restart_rows":7`, `"restart_rows":6`, "restart_rows=6"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cases := map[string]outcome{
+				ordinaryWALCase:    {Status: "pass", Evidence: jsontext.Value(ordinaryWALJSON)},
+				restoredParityCase: {Status: "pass", Evidence: jsontext.Value(restoredParityJSON)},
+			}
+			if tc.from != "" {
+				probe := cases[tc.probe]
+				probe.Evidence = jsontext.Value(strings.Replace(string(probe.Evidence), tc.from, tc.to, 1))
+				cases[tc.probe] = probe
+			} else if tc.probe != "" {
+				delete(cases, tc.probe)
+			}
+			raw, err := json.Marshal(report{id, cases})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validateReportWithOptions(raw, id, required, validationOptions{requireCutover: true})
+			if tc.problem == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.probe) || !strings.Contains(err.Error(), tc.problem) {
+				t.Fatalf("wanted %q with %q, got %v", tc.probe, tc.problem, err)
+			}
+		})
+	}
+}
+
 func TestValidateCommand(t *testing.T) {
 	t.Setenv("BOG_RELEASE_REQUIRE_RETARGET", "")
 	t.Setenv("BOG_RELEASE_REQUIRE_CUTOVER", "")
@@ -200,12 +270,15 @@ func TestValidateCommand(t *testing.T) {
 	produced := string(producerCutoverReport(t))
 	produced = strings.NewReplacer(strings.Repeat("a", 40), id.Revision, strings.Repeat("b", 64), id.BinarySHA256).Replace(produced)
 	writeFixture(t, filepath.Join(dir, "capacity.json"), []byte(produced))
-	if err := run(t.Context(), args); err != nil {
-		t.Fatalf("cutover rejected producer evidence: %v", err)
+	if err := run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "-parity is required") {
+		t.Fatalf("cutover accepted an omitted parity report: %v", err)
 	}
 	parityPath := filepath.Join(dir, "parity.json")
 	parityArgs := append(append([]string(nil), args...), "-parity", parityPath)
-	parity := report{id, map[string]outcome{"restored_parity": {Status: "pass"}}}
+	if err := run(t.Context(), parityArgs); !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), "restored parity report") {
+		t.Fatalf("cutover accepted a missing parity file: %v", err)
+	}
+	parity := report{id, map[string]outcome{restoredParityCase: {Status: "pass"}}}
 	if err := writeReport(parityPath, parity); err != nil {
 		t.Fatal(err)
 	}
@@ -216,6 +289,15 @@ func TestValidateCommand(t *testing.T) {
 		t.Fatalf("cutover accepted parity without ordinary WAL replay: %v", err)
 	}
 	parity.Cases[ordinaryWALCase] = outcome{Status: "pass"}
+	if err := writeReport(parityPath, parity); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(t.Context(), parityArgs); err == nil ||
+		!strings.Contains(err.Error(), ordinaryWALCase) || !strings.Contains(err.Error(), restoredParityCase) {
+		t.Fatalf("cutover accepted status-only recovery cases: %v", err)
+	}
+	parity.Cases[restoredParityCase] = outcome{Status: "pass", Evidence: jsontext.Value(restoredParityJSON)}
+	parity.Cases[ordinaryWALCase] = outcome{Status: "pass", Evidence: jsontext.Value(ordinaryWALJSON)}
 	if err := writeReport(parityPath, parity); err != nil {
 		t.Fatal(err)
 	}
@@ -230,9 +312,10 @@ func TestValidateCommand(t *testing.T) {
 		t.Fatalf("missing report accepted: %v", err)
 	}
 	writeFixture(t, binary, []byte("changed candidate"))
-	if err := run(t.Context(), args); err == nil ||
+	if err := run(t.Context(), parityArgs); err == nil ||
 		!strings.Contains(err.Error(), "admission report: report identity mismatch") ||
-		!strings.Contains(err.Error(), "durability report: report identity mismatch") {
+		!strings.Contains(err.Error(), "durability report: report identity mismatch") ||
+		!strings.Contains(err.Error(), "restored parity report: report identity mismatch") {
 		t.Fatalf("candidate change accepted: %v", err)
 	}
 }

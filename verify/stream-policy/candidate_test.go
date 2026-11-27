@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -465,57 +466,124 @@ func TestReadCandidateEvidence(t *testing.T) {
 	}
 }
 
-func TestCandidateQueryWireEvidence(t *testing.T) {
+type successfulQueryWireCase struct {
+	name, body string
+	rows       []Row
+	wantErr    error
+}
+
+func successfulQueryWireCases() []successfulQueryWireCase {
+	fixture := []Row{{Timestamp: "ts", Line: "fixture"}}
+	valid := ndjson("ts", "fixture")
+	return []successfulQueryWireCase{
+		{"empty body", "", nil, nil},
+		{"complete row", valid, fixture, nil},
+		{"empty strings", "{\"line\":\"\",\"ts\":\"\"}\n", []Row{{}}, nil},
+		{"escaped keys, Unicode, and CRLF", " \t" + `{"l\u0069ne":"雪\ud83e\udd89\nnext","\u0074s":"ts"}` + " \t\r\n",
+			[]Row{{Timestamp: "ts", Line: "雪🦉\nnext"}}, nil},
+		{"ordered rows and repeats", valid + ndjson("ts", "second") + valid,
+			[]Row{fixture[0], {Timestamp: "ts", Line: "second"}, fixture[0]}, nil},
+		{"duplicate timestamp", `{"ts":"ts","ts":"ts","line":"fixture"}` + "\n", fixture, ErrViolation},
+		{"duplicate decoded line key", `{"ts":"ts","line":"earlier","l\u0069ne":"fixture"}` + "\n", fixture, ErrViolation},
+		{"unknown third field", `{"ts":"ts","line":"fixture","extra":false}` + "\n", fixture, ErrViolation},
+		{"case variant key", `{"TS":"ts","line":"fixture"}` + "\n", fixture, ErrViolation},
+		{"missing timestamp", `{"line":"fixture"}` + "\n", []Row{{Line: "fixture"}}, ErrViolation},
+		{"missing line", `{"ts":"ts"}` + "\n", []Row{{Timestamp: "ts"}}, ErrViolation},
+		{"null timestamp", `{"ts":null,"line":"fixture"}` + "\n", []Row{{Line: "fixture"}}, ErrViolation},
+		{"null line", `{"ts":"ts","line":null}` + "\n", []Row{{Timestamp: "ts"}}, ErrViolation},
+		{"number value", `{"ts":"ts","line":42}` + "\n", fixture, ErrViolation},
+		{"object value", `{"ts":{},"line":"fixture"}` + "\n", fixture, ErrViolation},
+		{"null record", "null\n", []Row{{}}, ErrViolation},
+		{"array record", "[]\n", nil, ErrViolation},
+		{"malformed object", `{"ts":"ts","line":"fixture",}` + "\n", fixture, ErrViolation},
+		{"invalid UTF-8", "{\"ts\":\"ts\",\"line\":\"\xff\"}\n", []Row{{Timestamp: "ts", Line: "�"}}, ErrViolation},
+		{"missing final newline", strings.TrimSuffix(valid, "\n"), fixture, ErrViolation},
+		{"blank record", "\n", nil, ErrViolation},
+		{"trailing blank record", valid + "\n", fixture, ErrViolation},
+		{"trailing JSON value on same line", strings.TrimSuffix(valid, "\n") + " {}\n", fixture, ErrViolation},
+		{"trailing non-JSON whitespace", strings.TrimSuffix(valid, "\n") + "\u00a0\n", fixture, ErrViolation},
+		{"trailing bytes after complete row", valid + "x", fixture, ErrViolation},
+	}
+}
+
+func TestCandidateSuccessfulQueryWireEvidence(t *testing.T) {
 	t.Parallel()
-	for _, tc := range []struct {
-		name    string
-		status  int
-		body    string
-		headers http.Header
-		wantErr bool
-		rows    int
-	}{
-		{"complete row", 200, ndjson("ts", "fixture"), nil, false, 1},
-		{"partial row framing", 200, strings.TrimSuffix(ndjson("ts", "fixture"), "\n"), nil, true, 0},
-		{"invalid row", 200, "{\"line\":\"fixture\"}\n", nil, true, 0},
-		{"denial with row", 403, ndjson("ts", "fixture"), nil, false, 1},
-		{"denial with cursor", 403, "", http.Header{"Bog-Next-Cursor": {"opaque"}}, false, 0},
-		{"denial with cursor trailer", 403, "forbidden\n", http.Header{"Trailer:bog-next-cursor": {"opaque"}}, true, 0},
-		{"short HTTP body", 200, "", http.Header{"Content-Length": {"50"}}, true, 0},
-	} {
+	for _, tc := range successfulQueryWireCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				for key, values := range tc.headers {
-					if strings.HasPrefix(key, "Trailer:") {
-						w.Header()[http.TrailerPrefix+strings.TrimPrefix(key, "Trailer:")] = values
-					} else {
-						w.Header()[key] = values
-					}
-				}
-				w.WriteHeader(tc.status)
-				if _, err := io.WriteString(w, tc.body); err != nil {
-					panic(http.ErrAbortHandler)
-				}
-			}))
-			defer server.Close()
-			target := newCandidateAdapter(Candidate{
-				Request: func(ctx context.Context, _ CandidateRequest) (*http.Request, error) {
-					return http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
-				},
-			})
-			defer target.client.CloseIdleConnections()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			got, err := target.Query(ctx, QueryRequest{})
-			if (err != nil) != tc.wantErr || len(got.Rows) != tc.rows {
-				t.Fatalf("got %d rows and error %v", len(got.Rows), err)
+			got, err := queryCandidateWirePage(t, http.StatusOK, tc.body, nil)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("got error %v, want %v", err, tc.wantErr)
 			}
-			if tc.name == "denial with cursor" && got.NextCursor != "opaque" {
-				t.Fatal("denial cursor was lost in the adapter")
+			if tc.wantErr != nil {
+				if _, ok := err.(candidateViolation); !ok || len(got.Rows) != 0 || got.Complete {
+					t.Fatal("malformed response did not produce a candidate violation with no partial evidence")
+				}
+				return
+			}
+			if !got.Complete || !slices.Equal(got.Rows, tc.rows) || string(got.Body) != tc.body {
+				t.Fatalf("got page %+v, want complete evidence for %q with rows %v", got, tc.body, tc.rows)
 			}
 		})
 	}
+}
+
+func TestCandidateQueryWireEvidence(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		headers    http.Header
+		wantErr    error
+		rows       []Row
+		cursor     string
+	}{
+		{"denial with row", ndjson("ts", "fixture"), http.StatusForbidden, nil, nil, []Row{{"ts", "fixture"}}, ""},
+		{"denial with nonstandard row", "forbidden\n" + `{"ts":"ts","line":"earlier","line":"fixture","extra":true}`,
+			http.StatusForbidden, nil, nil, []Row{{"ts", "fixture"}}, ""},
+		{"denial with cursor", "", http.StatusForbidden, http.Header{"Bog-Next-Cursor": {"opaque"}}, nil, nil, "opaque"},
+		{"denial with cursor trailer", "forbidden\n", http.StatusForbidden, http.Header{"Trailer:bog-next-cursor": {"opaque"}}, ErrViolation, nil, ""},
+		{"short HTTP body", "", http.StatusOK, http.Header{"Content-Length": {"50"}}, io.ErrUnexpectedEOF, nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := queryCandidateWirePage(t, tc.status, tc.body, tc.headers)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("got error %v, want %v", err, tc.wantErr)
+			}
+			if !slices.Equal(got.Rows, tc.rows) || got.NextCursor != tc.cursor {
+				t.Fatalf("got rows %v and cursor %q, want rows %v and cursor %q", got.Rows, got.NextCursor, tc.rows, tc.cursor)
+			}
+		})
+	}
+}
+
+func queryCandidateWirePage(t *testing.T, status int, body string, headers http.Header) (Page, error) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for key, values := range headers {
+			if name, ok := strings.CutPrefix(key, "Trailer:"); ok {
+				w.Header()[http.TrailerPrefix+name] = values
+			} else {
+				w.Header()[key] = values
+			}
+		}
+		w.WriteHeader(status)
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("write fixture response: %v", err)
+			panic(http.ErrAbortHandler)
+		}
+	}))
+	defer server.Close()
+	target := newCandidateAdapter(Candidate{
+		Request: func(ctx context.Context, _ CandidateRequest) (*http.Request, error) {
+			return http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+		},
+	})
+	defer target.client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return target.Query(ctx, QueryRequest{})
 }
 
 func TestCandidateResponseReadCancellation(t *testing.T) {

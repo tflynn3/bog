@@ -1,9 +1,7 @@
 package streampolicy
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
@@ -64,16 +62,9 @@ func compareQueryBody(body []byte, want []Row) error {
 	if len(body) == 0 && len(want) != 0 {
 		return fmt.Errorf("%w: query rows lack wire evidence", ErrIncomplete)
 	}
-	for _, expected := range want {
-		line, rest, ended := bytes.Cut(body, []byte("\n"))
-		var row Row
-		if !ended || json.Unmarshal(line, &row) != nil || row != expected {
-			return fmt.Errorf("%w: wire page differs from expected rows", ErrViolation)
-		}
-		body = rest
-	}
-	if len(body) != 0 {
-		return fmt.Errorf("%w: wire page contains unexpected rows or trailing bytes", ErrViolation)
+	rows, err := decodeQueryRows(body)
+	if err != nil || !slices.Equal(rows, want) {
+		return fmt.Errorf("%w: wire page differs from expected rows", ErrViolation)
 	}
 	return nil
 }

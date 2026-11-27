@@ -39,6 +39,41 @@ func TestPolicyRevisionScenario(t *testing.T) {
 	}
 }
 
+func TestRevisionSuccessfulQueryWireEvidence(t *testing.T) {
+	t.Parallel()
+	want := []Row{{Timestamp: "ts", Line: "first"}, {Timestamp: "ts", Line: "second"}}
+	first, second := ndjson("ts", "first"), ndjson("ts", "second")
+	cases := append(successfulQueryWireCases(),
+		successfulQueryWireCase{"missing wire evidence", "", want, ErrIncomplete},
+		successfulQueryWireCase{"missing row", first, want, ErrViolation},
+		successfulQueryWireCase{"out of order", second + first, want, ErrViolation},
+		successfulQueryWireCase{"extra repeated row", first + second + first, want, ErrViolation},
+		successfulQueryWireCase{"unexpected row on empty page", first, nil, ErrViolation},
+	)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			target := &observedTarget{
+				syntheticTarget: newSynthetic(),
+				query: func(_ QueryRequest, page *Page) error {
+					// Keep the adapter's decoded rows correct to exercise the
+					// revision scenario's independent wire comparison.
+					page.Rows = tc.rows
+					page.Body = []byte(tc.body)
+					return nil
+				},
+			}
+			s := revisionScenario{scenario: newScenario(Adapters{Query: target})}
+			s.model = newPolicyModel(s.fixture)
+			request := s.queryRequest(Target{alice, s.fixture.Streams[0].Selector}, 10)
+			_, err := s.revisionPage(t.Context(), request, tc.rows)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("got error %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestMaskingRevisionCursorWitnesses(t *testing.T) {
 	t.Parallel()
 	const original, changed, restored = "fixture-masking-v1", "fixture-masking-v2", "fixture-masking-v3"

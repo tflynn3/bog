@@ -4,11 +4,9 @@ package fuzz
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"hash/crc32"
 	"io"
 	"maps"
 	"os"
@@ -25,12 +23,6 @@ import (
 )
 
 const (
-	metadataFile = "bog.backup"
-	manifestFile = "bog.checkpoint"
-	tailFile     = "bog.wal.tail"
-	walMagic     = "BOGWAL01"
-
-	frameHeader = 16
 	blockHeader = 44
 	rowHeader   = 24
 
@@ -40,13 +32,9 @@ const (
 )
 
 var (
-	le       = binary.LittleEndian
-	crcTable = crc32.MakeTable(crc32.Castagnoli)
-	start    = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	end      = start.Add(time.Hour)
+	start = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	end   = start.Add(time.Hour)
 )
-
-type files map[string][]byte
 
 type fixture struct {
 	image         files
@@ -54,34 +42,6 @@ type fixture struct {
 	point         backup.Point
 	covered, rows []backup.Row
 }
-
-type capture struct {
-	point backup.Point
-	files files
-	wal   []byte
-}
-
-func (c capture) Point() backup.Point { return c.point }
-
-func (c capture) OpenManifest() (io.ReadCloser, error) {
-	return c.OpenSegment(manifestFile)
-}
-
-func (c capture) OpenSegment(name string) (io.ReadCloser, error) {
-	data, ok := c.files[name]
-	if !ok {
-		return nil, os.ErrNotExist
-	}
-	return io.NopCloser(bytes.NewReader(data)), nil
-}
-
-func (c capture) OpenWAL() (backup.WALReader, error) {
-	return memoryWAL{bytes.NewReader(c.wal)}, nil
-}
-
-type memoryWAL struct{ *bytes.Reader }
-
-func (memoryWAL) Close() error { return nil }
 
 func must(t testing.TB, err error) {
 	t.Helper()
@@ -102,13 +62,7 @@ func frame(t testing.TB, rows []backup.Row) []byte {
 	for _, row := range rows {
 		must(t, encoder.Encode(row.Row))
 	}
-	b := make([]byte, frameHeader)
-	n := uint32(payload.Len())
-	le.PutUint32(b[0:4], n)
-	le.PutUint32(b[4:8], ^n)
-	le.PutUint32(b[8:12], crc32.Checksum(payload.Bytes(), crcTable))
-	le.PutUint32(b[12:16], crc32.Checksum(b[:12], crcTable))
-	return append(b, payload.Bytes()...)
+	return replayFrame(payload.Bytes())
 }
 
 func newFixture(t testing.TB) fixture {

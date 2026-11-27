@@ -195,3 +195,20 @@ capture reservations and fixture descriptors return to their catalog
 baseline. A fresh reader verifies every timestamp, line and append
 ordinal in order. Closing the catalog releases the generation pin and
 its reservations and descriptors.
+
+## Bounded replay oracle
+
+The checkpoint recovery and retained export lifecycle suites use a
+committed-batch ledger populated from synthetic fixture input and acknowledged
+WAL writes. It frames the expected WAL bytes independently and uses the
+append-log query model for timestamp and ordinal order. The cases check
+duplicate rows, backfill, export and restore bytes, the predecessor after
+interrupted publication, and the exact prefix selected by a stale WAL marker.
+A truncated checkpoint or tail and stale backup metadata paired with a newer
+tail require typed integrity rejection.
+
+The oracle admits at most eight batches, 64 rows, and 16 KiB of framed
+input. Artifact observation has a five-second deadline, caps individual files
+at 32 KiB and total file bytes at 64 KiB, and verifies rows as they are read.
+The Linux worker deadlines and resource limits also apply to these cases.
+Portable oracle unit and reader tests run with `go test -race ./verify/fuzz`.

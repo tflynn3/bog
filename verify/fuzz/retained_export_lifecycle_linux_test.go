@@ -10,13 +10,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	"bog/internal/backup"
 	"bog/internal/checkpoint"
 	"bog/internal/history"
-	"bog/internal/store"
 	"bog/internal/wal"
 )
 
@@ -29,6 +29,7 @@ type retainedExportSnapshot struct {
 	wal      *wal.Capture
 
 	ctx     context.Context
+	barrier sync.Once
 	entered chan struct{}
 	resume  chan struct{}
 }
@@ -42,11 +43,7 @@ func (s *retainedExportSnapshot) OpenManifest() (io.ReadCloser, error) {
 func (s *retainedExportSnapshot) OpenSegment(name string) (io.ReadCloser, error) {
 	// Export has installed the manifest in its private stage. Delay opening
 	// the first segment so the segment and WAL reads happen after activation.
-	select {
-	case <-s.entered:
-	default:
-		close(s.entered)
-	}
+	s.barrier.Do(func() { close(s.entered) })
 	select {
 	case <-s.resume:
 		return s.root.Open(name)
@@ -82,7 +79,7 @@ func TestRetainedExportLifecycle(t *testing.T) {
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^TestRetainedExportLifecycle$", "-test.count=1", "-test.v")
 	cmd.WaitDelay = time.Second
 	cmd.Env = append(cmd.Environ(), worker+"=1", "TMPDIR="+t.TempDir())
-	output, err := cmd.CombinedOutput()
+	output, err := runBoundedReplayWorker(cmd)
 	if ctx.Err() != nil {
 		t.Fatalf("retained export worker exceeded %s: %v\n%s", corpusDeadline, ctx.Err(), output)
 	}
@@ -101,6 +98,11 @@ func captureExportWAL(t *testing.T, owner *wal.Log, data []byte, next uint64) *w
 	t.Cleanup(func() { must(t, c.Release()) })
 	if c.CommittedEnd() != int64(len(data)) || c.NextOrdinal() != next {
 		t.Fatalf("captured WAL end/ordinal = %d/%d, want %d/%d", c.CommittedEnd(), c.NextOrdinal(), len(data), next)
+	}
+	got := make([]byte, len(data)+1)
+	n, err := c.ReadAt(got, 0)
+	if n != len(data) || !errors.Is(err, io.EOF) || !bytes.Equal(got[:n], data) {
+		t.Fatalf("captured WAL differs from fixture input: read %d bytes, error %v", n, err)
 	}
 	return c
 }
@@ -127,16 +129,11 @@ func runRetainedExportLifecycle(t *testing.T, cancelExport bool) {
 	catalog := history.NewCatalog(budget)
 	t.Cleanup(func() { must(t, catalog.Close()) })
 	publisher := checkpoint.NewPublisher(root, dir, budget)
-	walPath := filepath.Join(source, walFile)
-	rows := []store.Row{
-		{TS: start.Add(time.Second), Line: "checkpoint row"},
-		{TS: start.Add(time.Second), Line: "captured tail tie"},
-		{TS: start.Add(time.Second), Line: "later tie"},
-		{TS: start, Line: "later backfill"},
-	}
-
-	appendRows(t, owner, rows[:1])
-	prefix := readArtifact(t, walPath)
+	batches := replayHistory(42)
+	var ledger committedBatchLedger
+	appendReplayBatch(t, owner, &ledger, batches[0])
+	checkpointView := fixtureReplayView(t, &ledger, 1, 1)
+	prefix := checkpointView.wal
 	initial := captureExportWAL(t, owner, prefix, 1)
 	first, err := publisher.PublishCaptured(ctx, initial, initial.CommittedEnd(), nil, initial.NextOrdinal(), digest(prefix))
 	must(t, err)
@@ -147,13 +144,14 @@ func runRetainedExportLifecycle(t *testing.T, cancelExport bool) {
 		t.Fatalf("original generation boundary = %+v, want %+v", old.Boundary, want)
 	}
 
-	appendRows(t, owner, rows[1:2])
-	originalWAL := readArtifact(t, walPath)
-	walPin := captureExportWAL(t, owner, originalWAL, 2)
+	appendReplayBatch(t, owner, &ledger, batches[1])
+	exportView := fixtureReplayView(t, &ledger, 1, 2)
+	originalWAL := exportView.wal
+	walPin := captureExportWAL(t, owner, originalWAL, uint64(len(exportView.rows)))
 	pin, err := catalog.AcquireCurrent()
 	must(t, err)
 	t.Cleanup(func() { must(t, pin.Close()) })
-	checkHistoryRows(t, pin, old, checkpointRows(rows[:1]))
+	checkHistoryRows(t, pin, old, replayBackupRows(checkpointView))
 	assertExportUsage(t, budget, 1, 1)
 
 	parent := t.TempDir()
@@ -164,24 +162,23 @@ func runRetainedExportLifecycle(t *testing.T, cancelExport bool) {
 		placeholder, err = os.Stat(dest)
 		must(t, err)
 	}
-	exportCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	sourceImage := historyFiles(readFiles(t, source))
+	generationID := replayGenerationID(t, sourceImage)
+	boundary := exportView.boundary(generationID)
+	exportCtx, cancel := context.WithTimeout(ctx, wait)
+	t.Cleanup(cancel)
 	snapshot := &retainedExportSnapshot{
 		point: backup.Point{
-			Generation: [sha256.Size]byte(old.ID), CoveredOffset: int64(len(prefix)),
-			NextOrdinal: 1, CommittedEnd: int64(len(originalWAL)),
+			Generation: generationID, CoveredOffset: boundary.covered,
+			NextOrdinal: boundary.next, CommittedEnd: boundary.end,
 		},
-		manifest: readArtifact(t, filepath.Join(source, manifestFile)),
+		manifest: sourceImage[manifestFile],
 		root:     root, wal: walPin, ctx: exportCtx,
 		entered: make(chan struct{}), resume: make(chan struct{}),
 	}
 
 	done := make(chan struct{})
 	var exportErr error
-	go func() {
-		defer close(done)
-		exportErr = backup.Export(exportCtx, snapshot, dest)
-	}()
 	awaitExport := func() {
 		t.Helper()
 		select {
@@ -190,9 +187,13 @@ func runRetainedExportLifecycle(t *testing.T, cancelExport bool) {
 			t.Fatal("export did not finish")
 		}
 	}
-	defer func() {
+	t.Cleanup(func() {
 		cancel()
 		awaitExport()
+	})
+	go func() {
+		defer close(done)
+		exportErr = backup.Export(exportCtx, snapshot, dest)
 	}()
 
 	select {
@@ -217,9 +218,10 @@ func runRetainedExportLifecycle(t *testing.T, cancelExport bool) {
 
 	// This append is acknowledged while export is paused. Publish the same
 	// WAL inode at its newer cutoff and activate under the same owner.
-	appendRows(t, owner, rows[2:])
-	laterWAL := readArtifact(t, walPath)
-	later := captureExportWAL(t, owner, laterWAL, uint64(len(rows)))
+	appendReplayBatch(t, owner, &ledger, batches[2])
+	liveView := fixtureReplayView(t, &ledger, 3, 3)
+	laterWAL := liveView.wal
+	later := captureExportWAL(t, owner, laterWAL, uint64(len(liveView.rows)))
 	if later.Identity() != walPin.Identity() {
 		t.Fatal("incremental replacement changed WAL identity")
 	}
@@ -238,7 +240,7 @@ func runRetainedExportLifecycle(t *testing.T, cancelExport bool) {
 	}
 	fresh, err := replacement.ReplacePinned(ctx, dir)
 	must(t, err)
-	if want := (history.Boundary{SourceSHA256: sha256.Sum256(laterWAL), CoveredOffset: int64(len(laterWAL)), NextOrdinal: uint64(len(rows))}); fresh.ID == old.ID || fresh.Boundary != want {
+	if want := (history.Boundary{SourceSHA256: sha256.Sum256(laterWAL), CoveredOffset: int64(len(laterWAL)), NextOrdinal: uint64(len(liveView.rows))}); fresh.ID == old.ID || fresh.Boundary != want {
 		t.Fatalf("successor generation = %+v, want new ID and boundary %+v", fresh, want)
 	}
 
@@ -252,8 +254,8 @@ func runRetainedExportLifecycle(t *testing.T, cancelExport bool) {
 	if !errors.As(err, &expired) || expired.ID != old.ID {
 		t.Fatalf("acquire retired generation: got %v, want expiry for %x", err, old.ID)
 	}
-	assertHistoryRows(t, catalog.AcquireCurrent, fresh, checkpointRows(rows))
-	checkHistoryRows(t, pin, old, checkpointRows(rows[:1]))
+	assertHistoryRows(t, catalog.AcquireCurrent, fresh, replayBackupRows(liveView))
+	checkHistoryRows(t, pin, old, replayBackupRows(checkpointView))
 	assertExportUsage(t, budget, 2, 1)
 	select {
 	case <-old.Drained:
@@ -318,21 +320,12 @@ func runRetainedExportLifecycle(t *testing.T, cancelExport bool) {
 	extra.Close()
 
 	if !cancelExport {
-		point, err := backup.Verify(ctx, dest)
-		must(t, err)
-		if point != snapshot.point {
-			t.Fatalf("export point = %+v, want %+v", point, snapshot.point)
-		}
-		restored := filepath.Join(t.TempDir(), "restored")
-		must(t, backup.Restore(ctx, dest, restored))
-		assertRestored(t, restored, snapshot.point, checkpointRows(rows[:2]))
-		got := readFiles(t, restored)
-		if !bytes.Equal(got[manifestFile], snapshot.manifest) ||
-			!bytes.Equal(got[tailFile], originalWAL[len(prefix):]) {
-			t.Fatal("restored manifest or WAL tail differs from the original capture")
-		}
+		sourceImage[tailFile] = exportView.tail()
+		sourceImage[metadataFile] = replayBackupMetadata(exportView, generationID)
+		checkBackupReplayRoundTrip(t, dest, exportView, sourceImage, generationID)
+		checkBackupReplayRejections(t, sourceImage, replayBackupMetadata(checkpointView, generationID))
 	}
-	assertHistoryRows(t, catalog.AcquireCurrent, fresh, checkpointRows(rows))
+	assertHistoryRows(t, catalog.AcquireCurrent, fresh, replayBackupRows(liveView))
 	must(t, catalog.Close())
 	assertExportUsage(t, budget, 0, 0)
 }

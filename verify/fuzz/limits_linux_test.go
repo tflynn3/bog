@@ -69,7 +69,7 @@ func runCorpusWorker(t *testing.T, suite string) {
 	}
 	// The parent owns the temporary root even when killing the worker.
 	cmd.Env = append(cmd.Environ(), workerEnv+"="+suite, "TMPDIR="+temporaryRoot)
-	output, err := cmd.CombinedOutput()
+	output, err := runBoundedReplayWorker(cmd)
 	if ctx.Err() != nil {
 		t.Fatalf("%s exceeded %s: %v\n%s", suite, corpusDeadline, ctx.Err(), output)
 	}

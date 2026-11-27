@@ -16,7 +16,7 @@ authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
 The Linux amd64 and arm64 production inventories at
-`f432cf9a9f98aba41f7e787c70faaba015ab1226` agree on the 19 root-module
+`1bd7b12fefa319e6aea4bc23425a37df9546ea4d` agree on the 19 root-module
 production packages and 23 direct imports between them shown below.
 `cmd/bog` reaches HTTP, readiness, store, and WAL and recovers an ordinary
 WAL into an in-memory store. The command still uses path-based readiness
@@ -367,17 +367,32 @@ revision. #108 remains the release gate.
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification),
 [Tail-only recovery contract](../adr/0035-tail-only-retained-recovery-contract.md)
 
-Land the constructor fitness change ahead of Storage's registry and
-topology update. Recheck write leases at dispatch and at the Storage
-handoff. At the reviewed Storage SHA, compare both Linux inventories
-and rerun the architecture suite. The command wiring PR updates
-`internal/archtest/architecture_test.go` with the exact
+The constructor fitness guard landed in `b27b41ff9fcd46f3497725b052075e8353a0ede7`.
+Storage carries #47 and #15 in #108 and coordinates role promotion with
+Core Architecture in the reviewed command wiring PR. Recheck write leases
+at dispatch and at the Storage handoff. At the reviewed Storage SHA,
+compare both Linux inventories and rerun the architecture suite. The wiring
+PR updates `internal/archtest/architecture_test.go` with the exact
 imports and roles, `internal/archtest/staged_packages_test.go` with the
 remaining staging declarations, and `docs/architecture/SYSTEM.md` with the
 measured revision, diagram, and role table. Preserve the operator backup
 edge and the exporter and release evidence registrations.
+[Landed constructor guard](https://github.com/tflynn3/bog/commit/b27b41ff9fcd46f3497725b052075e8353a0ede7),
 [Package role governance](../adr/0019-package-role-governance.md),
 [Exporter integration handoff](../adr/0032-operator-export-boundary.md#integration-and-qualification)
+
+At promotion, Storage traces the serving `PageSource` to the command-owned
+adapter that pins the validated generation and exact durable, query-visible
+WAL suffix under the owner's synchronization. Core Engineering reviews
+paging and capture release after the final reference drains. Storage also
+traces readiness to a fresh, unlocked open relative to the pinned WAL
+directory and verifies that the command cancels probes before closing the
+descriptor. Release Verification still needs exact held, fresh, and restart
+walks across replacement and acknowledged backfill, plus readiness and
+ingest against the active WAL filesystem after path retargets in both
+directions, on the same composed revision on both native Linux targets.
+[Promotion evidence](../adr/0040-retained-runtime-constructor-boundary.md#runtime-evidence),
+[Native release evidence](#release-evidence)
 
 The Architecture workflow runs `go test -count=1 ./internal/archtest`.
 The suite lists packages with `GOOS=linux`, `GOAMD64=v1`, `GOARM64=v8.0`,
@@ -387,6 +402,8 @@ and server reachability are checked against both inventories. The diagram
 fitness test checks every declared production node and directed edge, the
 Runtime closure, and Staged membership against the same registry. Test
 imports and nested modules are outside the root-module production registry.
+Boundary checks walk declared imports and each measured Linux graph
+independently. The measured walk also follows external production imports.
 [Diagram fitness test](../../internal/archtest/system_diagram_test.go)
 
 - When the registry marks any of checkpoint, history, or backup as a

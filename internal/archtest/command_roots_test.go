@@ -33,14 +33,6 @@ func serverCommandBoundaryProblems(rules map[string]rule) []string {
 	return problems
 }
 
-func registeredReachability(rules map[string]rule, root string) map[string]bool {
-	packages := make(map[string]listedPackage, len(rules))
-	for path, entry := range rules {
-		packages[path] = listedPackage{Imports: entry.imports}
-	}
-	return reachableImports(packages, root)
-}
-
 func TestServerCommandRegistration(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {

@@ -22,11 +22,7 @@ func TestQueryOracleIndependence(t *testing.T) {
 // TestLinuxArchitecture checks that the registry matches the root-module
 // production graph. Enforce oracle independence even for registered paths.
 func queryOracleProblems(rules map[string]rule) []string {
-	packages := make(map[string]listedPackage, len(rules))
-	for path, entry := range rules {
-		packages[path] = listedPackage{Imports: entry.imports}
-	}
-	reached := reachableImports(packages, queryModel)
+	reached := registeredReachability(rules, queryModel)
 
 	var problems []string
 	for _, path := range slices.Sorted(maps.Keys(reached)) {
@@ -102,17 +98,7 @@ func TestQueryOracleIndependenceFixtures(t *testing.T) {
 				queryModel: {verifierModel, tt.oracleImports},
 				helper:     {verifierModel, tt.helperImports},
 			}
-			packages := make(map[string]listedPackage, len(rules))
-			for path, entry := range rules {
-				name := "library"
-				if entry.role == serverCommand || entry.role == verifier {
-					name = "main"
-				}
-				packages[path] = productionPackage(name, entry.imports...)
-			}
-			if problems := architectureProblems(packages, rules); len(problems) != 0 {
-				t.Fatalf("fixture violates the existing architecture rules: %v", problems)
-			}
+			requireValidCommandFixture(t, rules)
 			if got := queryOracleProblems(rules); !slices.Equal(got, tt.want) {
 				t.Errorf("queryOracleProblems() = %q, want %q", got, tt.want)
 			}

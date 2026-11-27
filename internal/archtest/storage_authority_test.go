@@ -25,10 +25,7 @@ func storageAuthorityProblems(rules map[string]rule) []string {
 		idempotency = "bog/internal/idempotency"
 		wal         = "bog/internal/wal"
 	)
-	packages := make(map[string]listedPackage, len(rules))
-	for path, entry := range rules {
-		packages[path] = listedPackage{Imports: entry.imports}
-	}
+	packages := ruleImportGraph(rules)
 
 	retained := []string{backup, checkpoint, history}
 	walPeers := append(retained, idempotency)
@@ -212,17 +209,7 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 				entry.imports = append(entry.imports, target)
 				rules[tt.from] = entry
 			}
-			packages := make(map[string]listedPackage, len(rules))
-			for path, entry := range rules {
-				name := "library"
-				if path == server {
-					name = "main"
-				}
-				packages[path] = productionPackage(name, entry.imports...)
-			}
-			if problems := architectureProblems(packages, rules); len(problems) != 0 {
-				t.Fatalf("fixture violates the existing architecture rules: %v", problems)
-			}
+			requireValidCommandFixture(t, rules)
 			if problems := pagingBoundaryProblems(rules); len(problems) != 0 {
 				t.Fatalf("fixture violates the HTTP paging boundary: %v", problems)
 			}

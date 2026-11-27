@@ -1,7 +1,10 @@
 # ADR 0040 — Retained runtime constructor boundary
 
-**Status** — Proposed for Cycle 176 and amended for Cycle 177. Core
-Architecture owns this decision.
+**Status** — The constructor fitness guard landed in
+`b27b41ff9fcd46f3497725b052075e8353a0ede7`. Storage's #108 runtime wiring,
+registry promotion, and native qualification are pending. Core Architecture
+owns this decision.
+[Landed constructor guard](https://github.com/tflynn3/bog/commit/b27b41ff9fcd46f3497725b052075e8353a0ede7)
 
 ## Decision
 
@@ -49,7 +52,8 @@ The existing fitness suites continue to enforce dependency direction,
 cycles, package reachability, and staging declarations. Constructor
 selection complements those checks because both implementations import the
 same HTTP and readiness packages. The constructor rule checks source
-references.
+references. Promotion also requires tracing the values passed to the
+serving constructors and collecting the runtime evidence below.
 [Constructor fitness check](../../internal/archtest/retained_runtime_wiring_test.go),
 [System fitness settings](../architecture/SYSTEM.md#fitness-and-registry-ownership)
 
@@ -75,13 +79,16 @@ references.
 
 ## Integration
 
-Land the Core Architecture fitness change before Storage's registry and
-topology update. Recheck write leases at dispatch and at the Storage
-handoff. Storage owns #108 runtime wiring, role promotions, and measured
-topology. On each promotion and on the final composed #108 SHA, verify
-the registry against both Linux production inventories and rerun the
-architecture suite. Storage reviews source and descriptor ownership.
-Core Engineering reviews the `PageSource` and paging lifecycle.
+Storage carries #47 and #15 in #108 and owns the runtime wiring. Recheck
+write leases at dispatch and at the Storage handoff. Coordinate each role
+promotion and its measured topology update with Core Architecture in the
+reviewed command wiring PR. Promote a retained library when `cmd/bog`
+reaches it in both Linux inventories and its activation criteria are met.
+On each promotion and on the final composed #108 SHA, verify the registry
+against both inventories and rerun the architecture suite. Storage reviews
+source and descriptor ownership. Core Engineering reviews the `PageSource`
+and paging lifecycle.
+[Registry promotion handoff](../architecture/SYSTEM.md#fitness-and-registry-ownership)
 
 #108 remains the release gate. Release Verification qualifies the same
 composed revision on native Linux amd64 and arm64, including exact live

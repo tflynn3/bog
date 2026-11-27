@@ -128,3 +128,48 @@ The parent enforces the 45-second corpus deadline. Kill workers reuse the
 12-second phase barrier and SIGKILL reaping, and all workers use the
 existing relative address-space and per-file write limits. This focused
 fixture runs alongside the separate 128 MiB capacity verifier fixtures.
+
+## Peak memory for concurrent retained scans
+
+Run on native Linux amd64 and arm64 and retain the two
+`retained_scan_memory` JSON records from the verbose test output.
+
+```sh
+BOG_TEST_CGROUP_PARENT=/sys/fs/cgroup/path/to/delegation \
+  go test -race -count=1 -v -timeout=2m -run '^TestRetainedScanMemory$' ./verify/fuzz
+```
+
+The parent must have the cgroup v2 memory controller enabled for its
+children and permit creating and entering a child cgroup. If the variable
+is omitted, the harness tries the current cgroup as the parent. On hosts
+without delegation or `memory.peak`, the report records a null cgroup peak
+and a reason. An explicitly requested cgroup must work. Each of the two
+fresh workers enters its own cgroup before loading the catalog. The
+parent seeds the shared fixture outside those cgroups, so filesystem
+cache charged during seeding can remain outside the measured groups.
+The harness removes each group after its worker exits.
+
+The fixture uses 1,024 overlapping segments within a 10 MiB disk budget.
+Its first ordered row contains the largest unescaped line that fits a
+single WAL batch. It spans the scan read page and forces overflow on each
+worker. The other segments contain late appends and identical tied
+backfills. Each concurrency case uses the same on-disk generation,
+measuring once with a single scan and once with the server's configured
+default concurrency. All visitors hold the maximum-size line together.
+
+Process peak RSS comes from `VmHWM` and the isolated cgroup peak comes
+from `memory.peak`, both read after cancellation and before the exact
+retry. These high-water marks include catalog load. The heap baseline is
+the loaded catalog after a forced GC. The harness samples Go's
+`HeapAlloc` during scan startup and at the overflow barrier and reports
+the largest observed increment above baseline. In between collections,
+`HeapAlloc` can include objects awaiting collection. The separate
+post-GC heap samples at the barrier and after cancellation show retained
+heap with and without active scan state.
+
+The barrier closes reader handles while scan reservations are still
+charged. Cancellation joins the scans under one deadline and checks that
+capture reservations and fixture descriptors return to their catalog
+baseline. A fresh reader verifies every timestamp, line and append
+ordinal in order. Closing the catalog releases the generation pin and
+its reservations and descriptors.

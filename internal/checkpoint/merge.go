@@ -2,7 +2,6 @@ package checkpoint
 
 import (
 	"cmp"
-	"container/heap"
 	"errors"
 	"fmt"
 	"slices"
@@ -11,15 +10,7 @@ import (
 	"bog/internal/store"
 )
 
-const (
-	// The local packing window holds at most four old inputs. If the
-	// suffix fits only across more blocks, fillSlack visits them one at a
-	// time. Each original can be replaced once per attempt.
-	mergeFanIn   = 4
-	blockPayload = MaxBlockSize - blockHeaderSize
-)
-
-var errSegmentCapacity = errors.New("checkpoint segment limit exceeded: bounded merge has insufficient space")
+const blockPayload = MaxBlockSize - blockHeaderSize
 
 type segmentBuilder struct {
 	attempt       *publicationAttempt
@@ -245,7 +236,7 @@ func (b *segmentBuilder) repack(window []int, run []BlockRow, payload int) error
 		if minimum > i+1 {
 			continue
 		}
-		layout, err := packMergeRows(b.attempt, rows, minimum, i+1)
+		layout, err := packMergeRows(b.attempt.ctx, rows, blockPayload, minimum, i+1)
 		if errors.Is(err, errSegmentCapacity) {
 			continue
 		}
@@ -261,76 +252,6 @@ func (b *segmentBuilder) repack(window []int, run []BlockRow, payload int) error
 		return nil
 	}
 	return errSegmentCapacity
-}
-
-// packMergeRows groups rows in place using one small assignment index per
-// row. Retrying with more bins does not decode or allocate another copy of the
-// rows. The window bounds both row storage and the number of placement trials.
-func packMergeRows(a *publicationAttempt, rows []BlockRow, minimum, maximum int) ([][]BlockRow, error) {
-	sortByMergeSize(rows)
-	bins := make([]uint16, len(rows))
-	var counts [mergeFanIn]int
-	for limit := minimum; limit <= maximum; limit++ {
-		var room [mergeFanIn]int
-		for i := range room[:limit] {
-			room[i] = blockPayload
-		}
-		clear(counts[:])
-		for i, row := range rows {
-			if i%1024 == 0 {
-				if err := a.ctx.Err(); err != nil {
-					return nil, err
-				}
-			}
-			size := blockRowSize + len(row.Row.Line)
-			best := -1
-			for candidate, free := range room[:limit] {
-				if free >= size && (best == -1 || free < room[best]) {
-					best = candidate
-				}
-			}
-			if best == -1 {
-				break
-			}
-			bins[i] = uint16(best)
-			room[best] -= size
-			counts[best]++
-			if i == len(rows)-1 {
-				return groupMergeRows(rows, bins, counts[:limit]), nil
-			}
-		}
-	}
-	return nil, errSegmentCapacity
-}
-
-func groupMergeRows(rows []BlockRow, bins []uint16, counts []int) [][]BlockRow {
-	ends := make([]int, len(counts))
-	next := make([]int, len(counts))
-	pos := 0
-	layout := make([][]BlockRow, 0, len(counts))
-	for bin, count := range counts {
-		next[bin] = pos
-		ends[bin] = pos + count
-		if count > 0 {
-			layout = append(layout, rows[pos:pos+count:pos+count])
-		}
-		pos += count
-	}
-	for bin, end := range ends {
-		for next[bin] < end {
-			i := next[bin]
-			dest := bins[i]
-			if int(dest) == bin {
-				next[bin]++
-				continue
-			}
-			j := next[dest]
-			rows[i], rows[j] = rows[j], rows[i]
-			bins[i], bins[j] = bins[j], bins[i]
-			next[dest]++
-		}
-	}
-	return layout
 }
 
 // fillSlack partitions only the suffix across eligible gaps. It decodes one
@@ -363,8 +284,11 @@ func (b *segmentBuilder) fillSlack(run []BlockRow, payload int) error {
 	// The run arrives in ordinal order. Remember its lower bound before
 	// changing that order so staged inputs can be checked independently.
 	first := run[0].Ordinal
-	sortByMergeSize(run)
-	layout, err := b.placeInSlack(run, candidates)
+	rooms := make([]int, len(candidates))
+	for i, candidate := range candidates {
+		rooms[i] = candidate.room
+	}
+	layout, err := placeInSlack(b.attempt.ctx, run, rooms)
 	if err != nil {
 		return err
 	}
@@ -400,71 +324,4 @@ type slackInput struct {
 	index  int
 	room   int
 	staged bool
-}
-
-func sortByMergeSize(rows []BlockRow) {
-	slices.SortFunc(rows, func(a, b BlockRow) int {
-		if bySize := cmp.Compare(len(b.Row.Line), len(a.Row.Line)); bySize != 0 {
-			return bySize
-		}
-		return cmp.Compare(a.Ordinal, b.Ordinal)
-	})
-}
-
-type slackBin struct {
-	index int
-	room  int
-}
-
-type slackQueue []slackBin
-
-func (q slackQueue) Len() int { return len(q) }
-func (q slackQueue) Less(i, j int) bool {
-	if q[i].room != q[j].room {
-		return q[i].room > q[j].room
-	}
-	return q[i].index < q[j].index
-}
-func (q slackQueue) Swap(i, j int) { q[i], q[j] = q[j], q[i] }
-
-func (q *slackQueue) Push(x any) { *q = append(*q, x.(slackBin)) }
-func (q *slackQueue) Pop() any {
-	old := *q
-	last := old[len(old)-1]
-	*q = old[:len(old)-1]
-	return last
-}
-
-func (b *segmentBuilder) placeInSlack(run []BlockRow, candidates []slackInput) ([][]BlockRow, error) {
-	q := make(slackQueue, 0, len(candidates))
-	// Avoid spreading small backfills across more blocks than necessary.
-	// Add a new candidate only when all previously used gaps are too small.
-	counts := make([]int, 0, len(candidates))
-	assignments := make([]uint16, len(run))
-	for i, row := range run {
-		if i%1024 == 0 {
-			if err := b.attempt.ctx.Err(); err != nil {
-				return nil, err
-			}
-		}
-		size := blockRowSize + len(row.Row.Line)
-		if len(q) == 0 || q[0].room < size {
-			next := len(counts)
-			if next == len(candidates) {
-				return nil, errSegmentCapacity
-			}
-			room := candidates[next].room
-			if room < size {
-				return nil, errSegmentCapacity
-			}
-			heap.Push(&q, slackBin{index: next, room: room})
-			counts = append(counts, 0)
-		}
-		c := q[0].index
-		counts[c]++
-		assignments[i] = uint16(c)
-		q[0].room -= size
-		heap.Fix(&q, 0)
-	}
-	return groupMergeRows(run, assignments, counts), nil
 }

@@ -11,12 +11,16 @@ uses the resulting absolute binary path for every verifier. Download
 the revision, SHA-256, build metadata, fixture, runner and filesystem
 configuration, reports, producer exit statuses, and logs.
 
+Native qualification of the composed #108 revision remains pending on
+both architectures. Earlier arm64 QA at `5423535` failed writable
+restore and loopback compaction setup.
+
 The admission, durability, and capacity producers take
 `-binary PATH -revision SHA -fixture ID -report PATH`.
 The release fixture ID is `linux-release-v1`. The workflow runs
 `go run ./verify/release`, restored parity, fixed-budget backfill,
-capacity control scope, and strict report validation from the workflow
-checkout (`gate`). It runs
+capacity control scope, retained shutdown, and strict report validation
+from the workflow checkout (`gate`). It runs
 `go run ./verify/linux` (#3) and `go run ./bench/retained-history` (#32) from the
 candidate checkout. The query-model race suite runs from `gate` against the
 pinned server. The direct HTTP handler fixtures compile from the candidate
@@ -125,6 +129,54 @@ duplicate, or mismatched required evidence blocks qualification.
 Historical report validation allows both event flags to be omitted. If
 either is supplied, both are required and the existing replay and handler
 checks apply.
+
+## Retained shutdown qualification
+
+Both native jobs run the required `retained_shutdown` producer from the
+`gate` checkout pinned to the workflow SHA. The producer sets
+`BOG_RELEASE_RETAINED_SHUTDOWN=1` and passes the binary path, full
+candidate revision, `linux-release-v1` fixture, and recorded SHA-256.
+It runs `TestReleaseRetainedShutdown` once under the race detector
+with a 90-second Go test timeout inside a three-minute command timeout.
+The workflow verifies `binary.sha256` before and after the test run.
+The test checks identity before launch, before restart, and after the
+scenario.
+
+The probe requires the following observations in order.
+
+1. Publish a predecessor with a committed suffix and open a one-row
+   page with a continuation. Admit the continuation on a socket with a
+   small receive window, read the headers, and wait for TCP zero-window
+   backpressure. A competing query must receive HTTP 503 because the
+   continuation occupies the sole query slot.
+2. Acknowledge backfill and publish the successor at the exact cutoff.
+   Observe exactly one retired predecessor pin and confirm that the
+   continuation still occupies the slot and remains backpressured.
+3. Verify listener ownership and send SIGTERM. Before releasing the
+   response, require new connections to be refused, the candidate to
+   remain alive, and a separate directory descriptor's nonblocking
+   exclusive lock attempt to return `EWOULDBLOCK`. Check that the
+   continuation remains backpressured during this drain.
+4. Read the body on the same connection. Require a terminal HTTP 200
+   NDJSON response with the declared content length, a final newline,
+   no continuation header or trailer, and the exact predecessor rows
+   in order, including ties and duplicates. Require zero exit status
+   and reap the original process before restart.
+5. Restart the same binary on the same directory and walk through
+   exhaustion. Compare every row in order and with exact multiplicity
+   against the independent ledger of acknowledged appends, including
+   backfill. Require child teardown and fixture cleanup.
+
+In each native artifact, inspect `retained-shutdown-events.jsonl`,
+`retained_shutdown.log`, and `producers.txt`. The gate requires exactly
+one explicit pass each for `TestReleaseRetainedShutdown` and
+`bog/verify/release`. A skip, failure, or missing or duplicate required
+pass blocks qualification. The manifest must contain one exit-zero
+`retained_shutdown` record with the expected candidate revision, native
+architecture, and gate checkout SHA. This is a workflow evidence check.
+Historical schema-v1 report validation still uses the existing reports.
+[Gate evidence checks](../../docs/adr/0048-release-gate-evidence-checks.md#retained-shutdown),
+[Retained-shutdown test](retained_shutdown_linux_test.go)
 
 ## Durability evidence
 

@@ -2,7 +2,9 @@ package archtest
 
 import (
 	"fmt"
+	"maps"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -22,8 +24,9 @@ func serverCommandBoundaryProblems(rules map[string]rule) []string {
 	reached := registeredReachability(rules, server)
 
 	var problems []string
-	for _, path := range []string{goClient, queryModel} {
-		if reached[path] {
+	for _, path := range slices.Sorted(maps.Keys(reached)) {
+		if path == goClient || path == "bog/verify" || strings.HasPrefix(path, "bog/verify/") ||
+			path == "bog/bench" || strings.HasPrefix(path, "bog/bench/") {
 			problems = append(problems, fmt.Sprintf("forbidden server command dependency: %s reaches %s", server, path))
 		}
 	}
@@ -63,57 +66,90 @@ func TestServerCommandBoundaryFixtures(t *testing.T) {
 		backup     = "bog/internal/backup"
 		checkpoint = "bog/internal/checkpoint"
 		history    = "bog/internal/history"
+		httpapi    = "bog/internal/httpapi"
+		readiness  = "bog/internal/readiness"
+		wal        = "bog/internal/wal"
 		helper     = "bog/internal/commandhelper"
 		store      = "bog/internal/store"
-		release    = "bog/verify/release"
+		verifyLeaf = "bog/verify/report/format"
+		benchLeaf  = "bog/bench/retained-history/metrics"
+		forbidden  = "forbidden server command dependency: " + server + " reaches "
 	)
 	tests := []struct {
-		name           string
-		retained       bool
-		clientOrOracle string
-		throughHelper  bool
-		want           []string
+		name          string
+		retained      bool
+		dependencies  []string
+		throughHelper bool
+		want          []string
 	}{
 		{name: "operator uses staged backup and shares row types with the server"},
-		{name: "server and operator share retained read-side libraries", retained: true},
+		{name: "composed storage shares row types with the operator and evidence producers", retained: true},
 		{
-			name:           "direct client import",
-			clientOrOracle: goClient,
-			want:           []string{"forbidden server command dependency: bog/cmd/bog reaches bog/internal/client"},
+			name:         "sibling package names are outside the evidence trees",
+			dependencies: []string{"bog/verifyextra/format", "bog/benchmark/metrics"},
 		},
 		{
-			name:           "direct oracle import",
-			clientOrOracle: queryModel,
-			want:           []string{"forbidden server command dependency: bog/cmd/bog reaches bog/verify/query-model"},
+			name:         "direct client import",
+			dependencies: []string{goClient},
+			want:         []string{forbidden + goClient},
 		},
 		{
-			name:           "client through a registered helper",
-			retained:       true,
-			clientOrOracle: goClient,
-			throughHelper:  true,
-			want:           []string{"forbidden server command dependency: bog/cmd/bog reaches bog/internal/client"},
+			name:         "direct oracle import",
+			dependencies: []string{queryModel},
+			want:         []string{forbidden + queryModel},
 		},
 		{
-			name:           "oracle through a registered helper",
-			retained:       true,
-			clientOrOracle: queryModel,
-			throughHelper:  true,
-			want:           []string{"forbidden server command dependency: bog/cmd/bog reaches bog/verify/query-model"},
+			name:          "client through a registered helper",
+			retained:      true,
+			dependencies:  []string{goClient},
+			throughHelper: true,
+			want:          []string{forbidden + goClient},
+		},
+		{
+			name:          "oracle through a registered helper",
+			retained:      true,
+			dependencies:  []string{queryModel},
+			throughHelper: true,
+			want:          []string{forbidden + queryModel},
+		},
+		{
+			name:         "direct evidence imports",
+			retained:     true,
+			dependencies: []string{verifyLeaf, benchLeaf},
+			want:         []string{forbidden + benchLeaf, forbidden + verifyLeaf},
+		},
+		{
+			name:          "evidence imports through a registered helper",
+			retained:      true,
+			dependencies:  []string{verifyLeaf, benchLeaf},
+			throughHelper: true,
+			want:          []string{forbidden + benchLeaf, forbidden + verifyLeaf},
+		},
+		{
+			name:         "packages at the evidence tree roots",
+			dependencies: []string{"bog/verify", "bog/bench"},
+			want:         []string{forbidden + "bog/bench", forbidden + "bog/verify"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			rules := map[string]rule{
-				server:          {serverCommand, []string{store}},
+				server:          {serverCommand, []string{httpapi, readiness, store, wal}},
 				operatorCommand: {verifier, []string{backup, goClient, store}},
 				backup:          {staged, []string{store}},
 				history:         {staged, []string{checkpoint, store}},
 				checkpoint:      {staged, []string{store}},
+				httpapi:         {runtimeLibrary, []string{store, wal}},
+				readiness:       {runtimeLibrary, []string{store, wal}},
 				store:           {runtimeLibrary, nil},
+				wal:             {runtimeLibrary, []string{store}},
 				goClient:        {standalone, []string{store}},
 				queryModel:      {verifierModel, nil},
-				release:         {verifier, []string{goClient, queryModel}},
+				releaseVerifier: {verifier, []string{goClient, queryModel, verifyLeaf}},
+				retainedBench:   {verifier, []string{benchLeaf}},
+				verifyLeaf:      {verifierModel, []string{store}},
+				benchLeaf:       {verifierModel, []string{store}},
 			}
 			command := rules[server]
 			if tt.retained {
@@ -124,17 +160,18 @@ func TestServerCommandBoundaryFixtures(t *testing.T) {
 					rules[path] = entry
 				}
 			}
-			if target := tt.clientOrOracle; target != "" {
+			for _, target := range tt.dependencies {
 				// Update the destination's role so the fixture satisfies the
 				// existing reachability check even with the forbidden edge.
 				entry := rules[target]
 				entry.role = runtimeLibrary
 				rules[target] = entry
-				if tt.throughHelper {
-					rules[helper] = rule{runtimeLibrary, []string{target}}
-					target = helper
-				}
-				command.imports = append(command.imports, target)
+			}
+			if tt.throughHelper {
+				rules[helper] = rule{runtimeLibrary, tt.dependencies}
+				command.imports = append(command.imports, helper)
+			} else {
+				command.imports = append(command.imports, tt.dependencies...)
 			}
 			rules[server] = command
 

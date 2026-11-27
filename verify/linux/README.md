@@ -30,18 +30,25 @@ Bog is serving.
   `/ready` must continue reporting `low_disk_headroom`. Ingest must return
   HTTP 503 and readiness must report `wal_rollback` with category `enospc`.
   The verifier checks the live walk, restores the launch path, and checks
-  replay at capacity. After freeing space, it acknowledges another batch,
-  kills the candidate, and checks a complete walk after restart.
+  exact replay on the original tmpfs at capacity. It then removes the filler,
+  requires HTTP 204 for a new batch, verifies the candidate exited from
+  SIGKILL, and restarts on the original tmpfs. The final walk must match the
+  full ledger, including the acknowledged batch and excluding the rollback.
 
-Each retarget direction samples readiness for six seconds before ingest, with
-a ten-second deadline for each observation. This outlasts cached readiness
-evidence and spans multiple disk samples. Each direction has its own probe
+Each retarget direction requires six seconds of matching readiness samples
+with a ten-second deadline. This outlasts cached readiness evidence and spans
+multiple disk samples. A complete response with the wrong readiness state
+fails the case even if ingest and replay succeed. The full-to-healthy
+drill continues through post-ENOSPC recovery when the rollback and
+at-capacity replay are confirmed. Failed probes, ambiguous writes, and failed
+replay block dependent recovery claims. Each direction has its own probe
 budget. The verifier attempts cleanup of the first candidate and filler
 before starting the second probe. The `enospc` case reports
 `healthy_to_full` and `full_to_healthy` with the observed readiness status
-and reason and the ingest HTTP status. It also records replay success for
-`healthy_to_full` and the rollback reason and category for
-`full_to_healthy`. Setup, probe, and cleanup failures appear in the case
+and reason and the ingest HTTP status. It also records exact replay in both
+directions, the rollback reason and category for `full_to_healthy`, and
+whether post-ENOSPC crash replay reconciled the augmented ledger. Setup,
+probe, and cleanup failures appear in the case
 detail and fail the producer. Candidate cleanup precedes unmount on every
 exit path. If unmount fails and the verifier cannot confirm detachment,
 the case detail identifies the retained mount directory.

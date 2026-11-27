@@ -130,36 +130,56 @@ func TestRetargetDiagnosticsBeforeReconciliation(t *testing.T) {
 	}
 }
 
-func TestRetargetReadinessFailureEvidence(t *testing.T) {
+func TestRetargetRecoveryEvidence(t *testing.T) {
 	t.Parallel()
 	closeFailure := errors.New("readiness close failed")
 	for _, tc := range []struct {
 		name       string
 		direction  diskDirection
+		matches    bool
 		readyErr   error
 		malformed  bool
 		earlyExit  bool
 		ingestErr  error
+		badLive    bool
+		noRollback bool
 		badReplay  bool
 		wantReplay bool
+		freeErr    bool
+		appendErr  bool
+		exitOn204  bool
+		badCrash   bool
 		wantError  string
 	}{
 		{name: "healthy WAL stays writable despite low readiness", direction: healthyToFull, wantReplay: true},
 		{name: "full WAL rolls back despite healthy readiness", direction: fullToHealthy, wantReplay: true},
+		{name: "full WAL readiness matches and recovery passes", direction: fullToHealthy, matches: true, wantReplay: true},
 		{name: "readiness transport lost after valid sample", direction: healthyToFull, readyErr: io.EOF},
 		{name: "malformed readiness", direction: fullToHealthy, malformed: true, wantError: "decode readiness"},
 		{name: "readiness body close fails after decoding mismatch", direction: fullToHealthy, readyErr: closeFailure},
 		{name: "candidate exited before ingest", direction: healthyToFull, earlyExit: true, wantError: "candidate exited before retarget ingest"},
 		{name: "unconfirmed ingest", direction: fullToHealthy, ingestErr: io.EOF},
+		{name: "unconfirmed rollback", direction: fullToHealthy, noRollback: true, wantError: "readiness after rejected ingest"},
+		{name: "live query transport failure", direction: fullToHealthy, badLive: true, wantError: "queries after retarget ingest"},
 		{name: "replay order differs", direction: fullToHealthy, badReplay: true, wantError: "replay on original directory"},
+		{name: "cannot remove filler", direction: fullToHealthy, wantReplay: true, freeErr: true, wantError: "free space on original filesystem"},
+		{name: "append has ambiguous response", direction: fullToHealthy, wantReplay: true, appendErr: true, wantError: "ingest after freeing space"},
+		{name: "candidate already exited on acknowledgement", direction: fullToHealthy, wantReplay: true, exitOn204: true, wantError: "kill candidate after acknowledged append"},
+		{name: "crash replay omits acknowledged append", direction: fullToHealthy, wantReplay: true, badCrash: true, wantError: "replay after freeing space"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			root := t.TempDir()
 			original, target := t.TempDir(), t.TempDir()
 			link := filepath.Join(root, "data")
+			filler := filepath.Join(original, "filler")
 			if err := os.Symlink(original, link); err != nil {
 				t.Fatal(err)
+			}
+			if !tc.freeErr {
+				if err := os.WriteFile(filler, []byte("filler"), 0600); err != nil {
+					t.Fatal(err)
+				}
 			}
 			binary := filepath.Join(root, "candidate")
 			const script = "#!/bin/sh\ntrap 'exit 0' TERM\nprintf '%s\\n' \"$$\" > .candidate-pid || exit 1\nwhile :; do sleep 1; done\n"
@@ -200,7 +220,7 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 			}
 
 			want, observed := diskReady, diskLow
-			observedStatus, ingestStatus, outcome := http.StatusServiceUnavailable, http.StatusNoContent, ingestAcknowledged
+			observedStatus, ingestStatus, ingestResult := http.StatusServiceUnavailable, http.StatusNoContent, ingestAcknowledged
 			ingestRows := fixtureRows("healthy-retarget", 2, 1, "")
 			visible := ingestRows
 			var l ledger
@@ -209,14 +229,22 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 			evidence := proof.HealthyToFull
 			if tc.direction == fullToHealthy {
 				want, observed = diskLow, diskReady
-				observedStatus, ingestStatus, outcome = http.StatusOK, http.StatusServiceUnavailable, ingestRolledBack
+				observedStatus, ingestStatus, ingestResult = http.StatusOK, http.StatusServiceUnavailable, ingestRolledBack
 				ingestRows = fixtureRows("disk-rejected", 2, 1, strings.Repeat("x", 32<<10))
 				visible = fixtureRows("seed", 2, 1, "")
 				l = ledger{{visible, acknowledged}}
 				cursor = "issuer-cursor"
 				evidence = proof.FullToHealthy
 			}
+			if tc.matches {
+				observed, observedStatus = want, http.StatusServiceUnavailable
+			}
 			payload, err := encodeRows(ingestRows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendRows := fixtureRows("space-freed", 3, 1, "")
+			appendPayload, err := encodeRows(appendRows)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -230,7 +258,7 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 				}
 				return response(status, fmt.Sprintf(`{"ready":%t,"reason":%q,"category":%q}`, state.ready, state.reason, state.category))
 			}
-			var readinessCalls, ingests, staleChecks int
+			var readinessCalls, ingests, appends, staleChecks, atCapacityPages int
 			var queryLifetimes []int
 			s.client = &http.Client{Timeout: processTimeout, Transport: readinessTransport(func(req *http.Request) (*http.Response, error) {
 				lifetime := len(d.Candidates)
@@ -238,6 +266,9 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 				case "/ready":
 					readinessCalls++
 					if ingests > 0 {
+						if tc.noRollback {
+							return readyResponse(diskLow), nil
+						}
 						return readyResponse(diskRollback), nil
 					}
 					switch {
@@ -255,11 +286,29 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 						return readyResponse(observed), nil
 					}
 				case "/ingest":
-					ingests++
 					body, readErr := io.ReadAll(req.Body)
 					if err := errors.Join(readErr, req.Body.Close()); err != nil {
 						return nil, err
 					}
+					if lifetime == 2 {
+						appends++
+						if req.Method != http.MethodPost || string(body) != string(appendPayload) || atCapacityPages != 4 {
+							t.Fatalf("unexpected post-free ingest after %d at-capacity pages", atCapacityPages)
+						}
+						if _, err := os.Stat(filler); !errors.Is(err, os.ErrNotExist) {
+							t.Fatalf("append issued before freeing space: %v", err)
+						}
+						if tc.appendErr {
+							return nil, io.EOF
+						}
+						if tc.exitOn204 {
+							if err := s.process.stop(syscall.SIGTERM); err != nil {
+								return nil, err
+							}
+						}
+						return response(http.StatusNoContent, ""), nil
+					}
+					ingests++
 					if req.Method != http.MethodPost || string(body) != string(payload) || lifetime != 1 {
 						t.Fatal("unexpected retarget ingest")
 					}
@@ -281,34 +330,59 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 					if !ok {
 						return nil, io.EOF
 					}
+					if lifetime == 3 && (!d.Candidates[1].Reaped || d.Candidates[1].Signal != syscall.SIGKILL.String()) {
+						t.Fatalf("restart before confirmed SIGKILL: %+v", d.Candidates[1])
+					}
 					return response(http.StatusOK, ""), nil
 				case "/query":
 					token := req.URL.Query().Get("cursor")
-					if token != "" && token == cursor {
+					if (token != "" && token == cursor) || (lifetime == 3 && token == "before-kill-1") {
 						staleChecks++
-						if lifetime != 2 {
-							t.Fatal("stale cursor checked before restart")
+						if token == cursor && lifetime != 2 {
+							t.Fatal("unexpected lifetime for original stale cursor")
 						}
 						return response(http.StatusBadRequest, "invalid cursor\n"), nil
 					}
 					queryLifetimes = append(queryLifetimes, lifetime)
+					if tc.badLive && lifetime == 1 {
+						return nil, io.EOF
+					}
+					if lifetime == 2 {
+						atCapacityPages++
+						if tc.direction == fullToHealthy && !tc.freeErr {
+							if _, err := os.Stat(filler); err != nil {
+								t.Fatalf("lost filler before capacity replay and capture: %v", err)
+							}
+						}
+					}
+					prefix, pageRows := "next-", visible
+					if lifetime == 2 && atCapacityPages > 2 {
+						prefix = "before-kill-"
+					}
+					if lifetime == 3 && !tc.badCrash {
+						pageRows = slices.Concat(visible, appendRows)
+					}
 					index := 0
-					if token == "next" {
-						index = 1
+					if token != "" {
+						var err error
+						index, err = strconv.Atoi(strings.TrimPrefix(token, prefix))
+						if err != nil || index <= 0 || index >= len(pageRows) {
+							t.Fatalf("unexpected query token %q at lifetime %d", token, lifetime)
+						}
 					}
 					rowIndex := index
 					if tc.badReplay && lifetime == 2 {
 						rowIndex = 1 - index
 					}
-					body, err := encodeRows(visible[rowIndex : rowIndex+1])
+					body, err := encodeRows(pageRows[rowIndex : rowIndex+1])
 					if err != nil {
 						return nil, err
 					}
 					resp := response(http.StatusOK, string(body))
 					resp.Header = make(http.Header)
 					resp.Header.Set("Content-Type", "application/x-ndjson")
-					if index == 0 {
-						resp.Header.Set("Bog-Next-Cursor", "next")
+					if index+1 < len(pageRows) {
+						resp.Header.Set("Bog-Next-Cursor", prefix+strconv.Itoa(index+1))
 					}
 					return resp, nil
 				default:
@@ -317,8 +391,17 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 				}
 			})}
 
-			_, err = s.checkRetarget(t.Context(), original, l, cursor, &proof)
-			if err == nil || !strings.Contains(err.Error(), "readiness after retarget:") {
+			if tc.direction == fullToHealthy {
+				err = s.checkFullRetarget(t.Context(), &diskFixture{full: original, filler: filler}, l, cursor, &proof)
+			} else {
+				var assertion error
+				_, assertion, err = s.checkRetarget(t.Context(), original, l, cursor, &proof)
+				err = errors.Join(assertion, err)
+			}
+			if tc.matches && err != nil {
+				t.Fatalf("retarget error with correct readiness: %v", err)
+			}
+			if !tc.matches && (err == nil || !strings.Contains(err.Error(), "readiness after retarget:")) {
 				t.Fatalf("retarget error = %v, want retained readiness failure", err)
 			}
 			if tc.wantError != "" && !strings.Contains(err.Error(), tc.wantError) {
@@ -329,9 +412,20 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 					t.Errorf("retarget error = %v, missing %v", err, cause)
 				}
 			}
+			_, mismatch := errors.AsType[readinessMismatch](err)
+			if wantMismatch := !tc.matches && tc.readyErr == nil && !tc.malformed; mismatch != wantMismatch {
+				t.Fatalf("incorrect assertion classification: %v", err)
+			}
+			if !tc.freeErr {
+				_, statErr := os.Stat(filler)
+				if appends == 0 && statErr != nil || appends > 0 && !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("unexpected filler state after %d post-free appends: %v", appends, statErr)
+				}
+			}
 			prefix := string(tc.direction) + "/"
 			ready := d.Readiness[prefix+"after_retarget"]
-			if ready == nil || ready.FirstFailure == nil || ready.FirstFailure.Lifetime != 1 || ready.ExpectedReason != want.reason {
+			if ready == nil || ready.ExpectedReason != want.reason || ready.Last.Lifetime != 1 ||
+				(ready.FirstFailure == nil) != tc.matches {
 				t.Fatalf("readiness evidence = %+v", ready)
 			}
 			if tc.readyErr != nil || tc.malformed {
@@ -340,8 +434,8 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 				}
 				return
 			}
-			if ready.FirstFailure.state() != observed || evidence.ReadinessStatus != observedStatus || evidence.ReadinessReason != observed.reason {
-				t.Fatalf("actual readiness missing: evidence=%+v sample=%+v", evidence, ready.FirstFailure)
+			if ready.Last.state() != observed || evidence.ReadinessStatus != observedStatus || evidence.ReadinessReason != observed.reason {
+				t.Fatalf("actual readiness missing: evidence=%+v sample=%+v", evidence, ready.Last)
 			}
 			if tc.earlyExit {
 				if ingests != 0 || len(d.Candidates) != 1 || len(queryLifetimes) != 0 || evidence.ReplayedAfterRestart {
@@ -359,13 +453,71 @@ func TestRetargetReadinessFailureEvidence(t *testing.T) {
 				}
 				return
 			}
-			if ingest.Last.Outcome != outcome || evidence.IngestStatus != ingestStatus || evidence.ReplayedAfterRestart != tc.wantReplay ||
-				!slices.Equal(queryLifetimes, []int{1, 1, 2, 2}) || len(d.Candidates) != 2 || !d.Candidates[0].Reaped {
+			if tc.noRollback || tc.badLive {
+				if len(d.Candidates) != 1 || appends != 0 || evidence.ReplayedAfterRestart || proof.RecoveredAfterSpaceFreed {
+					t.Fatalf("unconfirmed live outcome allowed recovery: %+v", proof)
+				}
+				return
+			}
+			wantQueries := []int{1, 1, 2, 2}
+			wantLifetimes, wantStale, wantAppends := 2, 0, 0
+			wantRecovery := tc.direction == fullToHealthy && tc.wantReplay && !tc.freeErr && !tc.appendErr && !tc.exitOn204 && !tc.badCrash
+			if tc.direction == fullToHealthy {
+				wantStale++
+				if tc.wantReplay {
+					wantQueries = append(wantQueries, 2, 2)
+					if !tc.freeErr {
+						wantAppends++
+					}
+					if wantRecovery || tc.badCrash {
+						wantLifetimes++
+						wantStale++
+						pageCount := len(visible)
+						if wantRecovery {
+							pageCount += len(appendRows)
+						}
+						for range pageCount {
+							wantQueries = append(wantQueries, 3)
+						}
+					}
+				}
+			}
+			if ingest.Last.Outcome != ingestResult || evidence.IngestStatus != ingestStatus || evidence.ReplayedAfterRestart != tc.wantReplay ||
+				!slices.Equal(queryLifetimes, wantQueries) || len(d.Candidates) != wantLifetimes || !d.Candidates[0].Reaped {
 				t.Fatalf("unexpected ingest or replay evidence: evidence=%+v ingest=%+v query lifetimes=%v", evidence, ingest.Last, queryLifetimes)
 			}
 			if tc.direction == fullToHealthy && (evidence.PostIngestReason != diskRollback.reason ||
-				evidence.PostIngestCategory != diskRollback.category || staleChecks != 1 || proof.StaleCursorsRejected != 1) {
+				evidence.PostIngestCategory != diskRollback.category || staleChecks != wantStale || proof.StaleCursorsRejected != wantStale) {
 				t.Fatalf("missing rollback or cursor evidence: %+v, stale checks=%d", evidence, staleChecks)
+			}
+			if appends != wantAppends || proof.RecoveredAfterSpaceFreed != wantRecovery {
+				t.Fatalf("unexpected recovery evidence: %+v, append count=%d", proof, appends)
+			}
+			if wantRecovery {
+				if proof.reconciliation != (reconciliation{AcknowledgedRows: 5, RejectedRows: 2}) {
+					t.Fatalf("reconciliation = %+v", proof.reconciliation)
+				}
+				select {
+				case <-s.process.done:
+					if s.process.result != nil {
+						t.Fatalf("final candidate did not stop cleanly: %v", s.process.result)
+					}
+				default:
+					t.Fatal("final candidate was left running")
+				}
+				r := report{Cases: make(map[string]outcome)}
+				reportErr := r.record("enospc", proof, err)
+				caseReport := r.Cases["enospc"]
+				if tc.matches {
+					if reportErr != nil || caseReport.Status != "pass" {
+						t.Fatalf("successful probe failed report: %+v", caseReport)
+					}
+				} else if !errors.Is(reportErr, err) || caseReport.Status != "fail" ||
+					!strings.Contains(caseReport.Detail, "readiness after retarget") {
+					t.Fatalf("readiness failure lost from case report: %+v", caseReport)
+				}
+			} else if proof.reconciliation != (reconciliation{}) {
+				t.Fatalf("unconfirmed recovery published as reconciliation: %+v", proof)
 			}
 		})
 	}

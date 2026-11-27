@@ -40,9 +40,9 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// For #108, measure the composed command on both Linux targets before
-// promoting checkpoint, history, and backup and removing their declarations.
-// Operator reachability alone leaves a library staged.
+// At 54347c836018, cmd/bog reaches HTTP, readiness, store, and WAL on
+// both Linux targets. The retained roles still reflect the pre-cutover tree.
+// Promote each library with the measured #108 wiring and activation evidence.
 var registry = map[string]rule{
 	exportCommand:                {verifier, []string{goClient}},
 	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
@@ -139,6 +139,96 @@ func checkLinuxArchitecture(t *testing.T, arch string) {
 	}
 	for _, problem := range architectureProblems(packages, registry) {
 		t.Error(problem)
+	}
+	for _, problem := range measuredCutoverBoundaryProblems(packages) {
+		t.Error(problem)
+	}
+}
+
+// Check the cutover seams against the full production graph. The root-module
+// edge registry cannot describe a path that traverses an external dependency.
+func measuredCutoverBoundaryProblems(packages map[string]listedPackage) []string {
+	measured := make(map[string]rule, len(packages))
+	for path, pkg := range packages {
+		if pkg.production() {
+			measured[path] = rule{imports: pkg.Imports}
+		}
+	}
+	return append(pagingBoundaryProblems(measured), storageAuthorityProblems(measured)...)
+}
+
+func TestMeasuredCutoverBoundaries(t *testing.T) {
+	t.Parallel()
+	const (
+		backup     = "bog/internal/backup"
+		checkpoint = "bog/internal/checkpoint"
+		history    = "bog/internal/history"
+		httpapi    = "bog/internal/httpapi"
+		wal        = "bog/internal/wal"
+		relay      = "example.com/relay"
+	)
+	tests := []struct {
+		name, consumer, target string
+		testOnly               bool
+		want                   []string
+	}{
+		{name: "command composes retained paging and WAL", consumer: server},
+		{
+			name:     "HTTP reaches history and checkpoint through an external relay",
+			consumer: httpapi, target: history,
+			want: []string{
+				"HTTP must use the page source seam: " + httpapi + " reaches " + checkpoint,
+				"HTTP must use the page source seam: " + httpapi + " reaches " + history,
+				"forbidden retained storage composition: " + httpapi + " reaches " + wal + " and " + checkpoint + ", " + history + ". Compose in " + server,
+			},
+		},
+		{
+			name:     "backup reaches WAL through an external relay",
+			consumer: backup, target: wal,
+			want: []string{"forbidden storage authority dependency: " + backup + " reaches " + wal},
+		},
+		{
+			name:     "WAL reaches backup through an external relay",
+			consumer: wal, target: backup,
+			want: []string{
+				"HTTP must use the page source seam: " + httpapi + " reaches " + backup,
+				"forbidden storage authority dependency: " + wal + " reaches " + backup,
+				"forbidden retained storage composition: " + httpapi + " reaches " + wal + " and " + backup + ". Compose in " + server,
+			},
+		},
+		{
+			name:     "test-only relay supplies no production edge",
+			consumer: httpapi, target: history, testOnly: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			packages := map[string]listedPackage{
+				server:     productionPackage("main", backup, history, httpapi, wal),
+				backup:     productionPackage("backup"),
+				checkpoint: productionPackage("checkpoint"),
+				history:    productionPackage("history", checkpoint),
+				httpapi:    productionPackage("httpapi", wal),
+				wal:        productionPackage("wal"),
+				relay:      {GoFiles: []string{"relay.go"}},
+			}
+			consumer := packages[tt.consumer]
+			consumer.Imports = append(consumer.Imports, relay)
+			packages[tt.consumer] = consumer
+			if tt.target != "" {
+				pkg := packages[relay]
+				pkg.Imports = []string{tt.target}
+				if tt.testOnly {
+					pkg.GoFiles = nil
+					pkg.TestGoFiles = []string{"relay_test.go"}
+				}
+				packages[relay] = pkg
+			}
+			if got := measuredCutoverBoundaryProblems(packages); !slices.Equal(got, tt.want) {
+				t.Errorf("measuredCutoverBoundaryProblems() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

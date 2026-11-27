@@ -52,14 +52,23 @@ accepted. Capture expiry (HTTP 410), invalid cursors (HTTP 400), and retry
 exhaustion produce distinct incomplete diagnostics. The overall
 `-timeout` covers both comparisons, retry waits, and the restart boundary.
 
-On native Linux, the fixture-backed smoke test can run the drill against
-the shipped retained-restore binary. It restores a disposable copy and
-restarts the candidate on the same data directory and listener address.
+On native Linux, run the fixture-backed integration test with a built #53
+candidate for the runner's architecture. The test restores a disposable
+copy and runs the read-only drill, checking exact parity with the immutable
+bundle before and after restart. Once the drill completes, the test harness
+posts a batch of backfilled rows with tied timestamps and requires HTTP 204.
+It restarts the same binary on the same data directory and listener address,
+compares the full ordered history with the original fixture and appended rows
+through the terminal page, and reverifies the reference bundle.
 
 ```sh
 BOG_RESTORE_DRILL_BINARY=/absolute/path/to/bog \
   go test -count=1 ./cmd/bog-verify -run '^TestRestoreDrillShippedServer$' -v
 ```
+
+The test skips when `BOG_RESTORE_DRILL_BINARY` is unset. A supplied candidate
+must pass every phase. The CLI's `drill` remains read-only. Release parity is
+qualified by [`verify/release`](../../verify/release/README.md).
 
 ## Limits and exit statuses
 

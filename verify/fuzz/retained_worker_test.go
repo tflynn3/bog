@@ -28,6 +28,8 @@ type retainedRecoveryEvidence struct {
 	Seed                 uint8           `json:"seed"`
 	Case                 string          `json:"case"`
 	Outcome              retainedOutcome `json:"outcome"`
+	CheckpointRejection  string          `json:"checkpoint_rejection,omitempty"`
+	BackupRejection      string          `json:"backup_rejection,omitempty"`
 	Rejection            string          `json:"rejection,omitempty"`
 	Generation           string          `json:"validated_generation"`
 	PrefixSHA256         string          `json:"prefix_sha256"`
@@ -69,12 +71,10 @@ func measureRetainedCase(ctx context.Context, parent string, f retainedFixture, 
 		return retainedRecoveryEvidence{}, err
 	}
 	b := g.view.boundary(g.id)
-	var rejection string
-	if tc.reject != nil {
-		rejection = tc.reject.Error()
-	}
+	rejection, checkpointRejection, backupRejection := retainedRejections(tc)
 	return retainedRecoveryEvidence{
 		Seed: retainedSeed, Case: tc.name, Outcome: tc.outcome, Rejection: rejection,
+		CheckpointRejection: checkpointRejection, BackupRejection: backupRejection,
 		Generation: fmt.Sprintf("%x", b.generation), PrefixSHA256: fmt.Sprintf("%x", b.prefixHash),
 		CoveredOffset: b.covered, CommittedEnd: b.end, CoveredRows: b.next,
 		SuffixFrames: len(f.cuts) - 1 - slices.Index(f.cuts, g.view.covered), TotalRows: len(g.view.rows),
@@ -132,15 +132,13 @@ func decodeRetainedEvidence(output []byte) (retainedRecoveryEvidence, error) {
 
 func validateRetainedEvidence(report retainedRecoveryEvidence, f retainedFixture, tc retainedCase) error {
 	g := f.previous
-	if tc.outcome == retainedAccept {
+	if tc.outcome == retainedAccept && tc.reader == nil {
 		g = f.successor
 	}
 	b := g.view.boundary(g.id)
-	var rejection string
-	if tc.reject != nil {
-		rejection = tc.reject.Error()
-	}
+	rejection, checkpointRejection, backupRejection := retainedRejections(tc)
 	if report.Seed != retainedSeed || report.Case != tc.name || report.Outcome != tc.outcome || report.Rejection != rejection ||
+		report.CheckpointRejection != checkpointRejection || report.BackupRejection != backupRejection ||
 		report.Generation != fmt.Sprintf("%x", b.generation) || report.PrefixSHA256 != fmt.Sprintf("%x", b.prefixHash) ||
 		report.CoveredOffset != b.covered || report.CommittedEnd != b.end || report.CoveredRows != b.next ||
 		report.TotalRows != len(g.view.rows) || report.SuffixFrames != len(f.cuts)-1-slices.Index(f.cuts, g.view.covered) {
@@ -152,6 +150,16 @@ func validateRetainedEvidence(report retainedRecoveryEvidence, f retainedFixture
 		return fmt.Errorf("retained recovery limits or cleanup were not verified: %+v", report)
 	}
 	return nil
+}
+
+func retainedRejections(tc retainedCase) (legacy, checkpoint, backup string) {
+	if tc.reject != nil {
+		legacy = tc.reject.Error()
+	}
+	if tc.reader != nil && tc.reader.checkpoint != nil {
+		checkpoint, backup = tc.reader.checkpoint.Error(), tc.reader.backup.Error()
+	}
+	return legacy, checkpoint, backup
 }
 
 func TestRetainedMalformedRecovery(t *testing.T) {

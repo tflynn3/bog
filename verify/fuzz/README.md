@@ -240,6 +240,19 @@ checks the predecessor's checkpoint rows, exact WAL suffix frames, and
 merged timestamp and append-ordinal order. Restore refusals also exercise an
 attempt to overwrite the prior valid image and verify its bytes and replay.
 
+The recovery-view cases feed the same pinned manifest, segments and suffix
+to checkpoint advancement and backup export. They shorten the manifest or
+second frame, corrupt its length or CRC, append bytes past the committed end,
+and change the declared suffix digest. The two APIs report their own integrity
+categories, and a physically short suffix stream reports unexpected EOF.
+The damaged disk images also exercise pinned backup verification and offline
+open. Deterministic cancellation after the second frame header and an injected
+suffix close error exercise reader ownership. Each failure is followed by a
+valid read using the same publisher or export destination. The successful
+checkpoint advance and backup walk must both match the ledger's exact order.
+Workers check staging, reservation usage and transferred descriptors, and
+Linux workers also inventory fixture descriptors through procfs.
+
 Each case owns a fresh worker and private fixture. The worker has a five-second
 case deadline, a 16 MiB cumulative Go allocation ceiling and a 16 KiB replay
 admission limit. The parent enforces a ten-second subprocess deadline and
@@ -247,4 +260,5 @@ removes its scratch directory after reaping the worker. Linux workers also
 use the corpus address-space and per-file limits. Each verdict records the
 validated generation and replay boundary, row and suffix-frame counts, time,
 allocation, and fixture cleanup. In rejection cases the reported generation
-belongs to the independently replayed predecessor.
+belongs to the independently replayed predecessor. Recovery-view verdicts
+record the common input generation and both reader rejection categories.

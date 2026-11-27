@@ -137,13 +137,14 @@ type retainedCase struct {
 	reject         error
 	admissionCalls int
 	malformedFrame bool
-	// A nil stage selects the pinned restore path. A nonnil stage selects
+	reader         *retainedReaderCase
+	// For legacy cases a nil stage selects the pinned restore path. A nonnil stage selects
 	// interrupted checkpoint recovery with the previous committed generation.
 	prepare func(retainedFixture) retainedImages
 }
 
 func retainedCases() []retainedCase {
-	return []retainedCase{
+	cases := []retainedCase{
 		backupRecoveryCase("valid-successor", retainedAccept, nil, 1, func(_ retainedFixture, _ files) {}),
 		backupRecoveryCase("truncated-backup-metadata", retainedReject, backup.ErrIntegrity, 0, func(_ retainedFixture, image files) {
 			meta := image[metadataFile]
@@ -191,6 +192,17 @@ func retainedCases() []retainedCase {
 			delete(image.main, manifestFile)
 		}),
 	}
+	for _, reader := range retainedReaderCases() {
+		tc := retainedCase{
+			name: "recovery-view-" + reader.name, outcome: retainedAccept, reader: &reader,
+			prepare: func(f retainedFixture) retainedImages { return retainedImages{main: reader.input(f).image} },
+		}
+		if reader.checkpoint != nil {
+			tc.outcome = retainedReject
+		}
+		cases = append(cases, tc)
+	}
+	return cases
 }
 
 func cloneRetainedFiles(source files) files {

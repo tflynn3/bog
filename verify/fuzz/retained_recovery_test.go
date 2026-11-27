@@ -282,6 +282,9 @@ func checkRetainedAbsent(path string) error {
 }
 
 func runRetainedOperation(ctx context.Context, root string, f retainedFixture, tc retainedCase) (retainedGeneration, error) {
+	if tc.reader != nil {
+		return f.previous, runRetainedReaders(ctx, root, f, *tc.reader)
+	}
 	images := tc.prepare(f)
 	var err error
 	path := filepath.Join(root, "candidate")

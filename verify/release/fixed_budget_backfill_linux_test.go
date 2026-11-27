@@ -276,35 +276,9 @@ func fetchBackfillPage(ctx context.Context, pager *releasePager, req querymodel.
 	return page, nil
 }
 
-type backfillCompaction struct {
-	state              string
-	generation         uint64
-	covered, committed int
-}
-
 func readBackfillCompaction(ctx context.Context, raw *http.Client, base, method, action string, cutoff int) (backfillCompaction, error) {
-	target := base + "/_capacity/compaction?action=" + action + "&cutoff=" + strconv.Itoa(cutoff)
-	res, err := request(ctx, raw, method, target, nil)
-	if err != nil {
-		return backfillCompaction{}, fmt.Errorf("compaction %s cutoff %d: %w", action, cutoff, err)
-	}
-	if res.status != http.StatusOK {
-		return backfillCompaction{}, fmt.Errorf("compaction %s cutoff %d returned HTTP %d: %.200s", action, cutoff, res.status, res.body)
-	}
-	var wire struct {
-		State         *string `json:"state"`
-		Generation    *uint64 `json:"generation"`
-		CoveredRows   *int    `json:"covered_rows"`
-		CommittedRows *int    `json:"committed_rows"`
-	}
-	if err := json.Unmarshal(res.body, &wire); err != nil {
-		return backfillCompaction{}, fmt.Errorf("decode compaction %s: %w", action, err)
-	}
-	if wire.State == nil || wire.Generation == nil || wire.CoveredRows == nil || wire.CommittedRows == nil ||
-		(*wire.State != "running" && *wire.State != "complete") || *wire.CoveredRows < 0 || *wire.CommittedRows < *wire.CoveredRows {
-		return backfillCompaction{}, fmt.Errorf("invalid compaction %s state or row counters", action)
-	}
-	return backfillCompaction{*wire.State, *wire.Generation, *wire.CoveredRows, *wire.CommittedRows}, nil
+	got, err := readCompactionObservation(ctx, raw, base, method, action, cutoff, false)
+	return got.backfillCompaction, err
 }
 
 func publishBackfillGeneration(ctx context.Context, raw *http.Client, base string, cutoff int, previous *backfillCompaction) (backfillCompaction, error) {
@@ -597,7 +571,10 @@ func TestFixedBudgetBackfillPublication(t *testing.T) {
 		{name: "stale generation", publication: backfillTestCompaction("complete", 7, 4, 4), want: "unexpected compaction state"},
 		{name: "wrong cutoff", publication: backfillTestCompaction("complete", 8, 3, 4), want: "unexpected compaction state"},
 		{name: "wrong committed rows", publication: backfillTestCompaction("complete", 8, 4, 5), want: "unexpected compaction state"},
-		{name: "missing generation", publication: lengthResponse(200, "", `{"state":"complete","covered_rows":4,"committed_rows":4}`), want: "invalid compaction"},
+		{name: "missing generation", publication: lengthResponse(200, "", `{"state":"complete","covered_rows":4,"committed_rows":4}`), want: `missing or null "generation"`},
+		{name: "null coverage", publication: lengthResponse(200, "", `{"state":"complete","generation":8,"covered_rows":null,"committed_rows":4}`), want: `missing or null "covered_rows"`},
+		{name: "duplicate generation", publication: lengthResponse(200, "", `{"state":"complete","generation":7,"generation":8,"covered_rows":4,"committed_rows":4}`), want: "duplicate"},
+		{name: "mis-cased state", publication: lengthResponse(200, "", `{"State":"complete","generation":8,"covered_rows":4,"committed_rows":4}`), want: `missing or null "state"`},
 		{name: "control unavailable", publication: lengthResponse(404, "", "missing"), want: "returned HTTP 404"},
 		{name: "fresh capture lost backfill", publication: backfillTestCompaction("complete", 8, 4, 4), lastFreshRow: "z", want: "fresh walk after replacement"},
 	} {

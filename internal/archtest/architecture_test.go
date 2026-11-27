@@ -40,7 +40,7 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// At ddc0496f00812, cmd/bog reaches HTTP, readiness, store, and WAL on both
+// At 26535d86d556b, cmd/bog reaches HTTP, readiness, store, and WAL on both
 // Linux targets. Promote retained libraries with measured #108 wiring and
 // activation evidence. The offline backup consumer is already registered.
 var registry = map[string]rule{
@@ -97,17 +97,22 @@ func TestLinuxArchitecture(t *testing.T) {
 	}
 }
 
-func checkLinuxArchitecture(t *testing.T, arch string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "list", "-deps",
-		"-json=ImportPath,Name,Module,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports", "./...")
-	cmd.Dir = "../.."
+func linuxProductionList(ctx context.Context, root, arch string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "go", append([]string{"list", "-deps"}, args...)...)
+	cmd.Dir = root
 	cmd.Env = append(cmd.Environ(),
 		"GOOS=linux", "GOARCH="+arch, "GOAMD64=v1", "GOARM64=v8.0", "CGO_ENABLED=0",
 		"GOENV=off", "GOFLAGS=", "GO111MODULE=on", "GOWORK=off")
 	cmd.WaitDelay = 2 * time.Second
+	return cmd
+}
+
+func checkLinuxArchitecture(t *testing.T, arch string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	cmd := linuxProductionList(ctx, "../..", arch,
+		"-json=ImportPath,Name,Module,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports", "./...")
 
 	data, err := cmd.Output()
 	if err != nil {
@@ -143,6 +148,12 @@ func checkLinuxArchitecture(t *testing.T, arch string) {
 	for _, problem := range measuredCutoverBoundaryProblems(packages, registry) {
 		t.Error(problem)
 	}
+	t.Run("RetainedRuntimeWiring", func(t *testing.T) {
+		required := retainedRuntimeConstructors(registry, reachableImports(packages, server))
+		for _, problem := range retainedRuntimeWiringProblems(t, "../..", arch, required) {
+			t.Error(problem)
+		}
+	})
 }
 
 // Check the cutover seams against the full production graph. The root-module

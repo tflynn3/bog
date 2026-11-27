@@ -6,7 +6,9 @@ One Linux process, one HTTP listener, one WAL owner, and one pinned local
 data directory form Bog's deployment and consistency unit. `cmd/bog` opens
 the listener after the owner acquires the exclusive directory lock and
 recovers committed state. The owner holds the lock through HTTP drain. A
-drain failure leaves the WAL open and locked until process exit.
+drain failure leaves the WAL open and locked until process exit. The #108
+design adds retained recovery, paging, and maintenance within this same
+process and directory lock.
 
 The WAL owner orders appends and decides when a complete batch becomes
 durable and query-visible. The service requires a trusted, service-owned
@@ -16,7 +18,7 @@ authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
 The Linux amd64 and arm64 production inventories at
-`1bd7b12fefa319e6aea4bc23425a37df9546ea4d` agree on the 19 root-module
+`26535d86d556b9700bfb8a8b6c2c8379dcbfc094` agree on the 19 root-module
 production packages and 23 direct imports between them shown below.
 `cmd/bog` reaches HTTP, readiness, store, and WAL and recovers an ordinary
 WAL into an in-memory store. The command still uses path-based readiness
@@ -24,7 +26,8 @@ and the in-memory paging constructor. The WAL can capture a published
 prefix, and the command has yet to compose that capability with a
 retained generation. #108's writable restore, live replacement, and
 retained paging await the reviewed Storage handoff.
-[Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md)
+[Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
+[Retained runtime promotion](../adr/0049-retained-runtime-promotion.md)
 
 ## Declared Linux production import graph
 
@@ -68,7 +71,7 @@ flowchart TD
     subgraph Staged["Libraries awaiting server activation"]
         Checkpoint["internal/checkpoint"]
         History["internal/history"]
-        Backup["internal/backup"]
+        Backup["internal/backup (also used offline)"]
         Idempotency["internal/idempotency (staged keyed ingest)"]
         History --> Checkpoint
     end
@@ -145,6 +148,9 @@ reclamation. Store owns decoded rows and their order. The command uses
 the WAL owner's synchronization to supply checkpoint and backup with a
 pinned recovery view of the generation and its exact committed suffix.
 The command and WAL owner coordinate append publication and activation.
+The durable selector must identify the validated successor before the WAL
+owner activates it. An uncertain publication fences new writes. Readers
+admitted on the old view can finish while reclamation waits for their pins.
 Command-local adapters implement the separate backup and checkpoint
 `RecoveryView` contracts. Backup validates its own view for export and
 offline verification. History may reuse checkpoint validation. The caller
@@ -180,14 +186,14 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 
 | Package or entry point | Role | Responsibility |
 | --- | --- | --- |
-| `cmd/bog` | Server command | Recovery, listener, and lifecycle |
+| `cmd/bog` | Server command | Recovery, listener, and lifecycle. Owns retained composition at #108 cutover. |
 | `internal/httpapi` | Wired | HTTP validation, admission, cursors, and response framing |
 | `internal/readiness` | Wired | Disk headroom and write outcome observation |
 | `internal/wal` | Wired | Directory locking, commit, replay, and WAL capture |
 | `internal/store` | Wired | Row decoding, publication, and ordered queries |
 | `internal/checkpoint` | Staged | Checkpoint format, bounded WAL scans, and durable generation publication |
 | `internal/history` | Staged | Generation validation, ordered scans, pins, and reclamation |
-| `internal/backup` | Staged | Pinned export, verification, restore, offline reads, and staging recovery. Its production command consumer is `cmd/bog-verify`. |
+| `internal/backup` | Staged | Pinned export, verification, restore, offline reads, and staging recovery. `cmd/bog-verify` keeps its direct offline dependency through promotion. |
 | `internal/idempotency` | Staged | Keyed-ingest coordination and durable backend contract |
 | `cmd/bog-verify` | Operator command | Read-only image verification and complete HTTP query parity |
 | `cmd/bog-export` | Operator command | Stream ordered NDJSON from the server's HTTP query API |
@@ -206,13 +212,15 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
 `bog-storage` owns #108 activation for checkpoint, history, and backup.
-The table and diagram describe the measured revision. Promote each
-library in the command wiring PR once both Linux inventories confirm
-server reachability and its activation criteria are met.
+All three remain staged in the measured revision. Promote each library in
+the command wiring PR once both Linux inventories of the reviewed Storage
+SHA confirm server reachability and Storage supplies the activation
+evidence required by ADR 0049.
 Idempotency remains staged under its own criteria. Keyed retries require
 the production WAL to commit and recover retry records atomically with
 their batches. Exercise concurrent same-key submissions, conflicting
 bodies, and retries after an ambiguous response and process restart.
+[Retained runtime promotion](../adr/0049-retained-runtime-promotion.md),
 [Staging declarations](../../internal/archtest/staged_packages_test.go),
 [Ingest retry contract](../ingest-retries.md)
 
@@ -222,7 +230,7 @@ bodies, and retries after an ambiguous response and process restart.
 | --- | --- | --- | --- |
 | 1 | Durability | Acknowledge whole batches after durable commit and fence on uncertain WAL outcomes. | Sync the successor and durably select it before activation. Preserve whole-batch acknowledgments across selection and writable restore. Fencing during uncertain publication costs write availability. |
 | 2 | Exact queries | Preserve timestamp and append ordinal order in memory and through ordinary WAL replay. | Pin a generation and its exact committed suffix together. Merge by UTC timestamp and append ordinal through compaction and restart. Certification spends work before cursor issuance, and live pins delay reclamation. |
-| 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Reserve replay, whole-batch ingest, capture, pin, and staging capacity before work. Capacity pressure can defer maintenance and refuse whole batches while admitted work drains. |
+| 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Reserve replay, whole-batch ingest, capture, pin, and staging capacity before work. Capacity pressure can defer maintenance and refuse whole batches while admitted work drains. Verify both live scales under 128 MiB with swap disabled on each native architecture. |
 | 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the selected generation and writable authority, then replay its bounded committed suffix. Manifest, segment, and suffix validation adds startup I/O. |
 | 5 | Throughput | Group syncs across admitted commits. | Prune provably irrelevant scans and serialize activation with appends. Keeping and hashing the readable v1 WAL prefix costs disk space and I/O. A verified tail-only v1 restore has finite writable tail capacity. |
 
@@ -265,9 +273,14 @@ binary for every producer. The workflow checks out the candidate and
 the release gate at their respective pinned revisions. Reports bind to
 the full candidate revision, the native binary's SHA-256, and the
 `linux-release-v1` fixture. Both matrix jobs must pass strict report
-validation and cleanup. Qualification of the composed #108 revision
-is pending.
-[Linux release workflow](../../.github/workflows/linux-release.yml)
+validation and cleanup. Qualification of the composed #108 revision is
+pending the reviewed Storage handoff and both native verdicts. Release
+Verification owns the gate and the #130 retirement and #131 report
+publication evidence tracks. The workflow SHA pins the producer-manifest
+and Go test-event checker, and the workflow supplies the expectations for
+each job.
+[Linux release workflow](../../.github/workflows/linux-release.yml),
+[Release gate evidence checks](../adr/0048-release-gate-evidence-checks.md)
 
 | Producer | Report | Required evidence |
 | --- | --- | --- |
@@ -377,8 +390,11 @@ imports and roles, `internal/archtest/staged_packages_test.go` with the
 remaining staging declarations, and `docs/architecture/SYSTEM.md` with the
 measured revision, diagram, and role table. Preserve the operator backup
 edge and the exporter and release evidence registrations.
+Require the architecture suite to pass on the combined revision before
+merging the wiring PR.
 [Landed constructor guard](https://github.com/tflynn3/bog/commit/b27b41ff9fcd46f3497725b052075e8353a0ede7),
 [Package role governance](../adr/0019-package-role-governance.md),
+[Retained runtime promotion](../adr/0049-retained-runtime-promotion.md),
 [Exporter integration handoff](../adr/0032-operator-export-boundary.md#integration-and-qualification)
 
 At promotion, Storage traces the serving `PageSource` to the command-owned
@@ -406,10 +422,10 @@ Boundary checks walk declared imports and each measured Linux graph
 independently. The measured walk also follows external production imports.
 [Diagram fitness test](../../internal/archtest/system_diagram_test.go)
 
-- When the registry marks any of checkpoint, history, or backup as a
-  runtime library, `cmd/bog` must reference
+- When any of checkpoint, history, or backup has the runtime library role
+  or appears in the measured server closure, `cmd/bog` must reference
   `readiness.NewHandlerForDirectory` and exclude `readiness.NewHandler`.
-  When the registry marks history as a runtime library, `cmd/bog` must
+  When history meets either condition, `cmd/bog` must
   also reference `httpapi.NewWithPageSource` and exclude `httpapi.New`,
   `httpapi.NewWithQueryMaxResponseBytes`, and `httpapi.NewWithQueryLimits`.
   The typed scan checks the selected production Go files independently
@@ -434,7 +450,8 @@ independently. The measured walk also follows external production imports.
 - Command roots enforce server, operator verification, and operator export
   exclusions. The measured Linux graph checks those exclusions and the
   oracle and three release producer boundaries through external production
-  dependencies as well.
+  dependencies as well. Both the registry and measured Linux graphs require
+  the operator's direct backup edge for offline verification.
   [Server boundary](../../internal/archtest/command_roots_test.go),
   [Operator boundary](../../internal/archtest/operator_boundary_test.go),
   [Exporter boundary](../../internal/archtest/export_boundary_test.go),

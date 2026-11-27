@@ -18,12 +18,17 @@ func TestOperatorVerificationBoundary(t *testing.T) {
 // TestLinuxArchitecture checks that the registry matches the Linux production
 // imports. Enforce the operator boundary even when every edge is registered.
 func operatorBoundaryProblems(rules map[string]rule) []string {
-	if entry, ok := rules[operatorCommand]; !ok || entry.role != verifier {
+	entry := rules[operatorCommand]
+	if entry.role != verifier {
 		return []string{fmt.Sprintf("%s must be registered as a %s", operatorCommand, verifier)}
 	}
 	reached := registeredReachability(rules, operatorCommand)
 
 	var problems []string
+	const backup = "bog/internal/backup"
+	if !slices.Contains(entry.imports, backup) {
+		problems = append(problems, fmt.Sprintf("%s must directly import %s for offline verification", operatorCommand, backup))
+	}
 	for _, path := range []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/wal"} {
 		if reached[path] {
 			problems = append(problems, fmt.Sprintf("forbidden operator verification dependency: %s reaches %s", operatorCommand, path))
@@ -65,6 +70,7 @@ func TestOperatorVerificationBoundaryFixtures(t *testing.T) {
 		name            string
 		operatorImports []string
 		relayImports    []string
+		missingBackup   bool
 		forbidden       []string
 	}{
 		{
@@ -72,40 +78,51 @@ func TestOperatorVerificationBoundaryFixtures(t *testing.T) {
 			operatorImports: []string{backup, goClient},
 		},
 		{
-			name:            "read-only verification through a helper",
-			operatorImports: []string{relay},
-			relayImports:    []string{backup, goClient},
+			name:            "operator keeps offline backup with the client behind a helper",
+			operatorImports: []string{backup, relay},
+			relayImports:    []string{goClient},
+		},
+		{
+			name:            "operator drops offline backup after server promotion",
+			operatorImports: []string{goClient},
+			missingBackup:   true,
+		},
+		{
+			name:            "transitive backup use cannot replace the direct offline edge",
+			operatorImports: []string{goClient, relay},
+			relayImports:    []string{backup},
+			missingBackup:   true,
 		},
 		{
 			name:            "direct WAL owner import",
-			operatorImports: []string{wal},
+			operatorImports: []string{backup, wal},
 			forbidden:       []string{wal},
 		},
 		{
 			name:            "direct server HTTP import",
-			operatorImports: []string{httpapi},
+			operatorImports: []string{backup, httpapi},
 			forbidden:       []string{httpapi, wal},
 		},
 		{
 			name:            "direct readiness import",
-			operatorImports: []string{readiness},
+			operatorImports: []string{backup, readiness},
 			forbidden:       []string{readiness, wal},
 		},
 		{
 			name:            "WAL owner through a registered helper",
-			operatorImports: []string{relay},
+			operatorImports: []string{backup, relay},
 			relayImports:    []string{wal},
 			forbidden:       []string{wal},
 		},
 		{
 			name:            "server HTTP through a registered helper",
-			operatorImports: []string{relay},
+			operatorImports: []string{backup, relay},
 			relayImports:    []string{httpapi},
 			forbidden:       []string{httpapi, wal},
 		},
 		{
 			name:            "readiness through a registered helper",
-			operatorImports: []string{relay},
+			operatorImports: []string{backup, relay},
 			relayImports:    []string{readiness},
 			forbidden:       []string{readiness, wal},
 		},
@@ -114,9 +131,9 @@ func TestOperatorVerificationBoundaryFixtures(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			rules := map[string]rule{
-				server:          {serverCommand, []string{httpapi, readiness, wal}},
+				server:          {serverCommand, []string{backup, httpapi, readiness, wal}},
 				operatorCommand: {verifier, tt.operatorImports},
-				backup:          {staged, []string{store}},
+				backup:          {runtimeLibrary, []string{store}},
 				goClient:        {standalone, []string{store}},
 				httpapi:         {runtimeLibrary, []string{store, wal}},
 				readiness:       {runtimeLibrary, []string{store, wal}},
@@ -128,6 +145,9 @@ func TestOperatorVerificationBoundaryFixtures(t *testing.T) {
 			}
 			requireValidCommandFixture(t, rules)
 			var want []string
+			if tt.missingBackup {
+				want = append(want, operatorCommand+" must directly import "+backup+" for offline verification")
+			}
 			for _, path := range tt.forbidden {
 				want = append(want, "forbidden operator verification dependency: "+operatorCommand+" reaches "+path)
 			}

@@ -37,6 +37,28 @@ type restartLedgerEvidence struct {
 	Failure       string `json:"failure"`
 }
 
+// ValidateRecoveredCheckpoint compares a restart observation with the generation
+// and covered cutoff of an already validated publication. The acknowledged
+// ledger supplies the committed row count because appends can follow publication.
+func ValidateRecoveredCheckpoint(published CompactionObservation, recovered *CompactionObservation, acknowledgedRows int) error {
+	if recovered == nil {
+		return errors.New("missing recovered checkpoint observation")
+	}
+	if recovered.State != "complete" {
+		return fmt.Errorf("recovered checkpoint state %q, want complete", recovered.State)
+	}
+	if recovered.Generation != published.Generation {
+		return fmt.Errorf("recovered checkpoint generation %d, want published generation %d", recovered.Generation, published.Generation)
+	}
+	if recovered.CoveredRows != published.CoveredRows {
+		return fmt.Errorf("recovered checkpoint covers %d rows, want published cutoff %d", recovered.CoveredRows, published.CoveredRows)
+	}
+	if recovered.CommittedRows != acknowledgedRows {
+		return fmt.Errorf("recovered checkpoint reports %d committed rows, ledger has %d", recovered.CommittedRows, acknowledgedRows)
+	}
+	return nil
+}
+
 func (r *restartEvidence) validate(published compactionEvidence) error {
 	if r == nil || r.Status != "pass" || r.Phase != "complete" || r.Failure != "" {
 		return errors.New("require completed restart proof without failure")
@@ -64,9 +86,6 @@ func (r *restartEvidence) validate(published compactionEvidence) error {
 	if r.Publication == nil || *r.Publication != published {
 		return errors.New("restart publication disagrees with the completed scattered compaction")
 	}
-	if r.Recovered == nil || *r.Recovered != published {
-		return errors.New("recovered checkpoint disagrees with the completed scattered compaction")
-	}
 	ledger := r.Ledger
 	total := published.CommittedRows
 	suffix := total - published.CoveredRows
@@ -78,6 +97,9 @@ func (r *restartEvidence) validate(published compactionEvidence) error {
 	}
 	if suffix <= 0 || ledger.SuffixRows != suffix || ledger.MatchedSuffix != suffix {
 		return fmt.Errorf("restart ledger must expect and match the nonempty WAL suffix of %d rows", suffix)
+	}
+	if err := ValidateRecoveredCheckpoint(*r.Publication, r.Recovered, ledger.Acknowledged); err != nil {
+		return fmt.Errorf("recovered checkpoint disagrees with restart evidence: %w", err)
 	}
 	return nil
 }

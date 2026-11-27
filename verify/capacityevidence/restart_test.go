@@ -7,6 +7,34 @@ import (
 	"testing"
 )
 
+func TestValidateRecoveredCheckpoint(t *testing.T) {
+	t.Parallel()
+	const acknowledged = 256
+	published := CompactionObservation{State: "complete", Generation: 52, CoveredRows: 128, CommittedRows: 192}
+	for _, tc := range []struct {
+		name      string
+		recovered *CompactionObservation
+		want      string
+	}{
+		{"matching checkpoint with later acknowledged appends", &CompactionObservation{"complete", 52, 128, 256}, ""},
+		{"missing observation", nil, "missing recovered checkpoint observation"},
+		{"incomplete checkpoint with matching counters", &CompactionObservation{"running", 52, 128, 256}, `state "running", want complete`},
+		{"new generation with identical rows and cutoff", &CompactionObservation{"complete", 53, 128, 256}, "generation 53, want published generation 52"},
+		{"older generation with identical rows and cutoff", &CompactionObservation{"complete", 51, 128, 256}, "generation 51, want published generation 52"},
+		{"different covered cutoff", &CompactionObservation{"complete", 52, 192, 256}, "covers 192 rows, want published cutoff 128"},
+		{"committed count matches publication only", &CompactionObservation{"complete", 52, 128, 192}, "reports 192 committed rows, ledger has 256"},
+		{"committed count exceeds the ledger", &CompactionObservation{"complete", 52, 128, 320}, "reports 320 committed rows, ledger has 256"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := ValidateRecoveredCheckpoint(published, tc.recovered, acknowledged)
+			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Errorf("ValidateRecoveredCheckpoint error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateRestartEvidence(t *testing.T) {
 	t.Parallel()
 	for _, seed := range [...]int{SmallScale, LargeScale} {
@@ -44,8 +72,9 @@ func TestValidateRestartEvidence(t *testing.T) {
 			{"different publication cutoff", "publication.covered_rows", seed, false, "restart publication disagrees"},
 			{"publication behind final cutoff", "publication.committed_rows", seed + BatchRows, false, "restart publication disagrees"},
 			{"missing recovered checkpoint", "recovered_checkpoint", nil, true, "recovered checkpoint disagrees"},
+			{"null recovered checkpoint", "recovered_checkpoint", nil, false, "missing recovered checkpoint observation"},
 			{"running recovered checkpoint", "recovered_checkpoint.state", "running", false, "recovered checkpoint disagrees"},
-			{"different recovered generation", "recovered_checkpoint.generation", 53, false, "recovered checkpoint disagrees"},
+			{"different recovered generation with identical rows and cutoff", "recovered_checkpoint.generation", 53, false, "generation 53, want published generation 52"},
 			{"different recovered cutoff", "recovered_checkpoint.covered_rows", seed, false, "recovered checkpoint disagrees"},
 			{"recovered checkpoint without suffix", "recovered_checkpoint.committed_rows", seed + BatchRows, false, "recovered checkpoint disagrees"},
 			{"missing ledger", "ledger", nil, true, "passing, exhausted restart ledger"},

@@ -8,18 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
-	"bog/verify/listener"
 	model "bog/verify/query-model"
 )
 
@@ -58,7 +55,7 @@ func TestPinnedQueryModelReplay(t *testing.T) {
 			dir := t.TempDir()
 			if retained {
 				check := func(model.QueryTraceAdapter) error { return nil }
-				err := servePinnedQuery(t.Context(), binary, dir, cfg.MaxWorkBudget, true, check)
+				err := servePinnedQuery(t, t.Context(), binary, dir, cfg.MaxWorkBudget, true, check)
 				if err == errNoCompaction {
 					t.Skip("retained shipped qualification pending: candidate has no compaction control")
 				}
@@ -73,7 +70,7 @@ func TestPinnedQueryModelReplay(t *testing.T) {
 				if err := os.Mkdir(path, 0700); err != nil {
 					return err
 				}
-				return servePinnedQuery(ctx, binary, path, budget, retained, run)
+				return servePinnedQuery(t, ctx, binary, path, budget, retained, run)
 			})
 			if err != nil {
 				t.Fatalf("trace=%+v: %v", result, err)
@@ -106,156 +103,50 @@ func pinnedQueryDigest(binary, revision string) ([]byte, error) {
 	return hash.Sum(nil), errors.Join(readErr, f.Close())
 }
 
-func servePinnedQuery(ctx context.Context, binary, dir string, budget int, retained bool, run func(model.QueryTraceAdapter) error) (err error) {
-	socket, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		return err
-	}
-	addr := socket.Addr().(*net.TCPAddr)
-	if err := socket.Close(); err != nil {
-		return err
-	}
-	cmd := exec.Command(binary, "-addr="+addr.String(), "-data-dir="+dir, "-query-concurrency=1",
-		"-query-max-response-bytes=256", "-query-work-budget="+strconv.Itoa(budget))
-	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, "BOG_CAPACITY_CONTROL=") {
-			cmd.Env = append(cmd.Env, entry)
-		}
-	}
-	if retained {
-		cmd.Env = append(cmd.Env, "BOG_CAPACITY_CONTROL=1")
-	}
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	done := make(chan struct{})
-	var waitErr error
-	go func() {
-		waitErr = cmd.Wait()
-		close(done)
-	}()
-	defer func() {
-		select {
-		case <-done:
-			err = errors.Join(err, fmt.Errorf("candidate exited before shutdown (wait result: %v)", waitErr))
-			return
-		default:
-		}
-		if signalErr := cmd.Process.Signal(syscall.SIGTERM); signalErr != nil {
-			err = errors.Join(err, signalErr)
-		}
-		timer := time.NewTimer(3 * time.Second)
-		defer timer.Stop()
-		select {
-		case <-done:
-			if waitErr != nil {
-				err = errors.Join(err, fmt.Errorf("candidate shutdown: %w", waitErr))
-			}
-		case <-timer.C:
-			killErr := cmd.Process.Kill()
-			if errors.Is(killErr, os.ErrProcessDone) {
-				killErr = nil
-			}
-			err = errors.Join(err, errors.New("candidate exceeded graceful shutdown deadline"), killErr)
-			timer.Reset(3 * time.Second)
-			select {
-			case <-done:
-			case <-timer.C:
-				err = errors.Join(err, errors.New("timed out reaping candidate"))
+func servePinnedQuery(t *testing.T, ctx context.Context, binary, dir string, budget int, retained bool, run func(model.QueryTraceAdapter) error) error {
+	t.Helper()
+	command := func(addr string) *exec.Cmd {
+		cmd := exec.Command(binary, "-addr="+addr, "-data-dir="+dir, "-query-concurrency=1",
+			"-query-max-response-bytes=256", "-query-work-budget="+strconv.Itoa(budget))
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, "BOG_CAPACITY_CONTROL=") {
+				cmd.Env = append(cmd.Env, entry)
 			}
 		}
-	}()
-
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
-	defer transport.CloseIdleConnections()
-	raw := &http.Client{
-		Transport: transport, Timeout: 5 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		if retained {
+			cmd.Env = append(cmd.Env, "BOG_CAPACITY_CONTROL=1")
+		}
+		return cmd
 	}
-	base := "http://" + addr.String()
-	owns := func() (bool, error) { return listener.OwnsBind(cmd.Process.Pid, addr.Port, listener.BindLoopback) }
-	if err := awaitPinnedQuery(ctx, raw, base, owns, done); err != nil {
-		return err
-	}
-	c, fetch, err := newWitnessClient(base, transport, 256)
-	if err != nil {
-		return err
-	}
-	adapter := model.QueryTraceAdapter{
-		Acknowledge: func(ctx context.Context, rows []model.Row) error { return acknowledgeFixtureBatch(ctx, c, rows) },
-		Fetch:       fetch,
-	}
-	if retained {
-		control := pinnedCompaction{raw: raw, base: base}
-		status, initial, err := control.read(ctx, http.MethodGet, "status", 0)
+	return withPinnedQueryCandidate(ctx, command, t.Logf, func(raw *http.Client, base string) error {
+		c, fetch, err := newWitnessClient(base, raw.Transport, 256)
 		if err != nil {
 			return err
 		}
-		if status == http.StatusNotFound {
-			return errNoCompaction
+		adapter := model.QueryTraceAdapter{
+			Acknowledge: func(ctx context.Context, rows []model.Row) error { return acknowledgeFixtureBatch(ctx, c, rows) },
+			Fetch:       fetch,
 		}
-		if status != http.StatusOK {
-			return fmt.Errorf("compaction capability returned HTTP %d", status)
-		}
-		if *initial.State != "complete" || *initial.Covered != 0 || *initial.Committed != 0 {
-			return errors.New("compaction trial did not start at an empty published point")
-		}
-		control.last = initial
-		adapter.Publish = control.publish
-	}
-	if err := run(adapter); err != nil {
-		return err
-	}
-	owned, err := owns()
-	if err != nil {
-		return err
-	}
-	if !owned {
-		return errors.New("pinned replay candidate lost listener ownership")
-	}
-	return ctx.Err()
-}
-
-func awaitPinnedQuery(ctx context.Context, raw *http.Client, base string, owns func() (bool, error), done <-chan struct{}) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		owned, err := owns()
-		if err != nil {
-			return err
-		}
-		if owned {
-			status, _, err := pinnedRequest(ctx, raw, http.MethodGet, base+"/healthz")
-			if err != nil {
-				return fmt.Errorf("check candidate health: %w", err)
-			}
-			if status != http.StatusOK {
-				return fmt.Errorf("candidate health returned HTTP %d", status)
-			}
-			owned, err := owns()
+		if retained {
+			control := pinnedCompaction{raw: raw, base: base}
+			status, initial, err := control.read(ctx, http.MethodGet, "status", 0)
 			if err != nil {
 				return err
 			}
-			if !owned {
-				return errors.New("candidate lost listener during startup")
+			if status == http.StatusNotFound {
+				return errNoCompaction
 			}
-			return ctx.Err()
+			if status != http.StatusOK {
+				return fmt.Errorf("compaction capability returned HTTP %d", status)
+			}
+			if *initial.State != "complete" || *initial.Covered != 0 || *initial.Committed != 0 {
+				return errors.New("compaction trial did not start at an empty published point")
+			}
+			control.last = initial
+			adapter.Publish = control.publish
 		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("waiting for candidate listener: %w", ctx.Err())
-		case <-done:
-			return errors.New("candidate exited before health probe")
-		case <-ticker.C:
-		}
-	}
+		return run(adapter)
+	})
 }
 
 func pinnedRequest(ctx context.Context, raw *http.Client, method, path string) (status int, body []byte, err error) {

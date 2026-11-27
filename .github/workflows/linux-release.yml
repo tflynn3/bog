@@ -259,7 +259,28 @@ jobs:
           parity() (
             export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
             export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
-            timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
+            rm -f -- "$BOG_RELEASE_PARITY_REPORT" || exit
+            events="$EVIDENCE/parity-events.jsonl"
+            timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release |
+              tee "$events" || exit
+            python3 - "$events" <<'PY' || exit
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as events:
+              for line in events:
+                  event = json.loads(line)
+                  if (event.get("Action"), event.get("Package"), event.get("Test")) == (
+                      "pass", "bog/verify/release", "TestReleaseRestoredParity"
+                  ):
+                      break
+              else:
+                  sys.exit("TestReleaseRestoredParity did not report a passing test event")
+          PY
+            if [[ ! -s "$BOG_RELEASE_PARITY_REPORT" ]]; then
+              echo "TestReleaseRestoredParity did not produce a nonempty parity report" >&2
+              exit 1
+            fi
           )
           failed=0
           for name in admission durability capacity parity; do
@@ -302,7 +323,7 @@ jobs:
         env:
           CGO_ENABLED: '1'
         run: |
-          go test -race -count=1 ./internal/archtest ./verify/linux ./verify/release ./bench/retained-history ./verify/fuzz \
+          go test -race -count=1 ./internal/archtest ./verify/linux ./verify/listener ./verify/release ./bench/retained-history ./verify/fuzz \
             2>&1 | tee "$EVIDENCE/verifier-race.log"
 
       - name: Publish release evidence

@@ -260,32 +260,3 @@ func TestStopDoesNotClaimAnUnreapedExit(t *testing.T) {
 		})
 	}
 }
-
-func TestListenerSocketTable(t *testing.T) {
-	t.Parallel()
-	const port = 8080
-	for _, tc := range []struct {
-		name, local, state, want string
-		ipv6, malformed          bool
-	}{
-		{"IPv4 loopback", "0100007F:1F90", "0A", "123", false, false},
-		{"IPv4 wildcard", "00000000:1F90", "0A", "123", false, false},
-		{"IPv6 wildcard", "00000000000000000000000000000000:1F90", "0A", "123", true, false},
-		{"mapped loopback", "0000000000000000FFFF00000100007F:1F90", "0A", "123", true, false},
-		{"IPv6 loopback cannot accept IPv4 probes", "00000000000000000000000001000000:1F90", "0A", "", true, false},
-		{"other port", "0100007F:1F91", "0A", "", false, false},
-		{"established only", "0100007F:1F90", "01", "", false, false},
-		{"truncated listener", "0100007F:1F90", "0A", "", false, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			line := fmt.Sprintf("0: %s remote %s", tc.local, tc.state)
-			if !tc.malformed {
-				line += " tx timer retr uid timeout 123"
-			}
-			inodes, err := listenerSockets(line, port, tc.ipv6)
-			if (err != nil) != tc.malformed || strings.Join(inodes, ",") != tc.want {
-				t.Fatalf("inodes %v, error %v", inodes, err)
-			}
-		})
-	}
-}

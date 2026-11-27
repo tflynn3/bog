@@ -12,11 +12,14 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"bog/verify/listener"
 )
 
 type child struct {
 	cmd         *exec.Cmd
 	done        chan struct{}
+	port        int
 	waitErr     error // read after done closes
 	logDrainErr error
 	logs        candidateLog
@@ -31,6 +34,24 @@ func (p *child) exited() bool {
 	}
 }
 
+func (p *child) ownsListener() (bool, error) {
+	if p.exited() {
+		return false, errors.New("candidate exited before listener verification")
+	}
+	return listener.Owns(p.cmd.Process.Pid, p.port)
+}
+
+func (p *child) requireListener() error {
+	owned, err := p.ownsListener()
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errors.New("candidate no longer owns the listener")
+	}
+	return nil
+}
+
 const (
 	capacityControlEnv = "BOG_CAPACITY_CONTROL"
 	// Certifying the largest walk charges both scanning and encoding its
@@ -39,18 +60,18 @@ const (
 )
 
 func startChild(binary, dir, group, mode string) (*child, string, error) {
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	reserved, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		return nil, "", err
 	}
-	addr := listener.Addr().String()
-	if err := listener.Close(); err != nil {
+	addr := reserved.Addr().(*net.TCPAddr)
+	if err := reserved.Close(); err != nil {
 		return nil, "", err
 	}
 	// A gate keeps the candidate from running before it enters the cgroup.
 	// This also works on Linux environments that filter clone3.
 	args := []string{"-c", `read -r gate && [ "$gate" = start ] && exec "$@"`, "capacity",
-		binary, "-addr", addr, "-data-dir", dir}
+		binary, "-addr", addr.String(), "-data-dir", dir}
 	if mode == "live" {
 		args = append(args, "-query-work-budget", strconv.FormatUint(liveQueryWorkBudget, 10))
 	}
@@ -67,7 +88,7 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 		cmd.Env = append(cmd.Env, capacityControlEnv+"=1")
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-	p := &child{cmd: cmd, done: make(chan struct{})}
+	p := &child{cmd: cmd, done: make(chan struct{}), port: addr.Port}
 	cmd.Stdout, cmd.Stderr = &p.logs, &p.logs
 	cmd.WaitDelay = 500 * time.Millisecond
 	readGate, gate, err := os.Pipe()
@@ -99,7 +120,7 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 		_, err = gate.Write([]byte("start\n"))
 	}
 	// The caller owns p even when placement or release of the startup gate fails.
-	return p, "http://" + addr, errors.Join(err, gate.Close())
+	return p, "http://" + addr.String(), errors.Join(err, gate.Close())
 }
 
 func openGroup(parent string, limit uint64, measured *resources) (string, error) {
@@ -454,7 +475,7 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 	}
 	probe.queryPhases = r.Diagnostics.Queries
 	defer probe.client.CloseIdleConnections()
-	if err := probe.ready(ctx, p.done); err != nil {
+	if err := probe.ready(ctx, p.done, p.ownsListener); err != nil {
 		candidate.StartupError = diagnosticError(err)
 		return p, err
 	}
@@ -472,8 +493,14 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 	defer func() {
 		cancelWork()
 		<-watched
+		if listenerErr := p.requireListener(); listenerErr != nil {
+			err = errors.Join(err, fmt.Errorf("workload completion listener: %w", listenerErr))
+		}
 		if p.exited() {
 			err = errors.Join(err, errors.New("candidate exited during workload"))
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			err = errors.Join(err, ctxErr)
 		}
 	}()
 	elapsed := time.Since(start)

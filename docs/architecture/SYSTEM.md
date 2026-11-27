@@ -17,8 +17,8 @@ access layer. [Single-writer decision](../adr/0001-single-writer-retained-histor
 
 ## Observed Linux production imports
 
-The graph was measured at `6105ab8eb78d56412c7cc14c6385aaed21bb10ac`,
-the #53 architecture companion's base. `go list -deps` reports identical
+The graph was measured with the ADR 0017 listener wiring applied to
+`b08d977b50121e45acfeceae0cdf1e64794d8fd9`. `go list -deps` reports identical
 root-module production edges on Linux amd64 (v1) and arm64 (v8.0) with cgo
 disabled and the fitness suite's build settings. Arrows point from importer
 to direct dependency. Nodes with no outgoing arrows have zero direct
@@ -63,7 +63,10 @@ flowchart TD
         Admission["verify/release"]
         Durability["verify/linux"]
         Capacity["bench/retained-history"]
+        Listener["verify/listener"]
         Model["verify/query-model (independent oracle)"]
+        Admission --> Listener
+        Capacity --> Listener
     end
     Admission --> Client
 ```
@@ -154,6 +157,7 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `verify/release` | Verifier command | Admission, fixed-budget paging, and report validation. Its test entry point produces restored-parity evidence. |
 | `verify/linux` | Verifier command | Linux crash recovery, ENOSPC, and readiness across path retargets |
 | `bench/retained-history` | Verifier command | Legacy baseline and live capacity evidence |
+| `verify/listener` | Verifier support | Linux IPv4 loopback listener ownership for release and capacity |
 | `verify/query-model` | Verifier support | Independent append-log oracle for expected query results |
 | `bench/segment-layout` | Nested-module benchmark | Checkpoint layout experiment outside the root module |
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
@@ -216,6 +220,12 @@ uses the verified image as its reference.
 [Release verifier composition](../adr/0008-release-verifier-composition.md),
 [Release evidence process boundary](../adr/0013-release-evidence-process-boundary.md)
 
+Release and capacity each verify listener ownership around the startup
+HTTP probe and at workload completion. Capacity repeats the checks after
+restart using the new child PID. The workflow records restored-parity
+producer success only after an explicit passing test event and a
+nonempty report. [Candidate listener ownership](../adr/0017-release-candidate-listener-ownership.md)
+
 The workflow publishes `linux-release-evidence-amd64` and
 `linux-release-evidence-arm64` with build identity, fixture and runner
 details, reports, exit statuses, and logs. `verifier-race.log` includes the
@@ -260,6 +270,9 @@ imports and nested modules are outside the root-module production registry.
   [Operator boundary](../../internal/archtest/operator_boundary_test.go),
   [Oracle boundary](../../internal/archtest/verifier_boundaries_test.go),
   [Release evidence boundary](../../internal/archtest/release_evidence_boundary_test.go)
+- The release and capacity producers are the only production consumers of
+  the listener helper. The check follows indirect imports as well.
+  [Candidate listener boundary](../../internal/archtest/listener_boundary_test.go)
 - Standalone libraries require a production command consumer. Every staged
   package requires an owner and activation criteria. Declarations for
   removed or reclassified packages fail the suite.

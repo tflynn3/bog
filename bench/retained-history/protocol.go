@@ -84,7 +84,7 @@ func (s service) requestBounded(ctx context.Context, method, path string, body i
 	return res, data, err
 }
 
-func (s service) ready(ctx context.Context, exited <-chan struct{}) error {
+func (s service) ready(ctx context.Context, exited <-chan struct{}, ownsListener func() (bool, error)) error {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	done := make(chan struct{})
 	go func() {
@@ -116,18 +116,31 @@ func (s service) ready(ctx context.Context, exited <-chan struct{}) error {
 				return fmt.Errorf("readiness: %w", errors.Join(err, last))
 			}
 		}
-		res, data, err := s.request(ctx, http.MethodGet, "/ready", nil)
-		if err == nil && res.StatusCode == http.StatusOK {
-			select {
-			case <-exited:
-				return errors.New("child exited during readiness")
-			default:
-				return nil
-			}
+		owned, err := ownsListener()
+		if err != nil {
+			return fmt.Errorf("before readiness request: %w", err)
 		}
-		last = err
-		if err == nil {
-			last = fmt.Errorf("HTTP %d: %.200s", res.StatusCode, data)
+		if owned {
+			res, data, err := s.request(ctx, http.MethodGet, "/ready", nil)
+			if err == nil && res.StatusCode == http.StatusOK {
+				owned, err := ownsListener()
+				if err != nil {
+					return fmt.Errorf("after readiness response: %w", err)
+				}
+				if !owned {
+					return errors.New("candidate no longer owns the listener after readiness response")
+				}
+				select {
+				case <-exited:
+					return errors.New("child exited during readiness")
+				default:
+					return ctx.Err()
+				}
+			}
+			last = err
+			if err == nil {
+				last = fmt.Errorf("HTTP %d: %.200s", res.StatusCode, data)
+			}
 		}
 		select {
 		case <-ctx.Done():

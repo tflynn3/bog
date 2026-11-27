@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -106,11 +107,12 @@ func TestReadinessDeadlineAndChildExit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	exited := make(chan struct{})
-	if err := s.ready(ctx, exited); !errors.Is(err, context.DeadlineExceeded) {
+	ownsListener := func() (bool, error) { return true, nil }
+	if err := s.ready(ctx, exited, ownsListener); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("readiness returned %v", err)
 	}
 	close(exited)
-	if err := s.ready(t.Context(), exited); err == nil || !strings.Contains(err.Error(), "exited") {
+	if err := s.ready(t.Context(), exited, ownsListener); err == nil || !strings.Contains(err.Error(), "exited") {
 		t.Fatalf("readiness returned %v", err)
 	}
 }
@@ -130,7 +132,7 @@ func TestChildExitCancelsInFlightReadinessRequest(t *testing.T) {
 	defer cancel()
 	exited := make(chan struct{})
 	result := make(chan error, 1)
-	go func() { result <- s.ready(ctx, exited) }()
+	go func() { result <- s.ready(ctx, exited, func() (bool, error) { return true, nil }) }()
 	select {
 	case <-started:
 	case <-ctx.Done():
@@ -149,6 +151,61 @@ func TestChildExitCancelsInFlightReadinessRequest(t *testing.T) {
 	case <-finished:
 	case <-ctx.Done():
 		t.Fatal("canceled readiness request left the handler running")
+	}
+}
+
+func TestReadinessRequiresListenerOwnership(t *testing.T) {
+	t.Parallel()
+	foreign := errors.New("foreign listener")
+	type observation struct {
+		owned bool
+		err   error
+	}
+	for _, tc := range []struct {
+		name         string
+		observations []observation
+		wantRequests int32
+		wantError    string
+	}{
+		{"waits for candidate", []observation{{}, {owned: true}, {owned: true}}, 1, ""},
+		{"foreign before request", []observation{{err: foreign}}, 0, "before readiness request"},
+		{"foreign after HTTP 200", []observation{{owned: true}, {err: foreign}}, 1, "after readiness response"},
+		{"missing after HTTP 200", []observation{{owned: true}, {}}, 1, "no longer owns"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var requests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/ready" {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				requests.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			s := newService(srv.URL)
+			defer s.client.CloseIdleConnections()
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			checks := 0
+			err := s.ready(ctx, make(chan struct{}), func() (bool, error) {
+				if checks == len(tc.observations) {
+					t.Fatal("unexpected extra listener check")
+				}
+				if tc.wantRequests != 0 && checks < len(tc.observations)-1 && requests.Load() != 0 {
+					t.Fatal("readiness contacted the endpoint before ownership was confirmed")
+				}
+				next := tc.observations[checks]
+				checks++
+				return next.owned, next.err
+			})
+			if tc.wantError == "" && err != nil || tc.wantError != "" && (err == nil || !strings.Contains(err.Error(), tc.wantError)) {
+				t.Errorf("readiness error = %v, want %q", err, tc.wantError)
+			}
+			if checks != len(tc.observations) || requests.Load() != tc.wantRequests {
+				t.Errorf("got %d checks and %d requests, want %d and %d", checks, requests.Load(), len(tc.observations), tc.wantRequests)
+			}
+		})
 	}
 }
 

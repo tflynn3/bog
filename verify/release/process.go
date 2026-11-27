@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"bog/verify/listener"
 )
 
 const (
@@ -160,7 +162,7 @@ func (p *candidateProcess) checkRunning() error {
 }
 
 func (p *candidateProcess) requireListener(port int) error {
-	listening, err := candidateOwnsListener(p.process.Pid, port)
+	listening, err := listener.Owns(p.process.Pid, port)
 	if err != nil {
 		return err
 	}
@@ -179,7 +181,7 @@ func (p *candidateProcess) awaitHealth(ctx context.Context, client *http.Client,
 		if err := startup.Err(); err != nil {
 			return fmt.Errorf("startup health: %w", context.Cause(startup))
 		}
-		owned, err := candidateOwnsListener(p.process.Pid, port)
+		owned, err := listener.Owns(p.process.Pid, port)
 		if err != nil {
 			return fmt.Errorf("startup listener: %w", err)
 		}

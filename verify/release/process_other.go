@@ -11,7 +11,3 @@ func candidatePlatform() error {
 func candidateExited(_ int, _ bool) (bool, error) {
 	return false, candidatePlatform()
 }
-
-func candidateOwnsListener(_, _ int) (bool, error) {
-	return false, candidatePlatform()
-}

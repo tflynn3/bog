@@ -13,9 +13,9 @@ type stagingDeclaration struct {
 	activation string
 }
 
-// Both Linux inventories at ddc0496f00812 still leave the retained libraries
-// outside cmd/bog. Remove each declaration with its role change once the
-// reviewed Storage handoff meets these criteria.
+// Both Cycle 174 base inventories leave the retained libraries outside
+// cmd/bog. Remove their declarations with #108's measured role promotions.
+// Keyed ingest has its own activation contract.
 var stagedPackages = map[string]stagingDeclaration{
 	"bog/internal/checkpoint": {
 		owner:      "bog-storage",
@@ -155,24 +155,42 @@ func TestRetainedCutoverStaging(t *testing.T) {
 	)
 	tests := []struct {
 		name                  string
+		baseline              bool
 		operatorOnly          bool
+		missingMeasuredBackup bool
 		keepDeclarations      []string
 		dropIdempotency       bool
 		wireIdempotency       bool
 		leaveCheckpointStaged bool
 		wantArchitecture      []string
+		wantCutover           []string
 		want                  []string
 	}{
+		{
+			name:             "baseline retains all staging declarations",
+			baseline:         true,
+			keepDeclarations: []string{backup, checkpoint, history},
+		},
 		{name: "retained libraries promoted and keyed ingest stays staged"},
 		{
-			name:             "operator-only backup stays staged when history and checkpoint are wired",
+			name:             "operator-only backup leaves the cutover incomplete",
 			operatorOnly:     true,
 			keepDeclarations: []string{backup},
+			wantCutover:      []string{"partial #108 promotion: runtime registration still required for " + backup},
 		},
 		{
 			name:         "operator-only backup still needs its declaration",
 			operatorOnly: true,
+			wantCutover:  []string{"partial #108 promotion: runtime registration still required for " + backup},
 			want:         []string{"staged package " + backup + " has no staging declaration"},
+		},
+		{
+			name:                  "one Linux inventory is missing the server backup edge",
+			missingMeasuredBackup: true,
+			wantArchitecture: []string{
+				backup + " is registered as runtime library but reachability from " + server + " is false",
+				"stale production import registration: " + server + " -> " + backup,
+			},
 		},
 		{
 			name:             "promoted packages retain stale declarations",
@@ -188,11 +206,13 @@ func TestRetainedCutoverStaging(t *testing.T) {
 			leaveCheckpointStaged: true,
 			keepDeclarations:      []string{checkpoint},
 			wantArchitecture:      []string{checkpoint + " is registered as staged but reachability from " + server + " is true"},
+			wantCutover:           []string{"partial #108 promotion: runtime registration still required for " + checkpoint},
 		},
 		{
 			name:                  "wired checkpoint loses its declaration before its role is updated",
 			leaveCheckpointStaged: true,
 			wantArchitecture:      []string{checkpoint + " is registered as staged but reachability from " + server + " is true"},
+			wantCutover:           []string{"partial #108 promotion: runtime registration still required for " + checkpoint},
 			want:                  []string{"staged package " + checkpoint + " has no staging declaration"},
 		},
 		{
@@ -220,6 +240,12 @@ func TestRetainedCutoverStaging(t *testing.T) {
 				idempotency:     {staged, nil},
 				wal:             {runtimeLibrary, nil},
 			}
+			if tt.baseline {
+				rules[server] = rule{serverCommand, []string{wal}}
+				rules[backup] = rule{role: staged}
+				rules[checkpoint] = rule{role: staged}
+				rules[history] = rule{staged, []string{checkpoint}}
+			}
 			if tt.operatorOnly {
 				rules[server] = rule{serverCommand, []string{history, wal}}
 				rules[backup] = rule{staged, nil}
@@ -240,8 +266,23 @@ func TestRetainedCutoverStaging(t *testing.T) {
 				}
 				packages[path] = productionPackage(name, entry.imports...)
 			}
-			if got := architectureProblems(packages, rules); !slices.Equal(got, tt.wantArchitecture) {
-				t.Errorf("architectureProblems() = %q, want %q", got, tt.wantArchitecture)
+			for _, arch := range []string{"amd64", "arm64"} {
+				t.Run(arch, func(t *testing.T) {
+					inventory := packages
+					want := tt.wantArchitecture
+					if tt.missingMeasuredBackup && arch == "arm64" {
+						inventory = maps.Clone(packages)
+						inventory[server] = productionPackage("main", history, wal)
+					} else if tt.missingMeasuredBackup {
+						want = nil
+					}
+					if got := architectureProblems(inventory, rules); !slices.Equal(got, want) {
+						t.Errorf("architectureProblems() = %q, want %q", got, want)
+					}
+				})
+			}
+			if got := retainedCutoverRoleProblems(rules); !slices.Equal(got, tt.wantCutover) {
+				t.Errorf("retainedCutoverRoleProblems() = %q, want %q", got, tt.wantCutover)
 			}
 			declarations := make(map[string]stagingDeclaration)
 			if !tt.dropIdempotency {

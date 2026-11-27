@@ -46,6 +46,10 @@ func TestInvalidOptionsDoNotRequest(t *testing.T) {
 		{"bad retries", "-max-retries", []string{"-max-retries", "-1"}},
 		{"bad retry delay", "-retry-delay", []string{"-retry-delay", "-1ns"}},
 		{"unexpected argument", "unexpected argument", []string{"export"}},
+		{"resume without checkpoint", "-resume requires -checkpoint", []string{"-resume"}},
+		{"empty checkpoint", "invalid -checkpoint", []string{"-checkpoint", ""}},
+		{"checkpoint directory spelling", "invalid -checkpoint", []string{"-checkpoint", "checkpoint/"}},
+		{"reserved checkpoint name", "invalid -checkpoint", []string{"-checkpoint", checkpointLockPrefix + "test"}},
 		{"unknown flag", "-bogus", []string{"-bogus"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

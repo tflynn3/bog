@@ -17,6 +17,7 @@ import (
 type recordOutput struct {
 	ctx    context.Context
 	write  func([]byte) error
+	sync   func() error
 	finish func() error
 }
 
@@ -25,7 +26,16 @@ func openOutput(ctx context.Context, out io.Writer) (*recordOutput, error) {
 		return nil, err
 	}
 	if out == os.Stdout || out == os.Stderr {
-		return openInheritedOutput(ctx, out.(*os.File))
+		worker, err := openInheritedWorker(ctx, out.(*os.File))
+		if err != nil {
+			return nil, err
+		}
+		return &recordOutput{
+			ctx:    ctx,
+			write:  func(record []byte) error { return worker.writeRecord(ctx, record) },
+			sync:   func() error { return worker.sync(ctx) },
+			finish: worker.close,
+		}, nil
 	}
 
 	// In-process callers supply synchronous writers or writers whose
@@ -33,6 +43,9 @@ func openOutput(ctx context.Context, out io.Writer) (*recordOutput, error) {
 	output := &recordOutput{
 		ctx:   ctx,
 		write: func(record []byte) error { return writeOnce(out, record) },
+	}
+	if syncer, ok := out.(interface{ Sync() error }); ok {
+		output.sync = syncer.Sync
 	}
 	if file, ok := out.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		finish, err := armOutputDeadline(ctx, file.SetWriteDeadline)
@@ -53,6 +66,18 @@ func (out *recordOutput) WriteRecord(record []byte) error {
 		return err
 	}
 	return outputCancellation(out.ctx, out.write(record))
+}
+
+// Sync is the sink boundary for checkpointed exports. A record reply
+// confirms delivery of bytes, while a sync reply confirms file durability.
+func (out *recordOutput) Sync() error {
+	if err := outputCancellation(out.ctx, nil); err != nil {
+		return err
+	}
+	if out.sync == nil {
+		return errors.New("output does not support sync")
+	}
+	return outputCancellation(out.ctx, out.sync())
 }
 
 func (out *recordOutput) Close() error {

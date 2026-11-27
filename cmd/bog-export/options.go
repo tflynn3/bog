@@ -23,10 +23,13 @@ const usage = `Usage:
              [-contains TEXT] [-limit 100] [-max-pages 100000]
              [-max-page-bytes 33554432] [-max-retries 3]
              [-retry-delay 100ms] [-timeout 5m]
+             [-checkpoint PATH [-resume]]
 
 Export query rows as NDJSON to stdout. Times are RFC3339 and the range is
 half-open. The filter is a case-sensitive substring. The page budget includes
 the terminal page. The timeout covers the walk, retries, and output.
+Checkpoint mode requires stdout opened for append to a regular file.
+Use -resume with the same checkpoint, query, issuer, and output file.
 An incomplete export can leave a partial final record. Earlier newline-
 terminated records remain valid and in query order.
 
@@ -43,6 +46,8 @@ type options struct {
 	maxPageBytes int64
 	retry        client.PageRetry
 	timeout      time.Duration
+	checkpoint   string
+	resume       bool
 }
 
 func parseOptions(args []string) (options, error) {
@@ -60,6 +65,8 @@ func parseOptions(args []string) (options, error) {
 	flags.IntVar(&opts.retry.MaxRetries, "max-retries", 3, "maximum retries per page")
 	flags.DurationVar(&opts.retry.Delay, "retry-delay", 100*time.Millisecond, "wait between page attempts")
 	flags.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "overall export deadline")
+	flags.StringVar(&opts.checkpoint, "checkpoint", "", "path for durable page progress")
+	flags.BoolVar(&opts.resume, "resume", false, "resume an existing checkpoint")
 	if err := flags.Parse(args); err != nil {
 		return options{}, err
 	}
@@ -110,6 +117,21 @@ func parseOptions(args []string) (options, error) {
 	}
 	if opts.timeout <= 0 {
 		return options{}, errors.New("-timeout must be positive")
+	}
+	var checkpointSpecified bool
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "checkpoint" {
+			checkpointSpecified = true
+		}
+	})
+	if opts.resume && !checkpointSpecified {
+		return options{}, errors.New("-resume requires -checkpoint")
+	}
+	if checkpointSpecified {
+		opts.checkpoint, err = checkpointPath(opts.checkpoint)
+		if err != nil {
+			return options{}, fmt.Errorf("invalid -checkpoint: %w", err)
+		}
 	}
 	return opts, nil
 }

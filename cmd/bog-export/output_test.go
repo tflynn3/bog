@@ -116,3 +116,50 @@ func TestOutputWorkerStartFailure(t *testing.T) {
 		t.Errorf("start missing worker: %v", err)
 	}
 }
+
+func TestOutputSyncProtocol(t *testing.T) {
+	t.Parallel()
+	rejected := errors.New("destination sync failed")
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"sync acknowledged", nil, "firstlast"},
+		{"sync failed", rejected, "first"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var dest syncOutput
+			dest.sync = func() error {
+				if dest.String() != "first" {
+					t.Errorf("destination at sync = %q", dest.String())
+				}
+				return tc.err
+			}
+			var reply bytes.Buffer
+			req := outputFrame([]byte("first"))
+			req = binary.BigEndian.AppendUint64(req, outputSyncFrame)
+			req = append(req, outputFrame([]byte("last"))...)
+			if err := serveOutput(io.NopCloser(bytes.NewReader(req)), &dest, &reply); err != nil {
+				t.Fatal(err)
+			}
+			if dest.String() != tc.want {
+				t.Errorf("destination = %q, want %q", dest.String(), tc.want)
+			}
+			wantReply := []byte{0, 0, 0, 0, 0, 0}
+			if tc.err != nil {
+				wantReply = append([]byte{0, 0, 0, byte(len(tc.err.Error()))}, tc.err.Error()...)
+			}
+			if !bytes.Equal(reply.Bytes(), wantReply) {
+				t.Errorf("reply = %q, want %q", reply.Bytes(), wantReply)
+			}
+		})
+	}
+}
+
+type syncOutput struct {
+	bytes.Buffer
+	sync func() error
+}
+
+func (out *syncOutput) Sync() error { return out.sync() }

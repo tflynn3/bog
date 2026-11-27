@@ -238,7 +238,14 @@ func checkMarkers(data []byte, markers []string) error {
 
 func inspectResponse(response Response, markers []string) error {
 	return inspectSurfaces(response, func(surface []byte) error {
-		return checkMarkers(surface, markers)
+		if err := checkMarkers(surface, markers); err != nil {
+			return err
+		}
+		decoded := jsonUnescaped(surface)
+		if uri := uriUnescaped(decoded); len(uri) != len(decoded) {
+			return checkMarkers(uri, markers)
+		}
+		return nil
 	})
 }
 

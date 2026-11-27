@@ -25,17 +25,7 @@ func Run(ctx context.Context, adapters Adapters) error {
 	if adapters.Query == nil || adapters.Retry == nil || adapters.Replay == nil || adapters.Export == nil {
 		return fmt.Errorf("%w: all four adapters are required", ErrIncomplete)
 	}
-	fixture := ReferenceFixture()
-	s := scenario{
-		Adapters: adapters, fixture: fixture, appends: fixtureAppends(fixture), targets: fixture.targets(),
-		forbidden: []string{plain, escaped, failed, uncommitted},
-	}
-	for _, entry := range s.appends {
-		for _, row := range entry.rows {
-			s.committed = append(s.committed, Record{s.streamForSelector(entry.request.Selector).Scope, row})
-		}
-	}
-	s.denialMarkers = s.rejectionMarkers()
+	s := newScenario(adapters)
 	for _, step := range []struct {
 		name string
 		run  func(context.Context) error
@@ -55,6 +45,21 @@ func Run(ctx context.Context, adapters Adapters) error {
 		}
 	}
 	return observation(ctx, nil)
+}
+
+func newScenario(adapters Adapters) scenario {
+	fixture := ReferenceFixture()
+	s := scenario{
+		Adapters: adapters, fixture: fixture, appends: fixtureAppends(fixture), targets: fixture.targets(),
+		forbidden: []string{plain, escaped, failed, uncommitted},
+	}
+	for _, entry := range s.appends {
+		for _, row := range entry.rows {
+			s.committed = append(s.committed, Record{s.streamForSelector(entry.request.Selector).Scope, row})
+		}
+	}
+	s.denialMarkers = s.rejectionMarkers()
+	return s
 }
 
 func observation(ctx context.Context, err error) error {

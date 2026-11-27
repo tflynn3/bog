@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"sort"
 	"strings"
 )
 
@@ -23,20 +24,25 @@ type syntheticTarget struct {
 	cursors   map[string]syntheticCursor
 	artifacts map[string][]byte
 	next      int
+	revision  uint64
+	policies  map[Scope]StreamPolicy
 }
 
 type syntheticFrame struct {
-	Scope       Scope
-	Principal   string
-	Key         string
-	Fingerprint []byte
-	Rows        []Row
+	Scope            Scope
+	Principal        string
+	Key              string
+	Fingerprint      []byte
+	RedactionVersion string
+	Outcome          Response
+	Rows             []Row
 }
 
 type syntheticCursor struct {
-	request QueryRequest
-	scope   Scope
-	rows    []Row
+	request        QueryRequest
+	scope          Scope
+	maskingVersion string
+	rows           []Row
 }
 
 func newSynthetic() *syntheticTarget {
@@ -47,6 +53,33 @@ func newSynthetic() *syntheticTarget {
 }
 
 func (s *syntheticTarget) adapters() Adapters { return Adapters{s, s, s, s} }
+
+func (s *syntheticTarget) revisionAdapters() RevisionAdapters {
+	return RevisionAdapters{s.adapters(), s, s, s}
+}
+
+func (s *syntheticTarget) ApplyPolicy(ctx context.Context, revision PolicyRevision) (PolicyAck, error) {
+	if err := ctx.Err(); err != nil {
+		return PolicyAck{}, err
+	}
+	if revision.Number != s.revision+1 || len(revision.Streams) != len(s.fixture.Streams) {
+		return PolicyAck{}, errors.New("invalid fixture policy revision")
+	}
+	s.revision = revision.Number
+	s.fixture.Grants = revision.Grants
+	s.policies = make(map[Scope]StreamPolicy, len(revision.Streams))
+	for _, policy := range revision.Streams {
+		s.policies[policy.Scope] = policy
+	}
+	return PolicyAck{Complete: true, Number: s.revision}, nil
+}
+
+func (s *syntheticTarget) streamPolicy(stream Stream) StreamPolicy {
+	if policy, ok := s.policies[stream.Scope]; ok {
+		return policy
+	}
+	return StreamPolicy{RedactionVersion: stream.PolicyVersion, Redactions: s.fixture.Replacements, FailOn: s.fixture.FailOn}
+}
 
 func (s *syntheticTarget) authorize(target Target, permission func(Grant) bool) (Stream, bool) {
 	for _, grant := range s.fixture.Grants {
@@ -80,18 +113,22 @@ func (s *syntheticTarget) Ingest(_ context.Context, request IngestRequest) (Resp
 	for _, frame := range s.frames {
 		if frame.Scope == stream.Scope && frame.Principal == request.Principal && frame.Key == request.Key {
 			if hmac.Equal(frame.Fingerprint, digest) {
-				return response(http.StatusNoContent, ""), nil
+				return frame.Outcome, nil
 			}
 			return response(http.StatusConflict, "retry conflict\n"), nil
 		}
 	}
 
-	frame := syntheticFrame{Scope: stream.Scope, Principal: request.Principal, Key: request.Key, Fingerprint: digest}
+	policy := s.streamPolicy(stream)
+	outcome := response(http.StatusNoContent, "")
+	outcome.Headers = map[string][]string{"Bog-Disposition": {fmt.Sprintf("synthetic-commit-%04d", len(s.frames)+1)}}
+	frame := syntheticFrame{Scope: stream.Scope, Principal: request.Principal, Key: request.Key, Fingerprint: digest,
+		RedactionVersion: policy.RedactionVersion, Outcome: outcome}
 	if err := decodeFixture(strings.NewReader(request.Body), func(row Row) error {
-		if strings.Contains(row.Line, s.fixture.FailOn) {
+		if strings.Contains(row.Line, policy.FailOn) {
 			return errRedactorUnavailable
 		}
-		for _, rule := range s.fixture.Replacements {
+		for _, rule := range policy.Redactions {
 			row.Line = strings.ReplaceAll(row.Line, rule.Forbidden, rule.Replacement)
 		}
 		frame.Rows = append(frame.Rows, row)
@@ -108,7 +145,7 @@ func (s *syntheticTarget) Ingest(_ context.Context, request IngestRequest) (Resp
 	}
 	s.committed = append(s.committed, encoded.Bytes()...)
 	s.frames = append(s.frames, frame)
-	return response(http.StatusNoContent, ""), nil
+	return outcome, nil
 }
 
 var errRedactorUnavailable = errors.New("fixture redactor unavailable")
@@ -145,18 +182,27 @@ func (s *syntheticTarget) Query(_ context.Context, request QueryRequest) (Page, 
 	if !ok {
 		return Page{Response: forbiddenResponse()}, nil
 	}
+	policy := s.streamPolicy(stream)
 	var rows []Row
 	if request.Cursor == "" {
 		for _, record := range s.records() {
-			if record.Scope == stream.Scope && request.Start <= record.Row.Timestamp && record.Row.Timestamp < request.End &&
-				strings.Contains(record.Row.Line, request.Contains) {
-				rows = append(rows, record.Row)
+			if record.Scope != stream.Scope || request.Start > record.Row.Timestamp || record.Row.Timestamp >= request.End {
+				continue
+			}
+			row := record.Row
+			for _, rule := range policy.Masks {
+				row.Line = strings.ReplaceAll(row.Line, rule.Forbidden, rule.Replacement)
+			}
+			if strings.Contains(row.Line, request.Contains) {
+				rows = append(rows, row)
 			}
 		}
+		sort.SliceStable(rows, func(i, j int) bool { return rows[i].Timestamp < rows[j].Timestamp })
 	} else {
 		cursor, ok := s.cursors[request.Cursor]
 		if !ok || cursor.scope != stream.Scope || cursor.request.Principal != request.Principal ||
-			cursor.request.Contains != request.Contains || cursor.request.Start != request.Start || cursor.request.End != request.End {
+			cursor.request.Contains != request.Contains || cursor.request.Start != request.Start || cursor.request.End != request.End ||
+			cursor.maskingVersion != policy.MaskingVersion {
 			return Page{Response: response(http.StatusBadRequest, "invalid cursor\n")}, nil
 		}
 		rows = cursor.rows
@@ -166,7 +212,7 @@ func (s *syntheticTarget) Query(_ context.Context, request QueryRequest) (Page, 
 	if len(rows) > request.Limit {
 		s.next++
 		result.NextCursor = fmt.Sprintf("synthetic-cursor-%04d", s.next)
-		s.cursors[result.NextCursor] = syntheticCursor{request, stream.Scope, rows[request.Limit:]}
+		s.cursors[result.NextCursor] = syntheticCursor{request, stream.Scope, policy.MaskingVersion, rows[request.Limit:]}
 		result.Headers = map[string][]string{"Bog-Next-Cursor": {result.NextCursor}}
 		rows = rows[:request.Limit]
 	}
@@ -194,12 +240,54 @@ func (s *syntheticTarget) RestartAndReplay(context.Context) (Committed, error) {
 	return Committed{Complete: true, Bytes: bytes.Clone(s.committed), Records: s.records()}, nil
 }
 
+func (s *syntheticTarget) ObserveRetryRecovery(ctx context.Context) (RetryRecovery, error) {
+	if err := ctx.Err(); err != nil {
+		return RetryRecovery{}, err
+	}
+	result := RetryRecovery{Complete: true, Commits: []RetryCommit{}}
+	err := decodeFixture(bytes.NewReader(s.committed), func(frame syntheticFrame) error {
+		unit := RetryCommit{
+			Scope: frame.Scope, Principal: frame.Principal, Key: frame.Key,
+			RedactionVersion: frame.RedactionVersion, Outcome: frame.Outcome,
+		}
+		for _, row := range frame.Rows {
+			unit.Records = append(unit.Records, Record{frame.Scope, row})
+		}
+		result.Commits = append(result.Commits, unit)
+		return nil
+	})
+	return result, err
+}
+
 type syntheticImage struct {
 	Manifest Manifest
 	Records  []Record
 }
 
-func (s *syntheticTarget) CreateExport(_ context.Context, target Target) (ExportStart, error) {
+func (s *syntheticTarget) CreateExport(ctx context.Context, target Target) (ExportStart, error) {
+	return s.createExport(ctx, target, nil)
+}
+
+func (s *syntheticTarget) ObserveExportPublication(ctx context.Context, target Target, beforePublish func(context.Context) error) (ExportPublication, error) {
+	existing := make(map[string]bool, len(s.artifacts))
+	for id := range s.artifacts {
+		existing[id] = true
+	}
+	result, err := s.createExport(ctx, target, beforePublish)
+	if err != nil {
+		return ExportPublication{}, err
+	}
+	publication := ExportPublication{Complete: true, ExportStart: result}
+	for id := range s.artifacts {
+		if !existing[id] {
+			publication.Published = append(publication.Published, id)
+		}
+	}
+	slices.Sort(publication.Published)
+	return publication, nil
+}
+
+func (s *syntheticTarget) createExport(ctx context.Context, target Target, beforePublish func(context.Context) error) (ExportStart, error) {
 	stream, ok := s.authorize(target, func(g Grant) bool { return g.Export })
 	if !ok {
 		return ExportStart{Response: forbiddenResponse()}, nil
@@ -213,6 +301,14 @@ func (s *syntheticTarget) CreateExport(_ context.Context, target Target) (Export
 	data, err := json.Marshal(image)
 	if err != nil {
 		return ExportStart{}, err
+	}
+	if beforePublish != nil {
+		if err := beforePublish(ctx); err != nil {
+			return ExportStart{}, err
+		}
+		if _, ok := s.authorize(target, func(g Grant) bool { return g.Export }); !ok {
+			return ExportStart{Response: forbiddenResponse()}, nil
+		}
 	}
 	s.next++
 	id := fmt.Sprintf("synthetic-artifact-%04d", s.next)

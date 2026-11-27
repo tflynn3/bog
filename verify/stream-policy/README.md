@@ -45,6 +45,42 @@ surfaces with retained witnesses. `MaxEvidenceBytes` bounds each observation.
 Ordinary application rejections are observations. Adapter errors, cancellation,
 and missing or unsupported evidence fail with `ErrIncomplete`. Mismatches
 fail with `ErrViolation`. Diagnostics identify the failed phase without
-including fixture values or raw adapter errors. This fixture qualifies the
-evidence checks. Live policy changes, restore, and release-binary qualification
-require separate scenarios.
+including fixture values or raw adapter errors. This fixture qualifies the static evidence checks.
+
+## Policy revision scenario
+
+`streampolicy.RunPolicyRevisions` uses a fresh `ReferenceFixture()` target.
+Supply the four base observers and three additional capabilities. Provide a
+bounded context. The caller owns target startup and cleanup.
+
+| Capability | Required observation |
+| --- | --- |
+| `PolicyObserver` | Apply each full snapshot through the target policy authority. Acknowledge the requested revision only once it governs new admissions. The mapping from fixture versions to native versions preserves stream-local masking versions across grant changes and uses a fresh version when earlier masking rules return. |
+| `ExportPublicationObserver` | Pause an admitted export before its final grant check. Run the supplied callback to completion before releasing it. Observe the final application response and independently report every artifact ID made retrievable by that attempt. Cancel or release the barrier on every error or cancellation path. |
+| `RetryRecoveryObserver` | Read the complete recovered persistence units in append order. Each unit provides the scoped key, original redaction version and disposition, and all rows from the same atomic commit boundary. The existing restart observer also inspects actual committed bytes and independently replays rows. |
+
+The query probes hold cursors over acknowledged revocation and expansion,
+compare complete denials for valid and modified tokens, and confirm that a
+regrant restores an otherwise valid cursor. A masking revision invalidates
+old tokens even after earlier masking rules return. Fresh pages match over
+masked rows and continuations for an unaffected stream still work. Both decoded
+rows and the actual NDJSON must agree with the expected scoped pages.
+
+The export probes inspect exact authenticated artifacts for two scopes.
+They revoke an export-only grant at the publication barrier, require no
+artifact to become retrievable from the aborted attempt, and exercise
+retrieval revocation against existing and absent IDs.
+
+The retry probes change ingest redaction and revoke a previously successful
+principal before restart. An authorized exact retry must reproduce the original
+disposition. Revoked exact, changed-body, and unused-key requests must give
+equivalent denials. A fresh append witnesses the new redactor. A second
+restart verifies the exact committed rows and atomic batch-plus-disposition
+units, detecting any additional durable append caused by a retry.
+
+The in-package synthetic target exercises the evidence checks with serialized
+commits. For an actual target, return an error or incomplete evidence when a
+capability is unavailable. Runtime activation still requires production WAL
+evidence for atomic batch and retry persistence and recovery, including
+ambiguous response and crash cases in the
+[ingest retry contract](../../docs/ingest-retries.md#production-acceptance).

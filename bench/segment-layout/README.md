@@ -34,7 +34,7 @@ the same profile, size and dependency versions. Timings vary.
 
 ## Cold incremental comparison
 
-Storage owns this nested module. Run the schema v5 comparison on native
+Storage owns this nested module. Run the schema v6 comparison on native
 Linux with a disk-backed work directory.
 
 ```sh
@@ -46,8 +46,8 @@ go run . -validate-report cold-mixed-medium.json
 ```
 
 Run both `mixed` and `entropy` with the same seed, scale, run count, and
-filesystem. The report has three sections for the experiment, the production
-v1 storage component, and live server compaction. Each experiment uses a
+filesystem. The report includes paired codec deltas, experimental samples,
+the production v1 storage component, and live server compaction. Each experiment uses a
 64 KiB target and one immutable file per segment. Raw, LZ4, and Zstd each
 run with Bloom disabled and enabled. Late clustered and scattered
 backfills independently extend the same initial fixture. The v1 baseline
@@ -74,6 +74,40 @@ against the independent append-log oracle before accepting the sample.
 The all-rows probe verifies the complete generation. The short-literal
 probes require exact byte matching and check that enabling Bloom leaves
 their payload counts unchanged.
+
+### Paired codec results
+
+`pairing.comparisons` contains 36 comparisons. Each of the three codec pairs
+(raw/LZ4, raw/Zstd, LZ4/Zstd) is measured in both Bloom settings, for both
+sparse queries, on the initial snapshot and after each independent backfill.
+All round deltas are candidate minus baseline, so a negative delta favors
+the candidate on that metric. Join a round to its endpoint samples using
+`pair_id` and the layout names. The ID binds the execution, fixture, exact query
+window and literal, phase, cache protocol, and one-based round. Every sample
+also records a digest of the ordered timestamps, append ordinals, and
+complete line bytes it matched. Report validation rebuilds the fixture and
+oracle and recomputes all comparisons from their endpoint samples.
+
+| Paired field | Interpretation |
+| --- | --- |
+| `physical_read_bytes` | Delta in Linux `read_bytes` charged to each query worker, including readahead. `storage_read_observed_rounds` counts rounds with a positive reading on either endpoint. |
+| `peak_worker_rss_bytes` | Delta in the two workers' whole-process high-water RSS for that round. |
+| `rewrite_amplification` | Backfill-only delta in logical synced segment and manifest bytes and in bytes written per appended WAL byte. The report repeats the phase's single publication comparison for each sparse query. |
+
+The read and memory summaries show nearest-rank p50 of the signed round
+deltas and the number of lower, equal, and higher rounds. Use
+`candidate_lower` or `baseline_lower` to find comparisons where one layout
+was at least as good on every measured metric in every round and improved
+at least one. `tradeoff_or_variable` means the direction changed across
+metrics or rounds. `equal` means all observed deltas were zero. Check
+`storage_read_observed_rounds` before drawing storage conclusions because
+successful cache advice can still yield cached reads. Compare results across
+both fixture profiles and backfill phases before choosing a layout.
+
+The validator still accepts existing schema v5 cold reports. The paired
+deltas and per-round identity are required in schema v6.
+
+### Individual worker measurements
 
 | Report field | Measurement |
 | --- | --- |
@@ -102,7 +136,7 @@ ordered loopback query results for a bounded sparse query and all three
 short literals, and the full persisted checkpoint after shutdown. A
 missing candidate or unavailable control endpoint is recorded in the live
 section. The live comparison is pending #53. The historical measurements
-below describe the earlier full-rewrite experiment. Use schema v5 evidence
+below describe the earlier full-rewrite experiment. Use schema v6 evidence
 to assess the incremental format, including compressed size, Bloom metadata
 cost, cold query latency and I/O, and backfill amplification.
 

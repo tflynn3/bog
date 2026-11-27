@@ -50,6 +50,7 @@ func TestColdProcessReadCounters(t *testing.T) {
 		{"logical only due to cache", "rchar: 100\nread_bytes: 0\n", "rchar: 154\nread_bytes: 0\n", true},
 		{"bad integer", "rchar: bad\nread_bytes: 0\n", "rchar: 154\nread_bytes: 4096\n", false},
 		{"absent field", "rchar: 100\n", "rchar: 154\nread_bytes: 4096\n", false},
+		{"duplicate reads", "rchar: 100\nread_bytes: 0\n", "rchar: 154\nread_bytes: 4096\nread_bytes: 0\n", false},
 		{"negative storage", "rchar: 100\nread_bytes: 0\n", "rchar: 154\nread_bytes: -1\n", false},
 		{"cannot subtract observer", "rchar: 100\nread_bytes: 0\n", "rchar: 101\nread_bytes: 4096\n", false},
 		{"decreasing read bytes", "rchar: 100\nread_bytes: 5000\n", "rchar: 154\nread_bytes: 4096\n", false},

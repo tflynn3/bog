@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -101,20 +100,6 @@ func (input fixtureInput) batches() iter.Seq[[]checkpoint.BlockRow] {
 			}
 		}
 	}
-}
-
-func encodeBatch(batch []checkpoint.BlockRow) ([]byte, []store.Row, error) {
-	var payload bytes.Buffer
-	enc := json.NewEncoder(&payload)
-	rows := make([]store.Row, len(batch))
-	for i, row := range batch {
-		rows[i] = row.Row
-		if err := enc.Encode(row.Row); err != nil {
-			return nil, nil, err
-		}
-	}
-	// Omit the final newline to fit the maximum-sized singleton frame.
-	return bytes.TrimSuffix(payload.Bytes(), []byte{'\n'}), rows, nil
 }
 
 type publicationRun struct {

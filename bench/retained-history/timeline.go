@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -19,56 +18,6 @@ const (
 	drainBudget            = capacityevidence.DrainBudget
 	diagnosticRequestLimit = 250 * time.Millisecond
 )
-
-type runtimeSample struct {
-	PublicationLag *uint64           `json:"publication_lag_ns"`
-	Reserved       *uint64           `json:"staging_reserved_bytes"`
-	Used           *uint64           `json:"staging_used_bytes"`
-	OldestPin      *uint64           `json:"oldest_pin_age_ns"`
-	Reclaimable    *uint64           `json:"reclaimable_bytes"`
-	RetiredPins    *uint64           `json:"retired_generation_pins"`
-	Unavailable    map[string]string `json:"unavailable,omitempty"`
-}
-
-func readRuntimeMetrics(raw json.RawMessage, statusErr error) runtimeSample {
-	var m runtimeSample
-	var fields map[string]json.RawMessage
-	var absent string
-	switch {
-	case statusErr != nil:
-		absent = "compaction status unavailable: " + diagnosticError(statusErr)
-	case len(raw) == 0 || string(raw) == "null":
-		absent = "candidate did not expose metrics"
-	case json.Unmarshal(raw, &fields) != nil:
-		absent = "candidate metrics must be a JSON object"
-	}
-	for _, field := range []struct {
-		name string
-		dest **uint64
-	}{
-		{"publication_lag_ns", &m.PublicationLag},
-		{"staging_reserved_bytes", &m.Reserved},
-		{"staging_used_bytes", &m.Used},
-		{"oldest_pin_age_ns", &m.OldestPin},
-		{"reclaimable_bytes", &m.Reclaimable},
-		{"retired_generation_pins", &m.RetiredPins},
-	} {
-		reason := absent
-		if reason == "" {
-			if err := json.Unmarshal(fields[field.name], field.dest); err != nil || *field.dest == nil {
-				*field.dest = nil
-				reason = "candidate did not supply a nonnegative integer"
-			}
-		}
-		if reason != "" {
-			if m.Unavailable == nil {
-				m.Unavailable = make(map[string]string)
-			}
-			m.Unavailable[field.name] = reason
-		}
-	}
-	return m
-}
 
 type filesystemSample struct {
 	Elapsed      *time.Duration    `json:"observed_ns"`

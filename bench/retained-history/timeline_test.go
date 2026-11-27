@@ -16,41 +16,6 @@ import (
 	"time"
 )
 
-func TestRuntimeSamplesDistinguishZeroAndUnavailable(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		raw  string
-		err  error
-		want map[string]uint64
-	}{
-		{"absent", "", nil, nil},
-		{"null", "null", nil, nil},
-		{"non-object", "[]", nil, nil},
-		{"invalid individual fields", `{"publication_lag_ns":0,"staging_reserved_bytes":-1,"staging_used_bytes":2,"oldest_pin_age_ns":"3","reclaimable_bytes":null,"retired_generation_pins":18446744073709551616}`, nil, map[string]uint64{"publication_lag_ns": 0, "staging_used_bytes": 2}},
-		{"all counters", `{"publication_lag_ns":100,"staging_reserved_bytes":8,"staging_used_bytes":4,"oldest_pin_age_ns":10,"reclaimable_bytes":1,"retired_generation_pins":0,"added_later":true}`, nil, map[string]uint64{
-			"publication_lag_ns": 100, "staging_reserved_bytes": 8, "staging_used_bytes": 4,
-			"oldest_pin_age_ns": 10, "reclaimable_bytes": 1, "retired_generation_pins": 0,
-		}},
-		{"failed status", `{"publication_lag_ns":9}`, errors.New("status failed"), nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			m := readRuntimeMetrics(json.RawMessage(tc.raw), tc.err)
-			fields := map[string]*uint64{
-				"publication_lag_ns": m.PublicationLag, "staging_reserved_bytes": m.Reserved,
-				"staging_used_bytes": m.Used, "oldest_pin_age_ns": m.OldestPin,
-				"reclaimable_bytes": m.Reclaimable, "retired_generation_pins": m.RetiredPins,
-			}
-			for key, value := range fields {
-				want, present := tc.want[key]
-				if present && (value == nil || *value != want || m.Unavailable[key] != "") ||
-					!present && (value != nil || m.Unavailable[key] == "") {
-					t.Errorf("%s = %v, reason %q", key, value, m.Unavailable[key])
-				}
-			}
-		})
-	}
-}
-
 func TestTimelineLimitKeepsBoundariesAndLatestPolls(t *testing.T) {
 	timeline := newBackfillTimeline("clustered", 64, 128, 192)
 	timeline.add(phaseSample{Event: "phase_start"})
@@ -109,11 +74,11 @@ func TestTimelineSamplesMemoryBeforeRunningStatus(t *testing.T) {
 				if reads.Load() != 1 {
 					t.Error("status request was sent before the memory read")
 				}
-				generation, covered := 3, 64
+				generation, covered, pending, pin := 3, 64, 1, `"`+testPinnedGeneration+`"`
 				if tc.state == "complete" {
-					generation, covered = 4, 128
+					generation, covered, pending, pin = 4, 128, 0, "null"
 				}
-				if _, err := fmt.Fprintf(w, `{"state":%q,"generation":%d,"covered_rows":%d,"committed_rows":192}`, tc.state, generation, covered); err != nil {
+				if _, err := fmt.Fprintf(w, `{"state":%q,"generation":%d,"covered_rows":%d,"committed_rows":192,"metrics":{"pending_compactions":%d,"oldest_pinned_generation":%s}}`, tc.state, generation, covered, pending, pin); err != nil {
 					t.Error(err)
 				}
 			}))
@@ -124,8 +89,15 @@ func TestTimelineSamplesMemoryBeforeRunningStatus(t *testing.T) {
 				reads.Add(1)
 				return 42, tc.readErr
 			}
+			dir := t.TempDir()
+			if tc.state == "complete" {
+				pinRecord := filepath.Join(dir, ".bog-history-pin-"+strings.Repeat("a", 32))
+				if err := os.WriteFile(pinRecord, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			p := backfillProbe{backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
-				service: s, control: "/compact", dir: t.TempDir(), origin: time.Now()}
+				service: s, control: "/compact", dir: dir, origin: time.Now()}
 			c, sent, received, err := p.request(t.Context(), "start", false)
 			if err != nil {
 				t.Fatal(err)
@@ -144,7 +116,17 @@ func TestTimelineSamplesMemoryBeforeRunningStatus(t *testing.T) {
 				if m != nil || status.Event != "publication" {
 					t.Fatalf("recorded memory for a completed operation: %+v", status)
 				}
+				if c := status.Candidate; c.PendingCompactions == nil || *c.PendingCompactions != 0 ||
+					c.OldestPinnedGeneration != nil || c.Unavailable[oldestPinnedGenerationMetric] != "" ||
+					status.Filesystem.PinRecords == nil || *status.Filesystem.PinRecords != 1 {
+					t.Fatalf("lost observed idle, empty pin set, or filesystem evidence: %+v", status)
+				}
 				return
+			}
+			if c := status.Candidate; c.PendingCompactions == nil || *c.PendingCompactions != 1 ||
+				c.OldestPinnedGeneration == nil || *c.OldestPinnedGeneration != testPinnedGeneration ||
+				status.Filesystem.PinRecords == nil || *status.Filesystem.PinRecords != 0 {
+				t.Fatalf("lost independent candidate or filesystem metrics: %+v", status)
 			}
 			if m == nil || m.ReadStart < start.Elapsed || m.ReadEnd < m.ReadStart || m.ReadEnd > *status.RequestSent {
 				t.Fatalf("memory read was not bracketed by running status: %+v", status)
@@ -256,7 +238,7 @@ func TestCompactionProtocolAndPartialTimeline(t *testing.T) {
 		want       string
 	}{
 		{"missing generation", `{"state":"complete","covered_rows":128,"committed_rows":192}`, "invalid compaction"},
-		{"regressed generation", `{"state":"complete","generation":3,"covered_rows":128,"committed_rows":192}`, "unexpected compaction cutoff or generation"},
+		{"regressed generation", `{"state":"complete","generation":3,"covered_rows":128,"committed_rows":192,"metrics":{"pending_compactions":1,"oldest_pinned_generation":"` + testPinnedGeneration + `"}}`, "unexpected compaction cutoff or generation"},
 		{"wrong cutoff", `{"state":"complete","generation":4,"covered_rows":129,"committed_rows":192}`, "unexpected compaction cutoff or generation"},
 		{"oversized response", strings.Repeat("x", 64<<10+1), "response exceeds"},
 		{"timeout", "", "deadline exceeded"},
@@ -298,6 +280,17 @@ func TestCompactionProtocolAndPartialTimeline(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.want) || p.Publication != nil ||
 				len(p.Samples) != 2 || p.Samples[0].Event != "overlap" || p.Samples[1].StatusError == "" {
 				t.Fatalf("unexpected partial evidence: %+v, %v", p.Samples, err)
+			}
+			for _, sample := range p.Samples {
+				for _, key := range []string{pendingCompactionsMetric, oldestPinnedGenerationMetric} {
+					if !strings.HasPrefix(sample.Candidate.Unavailable[key], "compaction status unavailable: ") {
+						t.Fatalf("%s supplied evidence without a valid probe: %+v", key, sample)
+					}
+				}
+				if sample.Candidate.PendingCompactions != nil || sample.Candidate.OldestPinnedGeneration != nil ||
+					sample.Filesystem.PinRecords == nil || *sample.Filesystem.PinRecords != 0 {
+					t.Fatalf("failed candidate probe changed independent observations: %+v", sample)
+				}
 			}
 			if tc.name == "timeout" {
 				select {
@@ -368,7 +361,13 @@ func TestPinDrainStatusTransitions(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				i := int(calls.Add(1)) - 1
 				count := tc.counts[min(i, len(tc.counts)-1)]
-				_, err := fmt.Fprintf(w, `{"state":"complete","generation":4,"covered_rows":128,"committed_rows":192,"metrics":{"retired_generation_pins":%s}}`, count)
+				// The oldest live pin can be on another generation after the
+				// predecessor drains. Only its own count establishes drain.
+				pin := `"` + testPinnedGeneration + `"`
+				if count == "null" {
+					pin = "null"
+				}
+				_, err := fmt.Fprintf(w, `{"state":"complete","generation":4,"covered_rows":128,"committed_rows":192,"metrics":{"retired_generation_pins":%s,"oldest_pinned_generation":%s}}`, count, pin)
 				if err != nil && r.Context().Err() == nil {
 					t.Error(err)
 				}

@@ -137,7 +137,7 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, required ret
 		"bog/internal/readiness.NewHandlerForDirectory": {},
 	}
 	if required.retainedPaging {
-		missing["bog/internal/httpapi.NewWithPageSource"] = struct{}{}
+		missing["bog/internal/httpapi.NewWithPageSourceAndQueryResources"] = struct{}{}
 	}
 	var problems []string
 	for _, ident := range slices.SortedFunc(maps.Keys(uses), func(a, b *ast.Ident) int {
@@ -177,8 +177,8 @@ func retainedConstructorReplacement(path, name string) string {
 	switch path {
 	case "bog/internal/httpapi":
 		switch name {
-		case "New", "NewWithQueryMaxResponseBytes", "NewWithQueryLimits":
-			return "httpapi.NewWithPageSource"
+		case "New", "NewWithQueryMaxResponseBytes", "NewWithQueryLimits", "NewWithQueryResources", "NewWithPageSource":
+			return "httpapi.NewWithPageSourceAndQueryResources"
 		}
 	case "bog/internal/readiness":
 		if name == "NewHandler" {
@@ -190,29 +190,71 @@ func retainedConstructorReplacement(path, name string) string {
 
 func TestRetainedRuntimeWiringFixtures(t *testing.T) {
 	t.Parallel()
+	productionInternal, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
 	const (
 		checkpoint = "bog/internal/checkpoint"
 		history    = "bog/internal/history"
 		backup     = "bog/internal/backup"
 		pageSource = `package main
+import "context"
 import api "bog/internal/httpapi"
-func retainedAPI() { (api.NewWithPageSource)() }
+import "bog/internal/store"
+
+type retainedSource struct{}
+func (retainedSource) Page(context.Context, api.PageRequest, *store.QueryWork) (api.PageResult, error) {
+	return api.PageResult{}, nil
+}
+func (retainedSource) Release(string) error { return nil }
+func (retainedSource) PageScanBytes(api.PageRequest) uint64 { return 4096 }
+
+var _ api.PageSourceScanBound = retainedSource{}
+
+func retainedAPI() *api.API {
+	return (api.NewWithPageSourceAndQueryResources)(retainedSource{}, nil, 1024, 2, 100,
+		api.QueryResourceLimits{ResponseBytes: 2048, ScanBytes: 8192, Captures: 2})
+}
+`
+		dotImportedPageSource = `package main
+import . "bog/internal/httpapi"
+func retainedAPI(source PageSource) *API {
+	return NewWithPageSourceAndQueryResources(source, nil, 1024, 2, 100,
+		QueryResourceLimits{ResponseBytes: 2048, ScanBytes: 8192, Captures: 2})
+}
 `
 		directoryHandler = `package main
+import "context"
+import "net/http"
+import "os"
 import ready "bog/internal/readiness"
-func directoryProbe() { ready.NewHandlerForDirectory() }
+func directoryProbe(dir *os.File, log ready.Appender, newAPI func(ready.Appender) http.Handler) http.Handler {
+	return ready.NewHandlerForDirectory(context.Background(), dir, log, newAPI)
+}
 `
 		dotImportedDirectoryHandler = `package main
+import "context"
+import "net/http"
+import "os"
 import . "bog/internal/readiness"
-func directoryProbe() { NewHandlerForDirectory() }
+func directoryProbe(dir *os.File, log Appender, newAPI func(Appender) http.Handler) http.Handler {
+	return NewHandlerForDirectory(context.Background(), dir, log, newAPI)
+}
 `
 		pagingReference = `package main
 import api "bog/internal/httpapi"
-var _ = api.NewWithPageSource
+var _ = api.NewWithPageSourceAndQueryResources
 `
 		readinessReference = `package main
 import ready "bog/internal/readiness"
 var _ = ready.NewHandlerForDirectory
+`
+		compatibilityPaging = `package main
+import . "bog/internal/httpapi"
+func compatibilityAPI() *API {
+	return NewWithPageSource(nil, nil, 1024, 2, 100)
+}
 `
 	)
 	legacyWiring := map[string]string{"legacy.go": `package main
@@ -225,8 +267,9 @@ var _ = readiness.NewHandler
 		"readiness.go": directoryHandler,
 		"paging.go": `package main
 import "bog/internal/httpapi"
-var _ = httpapi.NewWithQueryLimits
+var _ = httpapi.NewWithQueryResources
 `,
+		"compatibility.go": compatibilityPaging,
 	}
 	retainedWiring := map[string]string{
 		"readiness.go": directoryHandler,
@@ -234,7 +277,7 @@ var _ = httpapi.NewWithQueryLimits
 	}
 	const (
 		legacyReadiness = "cmd/bog/legacy.go:5:19: retained runtime must use readiness.NewHandlerForDirectory instead of readiness.NewHandler"
-		legacyPaging    = "cmd/bog/legacy.go:4:17: retained runtime must use httpapi.NewWithPageSource instead of httpapi.NewWithQueryLimits"
+		legacyPaging    = "cmd/bog/legacy.go:4:17: retained runtime must use httpapi.NewWithPageSourceAndQueryResources instead of httpapi.NewWithQueryLimits"
 	)
 	allRetained := []string{checkpoint, history, backup}
 	splitWiring := map[string]string{
@@ -316,7 +359,7 @@ var _ = httpapi.NewWithQueryLimits
 			want: []string{
 				legacyPaging,
 				legacyReadiness,
-				"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSource",
+				"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSourceAndQueryResources",
 				"cmd/bog (linux/arm64): retained runtime must call readiness.NewHandlerForDirectory",
 			},
 		},
@@ -328,7 +371,7 @@ var _ = httpapi.NewWithQueryLimits
 			want: []string{
 				legacyPaging,
 				legacyReadiness,
-				"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSource",
+				"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSourceAndQueryResources",
 				"cmd/bog (linux/arm64): retained runtime must call readiness.NewHandlerForDirectory",
 			},
 		},
@@ -337,6 +380,28 @@ var _ = httpapi.NewWithQueryLimits
 			arch:    "arm64",
 			wired:   []string{history, checkpoint},
 			sources: retainedWiring,
+		},
+		{
+			name:      "observed history accepts dot-imported constructor calls",
+			arch:      "amd64",
+			reachable: []string{history},
+			sources: map[string]string{
+				"paging.go":    dotImportedPageSource,
+				"readiness.go": dotImportedDirectoryHandler,
+			},
+		},
+		{
+			name:  "compatibility paging call leaves the explicit constructor missing",
+			arch:  "arm64",
+			wired: []string{history},
+			sources: map[string]string{
+				"paging.go":    compatibilityPaging,
+				"readiness.go": directoryHandler,
+			},
+			want: []string{
+				"cmd/bog/paging.go:4:9: retained runtime must use httpapi.NewWithPageSourceAndQueryResources instead of httpapi.NewWithPageSource",
+				"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSourceAndQueryResources",
+			},
 		},
 		{
 			name:    "amd64 requires directory readiness in selected production sources",
@@ -350,7 +415,7 @@ var _ = httpapi.NewWithQueryLimits
 			arch:    "arm64",
 			wired:   allRetained,
 			sources: splitWiring,
-			want:    []string{"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSource"},
+			want:    []string{"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSourceAndQueryResources"},
 		},
 		{
 			name:  "unused required constructor references leave both calls missing",
@@ -361,7 +426,7 @@ var _ = httpapi.NewWithQueryLimits
 				"readiness.go": readinessReference,
 			},
 			want: []string{
-				"cmd/bog (linux/amd64): retained runtime must call httpapi.NewWithPageSource",
+				"cmd/bog (linux/amd64): retained runtime must call httpapi.NewWithPageSourceAndQueryResources",
 				"cmd/bog (linux/amd64): retained runtime must call readiness.NewHandlerForDirectory",
 			},
 		},
@@ -370,19 +435,20 @@ var _ = httpapi.NewWithQueryLimits
 			arch:  "arm64",
 			wired: allRetained,
 			sources: map[string]string{"indirect.go": `package main
+import "context"
 import api "bog/internal/httpapi"
 import ready "bog/internal/readiness"
-func acceptConstructor(func()) {}
+func pass[T any](constructor T) T { return constructor }
 func handlers() {
-	paging := api.NewWithPageSource
+	paging := api.NewWithPageSourceAndQueryResources
 	probe := ready.NewHandlerForDirectory
-	acceptConstructor(api.NewWithPageSource)
-	paging()
-	probe()
+	paging(nil, nil, 1024, 2, 100, api.QueryResourceLimits{})
+	pass(api.NewWithPageSourceAndQueryResources)(nil, nil, 1024, 2, 100, api.QueryResourceLimits{})
+	probe(context.Background(), nil, nil, nil)
 }
 `},
 			want: []string{
-				"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSource",
+				"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSourceAndQueryResources",
 				"cmd/bog (linux/arm64): retained runtime must call readiness.NewHandlerForDirectory",
 			},
 		},
@@ -391,15 +457,16 @@ func handlers() {
 			arch:  "arm64",
 			wired: allRetained,
 			sources: map[string]string{"lookalikes.go": `package main
-import httpapi "bog/internal/lookalike"
-import "bog/internal/readiness"
+import httpapi "bog/cmd/bog/lookalike"
+type probe struct{}
+func (probe) NewHandlerForDirectory() {}
 func lookalikes() {
-	httpapi.NewWithPageSource()
-	readiness.Probe.NewHandlerForDirectory(readiness.Probe{})
+	httpapi.NewWithPageSourceAndQueryResources()
+	probe.NewHandlerForDirectory(probe{})
 }
 `},
 			want: []string{
-				"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSource",
+				"cmd/bog (linux/arm64): retained runtime must call httpapi.NewWithPageSourceAndQueryResources",
 				"cmd/bog (linux/arm64): retained runtime must call readiness.NewHandlerForDirectory",
 			},
 		},
@@ -412,11 +479,11 @@ func lookalikes() {
 				"readiness_linux_amd64.go": directoryHandler,
 				"legacy_linux_arm64.go": `package main
 import "bog/internal/httpapi"
-var _ = httpapi.New
+var _ = httpapi.NewWithQueryResources
 `,
 				"legacy_linux_test.go": `package main
-import "bog/internal/readiness"
-var _ = readiness.NewHandler
+import "bog/internal/httpapi"
+var _ = httpapi.NewWithPageSource
 `,
 				"legacy_darwin_amd64.go": `package main
 import "bog/internal/readiness"
@@ -441,22 +508,31 @@ var _ = readiness.NewHandler
 import api "bog/internal/httpapi"
 import . "bog/internal/readiness"
 var _ = api.New
-var _ = api.NewWithQueryMaxResponseBytes()
+var _ = api.NewWithQueryMaxResponseBytes(nil, nil, 1024)
 var _ = api.NewWithQueryLimits
 var _ = NewHandler
+var _ = api.NewWithQueryResources(nil, nil, 1024, 2, 100, api.QueryResourceLimits{})
+var _ = api.NewWithPageSource
 `,
 			},
 			want: []string{
-				"cmd/bog/legacy_linux_arm64.go:4:13: retained runtime must use httpapi.NewWithPageSource instead of httpapi.New",
-				"cmd/bog/legacy_linux_arm64.go:5:13: retained runtime must use httpapi.NewWithPageSource instead of httpapi.NewWithQueryMaxResponseBytes",
-				"cmd/bog/legacy_linux_arm64.go:6:13: retained runtime must use httpapi.NewWithPageSource instead of httpapi.NewWithQueryLimits",
+				"cmd/bog/legacy_linux_arm64.go:4:13: retained runtime must use httpapi.NewWithPageSourceAndQueryResources instead of httpapi.New",
+				"cmd/bog/legacy_linux_arm64.go:5:13: retained runtime must use httpapi.NewWithPageSourceAndQueryResources instead of httpapi.NewWithQueryMaxResponseBytes",
+				"cmd/bog/legacy_linux_arm64.go:6:13: retained runtime must use httpapi.NewWithPageSourceAndQueryResources instead of httpapi.NewWithQueryLimits",
 				"cmd/bog/legacy_linux_arm64.go:7:9: retained runtime must use readiness.NewHandlerForDirectory instead of readiness.NewHandler",
+				"cmd/bog/legacy_linux_arm64.go:8:13: retained runtime must use httpapi.NewWithPageSourceAndQueryResources instead of httpapi.NewWithQueryResources",
+				"cmd/bog/legacy_linux_arm64.go:9:13: retained runtime must use httpapi.NewWithPageSourceAndQueryResources instead of httpapi.NewWithPageSource",
 			},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			root := t.TempDir()
+			// Compile against the production packages so the command fixtures
+			// exercise the real constructor signatures for the selected target.
+			if err := os.Symlink(productionInternal, filepath.Join(root, "internal")); err != nil {
+				t.Fatal(err)
+			}
 			fixture := map[string]string{
 				"go.mod": "module bog\n\ngo 1.27\n",
 				"cmd/bog/main.go": `package main
@@ -465,20 +541,8 @@ func main() {
 	_ = httpapi.New
 }
 `,
-				"internal/httpapi/http.go": `package httpapi
-func New() {}
-func NewWithQueryMaxResponseBytes() int { return 0 }
-func NewWithQueryLimits() {}
-func NewWithPageSource() {}
-`,
-				"internal/readiness/ready.go": `package readiness
-func NewHandler() {}
-func NewHandlerForDirectory() {}
-type Probe struct{}
-func (Probe) NewHandlerForDirectory() {}
-`,
-				"internal/lookalike/http.go": `package httpapi
-func NewWithPageSource() {}
+				"cmd/bog/lookalike/http.go": `package httpapi
+func NewWithPageSourceAndQueryResources() {}
 `,
 			}
 			for name, source := range tt.sources {

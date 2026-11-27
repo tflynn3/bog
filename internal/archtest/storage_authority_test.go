@@ -23,7 +23,12 @@ func storageAuthorityProblems(rules map[string]rule) []string {
 	}
 
 	var problems []string
-	for _, from := range []string{"bog/internal/backup", "bog/internal/checkpoint", "bog/internal/history"} {
+	for _, from := range []string{
+		"bog/internal/backup",
+		"bog/internal/checkpoint",
+		"bog/internal/history",
+		"bog/internal/idempotency",
+	} {
 		if reachableImports(packages, from)[wal] {
 			problems = append(problems, fmt.Sprintf("forbidden storage authority dependency: %s reaches %s", from, wal))
 		}
@@ -34,20 +39,21 @@ func storageAuthorityProblems(rules map[string]rule) []string {
 func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 	t.Parallel()
 	const (
-		backup     = "bog/internal/backup"
-		checkpoint = "bog/internal/checkpoint"
-		history    = "bog/internal/history"
-		httpapi    = "bog/internal/httpapi"
-		relay      = "bog/internal/relay"
-		store      = "bog/internal/store"
-		wal        = "bog/internal/wal"
+		backup      = "bog/internal/backup"
+		checkpoint  = "bog/internal/checkpoint"
+		history     = "bog/internal/history"
+		httpapi     = "bog/internal/httpapi"
+		idempotency = "bog/internal/idempotency"
+		relay       = "bog/internal/relay"
+		store       = "bog/internal/store"
+		wal         = "bog/internal/wal"
 	)
 	tests := []struct {
 		name          string
 		from, through string
 		want          []string
 	}{
-		{name: "command-local composition"},
+		{name: "command-local composition supplies the keyed ingest backend"},
 		{
 			name: "backup imports the owner directly",
 			from: backup, through: wal,
@@ -71,18 +77,31 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 			from: history, through: relay,
 			want: []string{"forbidden storage authority dependency: " + history + " reaches " + wal},
 		},
+		{
+			name: "idempotency imports the owner directly",
+			from: idempotency, through: wal,
+			want: []string{"forbidden storage authority dependency: " + idempotency + " reaches " + wal},
+		},
+		{
+			name: "idempotency reaches the owner through a registered relay",
+			from: idempotency, through: relay,
+			want: []string{"forbidden storage authority dependency: " + idempotency + " reaches " + wal},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			// The command can adapt its WAL owner to idempotency.Backend and
+			// inject it into the coordinator without a coordinator-to-WAL import.
 			rules := map[string]rule{
-				server:     {serverCommand, []string{backup, checkpoint, history, httpapi, wal}},
-				backup:     {runtimeLibrary, []string{store}},
-				checkpoint: {runtimeLibrary, []string{store}},
-				history:    {runtimeLibrary, []string{checkpoint, store}},
-				httpapi:    {runtimeLibrary, []string{store, wal}},
-				store:      {runtimeLibrary, nil},
-				wal:        {runtimeLibrary, []string{store}},
+				server:      {serverCommand, []string{backup, checkpoint, history, httpapi, idempotency, wal}},
+				backup:      {runtimeLibrary, []string{store}},
+				checkpoint:  {runtimeLibrary, []string{store}},
+				history:     {runtimeLibrary, []string{checkpoint, store}},
+				httpapi:     {runtimeLibrary, []string{store, wal}},
+				idempotency: {runtimeLibrary, nil},
+				store:       {runtimeLibrary, nil},
+				wal:         {runtimeLibrary, []string{store}},
 			}
 			if tt.through == relay {
 				rules[relay] = rule{runtimeLibrary, []string{wal}}

@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-
 	"time"
 )
 
@@ -43,7 +42,7 @@ func scanLiveHeap() uint64 {
 // Each scan announces arrival from its visitor and sends one result after
 // all storage defers have run. The deferred join consumes every unfinished
 // result under one timeout, including when a scan or the coordinator fails.
-func coordinateScanMemoryWorkers(parent context.Context, joinTimeout time.Duration, count int, ticks <-chan time.Time, sample func(),
+func coordinateScanMemoryWorkers(parent context.Context, joinTimeout time.Duration, count int, ticks <-chan time.Time, sample func() error,
 	scan func(context.Context, int, func()) error, paused func() error) (err error) {
 	ctx, cancel := context.WithCancel(parent)
 	type result struct {
@@ -86,9 +85,14 @@ func coordinateScanMemoryWorkers(parent context.Context, joinTimeout time.Durati
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return fmt.Errorf("scan %d exited before cancellation: %v", r.index, r.err)
+			if r.err == nil {
+				return fmt.Errorf("scan %d exited before cancellation", r.index)
+			}
+			return fmt.Errorf("scan %d exited before cancellation: %w", r.index, r.err)
 		case <-ticks:
-			sample()
+			if err := sample(); err != nil {
+				return err
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -115,11 +119,13 @@ func TestCoordinateScanMemoryWorkers(t *testing.T) {
 		name        string
 		early       bool
 		preCanceled bool
+		sampleErr   error
 		pausedErr   error
 		wantError   string
 	}{
 		{name: "all materialized"},
 		{name: "paused snapshot failed", pausedErr: pausedFailure, wantError: pausedFailure.Error()},
+		{name: "heap sample failed", sampleErr: errReplayLimit, wantError: errReplayLimit.Error()},
 		{name: "early scan error", early: true, wantError: "exited before cancellation"},
 		{name: "parent canceled", preCanceled: true, wantError: "context canceled"},
 	} {
@@ -135,7 +141,10 @@ func TestCoordinateScanMemoryWorkers(t *testing.T) {
 			sampled := make(chan struct{})
 			var active, released atomic.Int32
 			paused := false
-			err := coordinateScanMemoryWorkers(ctx, time.Second, count, ticks, func() { close(sampled) },
+			err := coordinateScanMemoryWorkers(ctx, time.Second, count, ticks, func() error {
+				close(sampled)
+				return tc.sampleErr
+			},
 				func(ctx context.Context, index int, arrive func()) error {
 					defer released.Add(1)
 					select {
@@ -163,7 +172,7 @@ func TestCoordinateScanMemoryWorkers(t *testing.T) {
 			if got := released.Load(); got != count || active.Load() != 0 {
 				t.Fatalf("returned with %d released scans and %d active", got, active.Load())
 			}
-			if paused != (!tc.early && !tc.preCanceled) {
+			if paused != (!tc.early && !tc.preCanceled && tc.sampleErr == nil) {
 				t.Fatalf("paused = %v", paused)
 			}
 			if tc.wantError == "" {

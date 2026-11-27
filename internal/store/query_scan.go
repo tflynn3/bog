@@ -99,8 +99,10 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 			if err := work.row(row.Line, inspectLine); err != nil {
 				return false, err
 			}
-			if strings.Contains(row.Line, contains) && matches.add(row, ordinal, count) {
-				return true, nil
+			if strings.Contains(row.Line, contains) {
+				if done, err := matches.add(row, ordinal, count); done || err != nil {
+					return done, err
+				}
 			}
 			next, err := run.nextVisible(directOffset+1, count, work)
 			if err != nil {
@@ -129,8 +131,10 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 			if err := work.row(row.Line, true); err != nil {
 				return false, err
 			}
-			if strings.Contains(row.Line, contains) && matches.add(row, current.ordinal, count) {
-				return true, nil
+			if strings.Contains(row.Line, contains) {
+				if done, err := matches.add(row, current.ordinal, count); done || err != nil {
+					return done, err
+				}
 			}
 			run := runs[current.run]
 			next, err := run.nextVisible(current.offset+1, count, work)
@@ -203,8 +207,10 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 					if err := work.row(row.Line, true); err != nil {
 						return err
 					}
-					if strings.Contains(row.Line, contains) && matches.add(row, ordinal, count) {
-						return nil
+					if strings.Contains(row.Line, contains) {
+						if done, err := matches.add(row, ordinal, count); done || err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -250,7 +256,9 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 				}
 			} else {
 				probes := literalProbes(contains)
-				possible := make([]int, 0)
+				var possible []int
+				defer func() { releaseQueryInts(matches.memory, cap(possible)) }()
+				maxBlocks := (intervalEnd-1)/blockSize - intervalStart/blockSize + 1
 				possibleRows := 0
 				for first := intervalStart / blockSize * blockSize; first < intervalEnd; first += blockSize {
 					block := first / blockSize
@@ -264,6 +272,9 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 					if possibleRows > bound/4 {
 						break
 					}
+					if err := growQueryInts(&possible, maxBlocks, matches.memory); err != nil {
+						return err
+					}
 					possible = append(possible, first)
 				}
 				if possibleRows <= bound/4 {
@@ -271,6 +282,8 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 					matches.reset()
 					return queryBlocks(rows, possible, count, start, end, contains, after, matches, work)
 				}
+				releaseQueryInts(matches.memory, cap(possible))
+				possible = nil
 			}
 		}
 	}
@@ -338,8 +351,8 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 	}
 	for h.Len() > 0 && !matches.full() {
 		current := heap.Pop(h).(candidate)
-		if matches.add(rows[current.ordinal], current.ordinal, count) {
-			return nil
+		if done, err := matches.add(rows[current.ordinal], current.ordinal, count); done || err != nil {
+			return err
 		}
 		offset, err := runs[current.run].nextVisible(current.offset+1, count, work)
 		if err != nil {

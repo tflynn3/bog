@@ -104,6 +104,7 @@ func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, lite
 		capacity = count
 	}
 	h := &latestHeap{rows: rows}
+	defer func() { releaseQueryInts(matches.memory, cap(h.ordinals)) }()
 	for _, first := range blocks {
 		last := min(first+blockSize, count)
 		for ordinal := first; ordinal < last; ordinal++ {
@@ -117,6 +118,9 @@ func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, lite
 				continue
 			}
 			if h.Len() < capacity {
+				if err := growQueryInts(&h.ordinals, capacity, matches.memory); err != nil {
+					return err
+				}
 				heap.Push(h, ordinal)
 			} else if capacity > 0 && rowLess(rows, ordinal, h.ordinals[0]) {
 				h.ordinals[0] = ordinal
@@ -126,8 +130,8 @@ func queryBlocks(rows []Row, blocks []int, count int, start, end time.Time, lite
 	}
 	sort.Slice(h.ordinals, func(i, j int) bool { return rowLess(rows, h.ordinals[i], h.ordinals[j]) })
 	for _, ordinal := range h.ordinals {
-		if matches.add(rows[ordinal], ordinal, len(h.ordinals)) {
-			break
+		if done, err := matches.add(rows[ordinal], ordinal, len(h.ordinals)); done || err != nil {
+			return err
 		}
 	}
 	return nil

@@ -88,8 +88,8 @@ func (s *Store) queryView() queryView {
 	return queryView{s.rows, s.blocks, s.restored, s.runs}
 }
 
-// queryMatches collects either legacy rows or positioned rows from an ordered
-// scan. A match beyond the limit establishes continuation without being stored.
+// queryMatches collects rows or ordinals from an ordered scan. A match beyond
+// the limit establishes continuation without being stored.
 type queryMatches struct {
 	limit        int
 	lookahead    bool
@@ -97,6 +97,7 @@ type queryMatches struct {
 	rows         []Row
 	positioned   []PositionedRow // non-nil when collecting positioned results
 	ordinals     []int           // non-nil when collecting an immutable match list
+	memory       QueryMemory     // optional meter for ordinal and scan scratch arrays
 	last         Position
 	more         bool
 }
@@ -111,12 +112,15 @@ func (p *queryMatches) reset() {
 	p.ordinals = p.ordinals[:0]
 }
 
-func (p *queryMatches) add(row Row, ordinal, capacity int) (done bool) {
+func (p *queryMatches) add(row Row, ordinal, capacity int) (done bool, err error) {
 	if p.full() {
 		p.more = true
-		return true
+		return true, nil
 	}
 	if p.ordinals != nil {
+		if err := growQueryInts(&p.ordinals, min(p.limit, capacity), p.memory); err != nil {
+			return false, err
+		}
 		p.ordinals = append(p.ordinals, ordinal)
 	} else if p.positioned != nil {
 		if cap(p.positioned) == 0 {
@@ -130,7 +134,7 @@ func (p *queryMatches) add(row Row, ordinal, capacity int) (done bool) {
 		p.rows = append(p.rows, row)
 		p.last = Position{row.TS, ordinal}
 	}
-	return !p.lookahead && p.full()
+	return !p.lookahead && p.full(), nil
 }
 
 // QueryPage captures the published row count when both snapshot and after are nil.

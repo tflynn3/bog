@@ -35,19 +35,31 @@ type PositionedMatches struct {
 // It returns no capture on cancellation, work exhaustion, or if there are
 // more than maxMatches matches. An empty literal needs no line-byte probes.
 func (s *Store) CapturePositionedMatches(start, end time.Time, contains string, maxMatches int, work *QueryWork) (*PositionedMatches, error) {
+	return s.CapturePositionedMatchesWithMemory(start, end, contains, maxMatches, work, nil)
+}
+
+// CapturePositionedMatchesWithMemory also meters variable-sized scan arrays.
+// On success only the ordinal backing array remains charged. On error all
+// reservations made by Store are returned and no view escapes.
+func (s *Store) CapturePositionedMatchesWithMemory(start, end time.Time, contains string, maxMatches int, work *QueryWork, memory QueryMemory) (*PositionedMatches, error) {
 	if err := work.Charge(); err != nil {
 		return nil, err
 	}
 	if maxMatches <= 0 {
 		return nil, ErrQueryWorkExhausted
 	}
-	view := s.CapturePositionedSnapshot().view
-	matches := queryMatches{limit: maxMatches, lookahead: true, ordinals: []int{}}
-	if err := view.scan(start, end, contains, len(view.rows), nil, &matches, work); err != nil {
-		return nil, err
+	view := s.queryView()
+	matches := queryMatches{limit: maxMatches, lookahead: true, ordinals: []int{}, memory: memory}
+	err := view.scan(start, end, contains, len(view.rows), nil, &matches, work)
+	if err == nil {
+		err = work.Charge()
+		if err == nil && matches.more {
+			err = ErrQueryWorkExhausted
+		}
 	}
-	if matches.more {
-		return nil, ErrQueryWorkExhausted
+	if err != nil {
+		releaseQueryInts(memory, cap(matches.ordinals))
+		return nil, err
 	}
 	return &PositionedMatches{rows: view.rows, ordinals: matches.ordinals}, nil
 }

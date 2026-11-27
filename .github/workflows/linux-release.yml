@@ -329,9 +329,9 @@ jobs:
           done 3<<< "$RELEASE_PRODUCERS"
           exit "$failed"
 
-      - name: Race-test release verifier lifecycle
+      - name: Race-test candidate runtime and release verifier lifecycle
         if: always() && steps.build.outcome == 'success'
-        timeout-minutes: 24
+        timeout-minutes: 30
         env:
           CGO_ENABLED: '1'
         run: |
@@ -396,14 +396,20 @@ jobs:
           PY
           )
           race_checkout() (
-            local checkout=$1 expected_sha=$2 status=0
+            local checkout=$1 expected_sha=$2 checkout_sha status=0
             shift 2
             cd "$checkout" || exit
             checkout_sha=$(git rev-parse HEAD) || exit
-            printf 'race checkout=%s checkout_sha=%s\n' "$checkout" "$checkout_sha" || exit
-            [[ "$checkout_sha" == "$expected_sha" ]] || exit 1
-            timeout --kill-after=5s 285s go test -race -count=1 "$@" || status=$?
-            printf 'race checkout=%s checkout_sha=%s exit=%d\n' "$checkout" "$checkout_sha" "$status" || exit
+            printf 'race checkout=%s checkout_sha=%s arch=%s packages=%s\n' \
+              "$checkout" "$checkout_sha" "$EXPECTED_ARCH" "$*" || exit
+            if [[ "$checkout_sha" == "$expected_sha" ]]; then
+              timeout --kill-after=5s 285s go test -race -count=1 "$@" || status=$?
+            else
+              printf 'race expected checkout SHA %s\n' "$expected_sha" >&2 || exit
+              status=1
+            fi
+            printf 'race checkout=%s checkout_sha=%s exit=%d arch=%s packages=%s\n' \
+              "$checkout" "$checkout_sha" "$status" "$EXPECTED_ARCH" "$*" || exit
             exit "$status"
           )
           query_race() (
@@ -426,6 +432,7 @@ jobs:
           {
             failed=0
             candidate_storage_race || failed=1
+            race_checkout candidate "$REVISION" ./cmd/bog ./internal/history ./internal/readiness || failed=1
             race_checkout candidate "$REVISION" ./internal/archtest ./verify/linux ./verify/listener \
               ./verify/release ./bench/retained-history ./verify/fuzz || failed=1
             # Gate-owned oracle exercises the pinned binary. Compile the

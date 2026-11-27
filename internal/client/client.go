@@ -64,6 +64,7 @@ type HTTPError struct {
 	Cause          error
 	QueryRetryable bool
 	CursorRejected bool
+	captureExpired bool
 }
 
 func (e *HTTPError) Error() string {
@@ -73,6 +74,11 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("Bog HTTP %d: %s", e.StatusCode, e.Body)
 }
 func (e *HTTPError) Unwrap() error { return e.Cause }
+
+func (e *HTTPError) Is(target error) bool {
+	return target == ErrCaptureExpired && e.captureExpired ||
+		target == ErrInvalidCursor && e.CursorRejected
+}
 
 // Retryable reports a query HTTP 503. A capacity rejection may clear on retry;
 // a work-budget rejection may require a smaller limit or a larger server budget.

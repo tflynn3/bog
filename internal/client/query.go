@@ -54,6 +54,13 @@ var ErrMalformedPage = errors.New("malformed query page")
 // or closing its body. Context cancellation uses the standard context errors.
 var ErrPageInterrupted = errors.New("query page delivery interrupted")
 
+// ErrCaptureExpired indicates that Bog authenticated the cursor but its
+// capture is expired or unavailable.
+var ErrCaptureExpired = errors.New("query capture expired")
+
+// ErrInvalidCursor indicates that Bog rejected a continuation cursor.
+var ErrInvalidCursor = errors.New("invalid cursor")
+
 var errCursorCycle = fmt.Errorf("%w: next cursor does not advance pagination: cursor cycle", ErrMalformedPage)
 
 func readQueryBody(ctx context.Context, r *http.Response, limit int64) ([]byte, error) {
@@ -161,9 +168,14 @@ func acceptQueryResponse(ctx context.Context, resp *http.Response, maxBytes int6
 	if resp.StatusCode != http.StatusOK {
 		e := statusError(resp)
 		e.QueryRetryable = resp.StatusCode == http.StatusServiceUnavailable
-		e.CursorRejected = cursor != "" && resp.StatusCode == http.StatusBadRequest && framed(resp) && e.Cause == nil && e.Body == "invalid cursor\n"
-		if err := resp.Body.Close(); err != nil {
-			return Page{}, withQueryCancellation(ctx, errors.Join(e, err))
+		closeErr := resp.Body.Close()
+		if cursor != "" && framed(resp) && e.Cause == nil {
+			e.CursorRejected = resp.StatusCode == http.StatusBadRequest && e.Body == "invalid cursor\n"
+			e.captureExpired = resp.StatusCode == http.StatusGone && e.Body == "query capture expired\n" &&
+				closeErr == nil && (resp.ContentLength < 0 || resp.ContentLength == int64(len(e.Body)))
+		}
+		if closeErr != nil {
+			return Page{}, withQueryCancellation(ctx, errors.Join(e, closeErr))
 		}
 		return Page{}, withQueryCancellation(ctx, e)
 	}

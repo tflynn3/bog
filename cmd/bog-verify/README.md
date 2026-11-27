@@ -9,6 +9,11 @@ bog-verify compare -backup /srv/backup/bog-snapshot \
   -url http://127.0.0.1:8080 \
   -start 2026-01-01T00:00:00Z -end 2026-01-02T00:00:00Z \
   -contains 'request completed' -limit 100
+
+bog-verify drill -backup /srv/backup/bog-snapshot \
+  -url http://127.0.0.1:8080 \
+  -start 2026-01-01T00:00:00Z -end 2026-01-02T00:00:00Z \
+  -contains 'request completed' -limit 100 -max-retries 3
 ```
 
 Keep the reference backup immutable for the entire operation. For comparison,
@@ -16,7 +21,7 @@ restore a separate copy and point `-url` at a running Bog server that can serve
 the restored image. Keep the restored server free of writes before the first
 query if you expect an exact match to the backup's recovery point.
 
-Both commands verify the backup's integrity and report the recovery point on
+All commands verify the backup's integrity and report the recovery point on
 success. Comparison verifies the reference before issuing a query. It applies
 the same half-open time range and case-sensitive substring to both sides, then
 compares decoded timestamps and lines in order, including tied timestamps and
@@ -25,6 +30,38 @@ the matched row count and both page counts after consuming both terminal pages.
 Bog emits at least one row on each page carrying a continuation. The Go client
 also accepts fully framed empty pages with fresh cursors, and comparison
 follows them within the same page budget.
+
+## Restore drill
+
+Point `-url` at the restored instance directly, with writes paused for the
+entire drill. Wait for the verifier's restart prompt after the first
+comparison. Stop and restart the server on the same restored data directory
+and URL. Once the server is ready, run the prompt's `kill -USR1 PID` command
+against the verifier process. The signal acknowledges the operator's restart.
+
+The drill reopens and verifies the immutable reference, checks its recovery
+point, and starts a new query snapshot at page one. Each phase has its own
+page budget. The verifier reports the phase and the first differing row, or
+the matched row and page counts for each completed phase.
+
+`-max-retries` defaults to three extra attempts per live page and accepts
+zero for a single attempt. `-retry-delay` defaults to 100 ms between attempts.
+On HTTP 503 or interrupted page delivery the verifier retries the same
+request, including its cursor. Empty and terminal pages count once when
+accepted. Capture expiry (HTTP 410), invalid cursors (HTTP 400), and retry
+exhaustion produce distinct incomplete diagnostics. The overall
+`-timeout` covers both comparisons, retry waits, and the restart boundary.
+
+On native Linux, the fixture-backed smoke test can run the drill against
+the shipped retained-restore binary. It restores a disposable copy and
+restarts the candidate on the same data directory and listener address.
+
+```sh
+BOG_RESTORE_DRILL_BINARY=/absolute/path/to/bog \
+  go test -count=1 ./cmd/bog-verify -run '^TestRestoreDrillShippedServer$' -v
+```
+
+## Limits and exit statuses
 
 `-limit` defaults to 100 rows per page and accepts 1 through 1000.
 `-max-pages` defaults to 100,000 pages per stream, including empty and terminal
@@ -44,7 +81,7 @@ a fresh snapshot.
 
 | Exit status | Meaning |
 | --- | --- |
-| 0 | Backup verified, or both query streams exhausted with identical rows |
+| 0 | Backup verified, comparison matched, or both drill phases matched |
 | 2 | Invalid command or options |
 | 3 | Backup verification failed |
 | 4 | Comparison incomplete or result could not be reported |

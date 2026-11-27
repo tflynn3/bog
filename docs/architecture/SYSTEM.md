@@ -23,8 +23,10 @@ root-module production edges on Linux amd64 (v1) and arm64 (v8.0) with cgo
 disabled and the fitness suite's build settings. Arrows point from importer
 to direct dependency. Nodes with no outgoing arrows have zero direct
 root-module production imports. Test-only packages appear in the registry
-below. The graph also includes the fixture-backed stream policy verifier support
-added in #86.
+below. The graph also includes the fixture-backed stream policy verifier
+support added in #86 and the two capacity evidence edges required in the
+composed #87 revision. The fitness suite measures both #87 edges on that
+revision.
 
 ```mermaid
 flowchart TD
@@ -64,11 +66,14 @@ flowchart TD
         Admission["verify/release"]
         Durability["verify/linux"]
         Capacity["bench/retained-history"]
+        CapacityEvidence["verify/capacityevidence"]
         Listener["verify/listener"]
         Model["verify/query-model (independent oracle)"]
         StreamPolicy["verify/stream-policy (fixture conformance)"]
         Admission --> Listener
         Capacity --> Listener
+        Admission --> CapacityEvidence
+        Capacity --> CapacityEvidence
     end
     Admission --> Client
 ```
@@ -159,6 +164,7 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `verify/release` | Verifier command | Admission, fixed-budget paging, and report validation. Its test entry point produces restored-parity evidence. |
 | `verify/linux` | Verifier command | Linux crash recovery, ENOSPC, and readiness across path retargets |
 | `bench/retained-history` | Verifier command | Legacy baseline and live capacity evidence |
+| `verify/capacityevidence` | Verifier support | Shared strict schema-v1 live capacity proof for release and capacity |
 | `verify/listener` | Verifier support | Linux IPv4 loopback listener ownership for release and capacity |
 | `verify/query-model` | Verifier support | Independent append-log oracle for expected query results |
 | `verify/stream-policy` | Verifier support | Fixture-backed checks of stream isolation and pre-append redaction |
@@ -229,6 +235,17 @@ restart using the new child PID. The workflow records restored-parity
 producer success only after an explicit passing test event and a
 nonempty report. [Candidate listener ownership](../adr/0017-release-candidate-listener-ownership.md)
 
+The benchmark's `-validate-cutover` and release's `validate -require-cutover`
+use one strict schema-v1 capacity validator. The proof requires a numeric
+zero in the raw cgroup OOM kill counter and validates the observed
+backfill timeline in execution order. Standard release validation still
+accepts historical schema-v1 live reports. Release validation matches
+the pinned candidate identity and requires affirmative writable-restore
+parity in strict mode. Release report publication anchors staging,
+replacement, cleanup, and directory sync to the same opened parent.
+[Capacity evidence validation](../adr/0018-capacity-evidence-validation.md),
+[Shared capacity evidence boundary](../adr/0020-shared-capacity-evidence.md)
+
 The workflow publishes `linux-release-evidence-amd64` and
 `linux-release-evidence-arm64` with build identity, fixture and runner
 details, reports, exit statuses, and logs. `verifier-race.log` includes the
@@ -265,6 +282,12 @@ wiring in one PR.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification)
 
+Architecture and Release Verification land the #87 imports and registry
+together. Storage and Architecture review the #53 runtime and its measured
+registry promotion in a separate composed PR. Rebase the later registry
+edit onto the first landed PR, then rerun both Linux inventories.
+[#53 package promotion handoff](../adr/0019-package-role-governance.md#53-promotion-handoff)
+
 The Architecture workflow runs `go test -count=1 ./internal/archtest`.
 The suite lists packages with `GOOS=linux`, `GOAMD64=v1`, `GOARM64=v8.0`,
 `CGO_ENABLED=0`, `GOENV=off`, empty `GOFLAGS`, `GO111MODULE=on`, and
@@ -292,6 +315,11 @@ imports and nested modules are outside the root-module production registry.
 - The release and capacity producers are the only production consumers of
   the listener helper. The check follows indirect imports as well.
   [Candidate listener boundary](../../internal/archtest/listener_boundary_test.go)
+- `verify/release` and `bench/retained-history` must both import
+  `verify/capacityevidence` directly in production. The helper has no
+  root-module production imports. The check rejects production reachability
+  from any other registered package, including through an intermediary.
+  [Capacity evidence boundary](../../internal/archtest/capacity_evidence_boundary_test.go)
 - Standalone libraries require a production command consumer. Every staged
   package requires an owner and activation criteria. Declarations for
   removed or reclassified packages fail the suite.

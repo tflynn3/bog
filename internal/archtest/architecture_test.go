@@ -56,9 +56,10 @@ var registry = map[string]rule{
 	"bog/internal/ingest":        {testOnly, nil},
 	"bog/internal/archtest":      {testOnly, nil},
 	fuzzVerifier:                 {testOnly, nil},
-	"bog/verify/release":         {verifier, []string{goClient, listenerVerifier}},
+	"bog/verify/release":         {verifier, []string{goClient, capacityEvidenceVerifier, listenerVerifier}},
 	"bog/verify/linux":           {verifier, nil},
-	"bog/bench/retained-history": {verifier, []string{listenerVerifier}},
+	"bog/bench/retained-history": {verifier, []string{capacityEvidenceVerifier, listenerVerifier}},
+	capacityEvidenceVerifier:     {verifierModel, nil},
 	listenerVerifier:             {verifierModel, nil},
 	"bog/verify/query-model":     {verifierModel, nil},
 	streamPolicyVerifier:         {verifierModel, nil},
@@ -123,6 +124,9 @@ func checkLinuxArchitecture(t *testing.T, arch string) {
 		packages[pkg.ImportPath] = pkg
 	}
 	for _, problem := range listenerBoundaryProblems(packages, registry) {
+		t.Error(problem)
+	}
+	for _, problem := range capacityEvidenceBoundaryProblems(packages, registry) {
 		t.Error(problem)
 	}
 	for _, problem := range architectureProblems(packages, registry) {

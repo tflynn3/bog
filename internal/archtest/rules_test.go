@@ -47,6 +47,14 @@ func TestArchitectureRules(t *testing.T) {
 			want: []string{"unregistered unreachable production package " + extra},
 		},
 		{
+			name: "unknown role cannot register an orphan",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[extra] = productionPackage("extra")
+				rules[extra] = rule{role: "helper"}
+			},
+			want: []string{extra + " has unknown architecture role \"helper\""},
+		},
+		{
 			name: "unregistered reachable production package",
 			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
 				pkgs[extra] = productionPackage("extra")
@@ -186,6 +194,7 @@ func TestComposedCutoverRules(t *testing.T) {
 		history    = "bog/internal/history"
 		backup     = "bog/internal/backup"
 		adapter    = "bog/internal/retained"
+		keyed      = "bog/internal/idempotency"
 	)
 	tests := []struct {
 		name   string
@@ -207,6 +216,22 @@ func TestComposedCutoverRules(t *testing.T) {
 				checkpoint + " is registered as staged but reachability from " + server + " is true",
 				history + " is registered as staged but reachability from " + server + " is true",
 			},
+		},
+		{
+			name: "retained wiring leaves keyed ingest staged until its own activation",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[wal] = productionPackage("wal", store, keyed)
+				rules[wal] = rule{runtimeLibrary, []string{store, keyed}}
+			},
+			want: []string{keyed + " is registered as staged but reachability from " + server + " is true"},
+		},
+		{
+			name: "wired checkpoint and history must remain acyclic",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[checkpoint] = productionPackage("checkpoint", store, history)
+				rules[checkpoint] = rule{runtimeLibrary, []string{store, history}}
+			},
+			want: []string{"production import cycle: " + history + " -> " + checkpoint + " -> " + history},
 		},
 		{
 			name: "registered checkpoint import still violates storage direction",
@@ -309,6 +334,7 @@ func TestComposedCutoverRules(t *testing.T) {
 				checkpoint: productionPackage("checkpoint", store),
 				history:    productionPackage("history", checkpoint, store),
 				httpapi:    productionPackage("httpapi", store, wal),
+				keyed:      productionPackage("idempotency"),
 				readiness:  productionPackage("readiness", store, wal),
 				store:      productionPackage("store"),
 				wal:        productionPackage("wal", store),
@@ -319,6 +345,7 @@ func TestComposedCutoverRules(t *testing.T) {
 				checkpoint: {runtimeLibrary, []string{store}},
 				history:    {runtimeLibrary, []string{checkpoint, store}},
 				httpapi:    {runtimeLibrary, []string{store, wal}},
+				keyed:      {staged, nil},
 				readiness:  {runtimeLibrary, []string{store, wal}},
 				store:      {runtimeLibrary, nil},
 				wal:        {runtimeLibrary, []string{store}},
@@ -328,6 +355,103 @@ func TestComposedCutoverRules(t *testing.T) {
 			}
 			if got := architectureProblems(pkgs, rules); !slices.Equal(got, tt.want) {
 				t.Errorf("architectureProblems() = [%s], want [%s]", strings.Join(got, "\n"), strings.Join(tt.want, "\n"))
+			}
+		})
+	}
+}
+
+func TestMeasuredProductionBoundaries(t *testing.T) {
+	t.Parallel()
+	const (
+		backup     = "bog/internal/backup"
+		checkpoint = "bog/internal/checkpoint"
+		history    = "bog/internal/history"
+		httpapi    = "bog/internal/httpapi"
+		wal        = "bog/internal/wal"
+		external   = "example.com/bridge"
+	)
+	tests := []struct {
+		name     string
+		from, to string
+		testOnly bool
+		want     []string
+	}{
+		{name: "server and operator share retained read-side code"},
+		{
+			name: "HTTP reaches history across a module boundary",
+			from: httpapi, to: history,
+			want: []string{
+				"HTTP must use the page source seam: " + httpapi + " reaches " + checkpoint,
+				"HTTP must use the page source seam: " + httpapi + " reaches " + history,
+			},
+		},
+		{
+			name: "shared backup reaches the WAL across a module boundary",
+			from: backup, to: wal,
+			want: []string{
+				"forbidden storage authority dependency: " + backup + " reaches " + wal,
+				"forbidden operator verification dependency: " + operatorCommand + " reaches " + wal,
+			},
+		},
+		{
+			name: "server reaches the client across a module boundary",
+			from: server, to: goClient,
+			want: []string{"forbidden server command dependency: " + server + " reaches " + goClient},
+		},
+		{
+			name: "release evidence reaches the WAL across a module boundary",
+			from: releaseVerifier, to: wal,
+			want: []string{"forbidden release evidence dependency: " + releaseVerifier + " reaches " + wal},
+		},
+		{
+			name: "query oracle reaches wired backup across a module boundary",
+			from: queryModel, to: backup,
+			want: []string{
+				"forbidden query oracle dependency: " + queryModel + " reaches " + backup,
+				"forbidden query oracle dependency: " + queryModel + " reaches bog/internal/store",
+			},
+		},
+		{
+			name: "test-only bridge has no production path",
+			from: operatorCommand, to: wal, testOnly: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rules := map[string]rule{
+				server:               {serverCommand, []string{backup, history, httpapi}},
+				operatorCommand:      {verifier, []string{backup, goClient}},
+				backup:               {runtimeLibrary, []string{"bog/internal/store"}},
+				checkpoint:           {runtimeLibrary, nil},
+				history:              {runtimeLibrary, []string{checkpoint}},
+				httpapi:              {runtimeLibrary, []string{wal}},
+				wal:                  {runtimeLibrary, nil},
+				goClient:             {standalone, nil},
+				queryModel:           {verifierModel, nil},
+				releaseVerifier:      {verifier, []string{goClient}},
+				linuxVerifier:        {verifier, nil},
+				retainedBench:        {verifier, nil},
+				"bog/internal/store": {runtimeLibrary, nil},
+			}
+			requireValidCommandFixture(t, rules)
+			packages := make(map[string]listedPackage, len(rules)+1)
+			for path, entry := range rules {
+				packages[path] = productionPackage("fixture", entry.imports...)
+			}
+			if tt.from != "" {
+				bridge := listedPackage{GoFiles: []string{"bridge.go"}, Imports: []string{tt.to}}
+				if tt.testOnly {
+					bridge.GoFiles = nil
+					bridge.TestGoFiles = []string{"bridge_test.go"}
+				}
+				packages[external] = bridge
+				pkg := packages[tt.from]
+				pkg.Imports = append(slices.Clone(pkg.Imports), external)
+				packages[tt.from] = pkg
+			}
+			if got := productionBoundaryProblems(packages, rules); !slices.Equal(got, tt.want) {
+				t.Errorf("productionBoundaryProblems() = %q, want %q", got, tt.want)
 			}
 		})
 	}

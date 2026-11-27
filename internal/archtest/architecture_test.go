@@ -123,6 +123,28 @@ func checkLinuxArchitecture(t *testing.T, arch string) {
 	for _, problem := range architectureProblems(packages, registry) {
 		t.Error(problem)
 	}
+	for _, problem := range productionBoundaryProblems(packages, registry) {
+		t.Error(problem)
+	}
+}
+
+// Check ownership on the measured production graph as well as on the
+// registry. Exact local edges cannot detect a path through another module.
+func productionBoundaryProblems(packages map[string]listedPackage, rules map[string]rule) []string {
+	measured := make(map[string]rule, len(packages))
+	for path, pkg := range packages {
+		if pkg.production() {
+			measured[path] = rule{rules[path].role, pkg.Imports}
+		}
+	}
+
+	problems := pagingBoundaryProblems(measured)
+	problems = append(problems, storageAuthorityProblems(measured)...)
+	problems = append(problems, serverCommandBoundaryProblems(measured)...)
+	problems = append(problems, operatorBoundaryProblems(measured)...)
+	problems = append(problems, releaseEvidenceBoundaryProblems(measured)...)
+	problems = append(problems, queryOracleProblems(measured)...)
+	return problems
 }
 
 func architectureProblems(packages map[string]listedPackage, rules map[string]rule) []string {
@@ -143,6 +165,12 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 
 	for _, path := range slices.Sorted(maps.Keys(rules)) {
 		r := rules[path]
+		switch r.role {
+		case serverCommand, runtimeLibrary, staged, standalone, testOnly, verifier, verifierModel:
+		default:
+			problems = append(problems, fmt.Sprintf("%s has unknown architecture role %q", path, r.role))
+			continue
+		}
 		pkg, exists := local[path]
 		switch {
 		case !exists:

@@ -1,10 +1,12 @@
 # ADR 0015 — Retained-history runtime cutover
 
-**Status** — Proposed for the #53 integration review. The architecture
-companion was measured at `6105ab8eb78d56412c7cc14c6385aaed21bb10ac`.
-That checkout serves ordinary WAL recovery and an in-memory query view.
-The Storage draft and native qualification are pending.
-[#53](https://github.com/tflynn3/bog/issues/53)
+**Status** — Cutover contract for the #53 integration review. Cycle 86's
+base `5fdbe223b87b3c6d22b2e9d038b8595ac09db456` serves ordinary WAL
+recovery and an in-memory query view. The storage API handoff is available
+at that base. Composed measurement and native qualification require the
+#53 command-wiring revision.
+[#53](https://github.com/tflynn3/bog/issues/53),
+[Storage API handoff](https://github.com/tflynn3/bog/issues/53#issuecomment-7203853989)
 
 ## Runtime interfaces
 
@@ -25,15 +27,45 @@ Fail startup on ambiguous authority or corrupt committed data.
 | HTTP and command adapter | Inject a command-local `httpapi.PageSource` with `httpapi.NewWithPageSource`. The source implements `Page(context.Context, PageRequest, *store.QueryWork) (PageResult, error)` and idempotent `Release(capture string) error`. Repeat the ordered rows, positions, and exhaustion decision for the same captured source request. HTTP owns query admission, the bounded replay plan, cursor authentication and expiry, and complete response framing. |
 | WAL owner and retained view | Serialize durable append visibility, capture selection, and generation activation. Bind the generation and its pin to the matching WAL identity or epoch, covered whole-frame boundary, first uncovered ordinal, and exact durable query-visible end. Merge checkpoint and suffix by UTC timestamp and append ordinal. Publish whole committed batches before HTTP 204. Confirmed rollback publishes no rows. Uncertain outcomes fence the owner pending recovery. |
 | Checkpoint, catalog, and backup | Supply pinned readers, bounds, and reservations through composition. Sync immutable checkpoint files and authority before validating and installing the successor and trimming the live tail. Existing captures and exports hold their generation and tail references through completion. Reclaim only protocol-owned files unreachable from durable authority and all live pins. |
-| Capacity control | Mount `/_capacity/compaction` only with `BOG_CAPACITY_CONTROL=1` and a loopback listener. POST starts asynchronous replacement at the requested committed row cutoff. GET reports progress. Report `running` with the published generation and `complete` only after the newer generation is durable and installed at the exact cutoff. |
+| Capacity control | Mount `/_capacity/compaction` only with `BOG_CAPACITY_CONTROL=1` and a bound loopback listener. POST starts asynchronous replacement at the requested committed row cutoff. GET reports progress. Report `running` with the published generation and `complete` only after the newer generation is durable and installed at the exact cutoff. |
 | Readiness and shutdown | `/ready` observes disk headroom and terminal write outcomes. #60 follows the command lease and supplies a separately owned descriptor to the active WAL directory through `readiness.NewHandlerForDirectory`. On shutdown stop admission and maintenance scheduling, retire captures, drain HTTP, append, publication, and export work, then close storage. A drain timeout leaves the lock held until process exit. |
 
-HTTP certifies a snapshot walk through exhaustion under the configured
-per-request work and response byte caps before issuing a cursor. The
-same budgets apply when the client lowers its resume limit. The earlier
-source or HTTP deadline bars new resumes, and an authenticated cursor
-for an expired capture receives 410. Admitted operations retain their
-references. [Fixed-budget continuation contract](0006-fixed-budget-query-continuations.md),
+The restore adapter uses `backup.VerifyPinnedRestore` with the locked
+directory root. Its replay check runs before the suffix is opened or read.
+The caller closes the returned tail reader, which owns a descriptor and uses
+absolute WAL offsets. The page adapter passes the request's `store.QueryWork`
+meter to `history.Reader.ScanWithWork` and shares it with tail paging. It
+charges lookahead against that meter and discards partial page results when
+the scan fails.
+[Storage API handoff](https://github.com/tflynn3/bog/issues/53#issuecomment-7203853989)
+
+## Capture lifetime and loopback retirement
+
+Take the generation pin and the matching tail view in one owner-synchronized
+acquisition. Charge the capture before acquiring its resources. Release
+partial acquisitions on error or cancellation. Each paging operation and
+export holds its own references until it returns, including error cleanup.
+Replacement switches the view for fresh walks. Held cursors and in-flight
+exports continue to read their original immutable generation and fixed tail.
+
+HTTP certifies the walk through exhaustion at the configured per-request
+work and response byte caps before issuing a cursor. The same budgets apply
+when the client lowers its resume limit. Release an acquisition that
+publishes no cursor. A published cursor remains retryable through the
+terminal page until the earlier of the source expiry and the HTTP deadline,
+explicit retirement, or shutdown. An authenticated cursor for an expired
+or retired capture receives 410. An invalid token receives 400.
+[Fixed-budget continuation contract](0006-fixed-budget-query-continuations.md)
+
+The fixture exhausts its held cursor and explicitly retires that capture
+through the opt-in loopback control. Use an authenticated cursor to identify
+the capture and retire only that capture. Apply the same environment and
+listener gate as compaction. Retirement is idempotent and shares the
+expiry path. It closes admission for new resumes immediately and defers
+release of the generation and tail until the last admitted user returns.
+Other captures and exports keep their own references. Observe a positive
+runtime predecessor pin count before retirement and zero after drain.
+Report unavailable metrics with their reasons.
 [Live capacity control and metrics](../../bench/retained-history/README.md)
 
 ## Trade-offs
@@ -42,7 +74,10 @@ Durable whole-batch acknowledgement and synchronized activation preserve
 recoverable history at the cost of sync latency and write availability
 on uncertainty. Certifying the walk spends work before the first cursor.
 Pins preserve exact membership and order across appends and replacement
-and delay reclamation. Bound replay and append reservations, live
+and delay reclamation through the retry window. Explicit fixture retirement
+makes pin drain measurable within the capacity run and ends retries for
+that capture. Keeping the control opt-in and on loopback preserves the
+ordinary query contract. Bound replay and append reservations, live
 captures, pinned generations, and staging. Capacity refusal protects
 already admitted work and can defer maintenance or reject whole batches.
 [Generation pins](0002-bounded-history-generation-pins.md),
@@ -60,10 +95,13 @@ bytes. [V1 prefix digest](0005-pinned-writable-recovery-authority.md#keep-the-v1
 
 Promote each retained package only when both Linux production inventories
 show that `cmd/bog` reaches it. Remove the corresponding staging
-declaration in the same change. As measured, `cmd/bog-verify` reaches
-`internal/backup`, `internal/client`, and `internal/store` directly.
-The server reaches none of checkpoint, history, backup, or idempotency,
-so their staging declarations remain active.
+declaration in the same change. Both Linux inventories at the Cycle 86 base
+show direct `cmd/bog` imports of HTTP, readiness, WAL, and store. Those four
+packages are also the full root-module dependency closure of the command,
+excluding the command itself.
+`cmd/bog-verify` reaches `internal/backup`, `internal/client`, and
+`internal/store` directly. Checkpoint, history, backup, and idempotency
+remain staged at that base.
 
 | Staged package | Owner | Activation criteria |
 | --- | --- | --- |
@@ -73,9 +111,11 @@ so their staging declarations remain active.
 | `internal/idempotency` | `bog-storage` | The production WAL atomically commits and recovers retry records with their batches. HTTP ingest covers concurrent same-key submissions, conflicting bodies, and retry after an ambiguous response and restart. |
 
 A staging declaration must name an owner and state activation criteria.
-The fitness check rejects missing or blank fields and declarations for
-removed or reclassified packages. Review evaluates the criteria and
-test evidence. Exact imports and reachability verify the role.
+The fitness check rejects missing or blank fields, declarations for removed
+or reclassified packages, and unrecognized package roles. Standalone
+libraries require a registered production command consumer. Review
+evaluates the activation criteria and test evidence. Exact imports and
+reachability verify the role.
 [Staging declaration check](../../internal/archtest/staged_packages_test.go),
 [Command root boundaries](0012-command-root-boundaries.md),
 [Standalone production consumers](0014-standalone-package-consumers.md)
@@ -94,10 +134,24 @@ append ledger and exercises the separate pinned server process.
 
 Core engineering owns the registry and system record. Storage owns the
 runtime draft and hands it off for read review. Recheck leases at dispatch
-and handoff. Measure direct root-module production imports and transitive
-server reachability on the composed tree with the architecture suite's
-Linux amd64 and arm64 settings. Update measured edges, package roles,
-and the system diagram together. Run `go test -count=1 ./internal/archtest`
+and handoff. Run the following on the composed tree to collect the
+production inventory and the server's dependency closure for each target.
+
+```sh
+for arch in amd64 arm64; do
+    (
+        export GOOS=linux GOARCH="$arch" GOAMD64=v1 GOARM64=v8.0 CGO_ENABLED=0
+        export GOENV=off GOFLAGS= GO111MODULE=on GOWORK=off
+        go list -json=ImportPath,GoFiles,CgoFiles,Imports ./...
+        go list -deps ./cmd/bog
+    )
+done
+```
+
+Use the `bog/` imports of packages with production Go files for the direct
+edges, and the `bog/` entries under `go list -deps` for server reachability.
+Update measured edges, package roles, and the system diagram together. Run
+`go test -count=1 ./internal/archtest`
 and `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on the
 composed tree and land runtime and governance in one reviewed PR.
 [System fitness settings](../architecture/SYSTEM.md#fitness-and-registry-ownership)
@@ -106,8 +160,9 @@ The native matrix qualifies the same clean revision on amd64 and arm64.
 Each runner uses its own SHA-256-pinned binary for all producers. Require
 exact HTTP order through verified restore, acknowledged append, restart,
 and generation replacement with a held cursor and concurrent backfill.
-Run both 128 MiB capacity fixtures, capture exact publication and pin-drain
-observations, and retain cleanup evidence. Verify readiness and ingest
+Run both 128 MiB capacity fixtures, capture exact publication, explicitly
+retire the exhausted fixture capture, observe predecessor pin drain, and
+retain cleanup evidence. Verify readiness and ingest
 against the active WAL filesystem after path retargets. Require both
 native verdicts. [System release evidence](../architecture/SYSTEM.md#release-evidence),
 [Release composition](0008-release-verifier-composition.md)

@@ -12,8 +12,9 @@ configuration, reports, producer exit statuses, and logs.
 The admission, durability, and capacity producers take
 `-binary PATH -revision SHA -fixture ID -report PATH`.
 The release fixture ID is `linux-release-v1`. The workflow runs
-`go run ./verify/release`, restored parity, the fixed-budget backfill test,
-and strict report validation from the workflow checkout (`gate`). It runs
+`go run ./verify/release`, restored parity, fixed-budget backfill,
+capacity control scope, and strict report validation from the workflow
+checkout (`gate`). It runs
 `go run ./verify/linux` (#3) and `go run ./bench/retained-history` (#32) from the
 candidate checkout. The query-model race suite runs from `gate`, which
 supplies the oracle and backfill test. The sibling commands provision their
@@ -54,6 +55,30 @@ exit independently of probing and reserves the leader PID through
 process-group teardown. Routine teardown requests SIGHUP and requires a
 matching wait status. Unexpected exits and teardown timeouts fail the
 fixture, even if escalation to SIGKILL succeeds.
+
+## Capacity control scope
+
+Both native jobs require an explicit passing event for
+`TestReleaseCapacityControlScope` against the pinned candidate. The test
+starts two children in separate disposable data directories. It binds
+one to `127.0.0.1` with `BOG_CAPACITY_CONTROL` unset and the other to
+`0.0.0.0` with `BOG_CAPACITY_CONTROL=1`. It verifies listener ownership
+and the actual bind in the Linux TCP tables, including a dual-stack
+wildcard. HTTP probes use `127.0.0.1` in both cases.
+
+Each child acknowledges ingest of a seed row before the test requests
+`GET /_capacity/compaction?action=status&cutoff=1` and
+`POST /_capacity/compaction?action=start&cutoff=1`. Both requests must
+return HTTP 404, and the candidate must pass `/healthz` before and after
+the workload. The existing live capacity workload supplies positive
+proof that an opted-in loopback candidate accepts compaction.
+
+The artifacts include `capacity-control-scope-events.jsonl`,
+`capacity_control_scope.log`, and the producer entry in `producers.txt`.
+Schema-v1 report validation continues to accept historical evidence.
+[ADR 0034](../../docs/adr/0034-capacity-control-release-qualification.md)
+
+## Durability evidence
 
 The durability report validator requires these fields in the `enospc` case's
 `evidence` object.

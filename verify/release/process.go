@@ -250,13 +250,26 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 	return serveDirectoryWithStop(ctx, binary, dir, client, flags, (*candidateProcess).stop, check)
 }
 
-func serveDirectoryWithStop(ctx context.Context, binary, dir string, client *http.Client, flags []string, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string) error) (err error) {
-	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+func serveDirectoryWithStop(ctx context.Context, binary, dir string, client *http.Client, flags []string, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string) error) error {
+	return serveDirectoryOn(ctx, binary, dir, client, flags, candidateBind{}, stopAfterProbe, check)
+}
+
+type candidateBind struct {
+	ip     net.IP // nil defaults to IPv4 loopback
+	verify func(pid, port int) error
+}
+
+func serveDirectoryOn(ctx context.Context, binary, dir string, client *http.Client, flags []string, bind candidateBind, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string) error) (err error) {
+	loopback := net.IPv4(127, 0, 0, 1)
+	if bind.ip == nil {
+		bind.ip = loopback
+	}
+	reservation, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: bind.ip})
 	if err != nil {
 		return fmt.Errorf("reserve release listener: %w", err)
 	}
-	addr := listener.Addr().(*net.TCPAddr)
-	if err := listener.Close(); err != nil {
+	addr := reservation.Addr().(*net.TCPAddr)
+	if err := reservation.Close(); err != nil {
 		return fmt.Errorf("release reserved listener: %w", err)
 	}
 	probes, cancel := context.WithCancelCause(ctx)
@@ -278,17 +291,27 @@ func serveDirectoryWithStop(ctx context.Context, binary, dir string, client *htt
 		err = errors.Join(err, stopErr)
 	}()
 
-	base := "http://" + addr.String()
+	// Use loopback for HTTP even when the child listens on a wildcard.
+	probeAddr := net.TCPAddr{IP: loopback, Port: addr.Port}
+	base := "http://" + probeAddr.String()
 	if err := p.awaitHealth(probes, client, base, addr.Port); err != nil {
 		return err
 	}
 	if err := probes.Err(); err != nil {
 		return err
 	}
+	if bind.verify != nil {
+		if err := bind.verify(p.process.Pid, addr.Port); err != nil {
+			return err
+		}
+	}
 	probeErr := check(probes, base)
 	// Keep the probe diagnostic first even when the listener or process
 	// disappeared during the last request.
 	err = errors.Join(probeErr, p.requireListener(addr.Port))
+	if err == nil && bind.verify != nil {
+		err = bind.verify(p.process.Pid, addr.Port)
+	}
 	probeComplete = err == nil
 	return err
 }

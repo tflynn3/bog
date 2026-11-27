@@ -291,10 +291,13 @@ jobs:
           fixed_budget_backfill() (
             run_candidate_test TestReleaseFixedBudgetBackfill "$EVIDENCE/fixed-budget-backfill-events.jsonl"
           )
+          capacity_control_scope() (
+            run_candidate_test TestReleaseCapacityControlScope "$EVIDENCE/capacity-control-scope-events.jsonl"
+          )
           failed=0
-          for name in admission durability capacity parity fixed_budget_backfill; do
+          for name in admission durability capacity parity fixed_budget_backfill capacity_control_scope; do
             case "$name" in
-              admission|parity|fixed_budget_backfill) checkout=gate ;;
+              admission|parity|fixed_budget_backfill|capacity_control_scope) checkout=gate ;;
               durability|capacity) checkout=candidate ;;
             esac
             checkout_sha=$(git -C "$checkout" rev-parse HEAD) || { failed=1; continue; }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -17,6 +18,8 @@ type backfillEvidence struct {
 	FinalCutoff  int    `json:"expected_committed_rows"`
 	HeldRows     int    `json:"held_rows_checked"`
 	Exhausted    bool   `json:"held_cursor_exhausted"`
+	Retried      bool   `json:"terminal_page_retried"`
+	Retired      bool   `json:"capture_retired"`
 	FreshVisible bool   `json:"fresh_backfill_visible"`
 	Acknowledged struct {
 		Rows     int       `json:"rows"`
@@ -95,6 +98,9 @@ func (b backfillEvidence) validate(want backfillCutoffs) error {
 	if !b.Exhausted || !b.FreshVisible || b.HeldRows <= 0 || b.HeldRows > want.held {
 		return errors.New("require held cursor exhaustion with verified rows and fresh backfill visibility")
 	}
+	if !b.Retried || !b.Retired {
+		return errors.New("require terminal page replay and explicit capture retirement")
+	}
 	ack := b.Acknowledged
 	if ack.Rows != want.final-want.held || ack.Batches != ack.Rows/capacityBatch ||
 		ack.First <= 0 || ack.Last < ack.First || ack.Earliest.IsZero() || ack.Latest.Before(ack.Earliest) {
@@ -106,14 +112,15 @@ func (b backfillEvidence) validate(want backfillCutoffs) error {
 	}
 	pins := b.PinDrain
 	if pins.Status != "observed" || pins.Reason != "" || pins.Held == nil || *pins.Held == 0 || pins.After == nil || *pins.After != 0 {
-		return fmt.Errorf("require observed pin drain from a positive held count to zero after exhaustion (status %q, reason %q)", pins.Status, pins.Reason)
+		return fmt.Errorf("require observed pin drain from a positive held count to zero after retirement (status %q, reason %q)", pins.Status, pins.Reason)
 	}
 	return b.validateSamples(want)
 }
 
 func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
-	var elapsed, startSent, overlapSent, exhaustedAt int64
-	var published, held, drained, fresh bool
+	const drainBudget = int64(2 * time.Second) // Match the capacity producer's drain budget.
+	var elapsed, startSent, overlapSent, exhaustedAt, retriedAt, retiredAt, drainStarted int64
+	var published, finalObserved, held, drained, fresh bool
 	var predecessor uint64
 	for _, sample := range b.Samples {
 		if sample.ElapsedNS < elapsed {
@@ -122,10 +129,22 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 		elapsed = sample.ElapsedNS
 		switch sample.Event {
 		case "held_exhausted":
-			if !held || exhaustedAt != 0 {
-				return errors.New("held cursor exhausted before proof of a retired pin")
+			if !finalObserved || exhaustedAt != 0 {
+				return errors.New("held cursor exhaustion requires a prior final cutoff observation")
 			}
 			exhaustedAt = elapsed
+			continue
+		case "terminal_retried":
+			if exhaustedAt == 0 || retriedAt != 0 {
+				return errors.New("terminal page replay must follow held cursor exhaustion")
+			}
+			retriedAt = elapsed
+			continue
+		case "capture_retired":
+			if !held || retiredAt != 0 {
+				return errors.New("capture retirement requires a prior before_retirement pin observation")
+			}
+			retiredAt = elapsed
 			continue
 		case "fresh_visible":
 			if !drained || fresh {
@@ -133,14 +152,41 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 			}
 			fresh = true
 			continue
-		case "compaction_start", "overlap", "publication", "final_cutoff", "after_exhaustion", "drain_poll":
+		case "compaction_start", "overlap", "status_poll", "publication", "final_cutoff", "before_retirement", "after_retirement", "drain_poll":
 		default:
 			continue
 		}
-		if sample.StatusError != "" {
+		drain := sample.Event == "after_retirement" || sample.Event == "drain_poll"
+		// The producer records a request deadline as a failed status sample
+		// and keeps polling within the drain budget.
+		retry := drain && sample.StatusError == context.DeadlineExceeded.Error()
+		if sample.StatusError != "" && !retry {
 			return fmt.Errorf("%s sample failed: %s", sample.Event, sample.StatusError)
 		}
-		if sample.SentNS == nil || *sample.SentNS <= 0 || *sample.SentNS > elapsed || sample.Compaction == nil {
+		if sample.Event == "status_poll" {
+			continue
+		}
+		if sample.SentNS == nil || *sample.SentNS <= 0 || *sample.SentNS > elapsed {
+			return fmt.Errorf("missing or invalid request timing for %s sample", sample.Event)
+		}
+		if drain {
+			if retiredAt == 0 || *sample.SentNS < retiredAt {
+				return errors.New("pin drain sample did not follow explicit capture retirement")
+			}
+			if drained || (sample.Event == "after_retirement") != (drainStarted == 0) {
+				return errors.New("pin drain must start with after_retirement and end at the first observed zero")
+			}
+			if drainStarted == 0 {
+				drainStarted = *sample.SentNS
+			}
+			if elapsed-drainStarted > drainBudget {
+				return errors.New("pin drain sample exceeded the drain budget")
+			}
+			if retry {
+				continue
+			}
+		}
+		if sample.Compaction == nil {
 			return fmt.Errorf("missing request timing or compaction state for %s sample", sample.Event)
 		}
 		c := *sample.Compaction
@@ -183,22 +229,26 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 		switch sample.Event {
 		case "publication", "final_cutoff":
 			if exhaustedAt != 0 || (sample.Event == "final_cutoff" && c.CommittedRows != want.final) {
-				return fmt.Errorf("%s sample did not confirm the held view at the expected cutoff", sample.Event)
+				return fmt.Errorf("%s sample must confirm its cutoff before held cursor exhaustion", sample.Event)
 			}
-			if pins != nil && *pins == *b.PinDrain.Held {
-				held = true
+			finalObserved = finalObserved || c.CommittedRows == want.final
+		case "before_retirement":
+			if retriedAt == 0 || *sample.SentNS < retriedAt || held || c.CommittedRows != want.final ||
+				pins == nil || *pins != *b.PinDrain.Held {
+				return errors.New("before_retirement must observe the positive held pin count at the final cutoff after terminal page replay")
 			}
-		case "after_exhaustion", "drain_poll":
-			if exhaustedAt == 0 || *sample.SentNS < exhaustedAt || c.CommittedRows != want.final {
-				return errors.New("pin drain sample did not follow held cursor exhaustion at the final cutoff")
+			held = true
+		case "after_retirement", "drain_poll":
+			if c.CommittedRows != want.final {
+				return errors.New("pin drain sample did not observe the final cutoff")
 			}
 			if pins != nil && *pins == 0 {
 				drained = true
 			}
 		}
 	}
-	if !published || !held || !drained || !fresh {
-		return errors.New("missing runtime samples for publication, held pin, pin drain, or fresh visibility")
+	if !published || !finalObserved || !held || !drained || !fresh {
+		return errors.New("missing runtime samples for publication, final cutoff, held pin, pin drain, or fresh visibility")
 	}
 	return nil
 }

@@ -1,21 +1,25 @@
 # Linux release verification
 
 Dispatch the **Linux release verification** workflow with the full commit SHA.
-The workflow builds the candidate once with Go 1.27.0 on Ubuntu 24.04 amd64 and
-uses the resulting absolute binary path for every verifier. Download the
-`linux-release-evidence` artifact for the revision, SHA-256, build metadata,
-fixture, runner and filesystem configuration, reports, producer exit statuses,
-and logs.
+Both native jobs must pass. The amd64 job uses `ubuntu-24.04` with
+`GOAMD64=v1`, and the arm64 job uses `ubuntu-24.04-arm` with
+`GOARM64=v8.0`. Each job builds the candidate once with Go 1.27.0 and
+uses the resulting absolute binary path for every verifier. Download
+`linux-release-evidence-amd64` and `linux-release-evidence-arm64` for
+the revision, SHA-256, build metadata, fixture, runner and filesystem
+configuration, reports, producer exit statuses, and logs.
 
 The admission, durability, and capacity producers take
 `-binary PATH -revision SHA -fixture ID -report PATH`.
 The release fixture ID is `linux-release-v1`. The workflow runs
-`go run ./verify/release` from the workflow checkout and
+`go run ./verify/release`, restored parity, the fixed-budget backfill test,
+and strict report validation from the workflow checkout (`gate`). It runs
 `go run ./verify/linux` (#3) and `go run ./bench/retained-history` (#32) from the
-candidate checkout. The sibling commands need to provision their Linux fixtures
-and use the supplied binary. The gate fails if any command or report is missing,
-including on revisions where only earlier harness entry points exist. The
-capacity producer runs as the runner user in a systemd service with delegated
+candidate checkout. The query-model race suite runs from `gate`, which
+supplies the oracle and backfill test. The sibling commands provision their
+Linux fixtures and use the supplied binary. The gate fails if any required
+evidence is missing, including on revisions with earlier harness entry points.
+The capacity producer runs as the runner user in a systemd service with delegated
 cgroup v2 memory and I/O controllers. The launcher clears any inherited
 `BOG_CAPACITY_CONTROL` and sets `BOG_CAPACITY_CONTROL=1` for both loopback
 candidate starts in live mode. Legacy mode leaves it unset.
@@ -168,6 +172,30 @@ verified page and row counts, and an outcome of `clean_rejection`,
 a clean rejection at its immediate predecessor. `first_failure` and
 `first_broken_continuation` retain the first observed failures in execution
 order, with the budget, page, requested limit, and HTTP status where available.
+
+## Fixed-budget backfill fixture
+
+On each native runner, `TestReleaseFixedBudgetBackfill` launches the
+pinned candidate in a fresh data directory for each budget attempt. The
+tied and duplicate cases start at 11 work units. The sparse case starts
+at 314 and requests four rows on the opening page. The 96-byte response
+cap fits exactly two of those rows. All three cases resume with limit one.
+
+A clean, framed opening work-budget refusal can advance the search to
+twice the previous budget, up to 2,048 units. Once the opening page issues
+a cursor, every resume uses the same process and configured budget. The
+candidate must acknowledge a backfill with HTTP 204 before the first
+resume and again before the terminal resume. The independent append-log
+oracle compares each complete page to the original capture in exact order,
+including duplicate multiplicity. Any continuation error fails the case.
+
+The workflow requires an explicit passing Go test event on both jobs.
+Each artifact retains `fixed-budget-backfill-events.jsonl`,
+`fixed_budget_backfill.log`, and the producer's entry in `producers.txt`
+with the gate checkout, candidate revision, and exit status. The test
+logs the candidate SHA-256, fixture, attempted budgets, acknowledgements,
+and accepted walk counts. This evidence accompanies the schema-v1
+admission, durability, capacity, and parity reports.
 
 ## Restored parity fixture
 

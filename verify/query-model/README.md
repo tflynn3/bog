@@ -99,3 +99,63 @@ run observed these failures:
 - With a 256-byte response cap, both issuers returned 422 on the opening
   request for both row limits. The diagnostic reported a 748-byte record
   and the wire walker accepted zero fitting rows.
+
+## Concurrent retained-query demand (#123 to #129)
+
+`TestConcurrentRetainedQueryDemand` runs the real HTTP handler over loopback
+with the retained PageSource fixture. At a four-query ceiling it holds dense
+and sparse terminal resumes at the first body write after header flush, and
+holds two additional opening scans with their row buffers live. A fifth query
+must get a clean 503. While all four are held, ingest acknowledges a backfill
+and a later tie, and replacement activates their exact whole-batch cutoff
+with a nonempty carried suffix. The test cancels both opening scans, retries
+both terminal requests byte for byte, retires both held cursors, cancels the
+dense delivery, then drains the sparse delivery. It requires the predecessor
+pin count to fall from four to zero at the observed steps, and checks both
+fresh walks against the augmented append log.
+
+The `concurrent_query_demand` JSON record gives samples and high-water marks.
+Use these observation points when comparing runs.
+
+| Resource | Observation |
+| --- | --- |
+| Prepared NDJSON bytes | Sum of HTTP 200 Content-Length values from entry to WriteHeader through handler return. This counts encoded payload bytes. The meter covers retries as well as the paused responses. |
+| Positioned scan-buffer bytes | Sum of live positioned-row slice capacities times element size after the store scan and through fixture PageSource return. This covers the observed row backing arrays. |
+| Source captures | Successful fixture registration through Release. The report gives the maximum live count and each completed lifetime in nanoseconds, identified by acquisition order. |
+| Release after cancellation or final drain | Elapsed nanoseconds from the cancellation signal or permission to finish the held body through joined completion and the confirming resource sample. |
+
+Run the portable report with:
+
+```sh
+go test -json -race -count=1 ./verify/query-model -run '^TestConcurrentRetainedQueryDemand$'
+```
+
+One Darwin arm64 fixture run with four query slots, a 256-byte page cap,
+and 32,768 work units observed peaks of 570 prepared bytes, 1,728
+positioned scan-buffer bytes, and four live captures. Six captures
+released, with a longest observed lifetime of 8.01 ms. Cancellation-to-release
+observations were 69 µs for the sparse scan, 62 µs for the dense scan, and
+58 µs for the dense delivery. Final drain took 127 µs to observe. The
+elapsed times describe that run.
+
+The fixture reports an observed working set at these boundaries. Whole-process
+memory, encoded scratch buffers, other storage scan internals, and production
+capture lifetimes require their own runtime observations.
+
+Once #108 supplies the composed binary, set `BOG_RELEASE_BINARY` and
+`BOG_RELEASE_REVISION` as above. On each native Linux release runner run:
+
+```sh
+go test -json -race -count=1 ./verify/query-model -run '^TestPinnedQueryGenerationReplacement$'
+```
+
+Require the matching revision and binary digest and a passing test event.
+The `pinned_query_replacement` JSON record includes byte-identical retries of
+one continuation observed before and after each of two exact-cutoff
+replacements, terminal replay, retired-pin samples, and elapsed time from
+the idle retirement request to the first observed zero retired pins. The
+`unavailable` object records the candidate metrics that the HTTP and
+capacity-control interfaces do not expose. Use both reports for #129 and keep
+the instrumented fixture measurements attributed to the fixture and its
+recorded host. The cgroup workload results come from the native capacity
+producer.

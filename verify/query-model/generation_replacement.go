@@ -1,6 +1,7 @@
 package querymodel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -65,13 +66,17 @@ type GenerationReplacementConfig struct {
 // identifies a byte-exact response received from the paused worker after
 // retirement. Replay-only trials leave that field false.
 type GenerationReplacementResult struct {
-	WorkBudget      int
-	Initial         ReplacementGeneration
-	Replacements    [2]ReplacementGeneration
-	Held, Fresh     WireStats
-	TerminalReplay  bool
-	AdmittedReplay  bool
-	CaptureReleased bool
+	WorkBudget               int                      `json:"work_budget"`
+	Initial                  ReplacementGeneration    `json:"initial"`
+	Replacements             [2]ReplacementGeneration `json:"replacements"`
+	Held                     WireStats                `json:"held"`
+	Fresh                    WireStats                `json:"fresh"`
+	TerminalReplay           bool                     `json:"terminal_replay"`
+	AdmittedReplay           bool                     `json:"admitted_replay"`
+	CaptureReleased          bool                     `json:"capture_released"`
+	AcrossReplacementReplay  [2]bool                  `json:"across_replacement_replay"`
+	RetiredPinsAtReplacement [2]uint64                `json:"retired_pins_at_replacement"`
+	RetirementToZeroObserved time.Duration            `json:"retirement_to_zero_observed_ns"`
 }
 
 type replacementData struct {
@@ -205,6 +210,17 @@ func runGenerationReplacement(ctx context.Context, data replacementData, f Gener
 	var opening string
 	var terminal terminalReplay
 	resumes := 0
+	var retryRequest WireRequest
+	var retryBody []byte
+	checkRetry := func(page WirePage) error {
+		if err := checkWirePage(retryRequest, page, matches[2:], 2, nil); err != nil {
+			return err
+		}
+		if page.EncodedBody == nil || !bytes.Equal(retryBody, page.EncodedBody) {
+			return errors.New("continuation body changed across replacement")
+		}
+		return nil
+	}
 	fetchHeld := func(ctx context.Context, req WireRequest) (WirePage, error) {
 		// The opening hook takes the first replacement. The successful
 		// one-row continuation then straddles the two activations.
@@ -217,6 +233,12 @@ func runGenerationReplacement(ctx context.Context, data replacementData, f Gener
 			}
 		}
 		page, err := f.Fetch(ctx, req)
+		if err == nil && req == retryRequest {
+			if err := checkRetry(page); err != nil {
+				return WirePage{}, err
+			}
+			result.AcrossReplacementReplay[0] = true
+		}
 		if err == nil && req.Cursor != "" && page.NextCursor == "" {
 			terminal.record(req, page)
 		}
@@ -224,6 +246,18 @@ func runGenerationReplacement(ctx context.Context, data replacementData, f Gener
 	}
 	result.Held, err = VerifyWireWalk(ctx, &ledger, data.walk, fetchHeld, func(ctx context.Context, cursor string) error {
 		opening = cursor
+		retryRequest = WireRequest{Filter: data.walk.Filter, Limit: data.walk.RowLimits[1], Cursor: cursor, MaxPageBytes: data.walk.Limits.MaxPageBytes}
+		page, err := f.Fetch(ctx, retryRequest)
+		if err != nil {
+			return redactWireFailure(fmt.Errorf("read witness before replacement: %w", err), cursor, page.NextCursor)
+		}
+		if err := checkWirePage(retryRequest, page, matches[2:], 2, nil); err != nil {
+			return err
+		}
+		if page.EncodedBody == nil {
+			return errors.New("continuation before replacement is missing its encoded body witness")
+		}
+		retryBody = bytes.Clone(page.EncodedBody)
 		return replaceGeneration(ctx, &ledger, data, 0, f, result)
 	})
 	if err != nil {
@@ -232,6 +266,14 @@ func runGenerationReplacement(ctx context.Context, data replacementData, f Gener
 	if resumes < 2 || terminal.req.Cursor == "" {
 		return errors.New("held walk did not resume through both replacements to a terminal continuation")
 	}
+	page, err := f.Fetch(ctx, retryRequest)
+	if err == nil {
+		err = checkRetry(page)
+	}
+	if err != nil {
+		return redactWireFailure(fmt.Errorf("retry after second replacement: %w", err), retryRequest.Cursor, page.NextCursor)
+	}
+	result.AcrossReplacementReplay[1] = true
 	if err := terminal.verify(ctx, f.Fetch, matches, result.Held.Rows, true); err != nil {
 		return fmt.Errorf("terminal replay at work budget %d: %w", result.WorkBudget, err)
 	}
@@ -285,21 +327,28 @@ func replaceGeneration(ctx context.Context, ledger *Log, data replacementData, i
 		return fmt.Errorf("%s did not advance beyond %+v: %+v", phase, previous, current)
 	}
 	result.Replacements[index] = current
-	if err := requireReplacementPins(ctx, f, true); err != nil {
+	pins, err := observeReplacementPins(ctx, f, true)
+	if err != nil {
 		return fmt.Errorf("%s predecessor pin: %w", phase, err)
 	}
+	result.RetiredPinsAtReplacement[index] = pins
 	return nil
 }
 
 func requireReplacementPins(ctx context.Context, f GenerationReplacementAdapter, held bool) error {
+	_, err := observeReplacementPins(ctx, f, held)
+	return err
+}
+
+func observeReplacementPins(ctx context.Context, f GenerationReplacementAdapter, held bool) (uint64, error) {
 	pins, err := f.RetiredPins(ctx)
 	if err != nil {
-		return err
+		return pins, err
 	}
 	if (pins > 0) != held {
-		return fmt.Errorf("retired pins=%d, want live predecessor pin=%t", pins, held)
+		return pins, fmt.Errorf("retired pins=%d, want live predecessor pin=%t", pins, held)
 	}
-	return ctx.Err()
+	return pins, ctx.Err()
 }
 
 func drainReplacementCapture(ctx context.Context, f GenerationReplacementAdapter, opening string, terminal terminalReplay, matches []Entry, pause bool, result *GenerationReplacementResult) error {
@@ -314,7 +363,9 @@ func drainReplacementCapture(ctx context.Context, f GenerationReplacementAdapter
 		}
 		return ctx.Err()
 	}
+	var retirement time.Time
 	retire := func() error {
+		retirement = time.Now()
 		if err := f.Retire(ctx, req.Filter, req.Cursor); err != nil {
 			return redactWireFailure(fmt.Errorf("retire predecessor capture: %w", err), opening, req.Cursor)
 		}
@@ -362,6 +413,7 @@ func drainReplacementCapture(ctx context.Context, f GenerationReplacementAdapter
 	if err := waitForReplacementRelease(ctx, f.RetiredPins); err != nil {
 		return fmt.Errorf("after final response: %w", err)
 	}
+	result.RetirementToZeroObserved = time.Since(retirement)
 	result.CaptureReleased = true
 	return nil
 }

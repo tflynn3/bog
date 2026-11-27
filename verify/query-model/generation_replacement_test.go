@@ -22,10 +22,17 @@ func replacementConfig() model.GenerationReplacementConfig {
 
 func launchReplacementFixture(t *testing.T, ctx context.Context, budget int, seed model.GenerationReplacementSeed, run func(model.GenerationReplacementAdapter) error) (err error) {
 	t.Helper()
-	f := &runtimeQueryFixture{retained: true, budget: budget, concurrency: 4}
+	return launchMeasuredReplacementFixture(t, ctx, budget, seed, nil, func(f model.ConcurrentQueryAdapter) error {
+		return run(f.GenerationReplacementAdapter)
+	})
+}
+
+func launchMeasuredReplacementFixture(t *testing.T, ctx context.Context, budget int, seed model.GenerationReplacementSeed, meter *queryDemandMeter, run func(model.ConcurrentQueryAdapter) error) (err error) {
+	t.Helper()
+	f := &runtimeQueryFixture{retained: true, budget: budget, concurrency: 4, demand: meter}
 	f.startIssuer()
 	defer func() { err = errors.Join(err, f.closeIssuer()) }()
-	s := newQuerySocketFixture(t, f.handler)
+	s := newMeasuredQuerySocketFixture(t, f.handler, meter)
 	defer s.server.Close()
 	ack := func(ctx context.Context, rows []model.Row) error {
 		return acknowledgeFixtureBatch(ctx, s.client, rows)
@@ -42,7 +49,7 @@ func launchReplacementFixture(t *testing.T, ctx context.Context, budget int, see
 	f.mu.Lock()
 	initial := f.replacementPointLocked()
 	f.mu.Unlock()
-	return run(model.GenerationReplacementAdapter{
+	adapter := model.ConcurrentQueryAdapter{GenerationReplacementAdapter: model.GenerationReplacementAdapter{
 		Initial: initial, Acknowledge: ack, Fetch: s.fetch, Activate: f.activateTail,
 		Refuse: s.refuse, RetiredPins: f.retiredPins, HoldResume: s.holdResume,
 		Retire: func(ctx context.Context, _ model.Filter, cursor string) error {
@@ -51,7 +58,12 @@ func launchReplacementFixture(t *testing.T, ctx context.Context, budget int, see
 			}
 			return f.api.RetireQueryCapture(cursor)
 		},
-	})
+	}}
+	if meter != nil {
+		adapter.Observe = meter.observe
+		adapter.Hold = s.holdQuery
+	}
+	return run(adapter)
 }
 
 func TestGenerationReplacementOverTCP(t *testing.T) {
@@ -78,7 +90,9 @@ func TestGenerationReplacementOverTCP(t *testing.T) {
 			}
 			if calls != 1 || result.WorkBudget != cfg.WorkBudget || result.Replacements != want ||
 				result.Held.Rows != 6 || result.Held.Pages != 3 || result.Fresh.Rows != 12 ||
-				!result.TerminalReplay || !result.AdmittedReplay || !result.CaptureReleased {
+				!result.TerminalReplay || !result.AdmittedReplay || !result.CaptureReleased ||
+				result.AcrossReplacementReplay != [2]bool{true, true} ||
+				result.RetiredPinsAtReplacement != [2]uint64{1, 1} || result.RetirementToZeroObserved <= 0 {
 				t.Fatalf("incomplete replacement evidence from %d launches: %+v", calls, result)
 			}
 		})
@@ -149,6 +163,22 @@ func TestGenerationReplacementRejectsBrokenObservations(t *testing.T) {
 					return model.WirePage{}, &model.FixedBudgetHTTPError{StatusCode: http.StatusServiceUnavailable, CleanBudgetRejection: true}
 				}
 				return fetch(ctx, req)
+			}
+		}},
+		{"same-length drift across first replacement", "continuation body changed across replacement", func(f *model.GenerationReplacementAdapter) {
+			fetch, activate := f.Fetch, f.Activate
+			replaced := false
+			f.Activate = func(ctx context.Context, cutoff int) (model.ReplacementGeneration, error) {
+				g, err := activate(ctx, cutoff)
+				replaced = err == nil
+				return g, err
+			}
+			f.Fetch = func(ctx context.Context, req model.WireRequest) (model.WirePage, error) {
+				page, err := fetch(ctx, req)
+				if err == nil && replaced && req.Cursor != "" && req.Limit == 1 {
+					driftReplacementBody(&page)
+				}
+				return page, err
 			}
 		}},
 		{"same-length terminal drift", "differs from the original encoded body", func(f *model.GenerationReplacementAdapter) {

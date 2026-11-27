@@ -21,8 +21,12 @@ func scanMemoryPeakRSS() (uint64, error) {
 }
 
 func parseScanMemoryPeakRSS(status string) (uint64, error) {
+	return parseScanMemoryStatusBytes(status, "VmHWM")
+}
+
+func parseScanMemoryStatusBytes(status, field string) (uint64, error) {
 	for line := range strings.SplitSeq(status, "\n") {
-		value, ok := strings.CutPrefix(line, "VmHWM:")
+		value, ok := strings.CutPrefix(line, field+":")
 		if !ok {
 			continue
 		}
@@ -33,9 +37,9 @@ func parseScanMemoryPeakRSS(status string) (uint64, error) {
 				return kib * 1024, nil
 			}
 		}
-		return 0, fmt.Errorf("invalid worker peak RSS: %q", line)
+		return 0, fmt.Errorf("invalid worker memory status: %q", line)
 	}
-	return 0, errors.New("missing VmHWM in worker /proc/self/status")
+	return 0, fmt.Errorf("missing %s in worker /proc/self/status", field)
 }
 
 func scanMemoryFixtureFDs(procFD, fixture string) ([]string, error) {

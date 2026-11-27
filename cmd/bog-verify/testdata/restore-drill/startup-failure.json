@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "parity": false,
+  "exit_status": 3,
+  "recovery_point": null,
+  "before_restart": {"status": "failed", "counts": null},
+  "after_restart": {"status": "not_run", "counts": null},
+  "diagnostic": {
+    "phase": "before_restart",
+    "code": "backup_verification_failed",
+    "message": "before restart: backup verification failed for \"/fixture/missing\": open /fixture/missing: no such file or directory"
+  }
+}

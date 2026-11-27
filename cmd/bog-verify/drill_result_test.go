@@ -93,6 +93,11 @@ func TestDrillJSONCLI(t *testing.T) {
 			wantMessage: "backup verification failed", beforeCounts: &complete,
 		},
 		{
+			name: "changed point with the same query rows", before: []drillPage{first, last}, action: "replace backup",
+			wantStatus: exitVerification, wantPhase: "after_restart", wantCode: "backup_verification_failed",
+			wantMessage: "reference recovery point changed", beforeCounts: &complete,
+		},
+		{
 			name: "cancellation at restart boundary", before: []drillPage{first, last}, action: "cancel at prompt",
 			wantStatus: exitIncomplete, wantPhase: "restart_boundary", wantCode: "canceled",
 			wantMessage: "context canceled", beforeCounts: &complete,
@@ -123,11 +128,19 @@ func TestDrillJSONCLI(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bundle := dir
+			var replacement string
+			var changedPoint string
 			switch tc.action {
 			case "missing":
 				bundle = filepath.Join(t.TempDir(), "missing")
 			case "remove backup":
 				bundle, _, _ = makeBundle(t)
+			case "replace backup":
+				bundle, _, _ = makeBundle(t)
+				// The same rows split across more WAL frames produce a different
+				// committed end with the same checkpoint and comparison rows.
+				other, replacementPoint := makeBundleFromRows(t, rows, 1)
+				replacement, changedPoint = other, formatPoint(replacementPoint)
 			}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
@@ -180,9 +193,15 @@ func TestDrillJSONCLI(t *testing.T) {
 					case "short prompt":
 						return 0, nil
 					default:
-						if tc.action == "remove backup" {
+						if tc.action == "remove backup" || replacement != "" {
 							if err := os.Rename(bundle, bundle+"-moved"); err != nil {
 								t.Errorf("move backup: %v", err)
+								return 0, err
+							}
+						}
+						if replacement != "" {
+							if err := os.Rename(replacement, bundle); err != nil {
+								t.Errorf("replace backup: %v", err)
 								return 0, err
 							}
 						}
@@ -227,6 +246,9 @@ func TestDrillJSONCLI(t *testing.T) {
 				if got.Diagnostic == nil || !strings.Contains(got.Diagnostic.Message, tc.wantMessage) ||
 					!strings.Contains(stderr.String(), "bog-verify: "+got.Diagnostic.Message+"\n") {
 					t.Fatalf("diagnostic %#v, stderr %q, want detail %q", got.Diagnostic, &stderr, tc.wantMessage)
+				}
+				if changedPoint != "" && !strings.Contains(got.Diagnostic.Message, "expected "+formatPoint(point)+", found "+changedPoint) {
+					t.Fatalf("diagnostic did not identify both points: %+v", got.Diagnostic)
 				}
 				want.Diagnostic = &drillDiagnostic{tc.wantPhase, tc.wantCode, got.Diagnostic.Message}
 			}

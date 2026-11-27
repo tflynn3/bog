@@ -1,0 +1,22 @@
+{
+  "before_restart": {
+    "status": "complete",
+    "recovery_point": {
+      "generation": "af8a373d9e4a1e9b1f1b89faaf9302895e48dcd040f22ded0d8cd362927047c8",
+      "covered_offset": 134,
+      "next_ordinal": 2,
+      "committed_end": 360
+    },
+    "counts": {"rows": 4, "reference_pages": 2, "server_pages": 2}
+  },
+  "after_restart": {
+    "status": "complete",
+    "recovery_point": {
+      "generation": "af8a373d9e4a1e9b1f1b89faaf9302895e48dcd040f22ded0d8cd362927047c8",
+      "covered_offset": 134,
+      "next_ordinal": 2,
+      "committed_end": 360
+    },
+    "counts": {"rows": 4, "reference_pages": 2, "server_pages": 3}
+  }
+}

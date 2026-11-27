@@ -41,6 +41,18 @@ func TestRestoreDrillShippedServer(t *testing.T) {
 	t.Cleanup(cancel)
 
 	bundle, rows, point := makeBundle(t)
+	expected := []client.Row{rows[0], rows[2], rows[3], rows[4]}
+	observations := drillObservations{
+		Before: phaseObservation{Status: observationNotRun},
+		After:  phaseObservation{Status: observationNotRun},
+	}
+	if path := os.Getenv("BOG_RESTORE_DRILL_OBSERVATIONS"); path != "" {
+		t.Cleanup(func() {
+			data, err := json.Marshal(observations)
+			check(t, err)
+			check(t, os.WriteFile(path, append(data, '\n'), 0o600))
+		})
+	}
 	restored := filepath.Join(t.TempDir(), "restored")
 	check(t, backup.Restore(ctx, bundle, restored))
 	reserved, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -57,6 +69,8 @@ func TestRestoreDrillShippedServer(t *testing.T) {
 	check(t, err)
 	defer server.CloseIdleConnections()
 	server.MaxPageBytes = opts.maxPageBytes
+	observations.Before, err = observeDrillPhase(ctx, opts, server, expected)
+	check(t, err)
 	boundary := restartFunc(func(ctx context.Context) error {
 		if err := current.checkListener(addr.Port); err != nil {
 			return err
@@ -71,8 +85,16 @@ func TestRestoreDrillShippedServer(t *testing.T) {
 		current = next
 		return nil
 	})
+	drillBoundary := restartFunc(func(ctx context.Context) error {
+		if err := boundary.WaitForRestart(ctx); err != nil {
+			return err
+		}
+		var err error
+		observations.After, err = observeDrillPhase(ctx, opts, server, expected)
+		return err
+	})
 	var out bytes.Buffer
-	status, err := drillBackup(ctx, opts, server, boundary, &out)
+	status, err := drillBackup(ctx, opts, server, drillBoundary, &out)
 	if err != nil || status != exitOK {
 		t.Fatalf("restore drill exit %d: %v\n%s", status, err, &out)
 	}
@@ -81,12 +103,18 @@ func TestRestoreDrillShippedServer(t *testing.T) {
 		result.RecoveryPoint == nil || *result.RecoveryPoint != *resultPoint(point) {
 		t.Fatalf("unexpected drill result:\n%s", &out)
 	}
-	for name, phase := range map[string]drillPhaseResult{
-		"before_restart": result.BeforeRestart, "after_restart": result.AfterRestart,
+	for _, phase := range []struct {
+		name string
+		got  drillPhaseResult
+		obs  phaseObservation
+	}{
+		{"before_restart", result.BeforeRestart, observations.Before},
+		{"after_restart", result.AfterRestart, observations.After},
 	} {
-		if phase.Status != "matched" || phase.Counts == nil ||
-			phase.Counts.Rows != 4 || phase.Counts.ReferencePages != 2 || phase.Counts.ServerPages < 2 {
-			t.Fatalf("%s has unexpected parity counts in %s", name, &out)
+		if phase.obs.Status != observationComplete || phase.obs.Point == nil || *phase.obs.Point != *result.RecoveryPoint ||
+			phase.obs.Counts == nil || phase.got.Status != phaseMatched || phase.got.Counts == nil ||
+			*phase.got.Counts != *phase.obs.Counts {
+			t.Fatalf("%s disagrees with independent observation: result %s, observation %+v", phase.name, &out, phase.obs)
 		}
 	}
 

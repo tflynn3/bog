@@ -58,7 +58,11 @@ Add `-json` to `drill` to write one newline-terminated JSON object to
 stdout when the drill ends, including on operational failure. Watch stderr
 for the restart prompt and the readable failure diagnostic. Exit statuses
 are the same as for text output. Help and invalid command-line options
-keep their usual behavior. An output write failure returns status 4.
+keep their usual behavior. Once the JSON object is delivered, the process
+exits with its `exit_status` even if stderr is unwritable or its pipe closes.
+Failure to write the restart prompt ends the drill at the restart boundary
+with status 4. Failure to write the JSON result returns status 4, and stdout
+may contain a partial object.
 
 | Field | Schema version 1 |
 | --- | --- |
@@ -117,6 +121,43 @@ BOG_RESTORE_DRILL_BINARY="$BINARY" \
 The test skips when `BOG_RESTORE_DRILL_BINARY` is unset. A supplied candidate
 must pass every phase. The CLI's `drill` remains read-only. Release parity is
 qualified by [`verify/release`](../../verify/release/README.md).
+
+### Release Verification observation contract
+
+The fixture harness collects evidence independently of the drill result.
+Before each drill walk, the harness opens and verifies the immutable backup
+anew and opens a fresh HTTP walk against the candidate at that phase.
+It checks each stream against the fixture's ordered rows and counts accepted
+pages through the terminal page, including empty pages. Each phase's point
+comes from that phase's verified backup open. The HTTP walk proves parity at
+the selected query scope. The recovery point describes the reference backup.
+
+Set `BOG_RESTORE_DRILL_OBSERVATIONS` to an output file path with an existing
+parent directory to save the native fixture's observation JSON. This is a
+separate artifact with `before_restart` and `after_restart` objects. Both
+objects always carry `status`, `recovery_point`, and `counts`.
+
+| Observation status | Recovery point | Counts |
+| --- | --- | --- |
+| `complete` | Independently verified in this phase | Measured row and page counts after both terminal pages |
+| `incomplete` | Observed point if verification succeeded, otherwise null | Null |
+| `not_run` | Null | Null |
+
+For a passing release check, require process exit 0 and schema-v1
+`exit_status` 0, `parity: true`, two `matched` drill phases, and two
+`complete` independent observations. Require both observed points to match
+the reported point and the verified fixture point. Compare each phase's
+reported counts with that phase's observation. Live page counts may differ
+across the restart. Keep the raw drill JSON, the observed process exit code,
+and the observations as separate inputs, and bind them to the same candidate,
+fixture, and query. A failed or skipped observation cannot establish a pass.
+
+The [handoff fixtures](testdata/restore-drill/) include a successful
+subprocess result with different live pagination after restart, its
+independently collected observations, a backup startup failure with exit
+status 3, and an incomplete observation that reached the expected row count
+before exhausting its page budget. The subprocess and observation tests
+check these against the fixture harness.
 
 ## Limits and exit statuses
 

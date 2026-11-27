@@ -126,9 +126,9 @@ func parseOptions(mode string, args []string) (options, error) {
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	status, err := execute(ctx, args, stdout, stderr)
 	if err != nil {
-		if writeErr := writeText(stderr, fmt.Sprintf("bog-verify: %v\n", err)); writeErr != nil {
-			return exitIncomplete
-		}
+		// The command has already selected its status and may have published
+		// it on stdout. A final diagnostic is best effort.
+		_ = writeText(stderr, fmt.Sprintf("bog-verify: %v\n", err))
 	}
 	return status
 }
@@ -215,6 +215,9 @@ func formatPoint(p backup.Point) string {
 }
 
 func main() {
+	// Let writes to closed stdout and stderr pipes return EPIPE so reporting
+	// failures follow the same status rules as other write errors.
+	signal.Ignore(syscall.SIGPIPE)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	status := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	stop()

@@ -118,7 +118,11 @@ func (p *legacyQueryPlan) prepare(limit, byteCap int, literalWork, budget uint64
 			return response, response.reserveDelivery(work)
 		}
 		if first && i < limit && size <= byteCap-response.size {
-			if err := appendMeasuredLegacyRow(&response, row.Line, stamp, size, true, work); err != nil {
+			var escaped []byte
+			if len(row.Line) > 0 && len(row.Line) <= queryStringChunk {
+				escaped = response.escapedChunkPayload()
+			}
+			if err := response.appendMeasuredRow(stamp, row.Line, size, escaped, work); err != nil {
 				return queryResponse{}, err
 			}
 			continue
@@ -199,7 +203,7 @@ func (p *legacyQueryPlan) replay(offset, limit, byteCap int, work *store.QueryWo
 		if err != nil {
 			return queryResponse{}, 0, err
 		}
-		if err := appendMeasuredLegacyRow(&response, row.Line, stamp, size, false, work); err != nil {
+		if err := response.appendMeasuredRow(stamp, row.Line, size, nil, work); err != nil {
 			return queryResponse{}, 0, err
 		}
 		offset++
@@ -210,34 +214,4 @@ func (p *legacyQueryPlan) replay(offset, limit, byteCap int, work *store.QueryWo
 		}
 	}
 	return response, offset, response.reserveDelivery(work)
-}
-
-// Both paths use the same timestamp encoding and escape chunks as the
-// measurement pass, so the record allocation matches the certified length.
-func appendMeasuredLegacyRow(response *queryResponse, line string, stamp []byte, size int, measured bool, work *store.QueryWork) error {
-	record := make([]byte, 0, size)
-	record = append(record, queryRecordPrefix...)
-	record = append(record, stamp...)
-	record = append(record, queryRecordField...)
-	if measured && len(line) > 0 && len(line) <= queryStringChunk {
-		quoted := response.scratch.Bytes()
-		record = append(record, quoted[1:len(quoted)-2]...)
-		line = ""
-	}
-	for len(line) > 0 {
-		if err := work.Charge(); err != nil {
-			return err
-		}
-		n := queryChunkEnd(line)
-		payload, err := response.escapeChunk(line[:n])
-		if err != nil {
-			return err
-		}
-		record = append(record, payload...)
-		line = line[n:]
-	}
-	record = append(record, queryRecordSuffix...)
-	response.rows = append(response.rows, record)
-	response.size += len(record)
-	return nil
 }

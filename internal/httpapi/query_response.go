@@ -36,20 +36,34 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	if err != nil || !complete || size > b.maxBytes-b.size {
 		return false, size, err
 	}
+	if err := b.appendMeasuredRow(stamp, row.Line, size, nil, work); err != nil {
+		return false, 0, err
+	}
+	return true, 0, nil
+}
 
+// appendMeasuredRow assembles a record whose exact size and fit are already
+// known. The caller reserves encoding work. A non-nil escaped payload covers
+// the whole line and may borrow scratch from the immediately preceding
+// measurement. Publish the record only after assembly succeeds.
+func (b *queryResponse) appendMeasuredRow(stamp []byte, line string, size int, escaped []byte, work *store.QueryWork) error {
 	record := make([]byte, 0, size)
 	record = append(record, queryRecordPrefix...)
 	record = append(record, stamp...)
 	record = append(record, queryRecordField...)
-	for line := row.Line; len(line) > 0; {
-		// The measurement pass reserved the work for these bytes.
+	if escaped != nil {
+		record = append(record, escaped...)
+		line = ""
+	}
+	for len(line) > 0 {
+		// Poll cancellation between chunks of the prepaid encoding work.
 		if err := work.Charge(); err != nil {
-			return false, 0, err
+			return err
 		}
 		n := queryChunkEnd(line)
 		payload, err := b.escapeChunk(line[:n])
 		if err != nil {
-			return false, 0, err
+			return err
 		}
 		record = append(record, payload...)
 		line = line[n:]
@@ -57,7 +71,7 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	record = append(record, queryRecordSuffix...)
 	b.rows = append(b.rows, record)
 	b.size += len(record)
-	return true, 0, nil
+	return nil
 }
 
 const (
@@ -175,8 +189,13 @@ func (b *queryResponse) escapeChunk(line string) ([]byte, error) {
 	if err := b.encoder.WriteToken(jsontext.String(line)); err != nil {
 		return nil, err
 	}
+	return b.escapedChunkPayload(), nil
+}
+
+// escapedChunkPayload borrows the last successfully encoded chunk from scratch.
+func (b *queryResponse) escapedChunkPayload() []byte {
 	quoted := b.scratch.Bytes()
-	return quoted[1 : len(quoted)-2], nil
+	return quoted[1 : len(quoted)-2]
 }
 
 // queryChunkEnd avoids splitting a valid UTF-8 rune. Malformed bytes must

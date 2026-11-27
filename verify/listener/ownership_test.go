@@ -15,11 +15,12 @@ func TestListenerSocketTable(t *testing.T) {
 		ipv6, malformed    bool
 		want               []listenerSocket
 	}{
-		{"IPv4 loopback", "0100007F:1F90", "0A", false, false, []listenerSocket{{inode: 123}}},
-		{"IPv4 wildcard", "00000000:1F90", "0A", false, false, []listenerSocket{{inode: 123}}},
-		{"IPv6 wildcard", "00000000000000000000000000000000:1F90", "0A", true, false, []listenerSocket{{inode: 123, ipv6Wildcard: true}}},
-		{"mapped loopback", "0000000000000000FFFF00000100007F:1F90", "0A", true, false, []listenerSocket{{inode: 123}}},
-		{"mapped wildcard", "0000000000000000FFFF000000000000:1F90", "0A", true, false, []listenerSocket{{inode: 123}}},
+		{"IPv4 loopback", "0100007F:1F90", "0A", false, false, []listenerSocket{{inode: 123, bind: BindLoopback}}},
+		{"IPv4 wildcard", "00000000:1F90", "0A", false, false, []listenerSocket{{inode: 123, bind: BindWildcard}}},
+		{"IPv6 wildcard", "00000000000000000000000000000000:1F90", "0A", true, false, []listenerSocket{{inode: 123, bind: BindWildcard, ipv6Wildcard: true}}},
+		{"mapped loopback", "0000000000000000FFFF00000100007F:1F90", "0A", true, false, []listenerSocket{{inode: 123, bind: BindLoopback}}},
+		{"mapped wildcard", "0000000000000000FFFF000000000000:1F90", "0A", true, false, []listenerSocket{{inode: 123, bind: BindWildcard}}},
+		{"other IPv4 address", "0200007F:1F90", "0A", false, false, nil},
 		{"IPv6 loopback cannot accept IPv4 probes", "00000000000000000000000001000000:1F90", "0A", true, false, nil},
 		{"other port", "0100007F:1F91", "0A", false, false, nil},
 		{"established only", "0100007F:1F90", "01", false, false, nil},
@@ -46,7 +47,7 @@ func TestListenerSocketTableRecordsEveryMatchingInode(t *testing.T) {
   2: 00000000:1F90 00000000:0000 0A 0 0 0 1000 0 131
   3: 0100007F:1F91 00000000:0000 0A 0 0 0 1000 0 132`
 	got, err := listenerSockets(lines, 8080, false)
-	if err != nil || !slices.Equal(got, []listenerSocket{{inode: 129}, {inode: 131}}) {
+	if err != nil || !slices.Equal(got, []listenerSocket{{inode: 129, bind: BindLoopback}, {inode: 131, bind: BindWildcard}}) {
 		t.Fatalf("inodes %v, error %v", got, err)
 	}
 }
@@ -66,6 +67,18 @@ func TestOwnsRejectsInvalidEndpoint(t *testing.T) {
 	for _, tc := range []struct{ pid, port int }{{0, 8080}, {-1, 8080}, {1, 0}, {1, -1}, {1, 65536}} {
 		if owned, err := Owns(tc.pid, tc.port); owned || err == nil || !strings.Contains(err.Error(), "invalid") {
 			t.Errorf("Owns(%d, %d) = %t, %v", tc.pid, tc.port, owned, err)
+		}
+		if owned, err := OwnsBind(tc.pid, tc.port, BindLoopback); owned || err == nil || !strings.Contains(err.Error(), "invalid") {
+			t.Errorf("OwnsBind(%d, %d, BindLoopback) = %t, %v", tc.pid, tc.port, owned, err)
+		}
+	}
+}
+
+func TestOwnsBindRejectsInvalidBind(t *testing.T) {
+	t.Parallel()
+	for _, bind := range []Bind{"", "127.0.0.2", "::", "::1"} {
+		if owned, err := OwnsBind(1, 8080, bind); owned || err == nil || !strings.Contains(err.Error(), "invalid expected") {
+			t.Errorf("OwnsBind(1, 8080, %q) = %t, %v", bind, owned, err)
 		}
 	}
 }

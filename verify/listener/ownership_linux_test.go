@@ -12,6 +12,45 @@ import (
 	"time"
 )
 
+func TestIPv4ExpectedBind(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		bind, other Bind
+	}{
+		{BindLoopback, BindWildcard},
+		{BindWildcard, BindLoopback},
+	} {
+		t.Run(string(tc.bind), func(t *testing.T) {
+			t.Parallel()
+			sock, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.ParseIP(string(tc.bind))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { closeTestListener(t, sock) })
+			pid, port := os.Getpid(), sock.Addr().(*net.TCPAddr).Port
+			if got, err := Owns(pid, port); !got || err != nil {
+				t.Fatalf("ordinary ownership = %t, %v", got, err)
+			}
+			assertExpectedBind(t, pid, port, tc.bind, true, "")
+			assertExpectedBind(t, pid, port, tc.other, false, "has bind "+string(tc.bind))
+			childPID := startListenerHolder(t, sock)
+			if err := sock.Close(); err != nil {
+				t.Fatal(err)
+			}
+			assertExpectedBind(t, childPID, port, tc.bind, true, "")
+			assertExpectedBind(t, pid, port, tc.bind, false, "foreign listener")
+			assertExpectedBind(t, pid, port, tc.other, false, "foreign listener")
+		})
+	}
+}
+
+func closeTestListener(t *testing.T, sock *net.TCPListener) {
+	t.Helper()
+	if err := sock.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Error(err)
+	}
+}
+
 func TestIPv6WildcardOwnershipFromIPv4(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -36,14 +75,7 @@ func TestIPv6WildcardOwnershipFromIPv4(t *testing.T) {
 			}
 			ipv6 := sock.(*net.TCPListener)
 			port := ipv6.Addr().(*net.TCPAddr).Port
-			closed := false
-			t.Cleanup(func() {
-				if !closed {
-					if err := ipv6.Close(); err != nil {
-						t.Error(err)
-					}
-				}
-			})
+			t.Cleanup(func() { closeTestListener(t, ipv6) })
 
 			endpoint := net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
 			dialer := net.Dialer{Timeout: time.Second}
@@ -67,20 +99,27 @@ func TestIPv6WildcardOwnershipFromIPv4(t *testing.T) {
 			if got, err := Owns(os.Getpid(), port); got != dualStack || err != nil {
 				t.Fatalf("candidate wildcard ownership = %t, %v, want %t, nil", got, err, dualStack)
 			}
+			assertExpectedBind(t, os.Getpid(), port, BindWildcard, dualStack, "")
+			if dualStack {
+				assertExpectedBind(t, os.Getpid(), port, BindLoopback, false, "has bind 0.0.0.0")
+			} else {
+				assertExpectedBind(t, os.Getpid(), port, BindLoopback, false, "")
+			}
 
 			childPID := startListenerHolder(t, ipv6)
-			closed = true
 			if err := ipv6.Close(); err != nil {
 				t.Fatal(err)
 			}
 			if got, err := Owns(childPID, port); got != dualStack || err != nil {
 				t.Fatalf("child wildcard ownership = %t, %v, want %t, nil", got, err, dualStack)
 			}
+			assertExpectedBind(t, childPID, port, BindWildcard, dualStack, "")
 			got, err := Owns(os.Getpid(), port)
 			if dualStack {
 				if got || err == nil || !strings.Contains(err.Error(), "foreign listener") {
 					t.Fatalf("foreign dual-stack ownership = %t, %v", got, err)
 				}
+				assertExpectedBind(t, os.Getpid(), port, BindWildcard, false, "foreign listener")
 				return
 			}
 			if got || err != nil {
@@ -91,19 +130,25 @@ func TestIPv6WildcardOwnershipFromIPv4(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() {
-				if err := ipv4.Close(); err != nil {
-					t.Error(err)
-				}
-			})
+			t.Cleanup(func() { closeTestListener(t, ipv4) })
 			if got, err := Owns(os.Getpid(), port); !got || err != nil {
 				t.Fatalf("IPv4 candidate alongside foreign IPv6-only wildcard = %t, %v", got, err)
 			}
+			assertExpectedBind(t, os.Getpid(), port, BindLoopback, true, "")
+			assertExpectedBind(t, os.Getpid(), port, BindWildcard, false, "has bind 127.0.0.1")
 		})
 	}
 }
 
-// The IPv6 descriptor survives exec in the child until the test closes stdin.
+func assertExpectedBind(t *testing.T, pid, port int, bind Bind, want bool, wantErr string) {
+	t.Helper()
+	got, err := OwnsBind(pid, port, bind)
+	if got != want || (err == nil) != (wantErr == "") || (err != nil && !strings.Contains(err.Error(), wantErr)) {
+		t.Fatalf("OwnsBind(%d, %d, %s) = %t, %v, want %t and error containing %q", pid, port, bind, got, err, want, wantErr)
+	}
+}
+
+// The listener descriptor survives exec in the child until stdin closes.
 func startListenerHolder(t *testing.T, listener *net.TCPListener) int {
 	t.Helper()
 	file, err := listener.File()

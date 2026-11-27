@@ -61,7 +61,7 @@ type qualificationExchange struct {
 // The proxy forwards real HTTP responses and cuts the first continuation
 // immediately after one complete row, preserving the advertised frame size
 // and successor. A client that accepts a partial page would skip a row.
-func qualificationProxy(t *testing.T, base string) (string, func() []qualificationExchange) {
+func qualificationProxy(t *testing.T, base string, observe func(int) error) (string, func() []qualificationExchange) {
 	t.Helper()
 	target, err := url.Parse(base)
 	if err != nil {
@@ -76,9 +76,14 @@ func qualificationProxy(t *testing.T, base string) (string, func() []qualificati
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		mu.Lock()
 		exchanges = append(exchanges, qualificationExchange{resp.Request.URL.RequestURI(), resp.Header.Get(nextCursorHeader)})
-		cut := len(exchanges) == 2
+		attempt := len(exchanges)
 		mu.Unlock()
-		if !cut {
+		if observe != nil {
+			if err := observe(attempt); err != nil {
+				return err
+			}
+		}
+		if attempt != 2 {
 			return nil
 		}
 		prefix, err := bufio.NewReader(resp.Body).ReadSlice('\n')
@@ -143,7 +148,7 @@ func TestBoundedWalkRetriesTruncatedContinuation(t *testing.T) {
 		serveQualificationPage(t, w, r)
 	}))
 	t.Cleanup(issuer.Close)
-	base, trace := qualificationProxy(t, issuer.URL)
+	base, trace := qualificationProxy(t, issuer.URL, nil)
 	c := newTestExportClient(t, base)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -195,7 +200,7 @@ func TestExportFilePrePublicationFailures(t *testing.T) {
 			base := server.URL
 			if tc.truncate {
 				var trace func() []qualificationExchange
-				base, trace = qualificationProxy(t, base)
+				base, trace = qualificationProxy(t, base, nil)
 				defer func() {
 					if got := trace(); len(got) != 2 {
 						t.Errorf("requests after truncation = %+v, want two", got)
@@ -380,7 +385,27 @@ func qualifyAtomicExport(t *testing.T, ctx context.Context, issuer string) {
 			t.Error(err)
 		}
 	}()
-	base, trace := qualificationProxy(t, issuer)
+	base, trace := qualificationProxy(t, issuer, func(attempt int) error {
+		assertQualificationFile(t, path, priorQualificationOutput)
+		stage, err := filepath.Glob(filepath.Join(filepath.Dir(path), exportDestinationStagePrefix+"*"))
+		if err != nil {
+			return err
+		}
+		if len(stage) != 1 {
+			return fmt.Errorf("at query attempt %d, expected one private stage, got %v", attempt, stage)
+		}
+		want := ""
+		switch attempt {
+		case 2, 3:
+			// The cut exposes a valid row on the wire. The retry must
+			// still see only the previously accepted page on disk.
+			want = qualificationEarly + qualificationTie
+		case 4:
+			want = qualificationEarly + qualificationTie + qualificationOther + qualificationTie
+		}
+		assertQualificationFile(t, stage[0], want)
+		return nil
+	})
 	c := newTestExportClient(t, base)
 
 	renames := 0

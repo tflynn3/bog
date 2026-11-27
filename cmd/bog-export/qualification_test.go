@@ -44,8 +44,13 @@ type exportInterruption struct {
 	wantOutput                   string
 }
 
+var exportDeliveryInterruption = exportInterruption{
+	name: "during page delivery", diagnostic: "terminated signal received",
+	interruptRequest: 2, wantAcknowledged: 1, wantOutput: exportFirst,
+}
+
 var exportInterruptions = []exportInterruption{
-	{name: "during page delivery", diagnostic: "terminated signal received", interruptRequest: 2, wantAcknowledged: 1, wantOutput: exportFirst},
+	exportDeliveryInterruption,
 	{name: "partial output record", diagnostic: "write stdout (page 2, row 2)", workerMode: "partial fourth record",
 		wantAcknowledged: 1, wantOutput: exportFirst + rowB + rowA[:partialRecordBytes]},
 	{name: "failed output sync", diagnostic: "sync stdout (page 2)", workerMode: "fail sync",
@@ -74,7 +79,7 @@ func TestCheckpointInterruptionQualification(t *testing.T) {
 					http.Error(w, "invalid cursor", http.StatusBadRequest)
 				}
 			})
-			qualifyExportInterruption(t, tc, backend, nil)
+			qualifyExportInterruption(t, t.Context(), tc, backend, nil)
 		})
 	}
 }
@@ -135,8 +140,10 @@ func (s *exportQueryTrace) handler(t *testing.T, backend http.Handler, interrupt
 			t.Errorf("flush interrupted page: %v", err)
 			return
 		}
-		close(gate)
-		<-r.Context().Done()
+		if gate != nil {
+			close(gate)
+			<-r.Context().Done()
+		}
 	})
 }
 
@@ -237,9 +244,9 @@ func (f exportQualification) interrupt(t *testing.T, ctx context.Context, tc exp
 	}
 }
 
-func qualifyExportInterruption(t *testing.T, tc exportInterruption, backend http.Handler, afterInterrupt func(context.Context)) {
+func qualifyExportInterruption(t *testing.T, parent context.Context, tc exportInterruption, backend http.Handler, afterInterrupt func(context.Context)) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 	var trace exportQueryTrace
 	var gate chan struct{}
@@ -298,6 +305,7 @@ func qualifyExportInterruption(t *testing.T, tc exportInterruption, backend http
 	if got := trace.snapshot(); len(got) != len(requests)+len(resumed) {
 		t.Errorf("completed checkpoint made requests: %q", got)
 	}
+	return string(readExportArtifact(t, f.output.Name()))
 }
 
 func readExportArtifact(t *testing.T, path string) []byte {

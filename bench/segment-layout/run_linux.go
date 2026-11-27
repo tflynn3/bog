@@ -201,6 +201,13 @@ func benchmarkEnvironment(dir string, cfg config) (map[string]any, error) {
 }
 
 func run(ctx context.Context, cfg config, out io.Writer) error {
+	if cfg.validateReport != "" {
+		f, err := os.Open(cfg.validateReport)
+		if err != nil {
+			return err
+		}
+		return errors.Join(validateQualificationJSON(f), f.Close())
+	}
 	if cfg.incremental {
 		result, err := collectIncremental(ctx, cfg)
 		if err != nil {

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"time"
 )
 
@@ -21,6 +22,7 @@ var scaleBatches = map[string]int{
 
 type config struct {
 	dir, revision, profile, scale string
+	validateReport                string
 	batches, runs                 int
 	fixtureSeed                   uint64
 	binary, binaryRevision        string
@@ -42,20 +44,29 @@ func parseConfig(args []string, revision string, output io.Writer) (config, erro
 	flags.StringVar(&cfg.profile, "fixture", "mixed", "fixture profile (mixed or entropy)")
 	flags.StringVar(&cfg.dir, "dir", "", "parent for temporary benchmark files (defaults to OS temp directory)")
 	flags.StringVar(&cfg.revision, "revision", revision, "source revision to record")
-	flags.BoolVar(&cfg.incremental, "incremental", false, "compare successive experimental segment publications")
+	flags.BoolVar(&cfg.incremental, "incremental", false, "compare successive segment publications against production v1")
+	flags.StringVar(&cfg.validateReport, "validate-report", "", "validate a schema v4 qualification report and exit")
 	smoke := flags.Bool("smoke", false, "use the fixed small fixture and one sample per query")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
 	}
-	var explicitBatches, explicitScale bool
+	var explicitBatches, explicitScale, validate bool
 	flags.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "batches":
 			explicitBatches = true
 		case "scale":
 			explicitScale = true
+		case "validate-report":
+			validate = true
 		}
 	})
+	if validate {
+		if cfg.validateReport == "" || flags.NFlag() != 1 || flags.NArg() != 0 {
+			return config{}, fmt.Errorf("-validate-report requires a path and must be used alone")
+		}
+		return cfg, nil
+	}
 	if explicitBatches && explicitScale {
 		return config{}, fmt.Errorf("choose either -batches or -scale")
 	}
@@ -79,6 +90,9 @@ func parseConfig(args []string, revision string, output io.Writer) (config, erro
 	}
 	if cfg.timeout <= 0 || (cfg.binary == "") != (cfg.binaryRevision == "") {
 		return config{}, fmt.Errorf("require a positive -timeout and provide -bog-bin and -bog-revision together")
+	}
+	if cfg.incremental && cfg.timeout > math.MaxInt64/5 {
+		return config{}, fmt.Errorf("-timeout exceeds the incremental worker limit")
 	}
 	if cfg.incremental && cfg.binary != "" {
 		return config{}, fmt.Errorf("-bog-bin is only supported by the full-rewrite benchmark")

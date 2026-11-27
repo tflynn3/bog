@@ -1,0 +1,78 @@
+name: Segment layout qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/segment-layout.yml'
+      - 'bench/segment-layout/**'
+      - 'internal/checkpoint/**'
+      - 'internal/history/**'
+      - 'internal/store/**'
+      - 'internal/wal/**'
+      - 'go.mod'
+      - 'go.sum'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Native Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            machine: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            machine: aarch64
+    defaults:
+      run:
+        working-directory: bench/segment-layout
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            bench/segment-layout/go.sum
+      - name: Check runner and test benchmark
+        shell: bash
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = "$EXPECTED_MACHINE"
+          test "$(go env GOHOSTARCH)" = "$EXPECTED_ARCH"
+          test "$(go env GOARCH)" = "$EXPECTED_ARCH"
+          export TMPDIR="$RUNNER_TEMP"
+          go vet ./...
+          go test -race -count=1 ./...
+      - name: Build and validate a smoke report
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          artifacts="$RUNNER_TEMP/segment-layout-artifacts"
+          mkdir "$artifacts"
+          go build -o "$artifacts/segment-layout" .
+          "$artifacts/segment-layout" -incremental -smoke -seed 44 \
+            -revision "$(git rev-parse HEAD)" -dir "$RUNNER_TEMP" > "$artifacts/report.json"
+          "$artifacts/segment-layout" -validate-report "$artifacts/report.json"
+          tar -C "$artifacts" -czf "$artifacts/segment-layout.tar.gz" segment-layout
+      - uses: actions/upload-artifact@v4
+        with:
+          name: segment-layout-linux-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/segment-layout-artifacts/segment-layout.tar.gz
+            ${{ runner.temp }}/segment-layout-artifacts/report.json
+          if-no-files-found: error

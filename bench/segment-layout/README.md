@@ -37,8 +37,14 @@ the same profile, size and dependency versions. Timings vary.
 Run the incremental experiment on native Linux.
 
 ```sh
-go run . -incremental -smoke -seed 44
-go run . -incremental -dir /path/to/data -fixture entropy -scale medium -seed 44 -runs 21
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+go build -o "$work/segment-layout" .
+"$work/segment-layout" -incremental -smoke -seed 44 \
+  -revision "$(git rev-parse HEAD)" -dir "$work" > report.json
+"$work/segment-layout" -validate-report report.json
+"$work/segment-layout" -incremental -dir /path/to/data -fixture entropy \
+  -scale medium -seed 44 -runs 21 -revision "$(git rev-parse HEAD)" > entropy-medium.json
 ```
 
 This mode emits schema v4 with `mode: "incremental"`. The default invocation
@@ -47,7 +53,11 @@ uses the same scales and profiles, with an initial publication followed by
 three cumulative four-row appends. The forward append shares the timestamp just
 after the final ordinary batch. The clustered and scattered appends use exact
 duplicates from the initial history with new ordinals. All nine codec and size
-combinations see the same rows at each cutoff.
+combinations and the `baseline` entry named `production-v1` see the same
+WAL frames, append ordinals, and checkpoint cutoffs. The baseline calls the
+production `checkpoint.Publisher.PublishCaptured` and queries the resulting
+generation with the production retained `history.Reader`. The comparison
+runs at the storage boundary.
 
 The layouts use raw, LZ4, and Zstd with 16, 64, and 256 KiB uncompressed segment
 targets. Each segment is an immutable file containing one v1 checkpoint block
@@ -82,19 +92,40 @@ append-order oracle, including exact timestamps, ordinals, and line bytes.
   peaks are reported separately so the singleton cannot mask the effect of
   segment size. The working-set accounting excludes metadata, codec internals,
   allocator overhead, and accumulated query results.
-- **Query latency under compaction.** For every append trial, a full-range
-  sparse query scans the immutable predecessor in the same process while the
-  writer builds and syncs the successor. The report includes sample durations,
-  overlap between query execution and the timed writer interval, and nearest-rank
-  p95. Query latency includes dispatching the paired writer, file reads, decode,
-  filtering, and result ordering. Oracle comparison and trial cleanup are outside
-  the timer. Zero-overlap trials are discarded. Each append phase has up to five
-  times the requested sample count in attempts and fails if it falls short. The
-  last accepted trial's successor advances the chain. The filesystem cache is
-  left in place, and these measurements characterize the experimental layout.
+- **Query and publication latency.** Each run uses a fresh Linux process and
+  private data directory. Sparse and dense scans run in separate trials.
+  Initial queries run against the verified initial generation at idle. Each
+  append times a full-range scan of the immutable predecessor while the writer
+  builds and durably publishes the successor. Timed scans include file reads,
+  decoding or row traversal, filtering, and producing ordered results. WAL
+  writes and prefix hashing precede the timed publication. Successor
+  activation, oracle checks and cleanup occur outside both timers. The
+  filesystem page cache is left in place. Each phase records both timings
+  and their actual intersection, plus nearest-rank p95 for each query and
+  publication group. A trial contributes samples when every append scan
+  overlaps publication. Each query gets up to five times the requested run
+  count in attempts. The existing `query_during_compaction` field also
+  summarizes sparse append scans.
+- **Physical write amplification.** Each sample divides the Linux
+  `/proc/self/io` `write_bytes` delta around publication and its paired
+  read-only scan by the actual committed WAL suffix length, including frame
+  headers. The initial denominator excludes the WAL magic. Use a disk-backed
+  directory that supplies positive process write accounting. The numerator
+  includes staging and publication writes charged to the worker by Linux.
+  Device-level I/O and filesystem writes charged to other processes are
+  outside this counter. Logical segment and manifest sizes are reported
+  separately.
+- **Peak RSS.** Each sample records the worker's Linux `VmHWM` through the
+  timed publication and query. This is a whole-process high-water mark;
+  fixture loading, WAL setup, and earlier work in the same trial contribute.
+  The decode-only RSS remains a separate measurement collected in an
+  isolated worker for the experimental layouts.
 
-The production codec decision remains open. The separate full-rewrite mode
-provides the production checkpoint and pinned-server comparison.
+The native Linux smoke workflow runs the benchmark on amd64 and arm64 using
+runner scratch space. It validates the schema v4 report, including the production
+baseline, every codec/size combination, the exact phase and query matrix,
+matched denominators, and the requested number of samples. Each job uploads
+the report and an archive containing its native executable.
 
 ## Fixture and queries
 

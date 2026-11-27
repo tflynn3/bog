@@ -22,6 +22,7 @@ type workerRequest struct {
 	Start, End    time.Time
 	Component     *componentRequest
 	Decode        *decodeRequest
+	Qualification *qualificationRequest
 }
 
 type querySample struct {
@@ -46,6 +47,9 @@ func worker(ctx context.Context, arg string, out io.Writer) error {
 			return err
 		}
 		return json.NewEncoder(out).Encode(m)
+	}
+	if req.Qualification != nil {
+		return qualificationWorker(ctx, *req.Qualification, out)
 	}
 	if req.Decode != nil {
 		return decodeWorker(ctx, *req.Decode, out)

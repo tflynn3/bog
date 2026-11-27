@@ -137,3 +137,19 @@ func TestWriteAmplification(t *testing.T) {
 		}
 	}
 }
+
+func TestValidationConfig(t *testing.T) {
+	for _, args := range [][]string{
+		{"-validate-report", ""},
+		{"-validate-report", "report.json", "-incremental"},
+		{"-validate-report", "report.json", "extra"},
+	} {
+		if _, err := parseConfig(args, "revision", io.Discard); err == nil {
+			t.Fatalf("accepted invalid validation args %q", args)
+		}
+	}
+	cfg, err := parseConfig([]string{"-validate-report", "report.json"}, "revision", io.Discard)
+	if err != nil || cfg.validateReport != "report.json" {
+		t.Fatalf("validation config %+v: %v", cfg, err)
+	}
+}

@@ -180,8 +180,8 @@ func (b backfillEvidence) validate(want backfillCutoffs, previousPublication, pe
 }
 
 func (b backfillEvidence) validateSamples(want backfillCutoffs, previousPublication, peak uint64) error {
-	var elapsed, startSent, lastRunningSent, exhaustedAt, retriedAt, retiredAt, drainStarted int64
-	var overlap, published, finalObserved, held, drained, fresh bool
+	var elapsed, startSent, lastRunningSent, exhaustedAt, retriedAt, retiredAt int64
+	var overlap, published, finalObserved, held, drainStarted, drained, fresh bool
 	var predecessor uint64
 	var committed int
 	var stagingObservedAt, firstRead int64
@@ -236,6 +236,9 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs, previousPublicat
 			if !drained || fresh {
 				return errors.New("fresh visibility sample must follow observed pin drain")
 			}
+			if b.Acknowledged.Last > elapsed {
+				return errors.New("last backfill acknowledgment must occur by the fresh visibility observation")
+			}
 			fresh = true
 			continue
 		case "compaction_start", "overlap", "status_poll", "publication", "final_cutoff", "before_retirement", "after_retirement", "drain_poll":
@@ -264,13 +267,11 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs, previousPublicat
 			return fmt.Errorf("%s sample request overlapped a previous observation", sample.Event)
 		}
 		if drain {
-			if drained || (sample.Event == "after_retirement") != (drainStarted == 0) {
+			if drained || (sample.Event == "after_retirement") == drainStarted {
 				return errors.New("pin drain must start with after_retirement and end at the first observed zero")
 			}
-			if drainStarted == 0 {
-				drainStarted = sent
-			}
-			if elapsed-drainStarted > int64(DrainBudget) {
+			drainStarted = true
+			if elapsed-retiredAt > int64(DrainBudget) {
 				return errors.New("pin drain sample exceeded the drain budget")
 			}
 			if retry {

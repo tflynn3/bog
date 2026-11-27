@@ -182,6 +182,20 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 		{name: "clustered final count in publication", pattern: "clustered"},
 		{name: "scattered publication before last acknowledgement", pattern: "scattered"},
 		{
+			name: "last acknowledgment at fresh visibility", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				b.Acknowledged.Last = sample(b, "fresh_visible").ElapsedNS
+			},
+		},
+		{
+			name: "last acknowledgment after fresh visibility", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				b.Acknowledged.Last = sample(b, "fresh_visible").ElapsedNS + 1
+				b.Samples = append(b.Samples, backfillSample{Event: "fresh_walk_complete", ElapsedNS: b.Acknowledged.Last + 1})
+			},
+			problem: "last backfill acknowledgment must occur by the fresh visibility observation",
+		},
+		{
 			name: "scattered final count in publication", pattern: "scattered",
 			mutate: func(b *backfillEvidence) {
 				sample(b, "publication").Compaction.CommittedRows = b.FinalCutoff
@@ -305,7 +319,7 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 			name: "zero at the drain budget boundary", pattern: "clustered",
 			mutate: func(b *backfillEvidence) {
 				poll := sample(b, "drain_poll")
-				poll.ElapsedNS = *sample(b, "after_retirement").SentNS + int64(DrainBudget)
+				poll.ElapsedNS = sample(b, "capture_retired").ElapsedNS + int64(DrainBudget)
 				poll.SentNS = new(poll.ElapsedNS - 1)
 				sample(b, "fresh_visible").ElapsedNS = poll.ElapsedNS + 1
 			},
@@ -321,9 +335,21 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 			name: "late zero exceeds producer drain budget", pattern: "clustered",
 			mutate: func(b *backfillEvidence) {
 				poll := sample(b, "drain_poll")
-				poll.ElapsedNS = *sample(b, "after_retirement").SentNS + int64(2*time.Second) + 1
+				poll.ElapsedNS = sample(b, "capture_retired").ElapsedNS + int64(DrainBudget) + 1
 				poll.SentNS = new(poll.ElapsedNS - 1)
 				sample(b, "fresh_visible").ElapsedNS = poll.ElapsedNS + 1
+			},
+			problem: "exceeded the drain budget",
+		},
+		{
+			name: "delay before first poll counts toward drain budget", pattern: "clustered",
+			mutate: func(b *backfillEvidence) {
+				first := sample(b, "after_retirement")
+				first.ElapsedNS = sample(b, "capture_retired").ElapsedNS + int64(DrainBudget) + 1
+				first.SentNS = new(first.ElapsedNS - 1)
+				first.Metrics.RetiredPins = new(uint64(0))
+				remove(b, "drain_poll")
+				sample(b, "fresh_visible").ElapsedNS = first.ElapsedNS + 1
 			},
 			problem: "exceeded the drain budget",
 		},

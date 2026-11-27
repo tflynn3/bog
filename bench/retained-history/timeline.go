@@ -242,8 +242,10 @@ func (p *backfillProbe) record(event string, sent, received time.Time, c compact
 	return sample.Candidate
 }
 
-func (p *backfillProbe) boundary(event string) {
-	p.record(event, time.Time{}, time.Now(), compactionReply{}, nil)
+func (p *backfillProbe) boundary(event string) time.Time {
+	observed := time.Now()
+	p.record(event, time.Time{}, observed, compactionReply{}, nil)
+	return observed
 }
 
 func (p *backfillProbe) request(ctx context.Context, action string, forceSample bool) (compactionReply, time.Time, time.Time, error) {
@@ -341,7 +343,7 @@ func (t *backfillTimeline) validateRunning(c compaction, previous uint64, commit
 	return nil
 }
 
-func (p *backfillProbe) observePublishedPins(ctx context.Context, event string) (*uint64, error) {
+func (p *backfillProbe) observePublishedPins(ctx context.Context, event string) (*uint64, time.Time, error) {
 	c, sent, received, err := p.request(ctx, "status", false)
 	if err == nil && (c.State != "complete" || c.Generation != p.Publication.Generation ||
 		c.CoveredRows != p.RequestedCutoff || c.CommittedRows != p.FinalCutoff) {
@@ -349,13 +351,13 @@ func (p *backfillProbe) observePublishedPins(ctx context.Context, event string) 
 	}
 	metrics := p.record(event, sent, received, c, err)
 	if err != nil {
-		return nil, err
+		return nil, received, err
 	}
-	return metrics.RetiredPins, nil
+	return metrics.RetiredPins, received, nil
 }
 
 func (p *backfillProbe) observeHeldPin(ctx context.Context) error {
-	count, err := p.observePublishedPins(ctx, "before_retirement")
+	count, _, err := p.observePublishedPins(ctx, "before_retirement")
 	p.PinDrain.Held = count
 	switch {
 	case err != nil:
@@ -370,27 +372,34 @@ func (p *backfillProbe) observeHeldPin(ctx context.Context) error {
 	}
 }
 
-func (p *backfillProbe) observeDrain(ctx context.Context, limit time.Duration) error {
+func (p *backfillProbe) observeDrain(ctx context.Context, retiredAt time.Time, limit time.Duration) error {
 	if p.PinDrain.Held == nil || *p.PinDrain.Held == 0 {
 		p.PinDrain.Reason = "candidate did not expose a positive predecessor pin count while the capture was held"
 		return errors.New(p.PinDrain.Reason)
 	}
-	budget, cancel := context.WithTimeout(ctx, limit)
+	p.PinDrain.Status, p.PinDrain.Reason = "pending", "no pin status observed within the drain budget"
+	deadline := retiredAt.Add(limit)
+	budget, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	ticker := time.NewTicker(timelineSampleInterval)
 	defer ticker.Stop()
-	for event := "after_retirement"; ; event = "drain_poll" {
+poll:
+	for event := "after_retirement"; budget.Err() == nil; event = "drain_poll" {
 		request, stop := context.WithTimeout(budget, diagnosticRequestLimit)
-		count, err := p.observePublishedPins(request, event)
+		count, received, err := p.observePublishedPins(request, event)
 		stop()
 		switch {
 		case ctx.Err() != nil:
 			return ctx.Err()
+		case err != nil && !errors.Is(err, context.DeadlineExceeded):
+			p.PinDrain.Reason = "drain status unavailable: " + diagnosticError(err)
+			return err
+		case received.After(deadline):
+			// Use the recorded reply time. The filesystem scan runs afterward.
+			p.PinDrain.Reason = "pin observation exceeded the drain budget"
+			break poll
 		case err != nil:
 			p.PinDrain.Reason = "drain status unavailable: " + diagnosticError(err)
-			if !errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
 		case count == nil:
 			p.PinDrain.Reason = "drain status did not include a valid retired_generation_pins count"
 		case *count == 0:
@@ -401,14 +410,14 @@ func (p *backfillProbe) observeDrain(ctx context.Context, limit time.Duration) e
 			p.PinDrain.After = count
 			p.PinDrain.Reason = "predecessor pins still present at the last drain sample"
 		}
-		p.PinDrain.Status = "pending"
 		select {
 		case <-budget.Done():
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return fmt.Errorf("predecessor pin drain unconfirmed after %s: %s", limit, p.PinDrain.Reason)
+			break poll
 		case <-ticker.C:
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("predecessor pin drain unconfirmed after %s: %s", limit, p.PinDrain.Reason)
 }

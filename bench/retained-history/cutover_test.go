@@ -18,7 +18,9 @@ func passingCutoverReport() report {
 			b.HeldRows, b.FreshRows = b.HeldCutoff/2, b.FinalCutoff
 			b.HeldExhausted, b.TerminalRetried, b.CaptureRetired = true, true, true
 			b.FreshVisible, b.FreshExact = true, true
-			b.Publication = &publicationProof{Generation: uint64(i + 1), LowerBound: 4 * time.Millisecond, UpperBound: 7 * time.Millisecond}
+			// The seed checkpoint advances the predecessor between phases.
+			predecessor := uint64(2*i + 1)
+			b.Publication = &publicationProof{Generation: predecessor + 1, LowerBound: 4 * time.Millisecond, UpperBound: 7 * time.Millisecond}
 			rows := b.FinalCutoff - b.HeldCutoff
 			b.Acknowledged = &backfillAcknowledgements{
 				Rows: rows, Batches: rows / f.BatchRows, First: time.Millisecond / 2, Last: 6500 * time.Microsecond,
@@ -27,12 +29,12 @@ func passingCutoverReport() report {
 			b.PinDrain = pinDrainProof{Status: "observed", Held: new(uint64(1)), After: new(uint64)}
 			status := &compaction{b.Publication.Generation, b.RequestedCutoff, b.FinalCutoff, "complete"}
 			b.Samples = []phaseSample{
-				{Event: "compaction_start", Status: &compaction{uint64(i), b.HeldCutoff, b.RequestedCutoff, "running"},
+				{Event: "compaction_start", Status: &compaction{predecessor, b.HeldCutoff, b.RequestedCutoff, "running"},
 					RequestSent: new(time.Millisecond), Elapsed: 2 * time.Millisecond},
-				{Event: "status_poll", Status: &compaction{uint64(i), b.HeldCutoff, b.RequestedCutoff, "running"},
+				{Event: "status_poll", Status: &compaction{predecessor, b.HeldCutoff, b.RequestedCutoff, "running"},
 					RequestSent: new(3 * time.Millisecond), Elapsed: 3500 * time.Microsecond,
 					Memory: &memoryCurrentSample{ReadStart: 2200 * time.Microsecond, ReadEnd: 2700 * time.Microsecond, Bytes: new(f.MemoryBytes / 8)}},
-				{Event: "overlap", Status: &compaction{uint64(i), b.HeldCutoff, b.FinalCutoff, "running"},
+				{Event: "overlap", Status: &compaction{predecessor, b.HeldCutoff, b.FinalCutoff, "running"},
 					RequestSent: new(5 * time.Millisecond), Elapsed: 6 * time.Millisecond,
 					Memory: &memoryCurrentSample{ReadStart: 3700 * time.Microsecond, ReadEnd: 4 * time.Millisecond, Bytes: new(f.MemoryBytes / 4)}},
 				{Event: "publication", Status: status, RequestSent: new(7 * time.Millisecond), Elapsed: 8 * time.Millisecond},
@@ -105,8 +107,15 @@ func TestStrictCutoverReportProof(t *testing.T) {
 		{"missing drained value", "to zero after retirement", func(_ *result, b *backfillTimeline) { b.PinDrain.After = nil }},
 		{"positive drained value", "to zero after retirement", func(_ *result, b *backfillTimeline) { *b.PinDrain.After = 1 }},
 		{"lost status samples", "missing runtime samples", func(_ *result, b *backfillTimeline) { b.Samples = nil }},
-		{"different generation sampled", "publication at the requested cutoff", func(_ *result, b *backfillTimeline) { b.Samples[3].Status.Generation++ }},
-		{"above final peak", "above-final-memory.peak", func(r *result, b *backfillTimeline) { *b.Samples[1].Memory.Bytes = *r.CgroupPeak + 1 }},
+		{"different generation sampled", "publication at the requested cutoff", func(_ *result, b *backfillTimeline) {
+			status := *b.Samples[3].Status
+			status.Generation++
+			b.Samples[3].Status = &status
+		}},
+		{"above final peak", "above-final-memory.peak", func(r *result, b *backfillTimeline) {
+			*b.Samples[1].Memory.Bytes = *r.CgroupPeak + 1
+			b.Memory = new(b.summarizeMemory())
+		}},
 		{"at final peak", "", func(r *result, b *backfillTimeline) {
 			*b.Samples[1].Memory.Bytes = *r.CgroupPeak
 			b.Memory = new(b.summarizeMemory())
@@ -135,7 +144,9 @@ func TestCutoverRequiresOverlapMemoryForEveryTimeline(t *testing.T) {
 		for pattern, b := range newBackfillTimelines(f) {
 			t.Run(fmt.Sprintf("%d/%s", f.SeedRows, b.Pattern), func(t *testing.T) {
 				r := passingCutoverReport()
-				r.Cases[capacityCase].Evidence[scale].Diagnostics.Backfills[pattern].Samples[2].Memory = nil
+				timeline := r.Cases[capacityCase].Evidence[scale].Diagnostics.Backfills[pattern]
+				timeline.Samples[2].Memory = nil
+				timeline.Memory = new(timeline.summarizeMemory())
 				if err := r.Cases[capacityCase].Evidence[scale].validateCutover(); err == nil || !strings.Contains(err.Error(), b.Pattern+" backfill: require a bracketed memory.current overlap sample") {
 					t.Fatalf("validation error = %v, want missing overlap rejection for %s", err, b.Pattern)
 				}

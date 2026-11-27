@@ -120,9 +120,9 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 		return published, fmt.Errorf("explicitly retire held capture: %w", err)
 	}
 	p.CaptureRetired = true
-	p.boundary("capture_retired")
+	retiredAt := p.boundary("capture_retired")
 	setPhase("pin_drain")
-	if err := p.observeDrain(ctx, drainBudget); err != nil {
+	if err := p.observeDrain(ctx, retiredAt, drainBudget); err != nil {
 		return published, err
 	}
 	setPhase("fresh_backfill")

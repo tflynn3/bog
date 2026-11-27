@@ -47,25 +47,12 @@ type budgetFixture struct {
 
 type budgetLaunch func(context.Context, int, func(context.Context, string) error) error
 
-type budgetProbeOutcome string
-
-const (
-	probeIndeterminate budgetProbeOutcome = "indeterminate"
-	probeRejected      budgetProbeOutcome = "clean_rejection"
-	probeIssued        budgetProbeOutcome = "issued_cursor"
-	probeExhausted     budgetProbeOutcome = "exhausted"
-)
-
 type budgetProbe struct {
 	Budget  int                 `json:"budget"`
 	Outcome budgetProbeOutcome  `json:"outcome"`
 	Pages   int                 `json:"pages"`
 	Rows    int                 `json:"rows"`
 	Failure *budgetProbeFailure `json:"failure,omitempty"`
-}
-
-func (p budgetProbe) issued() bool {
-	return p.Outcome == probeIssued || p.Outcome == probeExhausted
 }
 
 type budgetProbeFailure struct {
@@ -83,54 +70,45 @@ func (f *budgetProbeFailure) Error() string {
 
 func (f *budgetProbeFailure) Unwrap() error { return f.cause }
 
-type budgetSearch struct {
-	stats            budgetWalkStats
-	highestRejection int
-}
-
-func (s *budgetSearch) record(probe budgetProbe) {
-	s.stats.Probes = append(s.stats.Probes, probe)
+func (s *budgetWalkStats) record(probe budgetProbe) {
+	s.Probes = append(s.Probes, probe)
 	if probe.Outcome == probeRejected {
-		s.stats.RejectedBudgets++
-		s.highestRejection = max(s.highestRejection, probe.Budget)
+		s.RejectedBudgets++
 	}
-	if probe.issued() && (s.stats.FirstCursorBudget == 0 || probe.Budget < s.stats.FirstCursorBudget) {
-		s.stats.FirstCursorBudget = probe.Budget
-		s.stats.Pages, s.stats.Rows = probe.Pages, probe.Rows
+	if probe.Outcome.issued() && (s.FirstCursorBudget == 0 || probe.Budget < s.FirstCursorBudget) {
+		s.FirstCursorBudget = probe.Budget
+		s.Pages, s.Rows = probe.Pages, probe.Rows
 	}
 	if probe.Failure != nil {
-		if s.stats.FirstFailure == nil {
-			s.stats.FirstFailure = probe.Failure
+		if s.FirstFailure == nil {
+			s.FirstFailure = probe.Failure
 		}
-		if probe.Failure.Page > 1 && s.stats.FirstBrokenContinuation == nil {
-			s.stats.FirstBrokenContinuation = probe.Failure
+		if probe.Failure.Page > 1 && s.FirstBrokenContinuation == nil {
+			s.FirstBrokenContinuation = probe.Failure
 		}
 	}
 }
 
-func (s *budgetSearch) finish(maxBudget int, stopped error) (budgetWalkStats, error) {
-	budget := s.stats.FirstCursorBudget
-	// Budget 1 is the floor. For a monotone search at a higher
-	// budget, require a clean observation at the adjacent lower budget.
-	if budget > 0 && s.highestRejection == budget-1 {
-		s.stats.ExactThresholdBudget = budget
+func (s *budgetWalkStats) finish(boundary budgetBoundary, maxBudget int, stopped error) error {
+	if boundary.exact() {
+		s.ExactThresholdBudget = boundary.issuing
 	}
-	if first := s.stats.FirstFailure; first != nil {
+	if first := s.FirstFailure; first != nil {
 		if stopped != nil && stopped != first {
-			return s.stats, errors.Join(first, stopped)
+			return errors.Join(first, stopped)
 		}
-		return s.stats, first
+		return first
 	}
 	if stopped != nil {
-		return s.stats, stopped
+		return stopped
 	}
-	if budget == 0 {
-		return s.stats, fmt.Errorf("no first-page cursor at budgets 1 through %d", maxBudget)
+	if boundary.issuing == 0 {
+		return fmt.Errorf("no first-page cursor at budgets 1 through %d", maxBudget)
 	}
-	if s.stats.ExactThresholdBudget == 0 {
-		return s.stats, fmt.Errorf("issuing budget %d has no clean rejection at budget %d", budget, budget-1)
+	if s.ExactThresholdBudget == 0 {
+		return fmt.Errorf("issuing budget %d has no clean rejection at budget %d", boundary.issuing, boundary.issuing-1)
 	}
-	return s.stats, nil
+	return nil
 }
 
 func sparseBudgetFixture() budgetFixture {
@@ -181,40 +159,33 @@ func findBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, lau
 	// making append order observable across both continuations.
 	want := []row{{fixtureStart, "c"}, {fixtureStart, "a"}, {fixtureStart, "b"}}
 	fixture := budgetFixture{seed: want, want: want, firstLimit: 1, resumeLimit: 1, firstRows: 1}
-	var search budgetSearch
+	var stats budgetWalkStats
+	var boundary budgetBoundary
+	var stopped error
 	for budget := 1; budget <= maxBudget; budget++ {
 		probe, err := tryBudgetWalk(ctx, client, launch, budget, fixture)
-		search.record(probe)
-		if err != nil || probe.Outcome != probeRejected {
-			return search.finish(maxBudget, err)
+		stats.record(probe)
+		boundary.record(budget, probe.Outcome)
+		if err != nil || probe.Outcome != probeRejected || budget == maxBudget {
+			stopped = err
+			break
 		}
 	}
-	return search.finish(maxBudget, nil)
+	err := stats.finish(boundary, maxBudget, stopped)
+	return stats, err
 }
 
 func findSparseBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, fixture budgetFixture, launch budgetLaunch) (sparseBudgetWalkProof, error) {
 	proof := sparseBudgetWalkProof{ResponseByteCap: fixture.byteCap, FirstLimit: fixture.firstLimit, ResumeLimit: fixture.resumeLimit}
-	var search budgetSearch
-	var stopped error
 	// Bisect on the first-page result. Every issuing probe still walks to
 	// exhaustion, and a broken resume leaves the first-page observation intact.
-	for low, high := 1, maxBudget; low <= high; {
-		budget := low + (high-low)/2
+	boundary, stopped := bisectBudget(maxBudget, 0, func(budget int) (budgetProbeOutcome, error) {
 		probe, err := tryBudgetWalk(ctx, client, launch, budget, fixture)
-		search.record(probe)
-		if err != nil || probe.Outcome == probeIndeterminate {
-			stopped = err
-			break
-		}
-		if probe.issued() {
-			high = budget - 1
-		} else {
-			low = budget + 1
-		}
-	}
-	stats, err := search.finish(maxBudget, stopped)
-	proof.budgetWalkStats = stats
-	if stats.FirstCursorBudget > 0 {
+		proof.record(probe)
+		return probe.Outcome, err
+	})
+	err := proof.finish(boundary, maxBudget, stopped)
+	if proof.FirstCursorBudget > 0 {
 		proof.FirstRows = fixture.firstRows
 	}
 	return proof, err

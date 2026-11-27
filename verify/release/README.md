@@ -181,20 +181,33 @@ tied and duplicate cases start at 11 work units. The sparse case starts
 at 314 and requests four rows on the opening page. The 96-byte response
 cap fits exactly two of those rows. All three cases resume with limit one.
 
-A clean, framed opening work-budget refusal can advance the search to
-twice the previous budget, up to 2,048 units. Once the opening page issues
-a cursor, every resume uses the same process and configured budget. The
-candidate must acknowledge a backfill with HTTP 204 before the first
-resume and again before the terminal resume. The independent append-log
-oracle compares each complete page to the original capture in exact order,
-including duplicate multiplicity. Any continuation error fails the case.
+Backfill and sparse admission share bounded bisection and the same
+threshold rule. Backfill probes the historical reference first, then
+bisects the remaining range from 1 through 2,048 work units. It measures
+the lowest issuing budget on the ordinary and retained paths separately,
+requiring a clean, framed opening refusal exactly one unit below each
+threshold above 1.
+
+Every issuing backfill probe must exhaust at its configured budget on
+the same process. The candidate must acknowledge a backfill with HTTP 204
+before the first resume and again before the terminal resume. The
+independent append-log oracle compares each complete page to the original
+capture in exact order, including duplicate multiplicity, and checks
+terminal replay. Any continuation error fails the case.
+
+The retained search publishes the seed generation before opening a
+cursor. The replacement trial uses its measured issuing budget and
+publishes a newer generation at the first acknowledged backfill cutoff
+before resuming. A separate launch at the ceiling replays the publications
+and both backfills and verifies a fresh walk of the augmented history.
 
 The workflow requires an explicit passing Go test event on both jobs.
 Each artifact retains `fixed-budget-backfill-events.jsonl`,
 `fixed_budget_backfill.log`, and the producer's entry in `producers.txt`
 with the gate checkout, candidate revision, and exit status. The test
-logs the candidate SHA-256, fixture, attempted budgets, acknowledgements,
-and accepted walk counts. This evidence accompanies the schema-v1
+logs the candidate SHA-256, fixture, attempted budgets, measured issuing
+budgets and adjacent rejections, acknowledgements, and accepted walk
+counts. This evidence accompanies the schema-v1
 admission, durability, capacity, and parity reports.
 
 ## Restored parity fixture

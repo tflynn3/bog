@@ -71,6 +71,11 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 		{name: "budget failure on resume", threshold: 4, pages: []page{first, {budgetRejectionBody, ""}}, wantBudgets: []int{4, 2, 3}, problem: "page 2: Bog HTTP 503", cursorAt: 4, exactAt: 4, firstBroken: 4, brokenPage: 2},
 		{name: "budget failure proving exhaustion", threshold: 4, pages: []page{first, middle, {budgetRejectionBody, ""}}, wantBudgets: []int{4, 2, 3}, problem: "page 3: Bog HTTP 503", cursorAt: 4, exactAt: 4, firstBroken: 4, brokenPage: 3},
 		{
+			name: "broken issuing boundary below a complete walk", threshold: 3, wantBudgets: []int{4, 2, 3},
+			override: map[int][]page{3: {first, {budgetRejectionBody, ""}}},
+			problem:  "at budget 3: page 2: Bog HTTP 503", cursorAt: 3, exactAt: 3, firstBroken: 3, brokenPage: 2,
+		},
+		{
 			name: "higher budget fails before a complete lower walk", threshold: 3, wantBudgets: []int{4, 2, 3},
 			override: map[int][]page{4: {first, {budgetRejectionBody, ""}}},
 			problem:  "at budget 4: page 2: Bog HTTP 503", cursorAt: 3, exactAt: 3, firstBroken: 4, brokenPage: 2,
@@ -195,7 +200,7 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 					t.Errorf("observation %d: %+v", i, p)
 				}
 				if p.Budget == tc.cursorAt {
-					if !p.issued() || got.FirstRows != 2 || got.Pages != p.Pages || got.Rows != p.Rows {
+					if !p.Outcome.issued() || got.FirstRows != 2 || got.Pages != p.Pages || got.Rows != p.Rows {
 						t.Errorf("lowest issuing observation = %+v, summary = %+v", p, got)
 					}
 					if p.Failure == nil && (p.Outcome != probeExhausted || got.Pages != 3 || got.Rows != 4) {

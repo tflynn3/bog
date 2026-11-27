@@ -66,10 +66,6 @@ const (
 	heldBackfill     backfillTrial = "replacement"
 )
 
-type backfillBudgetBoundary struct {
-	issuing, rejected int // rejected is zero at the budget floor.
-}
-
 func qualifyBackfillBudgets(ctx context.Context, t *testing.T, raw *http.Client, tc querymodel.FixedBudgetCase, maxBudget int, launch budgetLaunch) error {
 	t.Helper()
 	if _, err := searchBackfillBudget(ctx, t, raw, tc, maxBudget, ordinaryBackfill, launch); err != nil {
@@ -108,20 +104,14 @@ func qualifyBackfillBudgets(ctx context.Context, t *testing.T, raw *http.Client,
 	return nil
 }
 
-func searchBackfillBudget(ctx context.Context, t *testing.T, raw *http.Client, tc querymodel.FixedBudgetCase, maxBudget int, trial backfillTrial, launch budgetLaunch) (backfillBudgetBoundary, error) {
+func searchBackfillBudget(ctx context.Context, t *testing.T, raw *http.Client, tc querymodel.FixedBudgetCase, maxBudget int, trial backfillTrial, launch budgetLaunch) (budgetBoundary, error) {
 	t.Helper()
 	if maxBudget < 1 || tc.ReferenceWorkBudget < 1 {
-		return backfillBudgetBoundary{}, errors.New("work budgets must be positive")
+		return budgetBoundary{}, errors.New("work budgets must be positive")
 	}
-	low, high := 1, maxBudget
-	var boundary backfillBudgetBoundary
-	// Probe the historical budget first, then bisect. Only a clean opening
-	// refusal can move the lower bound. Every issuing probe must exhaust.
-	budget := min(tc.ReferenceWorkBudget, high)
-search:
-	for low <= high {
+	boundary, err := bisectBudget(maxBudget, tc.ReferenceWorkBudget, func(budget int) (budgetProbeOutcome, error) {
 		if err := ctx.Err(); err != nil {
-			return backfillBudgetBoundary{}, err
+			return probeIndeterminate, err
 		}
 		var result querymodel.FixedBudgetResult
 		err := launch(ctx, budget, func(ctx context.Context, base string) error {
@@ -132,30 +122,28 @@ search:
 			return err
 		})
 		if err != nil {
-			return backfillBudgetBoundary{}, fmt.Errorf("work budget %d: %w", budget, err)
+			return probeIndeterminate, fmt.Errorf("work budget %d: %w", budget, err)
 		}
 		if err := ctx.Err(); err != nil {
-			return backfillBudgetBoundary{}, err
+			return probeIndeterminate, err
 		}
 		switch result.Outcome {
 		case querymodel.FixedBudgetCleanRejection:
-			boundary.rejected = budget
-			if budget == high {
-				break search
-			}
-			low = budget + 1
+			return probeRejected, nil
 		case querymodel.FixedBudgetExhausted:
-			boundary.issuing, high = budget, budget-1
+			return probeExhausted, nil
 		default:
-			return backfillBudgetBoundary{}, fmt.Errorf("work budget %d: candidate probe has no conclusive result (%q)", budget, result.Outcome)
+			return probeIndeterminate, fmt.Errorf("work budget %d: candidate probe has no conclusive result (%q)", budget, result.Outcome)
 		}
-		budget = low + (high-low)/2
+	})
+	if err != nil {
+		return budgetBoundary{}, err
 	}
 	if boundary.issuing == 0 {
-		return backfillBudgetBoundary{}, fmt.Errorf("no cursor issued at work budgets through %d", maxBudget)
+		return budgetBoundary{}, fmt.Errorf("no cursor issued at work budgets through %d", maxBudget)
 	}
-	if boundary.rejected != boundary.issuing-1 {
-		return backfillBudgetBoundary{}, fmt.Errorf("issuing work budget %d lacks a clean rejection at budget %d", boundary.issuing, boundary.issuing-1)
+	if !boundary.exact() {
+		return budgetBoundary{}, fmt.Errorf("issuing work budget %d lacks a clean rejection at budget %d", boundary.issuing, boundary.issuing-1)
 	}
 	t.Logf("trial=%s issuing_work_budget=%d adjacent_lower_clean_rejection=%d", trial, boundary.issuing, boundary.rejected)
 	return boundary, nil
@@ -426,7 +414,7 @@ func TestFixedBudgetBackfillRetryBoundary(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			fixture := querymodel.FixedBudgetCases()[0]
-			fullWalk := []string{ack, open, ack, resume, ack, terminal}
+			fullWalk := []string{ack, open, ack, resume, ack, terminal, terminal}
 			var budgets []int
 			raw := new(http.Client)
 			launch := func(ctx context.Context, budget int, check func(context.Context, string) error) error {
@@ -454,7 +442,7 @@ func TestFixedBudgetBackfillRetryBoundary(t *testing.T) {
 				wantBudgets = []int{11}
 			}
 			boundary, err := searchBackfillBudget(t.Context(), t, raw, fixture, maxBudget, ordinaryBackfill, launch)
-			if tc.want == "" && boundary != (backfillBudgetBoundary{issuing: tc.threshold, rejected: tc.threshold - 1}) {
+			if tc.want == "" && boundary != (budgetBoundary{issuing: tc.threshold, rejected: tc.threshold - 1}) {
 				t.Errorf("boundary = %+v, want issuing %d and adjacent rejection %d", boundary, tc.threshold, tc.threshold-1)
 			}
 			if (tc.want == "" && err != nil) || (tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want))) {
@@ -465,6 +453,81 @@ func TestFixedBudgetBackfillRetryBoundary(t *testing.T) {
 			}
 			if tc.brokenBudget > 0 && (err == nil || !strings.Contains(err.Error(), "page 3 limit=1 HTTP 503")) {
 				t.Errorf("missing continuation failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestSparseBackfillBudgetBelowReference(t *testing.T) {
+	t.Parallel()
+	const threshold = 200
+	tc := querymodel.FixedBudgetCases()[2]
+	sparse := sparseBudgetFixture()
+	token1, token2 := strings.Repeat("A", 44), strings.Repeat("B", 44)
+	terminal := backfillRequest{path: "/query", filter: sparse.filter, cursor: token2}
+	requests := []backfillRequest{
+		{path: "/ingest", batch: sparse.seed},
+		{path: "/query", filter: sparse.filter, limit: tc.FirstLimit},
+		{path: "/ingest", batch: []row{{fixtureStart, "@new"}}},
+		{path: "/query", filter: sparse.filter, cursor: token1},
+		{path: "/ingest", batch: []row{{sparse.want[3].TS, "@new late tie"}}},
+		terminal, terminal,
+	}
+	page := func(cursor string, rows ...row) string {
+		var body strings.Builder
+		enc := json.NewEncoder(&body)
+		for _, r := range rows {
+			if err := enc.Encode(r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		headers := "Content-Type: application/x-ndjson\r\n"
+		if cursor != "" {
+			headers += nextCursor + ": " + cursor + "\r\n"
+		}
+		return lengthResponse(http.StatusOK, headers, body.String())
+	}
+	first := page(token1, sparse.want[:2]...)
+	resume := page(token2, sparse.want[2])
+	last := page("", sparse.want[3])
+	refusal := lengthResponse(http.StatusServiceUnavailable, "Content-Type: text/plain\r\n", budgetRejectionBody)
+	fullWalk := []string{backfillTestAck, first, backfillTestAck, resume, backfillTestAck, last, last}
+
+	for _, test := range []struct {
+		name       string
+		broken     bool
+		wantProbes []int
+	}{
+		{"measures adjacent rejection", false, []int{314, 157, 235, 196, 215, 205, 200, 198, 199}},
+		{"fails at issuing boundary after higher success", true, []int{314, 157, 235, 196, 215, 205, 200}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var probes []int
+			raw := new(http.Client)
+			launch := func(ctx context.Context, budget int, check func(context.Context, string) error) error {
+				probes = append(probes, budget)
+				replies := fullWalk
+				switch {
+				case budget < threshold:
+					replies = []string{backfillTestAck, refusal}
+				case budget == threshold && test.broken:
+					replies = []string{backfillTestAck, first, backfillTestAck, refusal}
+				}
+				raw.Transport = scriptedBackfillTransport(t, requests, replies)
+				return check(ctx, "http://127.0.0.1")
+			}
+			boundary, err := searchBackfillBudget(t.Context(), t, raw, tc, budgetWalkMax, ordinaryBackfill, launch)
+			if !slices.Equal(probes, test.wantProbes) {
+				t.Errorf("budgets = %v, want %v", probes, test.wantProbes)
+			}
+			if test.broken {
+				if boundary != (budgetBoundary{}) || err == nil ||
+					!strings.Contains(err.Error(), "work budget 200:") || !strings.Contains(err.Error(), "page 2 limit=1 HTTP 503") {
+					t.Fatalf("boundary = %+v, error = %v, want continuation failure at budget 200", boundary, err)
+				}
+			} else if err != nil || boundary != (budgetBoundary{issuing: threshold, rejected: threshold - 1}) {
+				t.Fatalf("boundary = %+v, error = %v, want issuing budget %d", boundary, err, threshold)
 			}
 		})
 	}
@@ -518,7 +581,8 @@ func TestFixedBudgetBackfillPublication(t *testing.T) {
 			}
 			if tc.lastFreshRow != "" {
 				requests = append(requests, held[3:]...)
-				replies = append(replies, backfillTestPage("a", token2), backfillTestAck, backfillTestPage("b", ""))
+				terminal := backfillTestPage("b", "")
+				replies = append(replies, backfillTestPage("a", token2), backfillTestAck, terminal, terminal)
 			}
 			raw := &http.Client{Transport: scriptedBackfillTransport(t, requests, replies)}
 			fixture := querymodel.FixedBudgetCases()[0]
@@ -627,7 +691,7 @@ func TestFixedBudgetBackfillReplacementAtRetainedBoundary(t *testing.T) {
 				return check(ctx, "http://127.0.0.1")
 			}
 			replacementScript := func(ctx context.Context, budget int, check func(context.Context, string) error) error {
-				pages := []string{resume, backfillTestAck, terminal}
+				pages := []string{resume, backfillTestAck, terminal, terminal}
 				if budget < tc.resumeBudget {
 					pages = []string{refusal}
 				}
@@ -639,13 +703,13 @@ func TestFixedBudgetBackfillReplacementAtRetainedBoundary(t *testing.T) {
 				budgets = append(budgets, budget)
 				switch {
 				case probe < len(ordinaryProbes):
-					replies := []string{backfillTestAck, open, backfillTestAck, resume, backfillTestAck, terminal}
+					replies := []string{backfillTestAck, open, backfillTestAck, resume, backfillTestAck, terminal, terminal}
 					if budget < ordinaryBudget {
 						replies = []string{backfillTestAck, refusal}
 					}
 					return withScript(ctx, held, replies, check)
 				case probe < len(ordinaryProbes)+len(retainedProbes):
-					replies := []string{open, backfillTestAck, resume, backfillTestAck, terminal}
+					replies := []string{open, backfillTestAck, resume, backfillTestAck, terminal, terminal}
 					if budget < retainedBudget {
 						replies = []string{refusal}
 					}
@@ -711,8 +775,9 @@ func TestFixedBudgetBackfillPublicationCancellation(t *testing.T) {
 }
 
 type backfillRequest struct {
-	path, cursor string
-	batch        []row
+	path, cursor, filter string
+	limit                int
+	batch                []row
 }
 
 func heldBackfillRequests(token1, token2 string) []backfillRequest {
@@ -723,6 +788,7 @@ func heldBackfillRequests(token1, token2 string) []backfillRequest {
 		{path: "/query", cursor: token1},
 		{path: "/ingest", batch: []row{{fixtureStart, "new final tie"}}},
 		{path: "/query", cursor: token2},
+		{path: "/query", cursor: token2}, // Replay the terminal request.
 	}
 }
 
@@ -777,8 +843,12 @@ func scriptedBackfillTransport(t *testing.T, requests []backfillRequest, replies
 			if want.cursor == "" {
 				wantPage = "1"
 			}
+			limit := want.limit
+			if limit == 0 {
+				limit = 1
+			}
 			if req.URL.Path != want.path || req.Method != http.MethodGet || q.Get("start") != fixtureStart || q.Get("end") != fixtureEnd ||
-				q.Get("limit") != "1" || q.Get("cursor") != want.cursor || q.Get("page") != wantPage || q.Get("contains") != "" {
+				q.Get("limit") != strconv.Itoa(limit) || q.Get("cursor") != want.cursor || q.Get("page") != wantPage || q.Get("contains") != want.filter {
 				return nil, fmt.Errorf("unexpected query at request %d", step)
 			}
 		default:

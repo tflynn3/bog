@@ -19,8 +19,184 @@ import (
 	"time"
 
 	"bog/internal/client"
+	"bog/internal/httpapi"
+	"bog/internal/store"
 	model "bog/verify/query-model"
 )
+
+type publishWireBatch struct{ store *store.Store }
+
+func (p publishWireBatch) Append(_ []byte, rows []store.Row) error {
+	p.store.Publish(rows)
+	return nil
+}
+
+type wireObservationKey struct{}
+
+type wireObservation struct {
+	response *http.Response
+	body     bytes.Buffer
+}
+
+type observingWireTransport struct{ *http.Transport }
+
+type observedWireBody struct {
+	io.Reader
+	io.Closer
+}
+
+func (transport observingWireTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	res, err := transport.Transport.RoundTrip(r)
+	if observation, ok := r.Context().Value(wireObservationKey{}).(*wireObservation); ok && err == nil {
+		observation.response = res
+		res.Body = observedWireBody{io.TeeReader(res.Body, &observation.body), res.Body}
+	}
+	return res, err
+}
+
+func openProductionWirePeer(t *testing.T, s *store.Store, budget uint64, cap int) *client.Client {
+	t.Helper()
+	handler := httpapi.NewWithQueryLimits(s, publishWireBatch{s}, cap, 4, budget)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	underlying := http.DefaultTransport.(*http.Transport).Clone()
+	t.Cleanup(underlying.CloseIdleConnections)
+	transport := new(http.Transport)
+	transport.RegisterProtocol("http", observingWireTransport{underlying})
+	c, err := client.New(server.URL, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.MaxPageBytes = int64(cap)
+	t.Cleanup(c.CloseIdleConnections)
+	return c
+}
+
+func fetchObservedPage(ctx context.Context, c *client.Client, req model.WireRequest) (model.WirePage, *wireObservation, error) {
+	var observation wireObservation
+	ctx = context.WithValue(ctx, wireObservationKey{}, &observation)
+	query := client.Query{Start: req.Filter.Start, End: req.Filter.End, Contains: req.Filter.Contains, Limit: req.Limit}
+	result, err := c.FetchPage(ctx, query, req.Cursor)
+	if err != nil {
+		return model.WirePage{}, &observation, err
+	}
+	res := observation.response
+	if res == nil || res.ContentLength != int64(observation.body.Len()) ||
+		res.Header.Get("Content-Type") != "application/x-ndjson" || len(res.TransferEncoding) != 0 ||
+		res.Trailer != nil {
+		return model.WirePage{}, &observation, errors.New("expected explicit NDJSON content length and no trailers")
+	}
+	page := model.WirePage{NextCursor: result.NextCursor, BodyBytes: res.ContentLength, NDJSON: observation.body.Bytes()}
+	for _, row := range result.Rows {
+		page.Rows = append(page.Rows, model.Row{Time: row.TS, Line: row.Line})
+	}
+	return page, &observation, nil
+}
+
+func appendWireRows(ctx context.Context, c *client.Client, log *model.Log, rows []model.Row) error {
+	var body bytes.Buffer
+	encoder := json.NewEncoder(&body)
+	for _, row := range rows {
+		if err := encoder.Encode(httpFixtureRow{row.Time, row.Line}); err != nil {
+			return err
+		}
+	}
+	outcome, err := c.Ingest(ctx, body.Bytes())
+	if err != nil {
+		return err
+	}
+	if outcome != client.IngestCommitted {
+		return fmt.Errorf("ingest outcome %d", outcome)
+	}
+	log.Append(rows)
+	return nil
+}
+
+func TestProductionFixedBudgetWireWalk(t *testing.T) {
+	t.Parallel()
+	start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(second int, line string) model.Row {
+		return model.Row{Time: start.Add(time.Duration(second) * time.Second), Line: line}
+	}
+	sparse := []model.Row{at(0, "@last"), at(0, "@tied"), at(3, "@next")}
+	for second := 4; second <= 30; second++ {
+		sparse = append(sparse, at(second, "miss"))
+	}
+	sparse = append(sparse, at(40, "@late"))
+	for second := 41; second <= 55; second++ {
+		sparse = append(sparse, at(second, "miss"))
+	}
+	for _, tc := range []struct {
+		name     string
+		rows     []model.Row
+		literal  string
+		budget   uint64
+		limit    int
+		openRows int
+		total    int
+		trimmed  int
+	}{
+		{"ties", []model.Row{at(0, "c"), at(0, "a"), at(0, "b")}, "", 11, 1, 1, 3, 0},
+		{"duplicates", []model.Row{at(0, "c"), at(0, "c"), at(0, "b")}, "", 11, 1, 1, 3, 0},
+		{"sparse", sparse, "@", 314, 4, 2, 4, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			const capBytes = 96
+			filter := model.Filter{Start: start, End: start.Add(10 * time.Minute), Contains: tc.literal}
+			limits := model.WireLimits{MaxPages: 8, MaxPageBytes: capBytes, Timeout: 5 * time.Second}
+			check := model.WireWalk{Filter: filter, Limits: limits, ExactNDJSON: true,
+				RowLimits: []int{tc.limit, 1, 1, 1}, FirstPageRows: tc.openRows}
+			ctx, cancel := context.WithTimeout(t.Context(), limits.Timeout)
+			defer cancel()
+			s := new(store.Store)
+			c := openProductionWirePeer(t, s, tc.budget, capBytes)
+			var log model.Log
+			if err := appendWireRows(ctx, c, &log, tc.rows); err != nil {
+				t.Fatal(err)
+			}
+			below := openProductionWirePeer(t, s, tc.budget-1, capBytes)
+			_, observation, err := fetchObservedPage(ctx, below, model.WireRequest{Filter: filter, Limit: tc.limit, MaxPageBytes: capBytes})
+			const rejection = "query work budget exhausted\n"
+			var httpErr *client.HTTPError
+			res := observation.response
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusServiceUnavailable ||
+				httpErr.Body != rejection || res == nil || observation.body.String() != rejection ||
+				res.ContentLength != int64(len(rejection)) || len(res.TransferEncoding) != 0 ||
+				res.Header.Get("Content-Type") != "text/plain; charset=utf-8" ||
+				len(res.Header.Values(cursorHeader)) != 0 || len(res.Trailer.Values(cursorHeader)) != 0 {
+				t.Fatalf("budget %d served an invalid rejection: response=%v body=%q error=%v", tc.budget-1, res, observation.body.String(), err)
+			}
+
+			fetch := func(ctx context.Context, req model.WireRequest) (model.WirePage, error) {
+				page, _, err := fetchObservedPage(ctx, c, req)
+				return page, err
+			}
+			backfill := at(0, "z")
+			if tc.literal != "" {
+				backfill.Line = "@new"
+			}
+			stats, err := model.VerifyWireWalk(ctx, &log, check, fetch, func(ctx context.Context, _ string) error {
+				return appendWireRows(ctx, c, &log, []model.Row{backfill})
+			})
+			if err != nil || stats.Rows != tc.total || stats.Pages != 3 || stats.ByteTrimmedPages != tc.trimmed {
+				t.Fatalf("held walk at budget %d = %+v, %v", tc.budget, stats, err)
+			}
+
+			// The append increases the scan's work, so use a larger allowance
+			// to verify that a fresh capture sees the acknowledged row.
+			fresh := openProductionWirePeer(t, s, httpapi.DefaultQueryWorkBudget, capBytes)
+			check.FirstPageRows = 0
+			stats, err = model.VerifyWireWalk(ctx, &log, check, func(ctx context.Context, req model.WireRequest) (model.WirePage, error) {
+				page, _, err := fetchObservedPage(ctx, fresh, req)
+				return page, err
+			}, nil)
+			if err != nil || stats.Rows != tc.total+1 {
+				t.Fatalf("fresh walk = %+v, %v", stats, err)
+			}
+		})
+	}
+}
 
 const cursorHeader = "Bog-Next-Cursor"
 

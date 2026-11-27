@@ -229,7 +229,12 @@ func (a *API) resumeQuery(w http.ResponseWriter, ctx context.Context, filter Pag
 	defer a.captures.done(capture, false)
 
 	response := queryResponse{maxBytes: a.maxResponseBytes}
-	token, err := a.replayQuery(ctx, capture, cursor, filter, limit, &response, work)
+	var token string
+	if capture.legacy != nil {
+		token, err = a.replayLegacyQuery(capture, cursor, filter, limit, &response, work)
+	} else {
+		token, err = a.replayQuery(ctx, capture, cursor, filter, limit, &response, work)
+	}
 	if err != nil {
 		if errors.Is(err, ErrCaptureExpired) {
 			a.captures.retire(capture)

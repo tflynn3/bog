@@ -13,16 +13,18 @@ import (
 const (
 	queryStringChunk          = 4 << 10
 	queryDeliveryBytesPerUnit = 16
+	queryFrameBytesPerUnit    = 8
 )
 
 // queryResponse buffers complete records until the status and cursor can be
 // committed. Each record's allocation is exact and never copies earlier rows.
 type queryResponse struct {
-	rows     [][]byte
-	size     int
-	maxBytes int
-	scratch  bytes.Buffer
-	encoder  jsontext.Encoder
+	rows         [][]byte
+	size         int
+	maxBytes     int
+	meterFraming bool
+	scratch      bytes.Buffer
+	encoder      jsontext.Encoder
 }
 
 // appendRow reports the exact encoded size when the first row doesn't fit.
@@ -35,7 +37,10 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	if err != nil || !complete || size > b.maxBytes-b.size {
 		return false, size, err
 	}
+	return true, 0, b.appendMeasuredRow(row, stamp, size, work)
+}
 
+func (b *queryResponse) appendMeasuredRow(row store.Row, stamp []byte, size int, work *store.QueryWork) error {
 	record := make([]byte, 0, size)
 	record = append(record, queryRecordPrefix...)
 	record = append(record, stamp...)
@@ -43,12 +48,12 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	for line := row.Line; len(line) > 0; {
 		// The measurement pass reserved the work for these bytes.
 		if err := work.Charge(); err != nil {
-			return false, 0, err
+			return err
 		}
 		n := queryChunkEnd(line)
 		payload, err := b.escapeChunk(line[:n])
 		if err != nil {
-			return false, 0, err
+			return err
 		}
 		record = append(record, payload...)
 		line = line[n:]
@@ -56,7 +61,7 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	record = append(record, queryRecordSuffix...)
 	b.rows = append(b.rows, record)
 	b.size += len(record)
-	return true, 0, nil
+	return nil
 }
 
 const (
@@ -74,6 +79,13 @@ func (b *queryResponse) measureRow(row store.Row, remaining int, allowEarlyExit 
 	}
 
 	size := len(queryRecordPrefix) + len(stamp) + len(queryRecordField) + len(queryRecordSuffix)
+	if b.meterFraming {
+		// Timestamp JSON and fixed delimiters have their own copy cost in
+		// addition to the line bytes metered below.
+		if err := work.Charge(uint64((size + queryFrameBytesPerUnit - 1) / queryFrameBytesPerUnit)); err != nil {
+			return nil, 0, false, err
+		}
+	}
 	for line := row.Line; ; {
 		// Escaping can only expand the remaining input.
 		if allowEarlyExit && len(line) > remaining-size {

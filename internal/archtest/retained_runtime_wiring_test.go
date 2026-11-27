@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -116,6 +117,10 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, rules map[st
 	if _, err := cfg.Check(server, fset, files, &types.Info{Uses: uses}); err != nil {
 		t.Fatalf("resolve %s constructor references: %v", server, err)
 	}
+	missing := map[string]struct{}{
+		"bog/internal/httpapi.NewWithPageSource":        {},
+		"bog/internal/readiness.NewHandlerForDirectory": {},
+	}
 	var problems []string
 	for _, ident := range slices.SortedFunc(maps.Keys(uses), func(a, b *ast.Ident) int {
 		return int(a.Pos() - b.Pos())
@@ -124,17 +129,23 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, rules map[st
 		if !ok || constructor.Pkg() == nil || constructor.Parent() != constructor.Pkg().Scope() {
 			continue
 		}
-		replacement := retainedConstructorReplacement(constructor.Pkg().Path(), constructor.Name())
+		path, name := constructor.Pkg().Path(), constructor.Name()
+		delete(missing, path+"."+name)
+		replacement := retainedConstructorReplacement(path, name)
 		if replacement == "" {
 			continue
 		}
 		pos := fset.PositionFor(ident.Pos(), false)
-		name, err := filepath.Rel(root, pos.Filename)
+		file, err := filepath.Rel(root, pos.Filename)
 		if err != nil {
 			t.Fatalf("resolve constructor source path: %v", err)
 		}
 		problems = append(problems, fmt.Sprintf("%s:%d:%d: retained runtime must use %s instead of %s.%s",
-			name, pos.Line, pos.Column, replacement, constructor.Pkg().Name(), constructor.Name()))
+			file, pos.Line, pos.Column, replacement, constructor.Pkg().Name(), name))
+	}
+	for _, constructor := range slices.Sorted(maps.Keys(missing)) {
+		problems = append(problems, fmt.Sprintf("cmd/bog (linux/%s): retained runtime must reference %s",
+			arch, strings.TrimPrefix(constructor, "bog/internal/")))
 	}
 	return problems
 }
@@ -160,6 +171,14 @@ func TestRetainedRuntimeWiringFixtures(t *testing.T) {
 		checkpoint = "bog/internal/checkpoint"
 		history    = "bog/internal/history"
 		backup     = "bog/internal/backup"
+		pageSource = `package main
+import api "bog/internal/httpapi"
+var _ = api.NewWithPageSource
+`
+		directoryHandler = `package main
+import . "bog/internal/readiness"
+func directoryProbe() { NewHandlerForDirectory() }
+`
 	)
 	legacyWiring := map[string]string{"legacy.go": `package main
 import "bog/internal/httpapi"
@@ -167,41 +186,76 @@ import "bog/internal/readiness"
 var _ = httpapi.NewWithQueryLimits
 var _ = readiness.NewHandler
 `}
+	splitWiring := map[string]string{
+		"paging_linux_amd64.go":    pageSource,
+		"readiness_linux_arm64.go": directoryHandler,
+		"readiness_linux_test.go":  directoryHandler,
+		"readiness_darwin.go":      directoryHandler,
+		"paging_tagged.go":         "//go:build retained_wiring_fixture\n\n" + pageSource,
+	}
 	for _, tt := range []struct {
-		name   string
-		arch   string
-		staged []string
-		legacy map[string]string
-		want   []string
+		name    string
+		arch    string
+		staged  []string
+		sources map[string]string
+		want    []string
 	}{
 		{
-			name:   "staged baseline permits legacy constructors",
-			arch:   "amd64",
-			staged: []string{checkpoint, history, backup},
-			legacy: legacyWiring,
+			name:    "staged baseline permits legacy constructors",
+			arch:    "amd64",
+			staged:  []string{checkpoint, history, backup},
+			sources: legacyWiring,
 		},
 		{
-			name:   "staged checkpoint delays activation",
-			arch:   "arm64",
-			staged: []string{checkpoint},
-			legacy: legacyWiring,
+			name:    "staged checkpoint delays activation",
+			arch:    "arm64",
+			staged:  []string{checkpoint},
+			sources: legacyWiring,
 		},
 		{
-			name:   "staged history delays activation",
-			arch:   "amd64",
-			staged: []string{history},
-			legacy: legacyWiring,
+			name:    "staged history delays activation",
+			arch:    "amd64",
+			staged:  []string{history},
+			sources: legacyWiring,
 		},
 		{
-			name:   "staged backup delays activation",
-			arch:   "arm64",
-			staged: []string{backup},
-			legacy: legacyWiring,
+			name:    "staged backup delays activation",
+			arch:    "arm64",
+			staged:  []string{backup},
+			sources: legacyWiring,
+		},
+		{
+			name:    "amd64 requires directory readiness in selected production sources",
+			arch:    "amd64",
+			sources: splitWiring,
+			want:    []string{"cmd/bog (linux/amd64): retained runtime must reference readiness.NewHandlerForDirectory"},
+		},
+		{
+			name:    "arm64 requires retained paging in selected production sources",
+			arch:    "arm64",
+			sources: splitWiring,
+			want:    []string{"cmd/bog (linux/arm64): retained runtime must reference httpapi.NewWithPageSource"},
+		},
+		{
+			name: "same-named functions and methods leave both constructors missing",
+			arch: "arm64",
+			sources: map[string]string{"lookalikes.go": `package main
+import httpapi "bog/internal/lookalike"
+import "bog/internal/readiness"
+var _ = httpapi.NewWithPageSource
+var _ = readiness.Probe.NewHandlerForDirectory
+`},
+			want: []string{
+				"cmd/bog (linux/arm64): retained runtime must reference httpapi.NewWithPageSource",
+				"cmd/bog (linux/arm64): retained runtime must reference readiness.NewHandlerForDirectory",
+			},
 		},
 		{
 			name: "retained constructors and selected production sources",
 			arch: "amd64",
-			legacy: map[string]string{
+			sources: map[string]string{
+				"paging_linux_amd64.go":    pageSource,
+				"readiness_linux_amd64.go": directoryHandler,
 				"legacy_linux_arm64.go": `package main
 import "bog/internal/httpapi"
 var _ = httpapi.New
@@ -223,16 +277,20 @@ var _ = readiness.NewHandler
 			},
 		},
 		{
-			name: "aliases and dot imports on Linux arm64",
+			name: "legacy aliases and dot imports still fail when both required constructors are present",
 			arch: "arm64",
-			legacy: map[string]string{"legacy_linux_arm64.go": `package main
+			sources: map[string]string{
+				"paging_linux_arm64.go":    pageSource,
+				"readiness_linux_arm64.go": directoryHandler,
+				"legacy_linux_arm64.go": `package main
 import api "bog/internal/httpapi"
 import . "bog/internal/readiness"
 var _ = api.New
 var _ = api.NewWithQueryMaxResponseBytes()
 var _ = api.NewWithQueryLimits
 var _ = NewHandler
-`},
+`,
+			},
 			want: []string{
 				"cmd/bog/legacy_linux_arm64.go:4:13: retained runtime must use httpapi.NewWithPageSource instead of httpapi.New",
 				"cmd/bog/legacy_linux_arm64.go:5:13: retained runtime must use httpapi.NewWithPageSource instead of httpapi.NewWithQueryMaxResponseBytes",
@@ -247,13 +305,7 @@ var _ = NewHandler
 			fixture := map[string]string{
 				"go.mod": "module bog\n\ngo 1.27\n",
 				"cmd/bog/main.go": `package main
-import (
-	"bog/internal/httpapi"
-	probe "bog/internal/readiness"
-)
 func main() {
-	httpapi.NewWithPageSource()
-	probe.NewHandlerForDirectory()
 	httpapi := struct{ New func() }{}
 	_ = httpapi.New
 }
@@ -267,9 +319,14 @@ func NewWithPageSource() {}
 				"internal/readiness/ready.go": `package readiness
 func NewHandler() {}
 func NewHandlerForDirectory() {}
+type Probe struct{}
+func (Probe) NewHandlerForDirectory() {}
+`,
+				"internal/lookalike/http.go": `package httpapi
+func NewWithPageSource() {}
 `,
 			}
-			for name, source := range tt.legacy {
+			for name, source := range tt.sources {
 				fixture[filepath.Join("cmd/bog", name)] = source
 			}
 			for path, source := range fixture {

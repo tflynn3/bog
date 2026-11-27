@@ -2,16 +2,31 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"os"
-	"slices"
 	"testing"
 	"time"
 
 	"bog/internal/checkpoint"
 )
+
+func TestMain(m *testing.M) {
+	if len(os.Args) == 3 && os.Args[1] == workerFlag {
+		if err := worker(context.Background(), os.Args[2], os.Stdout); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	if err := os.Setenv("GORACE", os.Getenv("GORACE")+" atexit_sleep_ms=0"); err != nil {
+		log.Fatal(err)
+	}
+	os.Exit(m.Run())
+}
 
 func TestSmokeLayouts(t *testing.T) {
 	if maxBlock != checkpoint.MaxBlockSize {
@@ -21,19 +36,22 @@ func TestSmokeLayouts(t *testing.T) {
 		t.Run(profile, func(t *testing.T) {
 			parent := t.TempDir()
 			var out bytes.Buffer
-			cfg := config{dir: parent, revision: "test", profile: profile, scale: "smoke", batches: 64, runs: 2}
-			if err := run(cfg, &out); err != nil {
+			cfg := config{dir: parent, revision: "test", profile: profile, scale: "smoke", batches: 64, runs: 1, fixtureSeed: seed, timeout: time.Minute}
+			if err := run(t.Context(), cfg, &out); err != nil {
 				t.Fatal(err)
 			}
 			var got report
 			if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 				t.Fatal(err)
 			}
-			if got.SchemaVersion != 2 || got.Revision != "test" || got.Fixture.Scale != "smoke" ||
+			if got.SchemaVersion != 3 || got.Revision != "test" || got.Fixture.Scale != "smoke" ||
 				got.Fixture.Name != profile+"-log-v2" || got.Fixture.Rows != 5253 || len(got.Layouts) != len(layouts) {
 				t.Fatalf("wrong report identity: schema %d, fixture %+v, %d layouts", got.SchemaVersion, got.Fixture, len(got.Layouts))
 			}
 
+			if len(got.Compaction.Component) != 2 || got.Compaction.Live.Status != "unavailable" {
+				t.Fatalf("unexpected production measurements %+v", got.Compaction)
+			}
 			baseline := map[codec]layoutReport{}
 			for i, item := range got.Layouts {
 				l := layouts[i]
@@ -54,6 +72,14 @@ func TestSmokeLayouts(t *testing.T) {
 					if !scenario.Earliest.Equal(epoch) || (j == 0 && !scenario.Latest.Equal(epoch)) ||
 						(j == 1 && !scenario.Latest.Equal(epoch.Add(62*time.Second))) {
 						t.Errorf("%s %s: wrong backfill bounds", item.Name, scenario.Scenario)
+					}
+					component := got.Compaction.Component[j]
+					a := component.WriteAmplification
+					if component.Scenario != scenario.Scenario || component.CoveredRows != scenario.Rows ||
+						component.PeakRSSBytes == 0 || a.WrittenBytes == 0 || a.AppendedWALBytes == 0 ||
+						a != writeAmplification(a.WrittenBytes, a.AppendedWALBytes, componentBoundary) ||
+						scenario.WriteAmplification != writeAmplification(uint64(scenario.RewriteBytes), a.AppendedWALBytes, benchmarkBoundary) {
+						t.Fatalf("invalid compaction accounting: %+v, %+v", component, scenario.WriteAmplification)
 					}
 					checkGeneration(t, l, scenario.generationReport, base.Backfills[j].generationReport, cfg.runs, scenario.Scenario)
 				}
@@ -88,6 +114,9 @@ func checkGeneration(t *testing.T, l layout, gen, baseline generationReport, run
 			m.BlocksAvoided != b.Blocks-m.Blocks || m.BytesAvoided != b.Bytes-m.Bytes ||
 			m.BlocksAvoided < 0 || m.BytesAvoided < 0 {
 			t.Errorf("%s/%s: wrong baseline accounting", l.name(), m.Name)
+		}
+		if len(m.SampleRSSBytes) != runs || m.PeakRSSBytes == 0 || m.PeakRSSBytes != m.SampleRSSBytes[0] {
+			t.Errorf("%s/%s: invalid peak RSS %+v", l.name(), m.Name, m.SampleRSSBytes)
 		}
 		if (m.PeakDecodeBytes == 0) != (m.Blocks == 0) {
 			t.Errorf("%s/%s: invalid decode memory %d", l.name(), m.Name, m.PeakDecodeBytes)
@@ -136,44 +165,47 @@ func (failedReportWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPip
 
 func TestReportFailureCleansUp(t *testing.T) {
 	parent := t.TempDir()
-	cfg := config{dir: parent, profile: "mixed", scale: "custom", batches: 1, runs: 1}
-	if err := run(cfg, failedReportWriter{}); !errors.Is(err, io.ErrClosedPipe) {
+	cfg := config{dir: parent, profile: "mixed", scale: "custom", batches: 1, runs: 1, fixtureSeed: seed, timeout: time.Minute}
+	if err := run(t.Context(), cfg, failedReportWriter{}); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("report failure: %v", err)
 	}
 	assertEmpty(t, parent)
 }
 
-func TestEachSampleChecksOracle(t *testing.T) {
-	input := fixture(4, false)
+func TestIsolatedSampleChecksCompleteRows(t *testing.T) {
+	input := fixture(4, false, seed)
 	path := t.TempDir() + "/raw"
-	size, err := writeGeneration(path, partition(input.rows), layout{codec: rawCodec})
-	if err != nil {
+	if _, err := writeGeneration(path, partition(input.rows), layout{codec: rawCodec}); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+	cfg := config{runs: 2, timeout: 10 * time.Second}
+	q := queries()[1]
+	n := len(input.rows)
+	if m, err := measureIsolated(t.Context(), cfg, path, q, reference(input.rows, q), n); err != nil || len(m.SampleRSSBytes) != 2 {
+		t.Fatalf("measure duplicate ties: %+v, %v", m, err)
 	}
-	q := queries()[1] // Equal timestamps and literal, distinct append ordinals.
-	want := slices.Clone(reference(input.rows, q))
-	samples := 0
-	_, err = measureQuery(bytes.NewReader(data), size, q, want, len(input.rows), 3, func() error {
-		samples++
-		if samples == 2 {
-			want[0], want[1] = want[1], want[0]
-		}
-		return nil
-	})
-	if err == nil || samples != 2 {
-		t.Fatalf("oracle failed to catch wrong duplicate order after %d samples: %v", samples, err)
-	}
-
-	samples = 0
-	_, err = measureQuery(bytes.NewReader(data), size, q, reference(input.rows, q), len(input.rows), 3, func() error {
-		samples++
-		return io.ErrClosedPipe
-	})
-	if !errors.Is(err, io.ErrClosedPipe) || samples != 1 {
-		t.Fatalf("failed cache preparation should terminate after one attempt: %d, %v", samples, err)
+	for _, tc := range []struct {
+		name    string
+		corrupt func([]checkpoint.BlockRow) []checkpoint.BlockRow
+	}{
+		{"ordinal", func(rows []checkpoint.BlockRow) []checkpoint.BlockRow {
+			rows[0], rows[1] = rows[1], rows[0]
+			return rows
+		}},
+		{"timestamp", func(rows []checkpoint.BlockRow) []checkpoint.BlockRow {
+			rows[0].Row.TS = rows[0].Row.TS.Add(time.Nanosecond)
+			return rows
+		}},
+		{"line", func(rows []checkpoint.BlockRow) []checkpoint.BlockRow {
+			rows[0].Row.Line = "x" + rows[0].Row.Line[1:]
+			return rows
+		}},
+		{"extra row", func(rows []checkpoint.BlockRow) []checkpoint.BlockRow { return rows[:1] }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := measureIsolated(t.Context(), cfg, path, q, tc.corrupt(reference(input.rows, q)), n); err == nil {
+				t.Fatal("sample did not detect oracle mismatch")
+			}
+		})
 	}
 }

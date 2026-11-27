@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"log"
 	"os"
+	"os/signal"
 	"runtime/debug"
+	"syscall"
 )
 
 func sourceRevision() string {
@@ -32,6 +35,15 @@ func sourceRevision() string {
 
 func main() {
 	log.SetFlags(0)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if len(os.Args) == 3 && os.Args[1] == workerFlag {
+		if err := worker(ctx, os.Args[2], os.Stdout); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfg, err := parseConfig(os.Args[1:], sourceRevision(), os.Stderr)
 	if errors.Is(err, flag.ErrHelp) {
 		return
@@ -40,7 +52,7 @@ func main() {
 		log.Print(err)
 		os.Exit(2)
 	}
-	if err := run(cfg, os.Stdout); err != nil {
+	if err := run(ctx, cfg, os.Stdout); err != nil {
 		log.Print(err)
 		os.Exit(1)
 	}

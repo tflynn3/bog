@@ -127,3 +127,25 @@ func TestIncompressibleBlocksFallBackToRaw(t *testing.T) {
 		}
 	}
 }
+
+func TestFilterReadTradeoff(t *testing.T) {
+	for _, l := range layouts {
+		raw := make([]byte, 2048)
+		copy(raw[blockHeader:], strings.Repeat("expected-literal ", 100))
+		data := layoutFixture(t, l, raw)
+		observation := make(map[string]int64)
+		for _, literal := range []string{"absent-query", "expected-literal", "e"} {
+			q := query{literal: literal, start: firstTime, end: endTime}
+			count, err := scanBlocks(bytes.NewReader(data), int64(len(data)), q, func([]byte, int) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (count.Blocks == 0) != (l.prune && literal == "absent-query") {
+				t.Fatalf("%s %q: unexpected reads %+v", l.name(), literal, count)
+			}
+			observation[literal] = count.Bytes
+		}
+		t.Logf("%s retained=%d absent=%d present=%d short=%d", l.name(), len(data),
+			observation["absent-query"], observation["expected-literal"], observation["e"])
+	}
+}

@@ -12,7 +12,6 @@ import (
 	"bog/internal/store"
 )
 
-const seed = 44
 const largeLineSize = store.MaxBatch - len(`{"ts":"2025-01-01T00:00:00Z","line":""}`)
 const blockTarget = 64 << 10
 const rareLiteral = "incident-4e71"
@@ -30,8 +29,8 @@ type fixtureInput struct {
 var epoch = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 var batchPattern = []int{1, 7, 64, 256}
 
-func fixture(batches int, entropy bool) (input fixtureInput) {
-	rng := rand.New(rand.NewPCG(seed, 0))
+func fixture(batches int, entropy bool, fixtureSeed uint64) (input fixtureInput) {
+	rng := rand.New(rand.NewPCG(fixtureSeed, 0))
 	appendRow := func(ts time.Time, line string) {
 		input.rows = append(input.rows, checkpoint.BlockRow{
 			Row: store.Row{TS: ts, Line: line}, Ordinal: uint64(len(input.rows)),

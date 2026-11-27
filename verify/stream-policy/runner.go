@@ -1,9 +1,12 @@
 package streampolicy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -11,10 +14,13 @@ import (
 
 type scenario struct {
 	Adapters
-	fixture   Fixture
-	appends   []appendCase
-	forbidden []string
-	outcomes  []Response
+	fixture     Fixture
+	matrix      []policyCell
+	exportState ExportStateObserver
+	appends     []appendCase
+	forbidden   []string
+	outcomes    []Response
+	committed   Committed
 }
 
 // Run executes the reference scenario on a freshly provisioned target. A nil
@@ -23,9 +29,14 @@ func Run(ctx context.Context, adapters Adapters) error {
 	if adapters.Query == nil || adapters.Retry == nil || adapters.Replay == nil || adapters.Export == nil {
 		return fmt.Errorf("%w: all four adapters are required", ErrIncomplete)
 	}
+	exportState, ok := adapters.Export.(ExportStateObserver)
+	if !ok {
+		return fmt.Errorf("%w: export state observer is required", ErrIncomplete)
+	}
 	fixture := ReferenceFixture()
 	s := scenario{
 		Adapters: adapters, fixture: fixture, appends: fixtureAppends(fixture),
+		matrix: policyMatrix(fixture), exportState: exportState,
 		forbidden: []string{plain, escaped, failed, uncommitted},
 	}
 	for _, step := range []struct {
@@ -33,11 +44,13 @@ func Run(ctx context.Context, adapters Adapters) error {
 		run  func(context.Context) error
 	}{
 		{"retry namespaces and failed append", s.checkIngest},
-		{"authorization and cursor scope", s.checkQueries},
-		{"committed bytes and replay", s.checkReplay},
+		{"authorization and cursor scope", s.checkFullQueries},
+		{"committed bytes and replay", s.captureCommitted},
 		{"reopened query and retry", s.checkReopened},
-		{"scoped export", s.checkExports},
-		{"final committed bytes and replay", s.checkReplay},
+		{"scoped export and authorization matrix", s.checkMatrix},
+		{"committed state after denied operations", s.checkCommittedUnchanged},
+		{"reopened controls after denied operations", s.checkReopened},
+		{"final committed bytes and replay", s.checkCommittedUnchanged},
 	} {
 		if err := observation(ctx, nil); err != nil {
 			return fmt.Errorf("%s: %w", step.name, err)
@@ -63,33 +76,26 @@ func observation(ctx context.Context, err error) error {
 func (s *scenario) records() []Record {
 	records := make([]Record, 0, len(s.appends))
 	for _, entry := range s.appends {
-		records = append(records, entry.record)
+		records = append(records, entry.records...)
 	}
 	return records
 }
 
 func (s *scenario) forScope(scope Scope) (records []Record, rows []Row) {
-	for _, entry := range s.appends {
-		if entry.record.Scope == scope {
-			records = append(records, entry.record)
-			rows = append(rows, entry.record.Row)
+	for _, record := range s.records() {
+		if record.Scope == scope {
+			records = append(records, record)
+			rows = append(rows, record.Row)
 		}
 	}
 	return records, rows
 }
 
-func (s *scenario) publicResponse(response Response, status int) error {
-	if err := requireResponse(response, status); err != nil {
-		return err
-	}
-	return inspectResponse(response, s.forbidden)
-}
-
 func (s *scenario) scopedMarkers(scope Scope) []string {
 	forbidden := slices.Clone(s.forbidden)
-	for _, entry := range s.appends {
-		if entry.record.Scope != scope {
-			retained, _, _ := strings.Cut(entry.record.Row.Line, " ")
+	for _, record := range s.records() {
+		if record.Scope != scope {
+			retained, _, _ := strings.Cut(record.Row.Line, " ")
 			forbidden = append(forbidden, retained)
 		}
 	}
@@ -116,25 +122,16 @@ func (s *scenario) scopedMarkersForSelector(selector string) []string {
 	return s.forbidden
 }
 
-func (s *scenario) deniedResponse(response Response, baseline Response, extra ...string) error {
-	if err := s.publicResponse(response, baseline.Status); err != nil {
-		return err
-	}
-	markers := append([]string{alice, bob, exporter, key, unknown}, extra...)
+func (s *scenario) denialMarkers() []string {
+	markers := append(slices.Clone(s.forbidden), alice, bob, exporter, key, unknown, freshRetryKey)
 	for _, stream := range s.fixture.Streams {
 		markers = append(markers, stream.Selector, stream.Scope.Tenant, stream.Scope.Stream, stream.PolicyVersion)
 	}
-	for _, entry := range s.appends {
-		retained, _, _ := strings.Cut(entry.record.Row.Line, " ")
+	for _, record := range s.records() {
+		retained, _, _ := strings.Cut(record.Row.Line, " ")
 		markers = append(markers, retained)
 	}
-	if err := inspectResponse(response, markers); err != nil {
-		return err
-	}
-	if !sameResponse(response, baseline) {
-		return fmt.Errorf("%w: rejection exposes different response evidence", ErrViolation)
-	}
-	return nil
+	return markers
 }
 
 func (s *scenario) ingest(ctx context.Context, request IngestRequest, status int) (Response, error) {
@@ -160,24 +157,6 @@ func (s *scenario) checkIngest(ctx context.Context) error {
 		}
 		s.outcomes = append(s.outcomes, response)
 	}
-	base := s.appends[0].request
-	base.Principal = exporter // Export authority is independent of ingest.
-	denied, err := s.ingest(ctx, base, http.StatusForbidden)
-	if err != nil {
-		return fmt.Errorf("ingest denied: %w", err)
-	}
-	for _, target := range []Target{base.Target, {bob, s.fixture.Streams[1].Selector}, {bob, unknown}} {
-		request := base
-		request.Target = target
-		resp, err := s.ingest(ctx, request, http.StatusForbidden)
-		if err != nil {
-			return err
-		}
-		if err := s.deniedResponse(resp, denied); err != nil {
-			return err
-		}
-	}
-
 	request := s.appends[0].request
 	request.Key = "fixture-failed-key"
 	const ts = "2026-01-01T00:00:05Z"
@@ -202,12 +181,16 @@ func (s *scenario) checkRetry(ctx context.Context, entry appendCase) (Response, 
 	if !sameResponse(retry, first) {
 		return Response{}, fmt.Errorf("%w: retry response differs from the committed outcome", ErrViolation)
 	}
-	conflict := entry.request
-	conflict.Body += ndjson("2026-01-01T00:00:06Z", uncommitted)
+	conflict := conflictingRetry(entry.request)
 	if _, err := s.ingest(ctx, conflict, http.StatusConflict); err != nil {
 		return Response{}, fmt.Errorf("changed retry: %w", err)
 	}
 	return first, nil
+}
+
+func conflictingRetry(request IngestRequest) IngestRequest {
+	request.Body += ndjson("2026-01-01T00:00:07Z", uncommitted)
+	return request
 }
 
 func (s *scenario) query(ctx context.Context, request QueryRequest, status int) (Page, error) {
@@ -236,74 +219,39 @@ func (s *scenario) query(ctx context.Context, request QueryRequest, status int) 
 	if page.NextCursor != "" && !sent {
 		return Page{}, fmt.Errorf("%w: continuation lacks header evidence", ErrIncomplete)
 	}
-	if status == http.StatusOK && len(page.Rows) != 0 && len(page.Body) == 0 {
-		return Page{}, fmt.Errorf("%w: query rows lack response bytes", ErrIncomplete)
+	if status == http.StatusOK {
+		if err := checkQueryBody(page, request.Limit); err != nil {
+			return Page{}, err
+		}
 	}
 	return page, nil
 }
 
-func (s *scenario) checkQueries(ctx context.Context) error {
-	if err := s.checkFullQueries(ctx); err != nil {
-		return err
+// Match the decoded rows to the original query NDJSON. The observer checks
+// HTTP framing, while the verifier checks what those bytes actually expose.
+func checkQueryBody(page Page, limit int) error {
+	if len(page.Rows) > limit {
+		return fmt.Errorf("%w: query exceeded its page limit", ErrViolation)
 	}
-	a, b, c := s.fixture.Streams[0], s.fixture.Streams[1], s.fixture.Streams[2]
-	_, rows := s.forScope(a.Scope)
-	request := QueryRequest{Target: Target{alice, a.Selector}, Limit: 1}
-	first, err := s.query(ctx, request, http.StatusOK)
-	if err != nil {
-		return fmt.Errorf("issue cursor: %w", err)
+	if len(page.Rows) != 0 && len(page.Body) == 0 {
+		return fmt.Errorf("%w: query rows lack response bytes", ErrIncomplete)
 	}
-	if err := compareRows(first.Rows, rows[:1]); err != nil {
-		return err
-	}
-	if first.NextCursor == "" {
-		return fmt.Errorf("%w: opening page has no continuation", ErrIncomplete)
-	}
-	valid := first.NextCursor
-	mid := len(valid) / 2
-	tampered := "A"
-	if valid[mid] == 'A' {
-		tampered = "Z"
-	}
-	modified := valid[:mid] + tampered + valid[mid+1:]
-	denied, err := s.query(ctx, QueryRequest{Target: Target{bob, b.Selector}, Limit: 1}, http.StatusForbidden)
-	if err != nil {
-		return err
-	}
-	for _, target := range []Target{{bob, b.Selector}, {bob, c.Selector}, {bob, unknown}, {exporter, a.Selector}} {
-		for _, cursor := range []string{"", valid, modified} {
-			got, err := s.query(ctx, QueryRequest{Target: target, Limit: 1, Cursor: cursor}, http.StatusForbidden)
-			if err != nil {
-				return fmt.Errorf("query authorization before validation: %w", err)
-			}
-			if err := s.deniedResponse(got.Response, denied.Response, valid, modified); err != nil {
-				return err
-			}
+	decoder := json.NewDecoder(bytes.NewReader(page.Body))
+	decoder.DisallowUnknownFields()
+	for i, reported := range page.Rows {
+		var row Row
+		if err := decoder.Decode(&row); err != nil {
+			return fmt.Errorf("%w: invalid query response row %d", ErrViolation, i+1)
+		}
+		if row != reported {
+			return fmt.Errorf("%w: query response bytes differ from observed row %d", ErrViolation, i+1)
 		}
 	}
-
-	request.Cursor = modified
-	invalid, err := s.query(ctx, request, http.StatusBadRequest)
-	if err != nil {
-		return fmt.Errorf("modified cursor: %w", err)
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("%w: query response contains unreported bytes", ErrViolation)
 	}
-	// Each target already has query access to the requested stream. Change
-	// one component of the issuer's scope per probe.
-	for _, target := range []Target{{alice, b.Selector}, {alice, c.Selector}, {bob, a.Selector}} {
-		got, err := s.query(ctx, QueryRequest{Target: target, Limit: 1, Cursor: valid}, http.StatusBadRequest)
-		if err != nil {
-			return fmt.Errorf("authorized cursor scope mismatch: %w", err)
-		}
-		if err := s.deniedResponse(got.Response, invalid.Response, valid, modified); err != nil {
-			return err
-		}
-	}
-	request.Cursor = valid
-	last, err := s.query(ctx, request, http.StatusOK)
-	if err != nil {
-		return fmt.Errorf("issuer resumes cursor: %w", err)
-	}
-	return terminalRows(last, rows[1:])
+	return nil
 }
 
 func terminalRows(page Page, want []Row) error {
@@ -314,52 +262,75 @@ func terminalRows(page Page, want []Row) error {
 }
 
 func (s *scenario) checkFullQueries(ctx context.Context) error {
-	for i, stream := range s.fixture.Streams {
-		_, rows := s.forScope(stream.Scope)
-		request := QueryRequest{Target: Target{alice, stream.Selector}, Limit: 10}
-		page, err := s.query(ctx, request, http.StatusOK)
-		if err != nil {
-			return fmt.Errorf("authorized query in stream %d: %w", i+1, err)
+	for _, cell := range s.matrix {
+		if !cell.Query {
+			continue
 		}
-		if err := terminalRows(page, rows); err != nil {
-			return fmt.Errorf("authorized query in stream %d: %w", i+1, err)
-		}
-		request.Contains = replacement
-		page, err = s.query(ctx, request, http.StatusOK)
-		if err != nil {
-			return fmt.Errorf("query for retained replacement in stream %d: %w", i+1, err)
-		}
-		if err := terminalRows(page, rows); err != nil {
-			return fmt.Errorf("query for retained replacement in stream %d: %w", i+1, err)
-		}
-		for _, marker := range s.forbidden {
-			request.Contains = marker
-			page, err := s.query(ctx, request, http.StatusOK)
-			if err != nil {
-				return fmt.Errorf("query for forbidden marker in stream %d: %w", i+1, err)
-			}
-			if err := terminalRows(page, nil); err != nil {
-				return fmt.Errorf("query for forbidden marker in stream %d: %w", i+1, err)
-			}
+		if err := s.checkFullQuery(ctx, cell); err != nil {
+			return fmt.Errorf("authorized query in stream %d: %w", cell.streamIndex+1, err)
 		}
 	}
-	bobPage, err := s.query(ctx, QueryRequest{Target: Target{bob, s.fixture.Streams[0].Selector}, Limit: 10}, http.StatusOK)
-	if err != nil {
-		return fmt.Errorf("second principal's authorized query: %w", err)
-	}
-	_, rows := s.forScope(s.fixture.Streams[0].Scope)
-	return terminalRows(bobPage, rows)
+	return nil
 }
 
-func (s *scenario) checkReplay(ctx context.Context) error {
+func (s *scenario) checkFullQuery(ctx context.Context, cell policyCell) error {
+	_, rows := s.forScope(cell.stream.Scope)
+	request := QueryRequest{Target: cell.Target, Limit: fixtureQueryLimit}
+	filters := append([]string{"", replacement}, s.forbidden...)
+	for _, record := range s.records() {
+		if record.Scope != cell.stream.Scope {
+			filters = append(filters, record.Row.Line)
+		}
+	}
+	for _, filter := range filters {
+		request.Contains = filter
+		page, err := s.query(ctx, request, http.StatusOK)
+		if err != nil {
+			return err
+		}
+		want := rows
+		if filter != "" && filter != replacement {
+			want = nil
+		}
+		if err := terminalRows(page, want); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *scenario) observeCommitted(ctx context.Context) (Committed, error) {
 	evidence, err := s.Replay.RestartAndReplay(ctx)
 	if err := observation(ctx, err); err != nil {
-		return err
+		return Committed{}, err
 	}
 	if !evidence.Complete || evidence.Records == nil {
-		return ErrIncomplete
+		return Committed{}, ErrIncomplete
 	}
-	return inspectRecords(evidence.Bytes, evidence.Records, s.records(), s.forbidden)
+	if err := inspectRecords(evidence.Bytes, evidence.Records, s.records(), s.forbidden); err != nil {
+		return Committed{}, err
+	}
+	return evidence, nil
+}
+
+func (s *scenario) captureCommitted(ctx context.Context) error {
+	evidence, err := s.observeCommitted(ctx)
+	if err != nil {
+		return err
+	}
+	s.committed = Committed{Complete: true, Bytes: bytes.Clone(evidence.Bytes), Records: slices.Clone(evidence.Records)}
+	return nil
+}
+
+func (s *scenario) checkCommittedUnchanged(ctx context.Context) error {
+	evidence, err := s.observeCommitted(ctx)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(evidence.Bytes, s.committed.Bytes) || !slices.Equal(evidence.Records, s.committed.Records) {
+		return fmt.Errorf("%w: committed state changed after denied operations and read-only controls", ErrViolation)
+	}
+	return nil
 }
 
 func (s *scenario) checkReopened(ctx context.Context) error {

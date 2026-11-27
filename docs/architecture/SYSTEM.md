@@ -17,9 +17,10 @@ sync, and powersafe overwrite. The ingest and query listener has no built-in
 authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
-The Linux amd64 and arm64 production inventories at
-`74e56a7d2f46abd010eb0a86414b179fff06ecae` agree on the 20 root-module
-production packages and 23 direct imports between them shown below.
+The Linux amd64 and arm64 production inventories at the ADR 0052
+adoption, based on `4ca40d3f92ef7dace84c58bb43bc663cb766b0f5`,
+agree on the 21 root-module production packages and 27 direct imports
+between them shown below.
 The entire root-module closure of `cmd/bog` consists of the command plus
 HTTP, readiness, store, and WAL. The command recovers an ordinary WAL into
 an in-memory store. Writable restore, live replacement, and retained
@@ -40,8 +41,8 @@ both memberships and the exact graph against the registry and checks the
 registry against both Linux production inventories.
 
 The declaration includes the fixture-backed stream policy verifier support
-added in #86 and both #87 capacity evidence imports. The shared validator
-and directory-anchored publisher are present in the repository. #87
+added in #86, both #87 capacity evidence imports, and the ADR 0052
+report publisher and its four direct imports. #87
 qualification still requires running the strict evidence gate against the
 composed #108 runtime on both native Linux runners.
 [Shared capacity evidence boundary](../adr/0020-shared-capacity-evidence.md)
@@ -88,6 +89,7 @@ flowchart TD
         Durability["verify/linux"]
         Capacity["bench/retained-history"]
         CapacityEvidence["verify/capacityevidence"]
+        ReportPublication["verify/reportpublication"]
         Listener["verify/listener"]
         Model["verify/query-model (independent oracle)"]
         StreamPolicy["verify/stream-policy (fixture conformance)"]
@@ -95,6 +97,10 @@ flowchart TD
         Capacity --> Listener
         Admission --> CapacityEvidence
         Capacity --> CapacityEvidence
+        Admission --> ReportPublication
+        Durability --> ReportPublication
+        Capacity --> ReportPublication
+        CapacityEvidence --> ReportPublication
     end
     Admission --> Client
 ```
@@ -222,7 +228,8 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `verify/release` | Verifier command | Admission, fixed-budget paging, and report validation. Its test entry point produces restored-parity evidence. |
 | `verify/linux` | Verifier command | Linux crash recovery, ENOSPC, and readiness across path retargets |
 | `bench/retained-history` | Verifier command | Legacy baseline and live capacity evidence |
-| `verify/capacityevidence` | Verifier support | Shared strict schema-v1 live capacity proof for release and capacity |
+| `verify/capacityevidence` | Verifier support | Shared strict schema-v1 live capacity proof and nested benchmark publication compatibility |
+| `verify/reportpublication` | Verifier support | Descriptor-relative staging, atomic commit, and durability for encoded reports |
 | `verify/listener` | Verifier support | Linux IPv4 loopback listener ownership for release and capacity |
 | `verify/query-model` | Verifier support | Independent append-log oracle for expected query results |
 | `verify/stream-policy` | Verifier support | Fixture-backed checks of stream isolation and pre-append redaction |
@@ -363,9 +370,15 @@ use one strict schema-v1 capacity validator. The proof requires a numeric
 zero in the raw cgroup OOM kill counter and validates the observed
 backfill timeline in execution order. Standard release validation still
 accepts historical schema-v1 live reports. Release validation matches
-the pinned candidate identity across evidence reports. Release report
-publication anchors staging, replacement, cleanup, and directory sync to
-the same opened parent.
+the pinned candidate identity across evidence reports. Release, retained
+history, and runner preflight publish through the shared transaction.
+Standalone publication replaces an existing entry. The delegated supervisor
+and producer use Linux atomic create-only commits in the parents opened by
+the supervisor. The supervisor reads a bounded regular proof from the
+inherited parent only after the producer exits successfully. Publication
+records whether commit failed, committed with uncertain durability, or
+completed both syncs.
+[Shared report publication](../adr/0052-shared-report-publication.md)
 [Capacity evidence validation](../adr/0018-capacity-evidence-validation.md),
 [Shared capacity evidence boundary](../adr/0020-shared-capacity-evidence.md)
 
@@ -506,10 +519,17 @@ independently. The measured walk also follows external production imports.
   the listener helper. The check follows indirect imports as well.
   [Candidate listener boundary](../../internal/archtest/listener_boundary_test.go)
 - `verify/release` and `bench/retained-history` must both import
-  `verify/capacityevidence` directly in production. The helper has no
-  root-module production imports. The check rejects production reachability
-  from any other registered package, including through an intermediary.
+  `verify/capacityevidence` directly in production. The helper's one
+  root-module import supports the nested benchmark's publication wrapper.
+  The validator's reachability is limited to those two producers, including
+  when the Linux runner publishes delegated evidence.
   [Capacity evidence boundary](../../internal/archtest/capacity_evidence_boundary_test.go)
+- The release, Linux, and retained-history producers and the compatibility
+  wrapper import `verify/reportpublication` directly. It has zero root-module
+  production imports. Both Linux inventories check the registered role and
+  direct consumers and reject reachability from other root-module
+  production packages through registered or external intermediaries.
+  [Report publication boundary](../../internal/archtest/report_publication_boundary_test.go)
 - Standalone libraries require a production command consumer. Every staged
   package requires an owner and activation criteria. Declarations for
   removed or reclassified packages fail the suite.

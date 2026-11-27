@@ -15,11 +15,17 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"bog/verify/reportpublication"
 )
 
 const cgroupMount = "/sys/fs/cgroup"
 
-func runDelegated(ctx context.Context, mode string, args []string) (err error) {
+func runDelegated(ctx context.Context, mode string, args []string) error {
+	return runDelegatedWithReportDirectory(ctx, mode, args, func(d *reportDestination) reportpublication.OpenedDirectory { return d })
+}
+
+func runDelegatedWithReportDirectory(ctx context.Context, mode string, args []string, reportDirectory func(*reportDestination) reportpublication.OpenedDirectory) (err error) {
 	f := flag.NewFlagSet(mode, flag.ContinueOnError)
 	arch := f.String("arch", "", "expected native Linux architecture")
 	revision := f.String("revision", "", "full candidate commit SHA")
@@ -56,6 +62,7 @@ func runDelegated(ctx context.Context, mode string, args []string) (err error) {
 		Probe: runnerProbe{Arch: runtime.GOARCH}}
 	if mode == "capacity" {
 		r.Capacity = newRunnerCapacity()
+		dest.report.mode = reportpublication.CreateOnly
 	}
 	defer func() {
 		if dest.proof != nil {
@@ -70,7 +77,8 @@ func runDelegated(ctx context.Context, mode string, args []string) (err error) {
 				}
 			}
 		}
-		err = errors.Join(err, dest.report.publish(ctx, r))
+		d := dest.report
+		err = errors.Join(err, writeRunnerReport(ctx, reportDirectory(d), d.path, d.name, r, d.mode))
 	}()
 
 	if err := ctx.Err(); err != nil {

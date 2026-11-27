@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	jsonv1 "encoding/json"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"slices"
 
 	"bog/verify/capacityevidence"
+	"bog/verify/reportpublication"
 )
 
 const schemaVersion = 1
@@ -289,5 +291,9 @@ func validateFile(ctx context.Context, path string, expected identity, required 
 }
 
 func writeReport(path string, results report) error {
-	return (capacityevidence.ReportPublisher{}).WriteReport(path, results)
+	data, err := jsonv1.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return &reportpublication.Error{Path: path, State: reportpublication.Unpublished, Err: fmt.Errorf("encode report: %w", err)}
+	}
+	return reportpublication.WriteFile(path, append(data, '\n'), nil)
 }

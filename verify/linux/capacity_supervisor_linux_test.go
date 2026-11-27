@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"bog/verify/reportpublication"
 )
 
 func TestCapacitySupervisorExitAndCancellation(t *testing.T) {
@@ -31,7 +33,7 @@ exit 3`,
 			kind: runnerFailure, exit: 3,
 		},
 		{
-			name: "cancellation preserves capacity report",
+			name: "cancellation leaves partial proof untrusted",
 			script: `trap 'cp "$BOG_TEST_PROOF_SOURCE" "$report"; exit 7' TERM
 printf ready > "$BOG_TEST_PRODUCER_READY"
 while :; do :; done`,
@@ -112,12 +114,17 @@ while :; do :; done`,
 			if large.Status != "unobserved" || large.MemoryPeak != nil {
 				t.Fatalf("unobserved scale=%+v", large)
 			}
-			if tc.kind == cancelledFailure {
-				if !errors.Is(err, context.Canceled) || small.Status != "pass" || small.MemoryPeak == nil || *small.MemoryPeak != 4100 {
-					t.Fatalf("partial progress=%+v, error=%v", small, err)
-				}
-			} else if small.Status != "unobserved" || !strings.Contains(err.Error(), "read capacity producer report") {
+			if small.Status != "unobserved" || small.MemoryPeak != nil ||
+				!strings.Contains(err.Error(), "capacity producer did not complete successfully") {
 				t.Fatalf("unobserved scale=%+v, error=%v", small, err)
+			}
+			if tc.kind == cancelledFailure {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("producer cancellation error = %v", err)
+				}
+				if data, err := os.ReadFile(proof); err != nil || string(data) != string(partial) {
+					t.Fatalf("partial proof = %q, %v", data, err)
+				}
 			}
 		})
 	}
@@ -128,11 +135,13 @@ while :; do :; done`,
 const producerReportScript = `#!/bin/sh
 set -eu
 while [ "$#" -gt 0 ]; do
-	if [ "$1" = "-report" ]; then
-		report=$2
-	fi
+	case "$1" in
+		-report) report=$2 ;;
+		-report-create-only) create_only=yes; shift; continue ;;
+	esac
 	shift 2
 done
+test "${create_only:-}" = yes
 `
 
 func TestCapacityReportsStayDistinctAfterParentRetarget(t *testing.T) {
@@ -199,6 +208,7 @@ mv "$stage" "$report"
 	if err := errors.Join(runErr, d.proof.Close()); err != nil {
 		t.Fatal(errors.Join(err, d.report.Close()))
 	}
+	d.report.mode = reportpublication.CreateOnly
 	if err := d.report.publish(ctx, r); err != nil {
 		t.Fatal(err)
 	}
@@ -307,8 +317,8 @@ func TestDelegatedPreflightCancellationPreservesReport(t *testing.T) {
 	cancel()
 	err := runDelegated(ctx, "preflight",
 		[]string{"-revision", testRevision, "-fixture", fixtureID, "-arch", "unused", "-report", report})
-	var publication *runnerPublicationError
-	if !errors.Is(err, context.Canceled) || !errors.As(err, &publication) || publication.state != reportUnpublished {
+	var publication *reportpublication.Error
+	if !errors.Is(err, context.Canceled) || !errors.As(err, &publication) || publication.State != reportpublication.Unpublished {
 		t.Fatalf("canceled preflight: %v", err)
 	}
 	if data, err := os.ReadFile(report); err != nil || string(data) != "previous" {
@@ -316,5 +326,200 @@ func TestDelegatedPreflightCancellationPreservesReport(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 1 {
 		t.Fatalf("entries = %v, %v", entries, err)
+	}
+}
+
+func TestDelegatedSupervisorReportRejectsCompetingWriter(t *testing.T) {
+	t.Parallel()
+	parent := t.TempDir()
+	const name = "supervisor.json"
+	path := filepath.Join(parent, name)
+	missingCandidate := filepath.Join(parent, "missing-candidate")
+	args := []string{"-revision", testRevision, "-fixture", fixtureID, "-arch", "unused",
+		"-report", path, "-capacity-report", filepath.Join(parent, "proof.json"),
+		"-binary", missingCandidate, "-producer", filepath.Join(parent, "producer"), "-work-dir", parent}
+	const competing = "{\"status\":\"pass\",\"detail\":\"competing writer\"}\n"
+	var ops supervisorCommitFixture
+	// Candidate identification fails after the destination checks, triggering
+	// the same deferred report publication without needing a delegated cgroup.
+	err := runDelegatedWithReportDirectory(t.Context(), "capacity", args, func(d *reportDestination) reportpublication.OpenedDirectory {
+		ops = supervisorCommitFixture{reportDestination: d, beforeCommit: func(staged string) error {
+			entries, err := os.ReadDir(parent)
+			if err != nil || len(entries) != 1 || entries[0].Name() != staged {
+				t.Errorf("staged entries = %v, %v", entries, err)
+			}
+			return installCompetingReport(d.File(), name, []byte(competing))
+		}}
+		return &ops
+	})
+	var outcome *reportpublication.Error
+	if !errors.As(err, &outcome) || outcome.Path != path || outcome.State != reportpublication.Unpublished || !errors.Is(outcome, os.ErrExist) {
+		t.Fatalf("supervisor verdict = %v", err)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("supervisor verdict lost the candidate identification error: %v", err)
+	}
+	if ops.closeErr != nil {
+		t.Fatalf("caller-owned directory unusable after commit: %v", ops.closeErr)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != competing {
+		t.Fatalf("supervisor report = %q, %v", got, err)
+	}
+	if entries, err := os.ReadDir(parent); err != nil || len(entries) != 1 || entries[0].Name() != name {
+		t.Fatalf("destination directory entries = %v, %v", entries, err)
+	}
+}
+
+type supervisorCommitFixture struct {
+	*reportDestination
+	beforeCommit func(staged string) error
+	closeErr     error
+}
+
+func (d *supervisorCommitFixture) Rename(from, to string) error {
+	if err := d.beforeCommit(from); err != nil {
+		return err
+	}
+	return d.reportDestination.Rename(from, to)
+}
+
+func (d *supervisorCommitFixture) RenameNoReplace(from, to string) error {
+	if err := d.beforeCommit(from); err != nil {
+		return err
+	}
+	return d.reportDestination.RenameNoReplace(from, to)
+}
+
+func (d *supervisorCommitFixture) Close() error {
+	d.closeErr = d.File().Sync()
+	return errors.Join(d.closeErr, d.reportDestination.Close())
+}
+
+func installCompetingReport(dir *os.File, name string, bytes []byte) error {
+	file, err := reportpublication.BorrowDirectory(dir).OpenExclusive(name)
+	if err != nil {
+		return err
+	}
+	_, err = file.Write(bytes)
+	return errors.Join(err, file.Close())
+}
+
+func passingSupervisorProof() []byte {
+	return capacityFixture("pass",
+		`{"fixture":{"seed_rows":196608},"status":"pass","phase":"complete","cgroup_peak_memory_bytes":4100},`+
+			`{"fixture":{"seed_rows":393216},"status":"pass","phase":"complete","cgroup_peak_memory_bytes":8192}`)
+}
+
+func TestDelegatedCapacityRejectsCompetingProof(t *testing.T) {
+	const failureExit = 13
+	const proofName = "capacity.json"
+	competing := passingSupervisorProof()
+	if os.Getenv("BOG_TEST_PROOF_CONFLICT_CHILD") == "yes" {
+		dir := os.NewFile(3, "inherited proof directory")
+		ops := proofConflictFixture{reportpublication.BorrowDirectory(dir), dir, competing}
+		state, err := reportpublication.Publish(t.Context(), ops, proofName, []byte("producer staging"), reportpublication.CreateOnly)
+		if state != reportpublication.Unpublished || !errors.Is(err, os.ErrExist) {
+			t.Fatalf("proof commit outcome = %q, %v", state, err)
+		}
+		if err := errors.Join(dir.Sync(), dir.Close()); err != nil {
+			t.Fatal(err)
+		}
+		os.Exit(failureExit)
+	}
+	// Verify the competing bytes would satisfy the supervisor if decoded.
+	control := newCapacityTestReport()
+	if kind, err := control.readCapacity(competing); kind != "" || err != nil {
+		t.Fatalf("fixture proof = %q, %v", kind, err)
+	}
+	parent := t.TempDir()
+	dest, err := openRunnerDestinations(filepath.Join(parent, "runner.json"), filepath.Join(parent, proofName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(dest.report.Close(), dest.proof.Close()); err != nil {
+			t.Error(err)
+		}
+	})
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BOG_TEST_GO_BINARY", executable)
+	t.Setenv("BOG_TEST_PROOF_CONFLICT_CHILD", "yes")
+	producer := filepath.Join(t.TempDir(), "producer")
+	script := producerReportScript + `exec "$BOG_TEST_GO_BINARY" -test.run '^TestDelegatedCapacityRejectsCompetingProof$'`
+	if err := os.WriteFile(producer, []byte(script+"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	r := newCapacityTestReport()
+	r.Probe.Parent = parent
+	files := controlFiles{read: func(path string) ([]byte, error) {
+		if path == filepath.Join(parent, "memory.events") {
+			return []byte("oom 0\noom_kill 0\n"), nil
+		}
+		return nil, os.ErrNotExist
+	}}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = r.runCapacity(ctx, files, producer, "/candidate", parent, dest.proof)
+	if err == nil || r.FailureKind != runnerFailure || r.Capacity.ExitCode == nil || *r.Capacity.ExitCode != failureExit {
+		t.Fatalf("delegated verdict = %v, kind=%q, capacity=%+v", err, r.FailureKind, r.Capacity)
+	}
+	for _, scale := range r.Capacity.Scales {
+		if scale.Status != "unobserved" || scale.MemoryPeak != nil {
+			t.Fatalf("competing proof was accepted: %+v", scale)
+		}
+	}
+	if err := dest.proof.File().Sync(); err != nil {
+		t.Fatalf("supervisor's proof descriptor unusable: %v", err)
+	}
+	if got, err := os.ReadFile(dest.proof.path); err != nil || string(got) != string(competing) {
+		t.Fatalf("competing proof = %q, %v", got, err)
+	}
+	if entries, err := os.ReadDir(parent); err != nil || len(entries) != 1 || entries[0].Name() != proofName {
+		t.Fatalf("proof directory entries = %v, %v", entries, err)
+	}
+}
+
+type proofConflictFixture struct {
+	reportpublication.DescriptorDirectory
+	dir       *os.File
+	competing []byte
+}
+
+func (d proofConflictFixture) RenameNoReplace(from, to string) error {
+	if err := installCompetingReport(d.dir, to, d.competing); err != nil {
+		return err
+	}
+	return d.DescriptorDirectory.RenameNoReplace(from, to)
+}
+
+func TestCapacityProofReadBound(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "proof")
+	dest, err := openReportDestination(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := dest.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, maxProducerProofBytes); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := readProducerProof(dest); err != nil || len(data) != maxProducerProofBytes {
+		t.Fatalf("read at limit = %d bytes, %v", len(data), err)
+	}
+	if err := os.Truncate(path, maxProducerProofBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := readProducerProof(dest); err == nil || !strings.Contains(err.Error(), "exceeds") || data != nil {
+		t.Fatalf("read above limit = %d bytes, %v", len(data), err)
 	}
 }

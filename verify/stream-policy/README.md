@@ -84,3 +84,35 @@ capability is unavailable. Runtime activation still requires production WAL
 evidence for atomic batch and retry persistence and recovery, including
 ambiguous response and crash cases in the
 [ingest retry contract](../../docs/ingest-retries.md#production-acceptance).
+
+## Candidate-driven acceptance
+
+Use `streampolicy.RunCandidate` with a deadline and one disposable candidate
+provisioned with the identities and canonical stream scopes from
+`ReferenceFixture()`. The caller owns candidate startup and cleanup. The
+HTTP binding maps the logical principal to its native credential and the
+selector to the candidate's public protocol. An empty principal uses no
+credentials. The adapter sends the fixture's original unkeyed NDJSON and
+captures full responses without redirects or transport retries.
+
+The policy binding applies revisions to the candidate's authoritative policy
+service and acknowledges them when they govern new requests. The probes
+exercise unauthenticated requests, independent grants, same- and cross-tenant
+cursor and artifact attempts, revocation and regrant, and original-cursor
+rejection after restart. Export creation must return its final outcome and
+retrieval must expose the original artifact body. Verify its manifest and
+payload independently using the candidate's native format.
+
+Open the exact committed range before restart using authoritative commit
+metadata. Decode that range with an independent parser and verify its framing
+and integrity. The verifier compares all decoded records in order, checks the
+actual bytes for plain and escaped forbidden values, and requires each
+retained line and replacement to appear in the observed bytes. After restart
+it checks reopened queries and exports, then reads the committed range again.
+The HTTP and file fixture includes a target that serves redacted queries
+while its committed file preserves a forbidden value.
+
+Bindings should report unsupported capabilities as errors. Missing bindings,
+incomplete observations, and HTTP 501 responses produce `ErrIncomplete`.
+This entry point covers unkeyed ingest and grant checks. The existing revision
+runner covers keyed retries and revocation at the export publication barrier.

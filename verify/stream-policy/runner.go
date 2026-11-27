@@ -66,6 +66,9 @@ func observation(ctx context.Context, err error) error {
 	if cause := ctx.Err(); cause != nil {
 		return errors.Join(ErrIncomplete, cause)
 	}
+	if violation, ok := err.(candidateViolation); ok {
+		return violation
+	}
 	if err != nil {
 		// Adapter errors can contain request contents, URLs, or cursor tokens.
 		return fmt.Errorf("%w: adapter could not complete observation", ErrIncomplete)

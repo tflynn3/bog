@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,20 +15,35 @@ import (
 const (
 	outputChunkSize    = 32 << 10
 	maxOutputErrorSize = 1024
+	outputSyncFrame    = math.MaxUint64
 )
 
-// A request is an eight-byte length followed by the record. The response
-// starts with a two-byte error length. Zero acknowledges the entire record,
-// and a nonzero length is followed by the destination's error string.
-// There is at most one outstanding request. A failed stream is never reused.
-func (worker *outputWorker) writeRecord(record []byte) (resultErr error) {
-	defer func() { worker.failed = resultErr != nil }()
+// After the startup handshake, a request is an eight-byte length and the
+// record, or the reserved sync value with no payload. A two-byte zero reply
+// acknowledges the requested operation. A nonzero length introduces a
+// bounded error string. There is at most one outstanding request.
+func (worker *outputWorker) writeRecord(ctx context.Context, record []byte) error {
+	return worker.withDeadline(ctx, func() error {
+		return worker.exchange(uint64(len(record)), record)
+	})
+}
+
+func (worker *outputWorker) sync(ctx context.Context) error {
+	return worker.withDeadline(ctx, func() error {
+		return worker.exchange(outputSyncFrame, nil)
+	})
+}
+
+func (worker *outputWorker) exchange(length uint64, record []byte) error {
 	var header [8]byte
-	binary.BigEndian.PutUint64(header[:], uint64(len(record)))
+	binary.BigEndian.PutUint64(header[:], length)
 	if err := writeOnce(worker.request, header[:]); err != nil {
 		return fmt.Errorf("send output record length: %w", err)
 	}
-	sendErr := writeOnce(worker.request, record)
+	var sendErr error
+	if len(record) != 0 {
+		sendErr = writeOnce(worker.request, record)
+	}
 	// If the destination failed early on a large record, the worker
 	// closes the request reader. Read its response even on EPIPE so
 	// the destination's error is retained.
@@ -45,11 +62,12 @@ func (worker *outputWorker) writeRecord(record []byte) (resultErr error) {
 	if _, err := io.ReadFull(worker.reply, message); err != nil {
 		return errors.Join(sendErr, fmt.Errorf("read output worker error: %w", err))
 	}
-	return errors.New(string(message))
+	return errors.Join(errors.New(string(message)), sendErr)
 }
 
-func runOutputWorker() int {
-	signal.Ignore(syscall.SIGPIPE)
+func runOutputWorker(destination io.Writer) int {
+	// The exporter handles group cancellation and owns orderly teardown.
+	signal.Ignore(syscall.SIGPIPE, syscall.SIGINT, syscall.SIGTERM)
 	reply := os.NewFile(3, "output reply")
 	lifeline := os.NewFile(4, "output lifeline")
 	// If the exporter disappears before it can reap us, EOF on the
@@ -63,7 +81,10 @@ func runOutputWorker() int {
 		}
 		os.Exit(exitOK)
 	}()
-	err := serveOutput(os.Stdin, os.Stdout, reply)
+	err := writeOnce(reply, []byte(workerHandshake))
+	if err == nil {
+		err = serveOutput(os.Stdin, destination, reply)
+	}
 	if err := errors.Join(err, reply.Close()); err != nil {
 		return exitIncomplete
 	}
@@ -86,6 +107,19 @@ func serveOutput(request io.ReadCloser, destination, reply io.Writer) (resultErr
 			return fmt.Errorf("read output record length: %w", err)
 		}
 		remaining := binary.BigEndian.Uint64(header[:])
+		if remaining == outputSyncFrame {
+			syncer, ok := destination.(interface{ Sync() error })
+			var err error
+			if ok {
+				err = syncer.Sync()
+			} else {
+				err = errors.New("destination does not support sync")
+			}
+			if replyErr := sendOutputReply(reply, err); err != nil || replyErr != nil {
+				return replyErr
+			}
+			continue
+		}
 		for remaining > 0 {
 			chunk := buffer[:min(remaining, uint64(len(buffer)))]
 			if _, err := io.ReadFull(request, chunk); err != nil {

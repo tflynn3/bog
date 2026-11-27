@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,9 +15,70 @@ import (
 	"time"
 )
 
+const (
+	testWorkerLog  = "BOG_EXPORT_TEST_WORKER_LOG"
+	testWorkerMode = "BOG_EXPORT_TEST_WORKER_MODE"
+	testSyncMarker = "BOG_EXPORT_TEST_SYNC_MARKER"
+)
+
+func runTestOutputWorker() int {
+	if log := os.Getenv(testWorkerLog); log != "" {
+		file, err := os.OpenFile(log, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+		if err != nil {
+			return exitIncomplete
+		}
+		_, err = fmt.Fprintln(file, os.Getpid())
+		if err := errors.Join(err, file.Close()); err != nil {
+			return exitIncomplete
+		}
+	}
+	mode := os.Getenv(testWorkerMode)
+	if mode != "" {
+		info, err := os.Stdout.Stat()
+		if err != nil {
+			return exitIncomplete
+		}
+		if info.Mode().IsRegular() {
+			switch mode {
+			case "failed probe":
+				reply := os.NewFile(3, "test reply")
+				err := writeOnce(reply, []byte(strings.Repeat("?", len(workerHandshake))))
+				if err := errors.Join(err, reply.Close()); err != nil {
+					return exitIncomplete
+				}
+				return exitOK
+			case "hold probe":
+				time.Sleep(time.Minute)
+				return exitIncomplete
+			case "hold sync":
+				return runOutputWorker(heldSyncFile{os.Stdout, os.Getenv(testSyncMarker)})
+			}
+		}
+	}
+	return runOutputWorker(os.Stdout)
+}
+
+type heldSyncFile struct {
+	*os.File
+	marker string
+}
+
+func (file heldSyncFile) Sync() error {
+	if err := file.File.Sync(); err != nil {
+		return err
+	}
+	// Publish evidence of the durable output, then wait without replying to
+	// the parent. Protocol cancellation must kill and reap this worker.
+	if err := os.WriteFile(file.marker, nil, 0600); err != nil {
+		return err
+	}
+	time.Sleep(time.Minute)
+	return errors.New("test sync gate timed out")
+}
+
 func TestMain(m *testing.M) {
 	if len(os.Args) == 2 && os.Args[1] == outputWorkerArg {
-		os.Exit(runOutputWorker())
+		os.Exit(runTestOutputWorker())
 	}
 	os.Exit(m.Run())
 }
@@ -29,7 +91,11 @@ func TestExportProcessHelper(t *testing.T) {
 }
 
 func exportProcess(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, os.Args[0], append([]string{"-test.run=^TestExportProcessHelper$", "--"}, args...)...)
+	return exportProcessAt(ctx, os.Args[0], args...)
+}
+
+func exportProcessAt(ctx context.Context, path string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, path, append([]string{"-test.run=^TestExportProcessHelper$", "--"}, args...)...)
 	cmd.Env = append(cmd.Environ(), "BOG_EXPORT_TEST_PROCESS=1", "GORACE=atexit_sleep_ms=0")
 	cmd.WaitDelay = time.Second
 	return cmd

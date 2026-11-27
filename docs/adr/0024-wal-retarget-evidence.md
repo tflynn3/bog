@@ -34,10 +34,18 @@ reconciliation sets the existing replay flag. The direction retains the
 original readiness assertion and reports any additional probe or cleanup
 failure.
 
-A readiness transport, response-validation, or observation-deadline failure
-ends the direction before ingest. An unconfirmed ingest outcome or failed
-process transition prevents a successful replay claim. Candidate reaping,
-filler removal, and filesystem detachment still run on failure.
+A readiness transport or response-validation failure ends the direction before
+ingest. The observation window also ends the direction before ingest when it
+expires or is canceled. Window termination is recorded as the terminal error.
+An interrupted request whose only error comes from that window leaves the last
+recorded sample intact. A completed, validated response remains attributable
+to the candidate even if the window closes as the probe returns. Record any
+state mismatch and any independent transport or response-validation failure
+as sample evidence, including when it coincides with window termination.
+
+An unconfirmed ingest outcome or failed process transition prevents a
+successful replay claim. Candidate reaping, filler removal, and filesystem
+detachment still run on failure.
 
 ## Trade-offs
 

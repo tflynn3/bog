@@ -83,42 +83,87 @@ type readinessMismatch struct{ error }
 
 func (e readinessMismatch) Unwrap() error { return e.error }
 
+// A request ended by the observation window may wrap its context error in
+// transport and body-read errors. A joined error can also carry a separate
+// failure, such as a failed body close, that still belongs in the evidence.
+func readinessInterrupted(err, contextErr error) bool {
+	if err == contextErr {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		for _, cause := range causes {
+			if !readinessInterrupted(cause, contextErr) {
+				return false
+			}
+		}
+		return len(causes) != 0
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return readinessInterrupted(cause, contextErr)
+	}
+	return false
+}
+
 // A known transient state is allowed only before the first expected sample.
 func pollDiskReadiness(ctx context.Context, want, transient diskReadiness, stableFor time.Duration,
 	probe func(context.Context) (readinessObservation, error), record func(readinessObservation, error),
 ) (readinessObservation, error) {
 	ctx, cancel := context.WithTimeout(ctx, readinessTimeout)
 	defer cancel()
+	deadline, _ := ctx.Deadline() // WithTimeout always supplies a deadline.
+	windowErr := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// The deadline timer and ticker can wake in either order.
+		if !time.Now().Before(deadline) {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
 	ticker := time.NewTicker(readinessPoll)
 	defer ticker.Stop()
 	var since time.Time
 	var last readinessObservation
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := windowErr(); err != nil {
 			return last, fmt.Errorf("waiting for readiness %q: %w", want.reason, err)
 		}
 		got, err := probe(ctx)
+		if expired := windowErr(); expired != nil && readinessInterrupted(err, expired) {
+			if got.Ready == nil {
+				return last, fmt.Errorf("waiting for readiness %q: %w", want.reason, expired)
+			}
+			// The response still carried a complete, validated body.
+			err = nil
+		}
 		last = got
-		err = errors.Join(err, ctx.Err())
+		stable := false
+		if err == nil {
+			switch state := got.state(); {
+			case state == want:
+				now := time.Now()
+				if since.IsZero() {
+					since = now
+				}
+				stable = now.Sub(since) >= stableFor
+			case state != transient || !since.IsZero():
+				err = readinessMismatch{fmt.Errorf("readiness %+v, want %+v", state, want)}
+			}
+		}
+		record(got, err)
+		if expired := windowErr(); expired != nil {
+			return last, fmt.Errorf("waiting for readiness %q: %w", want.reason, expired)
+		}
 		if err != nil {
-			record(got, err)
+			if _, mismatch := err.(readinessMismatch); mismatch {
+				return got, err
+			}
 			return got, fmt.Errorf("probe readiness %q: %w", want.reason, err)
 		}
-		switch state := got.state(); {
-		case state == want:
-			if since.IsZero() {
-				since = time.Now()
-			}
-			record(got, nil)
-			if time.Since(since) >= stableFor {
-				return got, ctx.Err()
-			}
-		case state != transient || !since.IsZero():
-			err := readinessMismatch{fmt.Errorf("readiness %+v, want %+v", state, want)}
-			record(got, err)
-			return got, err
-		default:
-			record(got, nil)
+		if stable {
+			return got, nil
 		}
 		select {
 		case <-ctx.Done():

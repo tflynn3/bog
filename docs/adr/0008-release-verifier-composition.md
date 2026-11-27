@@ -10,8 +10,9 @@ revision composing #53, #59 paging, and #60 descriptor-backed readiness.
 Dispatch the workflow from a revision containing the #70 fixed-budget
 probes, with the full 40-character lowercase SHA of the final candidate.
 The workflow records its own revision and runs admission, restored parity,
-and report validation from that checkout. Durability and capacity run from
-the candidate checkout.
+`TestReleaseFixedBudgetBackfill`, and report validation from that checkout.
+The query-model race suite also runs from the workflow checkout that provides
+the oracle. Durability and capacity run from the candidate checkout.
 [Release verifier contract](../../verify/release/README.md)
 
 Both Ubuntu 24.04 runners must pass. The amd64 job uses `ubuntu-24.04`
@@ -20,10 +21,14 @@ with `GOAMD64=v1`, and the arm64 job uses `ubuntu-24.04-arm` with
 machine, and Go host and target architectures. It confirms a clean
 checkout at the requested SHA, builds `cmd/bog` once natively with Go
 1.27.0 and cgo disabled, then checks the embedded build and VCS metadata.
-Admission, durability, live capacity, and restored parity use that job's
-single binary. The validator binds all reports to the candidate SHA, the
-job's binary SHA-256, and the `linux-release-v1` fixture. The job rechecks
-the digest after running the producers.
+Admission, durability, strict live capacity, restored parity, and the
+fixed-budget backfill test use that job's single binary. The validator binds
+all reports to the candidate SHA, the job's binary SHA-256, and the
+`linux-release-v1` fixture. The job rechecks the digest after running the
+producers. Both native jobs require an explicit passing event for
+`TestReleaseFixedBudgetBackfill` from `go test -json`. The test event stream,
+logs, and producer status record the gate checkout and candidate identity.
+The backfill test adds test-event evidence alongside the schema-v1 reports.
 
 The gate requires both capacity fixtures, with 196,608 and 393,216 seed
 rows, and both ENOSPC retarget directions on each runner. The durability
@@ -78,11 +83,21 @@ walks after acknowledged backfill or post-restore ingest and restart.
 Fixed-budget probes also check tied rows and sparse byte-trimmed pages
 with a smaller resume limit against their fixture expectations.
 
+The pinned backfill test checks tied rows, exact duplicates, and a
+sparse byte-trimmed walk against the oracle. Each launch applies the case's
+work budget and response byte cap in a fresh data directory. Only a clean
+opening work-budget refusal advances the bounded budget search. Once a
+cursor issues, the test requires HTTP 204 for a backfill before the first
+resume and another before the terminal resume. At the issuing budget the
+oracle compares the captured prefix through exhaustion. Every continuation
+error fails the case.
+
 The verifier may depend on both the production client and the oracle.
-Adapt their types at the verifier boundary. Oracle production imports
-must have no direct or transitive path to the server command, its wired
-or staged implementation libraries, or `internal/client`. A registered
-intermediary still falls under this rule. Test-only adapters may import
+The backfill adapter imports the oracle from the Linux test and adapts
+acknowledged batches and complete pages at the verifier boundary. Oracle
+production imports must have no direct or transitive path to the server
+command, its wired or staged implementation libraries, or `internal/client`.
+A registered intermediary still falls under this rule. Test-only adapters may import
 implementation packages to exercise them against the independent model.
 Use the existing architecture registry for package roles, exact direct
 imports, orphan governance, and acyclicity.

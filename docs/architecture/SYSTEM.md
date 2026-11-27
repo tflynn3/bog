@@ -16,11 +16,14 @@ authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
 The Linux amd64 and arm64 production inventories at
-`54347c836018789e0e3a95f7d76a02293169dfc5` agree on the graph below.
-On both targets the server reaches exactly four root-module libraries:
-HTTP, readiness, store, and WAL. The command recovers an ordinary WAL
-into an in-memory store. #108 is the activation handoff for bounded
-retained recovery and queries.
+`791e510a3afd11de6de8b4b2e05ac0eb3ce7ccb8` agree on the graph below.
+`cmd/bog` reaches HTTP, readiness, store, and WAL and recovers an ordinary
+WAL into an in-memory store. #108 keeps the same deployment unit and
+adds bounded retained recovery. The WAL owner serializes capture
+selection and generation activation with durable whole-batch
+publication. A verified restore establishes durable writable authority
+under the directory lock before the listener opens. The reviewed Storage
+handoff and the two native qualification verdicts are pending.
 [Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md)
 
 ## Declared Linux production import graph
@@ -59,13 +62,13 @@ flowchart TD
     end
     Operator["cmd/bog-verify"]
     Export["cmd/bog-export"]
-    subgraph Staged["Staged outside the server production closure"]
+    subgraph Staged["Retained libraries awaiting server activation"]
         Checkpoint["internal/checkpoint"]
         History["internal/history"]
         Backup["internal/backup"]
-        Idempotency["internal/idempotency"]
         History --> Checkpoint
     end
+    Idempotency["internal/idempotency (staged keyed ingest)"]
     Client["internal/client (standalone)"]
     Checkpoint --> Store
     History --> Store
@@ -189,25 +192,26 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
 `bog-storage` owns #108 activation for checkpoint, history, and backup.
-Update their roles, staging declarations, and the diagram with the
-reviewed command wiring once both Linux inventories show server
-reachability and the activation criteria are met. Idempotency has its
-own activation criteria. Keyed retries require the production WAL to
-commit and recover retry records atomically with their batches. Exercise
-concurrent same-key submissions, conflicting bodies, and retries after
-an ambiguous response and process restart.
+The table and diagram describe the measured revision. At the reviewed
+Storage handoff, promote each package whose server reachability and
+activation evidence are confirmed. Update the exact imports, roles, and
+diagram and remove each promoted staging declaration in the wiring PR.
+Idempotency remains staged under its own criteria. Keyed retries require
+the production WAL to commit and recover retry records atomically with
+their batches. Exercise concurrent same-key submissions, conflicting
+bodies, and retries after an ambiguous response and process restart.
 [Staging declarations](../../internal/archtest/staged_packages_test.go),
 [Ingest retry contract](../ingest-retries.md)
 
 ## Ranked quality attributes
 
-| Rank | Property | Measured server | #108 cutover requirement and cost |
+| Rank | Property | Measured server | #108 decision and cost |
 | --- | --- | --- | --- |
-| 1 | Durability | Acknowledge whole batches after durable commit and fence on uncertain WAL outcomes. | Sync generation files and the writable authority before activation. Fence on uncertain publication and fail startup on invalid committed authority, trading availability for recoverability. |
-| 2 | Exact queries | Preserve timestamp and append ordinal order in memory and through ordinary WAL replay. | Pin the generation with its matching durable tail across pages and verify the same order after writable restore and restart. Certification spends work before cursor issuance, and live pins delay reclamation. |
-| 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Bound replay, whole-batch append reservations, live captures, pinned generations, and staging overlap. Capacity pressure can defer maintenance and refuse whole batches. |
-| 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the selected generation and writable authority, then replay the bounded committed suffix. Manifest, segment, and suffix validation adds startup I/O. |
-| 5 | Throughput | Group syncs across admitted commits. | Prune provably irrelevant scan work. Retaining and hashing the readable v1 WAL prefix costs space and I/O. A verified v1 restore has finite writable tail capacity. |
+| 1 | Durability | Acknowledge whole batches after durable commit and fence on uncertain WAL outcomes. | Sync the successor and durably select it before activation. Preserve whole-batch acknowledgments across selection and writable restore. Fencing during uncertain publication costs write availability. |
+| 2 | Exact queries | Preserve timestamp and append ordinal order in memory and through ordinary WAL replay. | Pin a generation and its exact committed suffix together. Merge by UTC timestamp and append ordinal through compaction and restart. Certification spends work before cursor issuance, and live pins delay reclamation. |
+| 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Reserve replay, whole-batch ingest, capture, pin, and staging capacity before work. Capacity pressure can defer maintenance and refuse whole batches while admitted work drains. |
+| 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the selected generation and writable authority, then replay its bounded committed suffix. Manifest, segment, and suffix validation adds startup I/O. |
+| 5 | Throughput | Group syncs across admitted commits. | Prune provably irrelevant scans and serialize activation with appends. Keeping and hashing the readable v1 WAL prefix costs disk space and I/O. A verified tail-only v1 restore has finite writable tail capacity. |
 
 ## Operator verification boundary
 
@@ -255,19 +259,20 @@ qualification of the composed #108 revision is pending.
 | `verify/release` | `admission.json` | Query slot saturation, concurrent ingest, cursor replay, and clean work-budget rejection. Issuing budgets complete tied and sparse, byte-trimmed walks, including a smaller resume limit. |
 | `verify/linux` | `durability.json` | SIGKILL recovery, committed-prefix checks, and real ENOSPC on a disposable local filesystem. Retarget the configured path in both directions and check readiness and ingest against the active WAL filesystem. |
 | `bench/retained-history` | `capacity.json` | Both live scales (196,608 and 393,216 seed rows), each under a 128 MiB cgroup cap with swap disabled. Verify durable replacement at the exact cutoff, a held cursor across acknowledged backfill, exact fresh and restarted walks, and process and cgroup cleanup. Capture publication and retired pin drain evidence at the runtime observation points. |
-| `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Start the pinned binary on a verified restore, compare exact walks with the independent append-log oracle, observe 204 for new backfill, and check the held capture and exact augmented history after restart. |
+| `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Start the pinned binary on a verified restore, compare exact walks with the independent append-log oracle, observe 204 for new backfill, and check the held capture and exact augmented history after restart. Exercise immediate post-ack crash recovery on a separate restored fixture. |
+| `verify/release` / `TestReleaseFixedBudgetBackfill` and `TestReleaseCapacityControlScope` | Passing test events | Exercise fixed-budget paging through backfill and replacement. Check that capacity routes are available only with explicit opt-in on the loopback listener. |
 
 The three producers exercise a separate pinned server process through HTTP,
 process lifecycle, and disposable filesystem fixtures. Their Linux production
 imports have no direct or transitive root-module path to `internal/wal`,
 `internal/httpapi`, `internal/readiness`, `internal/checkpoint`,
 `internal/history`, or `internal/backup`. The exclusions apply through
-registered intermediaries and continue to apply after retained libraries
-are wired into the server. Producers may use the production HTTP client and
-shared row types. Test imports may use server and storage packages to
-construct fixtures. Restored-parity evidence comes from the pinned
-candidate and the independent append-log oracle. Operator parity uses the
-verified image as its reference.
+registered intermediaries and external dependencies and continue to apply
+after retained libraries are wired into the server. Producers may use the
+production HTTP client and shared row types. Test imports may use server
+and storage packages to construct fixtures. Restored-parity evidence
+comes from the pinned candidate and the independent append-log oracle.
+Operator parity uses the verified image as its reference.
 [Release verifier composition](../adr/0008-release-verifier-composition.md),
 [Release evidence process boundary](../adr/0013-release-evidence-process-boundary.md),
 [Retained storage boundary for release evidence](../adr/0021-retained-release-evidence-boundary.md),
@@ -317,12 +322,14 @@ qualification requires adapters that observe a shared-deployment implementation.
 
 ## Fitness and registry ownership
 
-Architecture within Core Engineering owns the architecture record and
-fitness registry. `bog-storage` owns #108 recovery, publication, and command
-composition. `bog-query` owns the #59 HTTP paging contract. Recheck the
-disjoint write leases at dispatch and at the Storage draft handoff.
-Review the measured edges and roles together with the runtime wiring
-in one PR.
+Architecture in the bog AgentSet owns the architecture record and
+fitness registry. Storage owns #108 recovery, publication, and command
+composition. Release Verification owns the two native verdicts.
+`bog-query` owns the HTTP paging contract. Recheck read and write leases
+at dispatch and at the immutable Storage handoff. Keep #104 behind the
+HTTP read lease and retained paging handoff, and #81 behind #108's
+writable recovery contract. Review the measured edges and roles together
+with the runtime wiring in one PR.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification)
 
@@ -353,8 +360,9 @@ root-module production registry.
   boundaries through external dependencies as well.
   [Storage authority](../../internal/archtest/storage_authority_test.go)
 - Command roots enforce server, operator verification, and operator export
-  exclusions. The oracle and the three release evidence roots enforce their
-  independent dependency rules.
+  exclusions. The measured Linux graph checks the server, operator
+  verification, oracle, and three release producer boundaries through
+  external production dependencies as well.
   [Server boundary](../../internal/archtest/command_roots_test.go),
   [Operator boundary](../../internal/archtest/operator_boundary_test.go),
   [Exporter boundary](../../internal/archtest/export_boundary_test.go),

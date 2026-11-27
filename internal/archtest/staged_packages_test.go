@@ -153,11 +153,13 @@ func TestRetainedCutoverStaging(t *testing.T) {
 		wal         = "bog/internal/wal"
 	)
 	tests := []struct {
-		name             string
-		operatorOnly     bool
-		keepDeclarations []string
-		dropIdempotency  bool
-		want             []string
+		name                  string
+		operatorOnly          bool
+		keepDeclarations      []string
+		dropIdempotency       bool
+		leaveCheckpointStaged bool
+		wantArchitecture      []string
+		want                  []string
 	}{
 		{name: "retained libraries promoted and keyed ingest stays staged"},
 		{
@@ -178,6 +180,18 @@ func TestRetainedCutoverStaging(t *testing.T) {
 				"stale staging declaration for " + checkpoint + ": package is registered as runtime library",
 				"stale staging declaration for " + history + ": package is registered as runtime library",
 			},
+		},
+		{
+			name:                  "wired checkpoint keeps its staged role",
+			leaveCheckpointStaged: true,
+			keepDeclarations:      []string{checkpoint},
+			wantArchitecture:      []string{checkpoint + " is registered as staged but reachability from " + server + " is true"},
+		},
+		{
+			name:                  "wired checkpoint loses its declaration before its role is updated",
+			leaveCheckpointStaged: true,
+			wantArchitecture:      []string{checkpoint + " is registered as staged but reachability from " + server + " is true"},
+			want:                  []string{"staged package " + checkpoint + " has no staging declaration"},
 		},
 		{
 			name:            "keyed ingest declaration removed with the retained declarations",
@@ -203,7 +217,20 @@ func TestRetainedCutoverStaging(t *testing.T) {
 				rules[server] = rule{serverCommand, []string{history, wal}}
 				rules[backup] = rule{staged, nil}
 			}
-			requireValidCommandFixture(t, rules)
+			if tt.leaveCheckpointStaged {
+				rules[checkpoint] = rule{staged, nil}
+			}
+			packages := make(map[string]listedPackage, len(rules))
+			for path, entry := range rules {
+				name := "library"
+				if path == server || path == operatorCommand {
+					name = "main"
+				}
+				packages[path] = productionPackage(name, entry.imports...)
+			}
+			if got := architectureProblems(packages, rules); !slices.Equal(got, tt.wantArchitecture) {
+				t.Errorf("architectureProblems() = %q, want %q", got, tt.wantArchitecture)
+			}
 			declarations := make(map[string]stagingDeclaration)
 			if !tt.dropIdempotency {
 				declarations[idempotency] = stagingDeclaration{

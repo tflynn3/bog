@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"bog/internal/client"
-	"bog/internal/store"
 )
 
 // Match the /query protocol limit without importing the server.
@@ -81,11 +80,11 @@ func parseOptions(args []string) (options, error) {
 			return options{}, errors.New("-url port must be between 1 and 65535")
 		}
 	}
-	opts.query.Start, err = store.ParseTime(start)
+	opts.query.Start, err = client.ParseQueryTime(start)
 	if err != nil {
 		return options{}, fmt.Errorf("invalid -start (expected RFC3339): %w", err)
 	}
-	opts.query.End, err = store.ParseTime(end)
+	opts.query.End, err = client.ParseQueryTime(end)
 	if err != nil {
 		return options{}, fmt.Errorf("invalid -end (expected RFC3339): %w", err)
 	}

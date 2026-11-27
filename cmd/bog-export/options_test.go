@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestInvalidOptionsDoNotRequest(t *testing.T) {
@@ -29,8 +30,11 @@ func TestInvalidOptionsDoNotRequest(t *testing.T) {
 		{"URL query", "-url", []string{"-url", server.URL + "?query=value"}},
 		{"empty URL query", "-url", []string{"-url", server.URL + "?"}},
 		{"empty URL fragment", "-url", []string{"-url", server.URL + "#"}},
-		{"invalid start", "-start", []string{"-start", "2025-01-01T00:00:00+24:00"}},
-		{"missing end", "-end", []string{"-end", ""}},
+		{"missing start", "invalid -start (expected RFC3339): invalid timestamp", []string{"-start", ""}},
+		{"invalid start", "invalid -start (expected RFC3339): invalid zone", []string{"-start", "2025-01-01T00:00:00+24:00"}},
+		{"missing end", "invalid -end (expected RFC3339): invalid timestamp", []string{"-end", ""}},
+		{"invalid end", "invalid -end (expected RFC3339): invalid timestamp", []string{"-end", "2025-01-01T00:00:10,1Z"}},
+		{"end outside UTC range", "invalid -end (expected RFC3339): timestamp outside supported range", []string{"-end", "9999-12-31T23:59:59-00:01"}},
 		{"backward range", "-end precedes -start", []string{"-start", "2025-01-01T00:00:11Z"}},
 		{"zero limit", "-limit", []string{"-limit", "0"}},
 		{"high limit", "-limit", []string{"-limit", "1001"}},
@@ -65,5 +69,21 @@ func TestOptionsAllowEmptyRange(t *testing.T) {
 	}
 	if !opts.query.Start.Equal(opts.query.End) || opts.query.Limit != 1000 {
 		t.Errorf("query = %+v", opts.query)
+	}
+}
+
+func TestOptionsNormalizeQueryBounds(t *testing.T) {
+	t.Parallel()
+	opts, err := parseOptions(argsFor("https://example.test",
+		"-start", "2025-01-01T01:30:00.123456789+01:30",
+		"-end", "2024-12-31T20:00:01.5-04:00",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStart := time.Date(2025, 1, 1, 0, 0, 0, 123456789, time.UTC)
+	wantEnd := time.Date(2025, 1, 1, 0, 0, 1, 500000000, time.UTC)
+	if opts.query.Start != wantStart || opts.query.End != wantEnd {
+		t.Errorf("query bounds = %v to %v, want %v to %v", opts.query.Start, opts.query.End, wantStart, wantEnd)
 	}
 }

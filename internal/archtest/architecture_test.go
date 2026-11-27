@@ -40,10 +40,12 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// At 62d13b7fa374, cmd/bog reaches HTTP, readiness, store, and WAL on both
-// Linux targets. Promote retained libraries with measured #108 wiring and
-// activation evidence. The operator's direct backup import is independent
-// of server reachability.
+// At cde0efe7ec7b, the four direct server imports are also its entire
+// root-module dependency closure on both Linux targets. Promote retained
+// libraries with measured #108 wiring and activation evidence. The
+// operator's direct backup import is independent
+// of server reachability. The staged stream-policy engine and the independent
+// stream-policy verifier both have zero direct root-module imports.
 var registry = map[string]rule{
 	exportCommand:                {verifier, []string{goClient}},
 	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
@@ -56,6 +58,7 @@ var registry = map[string]rule{
 	"bog/internal/history":       {staged, []string{"bog/internal/checkpoint", "bog/internal/store"}},
 	"bog/internal/backup":        {staged, []string{"bog/internal/store"}},
 	"bog/internal/idempotency":   {staged, nil},
+	streamPolicyEngine:           {staged, nil},
 	goClient:                     {standalone, []string{"bog/internal/store"}},
 	"bog/internal/ingest":        {testOnly, nil},
 	"bog/internal/archtest":      {testOnly, nil},
@@ -498,6 +501,47 @@ func TestRetainedCommandImportRegistrations(t *testing.T) {
 			}
 			if got := architectureProblems(packages, rules); !slices.Equal(got, tt.want) {
 				t.Errorf("architectureProblems() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStagedLibrariesStayOutsideMeasuredServerClosure(t *testing.T) {
+	t.Parallel()
+	const (
+		backup     = "bog/internal/backup"
+		checkpoint = "bog/internal/checkpoint"
+		history    = "bog/internal/history"
+		relay      = "example.com/relay"
+	)
+	for _, target := range []string{backup, checkpoint, history, streamPolicyEngine} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+			rules := map[string]rule{
+				server:             {role: serverCommand},
+				operatorCommand:    {verifier, []string{backup}},
+				backup:             {role: staged},
+				checkpoint:         {role: staged},
+				history:            {role: staged},
+				streamPolicyEngine: {role: staged},
+			}
+			packages := map[string]listedPackage{
+				server:             productionPackage("main"),
+				operatorCommand:    productionPackage("main", backup),
+				backup:             productionPackage("backup"),
+				checkpoint:         productionPackage("checkpoint"),
+				history:            productionPackage("history"),
+				streamPolicyEngine: productionPackage("streampolicy"),
+			}
+			if got := architectureProblems(packages, rules); len(got) != 0 {
+				t.Fatalf("baseline architectureProblems() = %q", got)
+			}
+
+			packages[server] = productionPackage("main", relay)
+			packages[relay] = listedPackage{GoFiles: []string{"relay.go"}, Imports: []string{target}}
+			want := []string{target + " is registered as staged but reachability from " + server + " is true"}
+			if got := architectureProblems(packages, rules); !slices.Equal(got, want) {
+				t.Errorf("architectureProblems() = %q, want %q", got, want)
 			}
 		})
 	}

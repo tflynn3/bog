@@ -17,13 +17,15 @@ sync, and powersafe overwrite. The ingest and query listener has no built-in
 authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
-The Linux amd64 and arm64 production inventories at
-`62d13b7fa3744feb213d227de10e8ee2b496b4a7` agree on the 19 root-module
+The Linux amd64 and arm64 production inventories at the Cycle 195 base
+`cde0efe7ec7b037ef0fae856b52aa0b0a514dc4d` agree on the 20 root-module
 production packages and 23 direct imports between them shown below.
-The entire root-module closure of `cmd/bog` consists of the command plus
-HTTP, readiness, store, and WAL. The command recovers an ordinary WAL into
-an in-memory store. Writable restore, live replacement, and retained
-paging await the reviewed #108 Storage handoff.
+Following all production imports from `cmd/bog` yields the command plus
+`internal/httpapi`, `internal/readiness`, `internal/store`, and
+`internal/wal` within the root module. Those four libraries are also the
+exact direct root-module imports of `cmd/bog` on each target. The command
+recovers an ordinary WAL into an in-memory store. Writable restore, live
+replacement, and retained paging await the reviewed #108 Storage handoff.
 [Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
 [Retained runtime promotion](../adr/0049-retained-runtime-promotion.md)
 
@@ -40,7 +42,9 @@ both memberships and the exact graph against the registry and checks the
 registry against both Linux production inventories.
 
 The declaration includes the fixture-backed stream policy verifier support
-added in #86 and both #87 capacity evidence imports. The shared validator
+added in #86, both #87 capacity evidence imports, and the staged #137
+stream-policy decision engine. The engine and the conformance verifier
+each have zero direct root-module production imports. The shared validator
 and directory-anchored publisher are present in the repository. #87
 qualification still requires running the strict evidence gate against the
 composed #108 runtime on both native Linux runners.
@@ -48,7 +52,7 @@ composed #108 runtime on both native Linux runners.
 
 ```mermaid
 flowchart TD
-    subgraph Runtime["Measured server production closure on Linux amd64 and arm64"]
+    subgraph Runtime["Server production closure at cde0efe7ec7b on Linux amd64 and arm64"]
         Cmd["cmd/bog"]
         HTTP["internal/httpapi"]
         Ready["internal/readiness"]
@@ -71,6 +75,7 @@ flowchart TD
         History["internal/history"]
         Backup["internal/backup (also used offline)"]
         Idempotency["internal/idempotency (staged keyed ingest)"]
+        PolicyEngine["internal/streampolicy (staged decision engine)"]
         History --> Checkpoint
     end
     Client["internal/client (standalone)"]
@@ -127,9 +132,9 @@ flowchart TD
 
 ## Retained-history handoff
 
-#108 must compose the retained `PageSource` in `cmd/bog` and inject it through
-`httpapi.NewWithPageSource`. Core Engineering owns the HTTP paging contract,
-including admission, cursor authentication and expiry, fixed-budget
+#108 must compose the retained `PageSource` in `cmd/bog` and inject it
+through `httpapi.NewWithPageSource`. Core Query (`bog-query`) owns the HTTP
+paging contract, including admission, cursor authentication and expiry, fixed-budget
 certification through exhaustion, and NDJSON framing.
 The adapter pins the validated generation and the matching durable,
 query-visible suffix together under WAL owner synchronization. At the
@@ -211,6 +216,7 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `internal/history` | Staged | Generation validation, ordered scans, pins, and reclamation |
 | `internal/backup` | Staged | Pinned export, verification, restore, offline reads, and staging recovery. `cmd/bog-verify` keeps its direct offline dependency through promotion. |
 | `internal/idempotency` | Staged | Keyed-ingest coordination and durable backend contract |
+| `internal/streampolicy` | Staged | Policy revision activation, operation grants, and stream-local redaction and masking |
 | `cmd/bog-verify` | Operator command | Read-only image verification and complete HTTP query parity |
 | `cmd/bog-export` | Operator command | Stream ordered NDJSON from the server's HTTP query API |
 | `internal/client` | Standalone | Production HTTP client for `cmd/bog-verify`, `cmd/bog-export`, and `verify/release`, including complete-page framing, opaque cursors, and ingest outcomes |
@@ -247,7 +253,7 @@ bodies, and retries after an ambiguous response and process restart.
 | 1 | Durability | Acknowledge whole batches after durable commit and fence on uncertain WAL outcomes. | Sync the successor and durably select it before activation. Preserve whole-batch acknowledgments across selection and writable restore. Fencing during uncertain publication costs write availability. |
 | 2 | Exact queries | Preserve timestamp and append ordinal order in memory and through ordinary WAL replay. | Pin a generation and its exact committed suffix together. Merge by UTC timestamp and append ordinal through compaction and restart. Certification spends work before cursor issuance. Retiring a cursor stops new resumes, and admitted users can keep predecessor storage charged until the last reference drains. |
 | 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Reserve replay, whole-batch ingest, capture, pin, and staging capacity before work. Capacity pressure can defer maintenance and refuse whole batches while admitted work drains. Verify both live scales under 128 MiB with swap disabled on each native architecture. |
-| 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the selected generation and writable authority, then replay its bounded committed suffix. Manifest, segment, and suffix validation adds startup I/O. |
+| 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the selected generation and writable authority, then replay its bounded committed suffix. Manifest, segment, and suffix validation adds startup I/O and bounds WAL replay after retained startup. |
 | 5 | Throughput | Group syncs across admitted commits. | Prune provably irrelevant scans and serialize activation with appends. Keeping and hashing the readable v1 WAL prefix costs disk space and I/O. A verified tail-only v1 restore has finite writable tail capacity. |
 
 ## Operator verification boundary
@@ -324,8 +330,9 @@ through exhaustion with the independent append-log oracle.
 The baseline includes query replay startup checks for verified bind
 collisions. For the measured baseline with this architecture update,
 both Linux inventories, portable architecture vet and race checks, and
-the Linux amd64 cross-build pass. Native qualification of the composed
-#108 candidate remains pending on both amd64 and arm64.
+the Linux amd64 cross-build pass. Release Verification needs the clean
+composed #108 SHA as the workflow's `revision` input. Native qualification
+remains pending on both amd64 and arm64.
 
 The three producers exercise a separate pinned server process through HTTP,
 process lifecycle, and disposable filesystem fixtures. Their Linux production
@@ -384,6 +391,10 @@ expiry with admitted operations still draining.
 
 ## Stream policy conformance
 
+The #137 decision engine remains staged under Core Engineering ownership.
+Its serving integration must pass ADR 0050's independent native evidence
+for scoped admission and paging, durable redaction and replay, export and
+writable restore, and scoped retry wherever keyed ingest is enabled.
 Security Verification owns the fixture-backed runner for the proposed
 shared-deployment contract. It compares authorized query and cursor results,
 retry outcomes, committed bytes and replayed records, and scoped export
@@ -391,6 +402,7 @@ evidence. Positive controls require exact retained values and durable byte
 witnesses. Missing adapter evidence leaves conformance incomplete. This
 milestone runs against deterministic synthetic adapters. Live server
 qualification requires adapters that observe a shared-deployment implementation.
+[Decision boundary and activation criteria](../adr/0050-stream-policy-decision-boundary.md),
 [Proposed stream authorization and durable redaction contract](../shared-deployment/stream-authorization-redaction.md),
 [Runner and adapter contract](../../verify/stream-policy/README.md)
 
@@ -399,9 +411,10 @@ qualification requires adapters that observe a shared-deployment implementation.
 Core Architecture in the bog AgentSet owns the architecture record and
 fitness registry, including the diagram and constructor checks.
 `bog-storage` owns #108 recovery, publication, and command composition.
-Core Engineering owns the HTTP paging contract. Release Verification
-owns the native Linux amd64 and arm64 verdicts for the same composed
-revision. #108 remains the release gate.
+Core Query owns the HTTP paging contract. Core Engineering must name the
+query execution and security integration owners within `bog`. Release
+Verification owns the native Linux amd64 and arm64 verdicts for the same
+composed revision. #108 remains the release gate.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification),
 [Tail-only recovery contract](../adr/0035-tail-only-retained-recovery-contract.md)
@@ -417,7 +430,8 @@ the combined change. The wiring PR updates
 imports and roles, `internal/archtest/staged_packages_test.go` with the
 remaining staging declarations, and `docs/architecture/SYSTEM.md` with the
 measured revision, diagram, and role table. Preserve the operator backup
-edge and the exporter and release evidence registrations.
+edge, the exporter and release evidence registrations, and the separate
+staged stream-policy registration.
 Require the architecture suite to pass on the combined revision before
 merging the wiring PR.
 [Landed constructor guard](https://github.com/tflynn3/bog/commit/b27b41ff9fcd46f3497725b052075e8353a0ede7),

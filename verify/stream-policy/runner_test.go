@@ -435,6 +435,134 @@ func TestMissingArtifactDeniedThroughAuthorizedStream(t *testing.T) {
 	}
 }
 
+func TestExportDenialMatrix(t *testing.T) {
+	t.Parallel()
+	target := &observedTarget{syntheticTarget: newSynthetic()}
+	a, b, c := target.fixture.Streams[0].Selector, target.fixture.Streams[1].Selector, target.fixture.Streams[2].Selector
+	ids := make(map[string]string)
+	target.create = func(request Target, start *ExportStart) {
+		if start.ArtifactID != "" {
+			ids[request.Selector] = start.ArtifactID
+		}
+	}
+	denials := make(map[Target][]string)
+	target.fetch = func(request Target, id string, artifact *Artifact) {
+		if artifact.Status == http.StatusForbidden {
+			denials[request] = append(denials[request], id)
+		}
+	}
+	if err := runFixture(t, Adapters{target, target, target, target}); err != nil {
+		t.Fatal(err)
+	}
+	for _, selector := range []string{a, b, c} {
+		if ids[selector] == "" {
+			t.Fatalf("no positive artifact for %s", selector)
+		}
+	}
+	for _, tc := range []struct {
+		request Target
+		sources []string
+	}{
+		{Target{alice, a}, []string{b, c}},
+		{Target{alice, b}, []string{a, c}},
+		{Target{alice, c}, []string{a, b}},
+		{Target{alice, unknown}, []string{a, b, c}},
+		{Target{bob, a}, []string{a, b, c}},
+		{Target{bob, b}, []string{a, c}},
+		{Target{bob, c}, []string{a, b, c}},
+		{Target{bob, unknown}, []string{a, b, c}},
+		{Target{exporter, a}, []string{b, c}},
+		{Target{exporter, b}, []string{a, b, c}},
+		{Target{exporter, c}, []string{a, b, c}},
+		{Target{exporter, unknown}, []string{a, b, c}},
+	} {
+		got := denials[tc.request]
+		if len(got) != 2*len(tc.sources) {
+			t.Errorf("%+v observed %d denials, want %d", tc.request, len(got), 2*len(tc.sources))
+			continue
+		}
+		for i, source := range tc.sources {
+			existing, missing := got[2*i], got[2*i+1]
+			if _, exists := target.artifacts[missing]; existing != ids[source] || missing == "" || exists {
+				t.Errorf("%+v has no existing/absent pair for %s", tc.request, source)
+			}
+		}
+	}
+}
+
+func TestExportDenialRegression(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		principal string
+		selector  string
+		source    string // Empty for an absent-ID fetch.
+		alter     func(*Artifact, string)
+		detail    string
+	}{
+		{
+			name:      "reverse same-tenant access through another authorized stream",
+			principal: alice, selector: "fixture-a", source: "fixture-b",
+			alter: func(a *Artifact, _ string) { a.Status = http.StatusOK }, detail: "want 403",
+		},
+		{
+			name:      "reverse cross-tenant access through the same stream ID",
+			principal: alice, selector: "fixture-a", source: "fixture-c",
+			alter: func(a *Artifact, _ string) { a.Status = http.StatusOK }, detail: "want 403",
+		},
+		{
+			name:      "same-scope request from a different principal without a grant",
+			principal: exporter, selector: "fixture-b", source: "fixture-b",
+			alter: func(a *Artifact, _ string) { a.Bytes = []byte("private data") }, detail: "disclosed artifact evidence",
+		},
+		{
+			name:      "denied cross-tenant request returns records",
+			principal: bob, selector: "fixture-b", source: "fixture-c",
+			alter:  func(a *Artifact, _ string) { a.Records = []Record{{Row: Row{Line: "private record"}}} },
+			detail: "disclosed artifact evidence",
+		},
+		{
+			name:      "existing ID changes the header for a cross-tenant request without a grant",
+			principal: bob, selector: "fixture-c", source: "fixture-b",
+			alter: func(a *Artifact, _ string) {
+				a.Headers = map[string][]string{"Bog-Result": {"artifact found"}}
+			},
+			detail: "different response evidence",
+		},
+		{
+			name:      "absent ID changes the body through a grant for another scope",
+			principal: alice, selector: "fixture-a",
+			alter: func(a *Artifact, _ string) { a.Body = []byte("artifact missing\n") }, detail: "different response evidence",
+		},
+		{
+			name:      "unknown selector echoes the third stream artifact ID",
+			principal: exporter, selector: unknown, source: "fixture-c",
+			alter: func(a *Artifact, id string) { a.Body = []byte(id) }, detail: "unexpected fixture marker",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			target := &observedTarget{syntheticTarget: newSynthetic()}
+			var sourceID string
+			target.create = func(request Target, start *ExportStart) {
+				if request.Selector == tc.source && start.ArtifactID != "" {
+					sourceID = start.ArtifactID
+				}
+			}
+			target.fetch = func(request Target, id string, artifact *Artifact) {
+				if request != (Target{tc.principal, tc.selector}) || artifact.Status != http.StatusForbidden {
+					return
+				}
+				_, exists := target.artifacts[id]
+				if (tc.source == "" && !exists) || (exists && id == sourceID) {
+					tc.alter(artifact, id)
+				}
+			}
+			assertFailure(t, target, ErrViolation, tc.detail)
+		})
+	}
+}
+
 func TestExportRequiresAnAbsentArtifactProbe(t *testing.T) {
 	t.Parallel()
 	target := &observedTarget{syntheticTarget: newSynthetic()}

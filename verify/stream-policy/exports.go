@@ -8,16 +8,17 @@ import (
 )
 
 func (s *scenario) checkExports(ctx context.Context) error {
-	a, b, c := s.fixture.Streams[0], s.fixture.Streams[1], s.fixture.Streams[2]
+	type scopedArtifact struct {
+		id    string
+		scope Scope
+	}
 	const missing = "fixture-missing-artifact"
-	var known string
+	artifacts := make([]scopedArtifact, 0, len(s.fixture.Streams))
+	markers := []string{missing}
+	// Keep a positive control in each scope, including the export-only grant.
+	creators := [...]string{exporter, bob, alice}
 	for i, stream := range s.fixture.Streams {
-		target := Target{alice, stream.Selector}
-		if stream == a {
-			target.Principal = exporter
-		} else if stream == b {
-			target.Principal = bob
-		}
+		target := Target{creators[i], stream.Selector}
 		id, err := s.checkExport(ctx, target, stream)
 		if err != nil {
 			return fmt.Errorf("authorized export in stream %d: %w", i+1, err)
@@ -25,78 +26,81 @@ func (s *scenario) checkExports(ctx context.Context) error {
 		if id == missing {
 			return fmt.Errorf("%w: missing-artifact probe does not name an absent artifact", ErrIncomplete)
 		}
-		if stream == a {
-			known = id
-		}
-	}
-	markers := []string{known, missing}
-
-	probes := []struct {
-		target        Target
-		phase         string
-		createAllowed bool
-	}{
-		{target: Target{bob, a.Selector}, phase: "artifact requested without an export grant"},
-		{target: Target{bob, c.Selector}, phase: "artifact requested in another tenant"},
-		{target: Target{bob, unknown}, phase: "artifact requested through an unknown selector"},
-		{target: Target{bob, b.Selector}, phase: "artifact requested in another authorized stream", createAllowed: true},
-	}
-	var baseline Response
-	for _, probe := range probes {
-		if probe.createAllowed {
-			continue
-		}
-		start, err := s.Export.CreateExport(ctx, probe.target)
-		if err := observation(ctx, err); err != nil {
-			return err
-		}
-		if err := requireResponse(start.Response, http.StatusForbidden); err != nil {
-			return err
-		}
-		if start.ArtifactID != "" {
-			return fmt.Errorf("%w: rejected export disclosed an artifact ID", ErrViolation)
-		}
-		if !baseline.Complete {
-			baseline = start.Response
-		}
-		if err := s.deniedResponse(start.Response, baseline, markers...); err != nil {
-			return err
-		}
+		artifacts = append(artifacts, scopedArtifact{id, stream.Scope})
+		markers = append(markers, id)
 	}
 
-	// Pair the existing artifact with an absent one under every selector,
-	// including the selector where Bob has an export grant.
-	baseline = Response{}
-	for _, probe := range probes {
-		for _, id := range []string{known, missing} {
-			resp, err := s.deniedDownload(ctx, probe.target, id)
-			if err != nil {
-				return fmt.Errorf("%s: %w", probe.phase, err)
+	exportGrants := make(map[Target]bool, len(s.fixture.Grants))
+	var principals []string
+	for _, grant := range s.fixture.Grants {
+		exportGrants[grant.Target] = grant.Export
+		if !slices.Contains(principals, grant.Principal) {
+			principals = append(principals, grant.Principal)
+		}
+	}
+	streams := append(slices.Clone(s.fixture.Streams[:]), Stream{Selector: unknown})
+	var createBaseline, downloadBaseline Response
+	for p, principal := range principals {
+		for j, stream := range streams {
+			target := Target{principal, stream.Selector}
+			allowed := exportGrants[target]
+			phase := "artifact requested in another authorized stream"
+			if !allowed {
+				phase = "artifact requested without an export grant"
+				if err := s.deniedCreate(ctx, target, &createBaseline, markers); err != nil {
+					return fmt.Errorf("denied export create by principal %d through selector %d: %w", p+1, j+1, err)
+				}
 			}
-			if !baseline.Complete {
-				baseline = resp
-			}
-			if err := s.deniedResponse(resp, baseline, markers...); err != nil {
-				return fmt.Errorf("%s: %w", probe.phase, err)
+
+			for i, artifact := range artifacts {
+				if allowed && stream.Scope == artifact.scope {
+					continue
+				}
+				for _, id := range []string{artifact.id, missing} {
+					if err := s.deniedDownload(ctx, target, id, &downloadBaseline, markers); err != nil {
+						return fmt.Errorf("%s (source stream %d, principal %d, selector %d): %w", phase, i+1, p+1, j+1, err)
+					}
+				}
 			}
 		}
 	}
 	return nil
 }
 
-func (s *scenario) deniedDownload(ctx context.Context, target Target, id string) (Response, error) {
+func (s *scenario) deniedCreate(ctx context.Context, target Target, baseline *Response, markers []string) error {
+	start, err := s.Export.CreateExport(ctx, target)
+	if err := observation(ctx, err); err != nil {
+		return err
+	}
+	if err := requireResponse(start.Response, http.StatusForbidden); err != nil {
+		return err
+	}
+	if start.ArtifactID != "" {
+		return fmt.Errorf("%w: rejected export disclosed an artifact ID", ErrViolation)
+	}
+	return s.compareExportDenial(start.Response, baseline, markers)
+}
+
+func (s *scenario) deniedDownload(ctx context.Context, target Target, id string, baseline *Response, markers []string) error {
 	artifact, err := s.Export.FetchExport(ctx, target, id)
 	if err := observation(ctx, err); err != nil {
-		return Response{}, err
+		return err
 	}
 	if err := requireResponse(artifact.Response, http.StatusForbidden); err != nil {
-		return Response{}, err
+		return err
 	}
 	if len(artifact.Bytes) != 0 || len(artifact.Records) != 0 || artifact.Verified ||
 		artifact.Manifest.Scope != (Scope{}) || artifact.Manifest.Version != "" || len(artifact.Manifest.PolicyVersions) != 0 {
-		return Response{}, fmt.Errorf("%w: rejected download disclosed artifact evidence", ErrViolation)
+		return fmt.Errorf("%w: rejected download disclosed artifact evidence", ErrViolation)
 	}
-	return artifact.Response, nil
+	return s.compareExportDenial(artifact.Response, baseline, markers)
+}
+
+func (s *scenario) compareExportDenial(response Response, baseline *Response, markers []string) error {
+	if !baseline.Complete {
+		*baseline = response
+	}
+	return s.deniedResponse(response, *baseline, markers...)
 }
 
 func (s *scenario) checkExport(ctx context.Context, target Target, stream Stream) (string, error) {

@@ -102,7 +102,7 @@ func publishSegments(ctx context.Context, dir, id string, previous snapshot, app
 		var decoder blockDecoder
 		defer decoder.close()
 		tail := keep[len(keep)-1]
-		if _, err := decodeSegment(dir, tail, target, &decoder, func(decoded []checkpoint.BlockRow) {
+		if _, err := decodeSegment(ctx, dir, tail, target, &decoder, func(decoded []checkpoint.BlockRow) {
 			rows = append(decoded, appended...)
 		}); err != nil {
 			return "", err
@@ -180,13 +180,13 @@ type decodeWorkingSet struct {
 	OversizedSegments  int `json:"oversized_segments"`
 }
 
-func decodeSegment(dir string, ref segmentRef, target int, decoder *blockDecoder, visit func([]checkpoint.BlockRow)) (peak int, err error) {
+func decodeSegment(ctx context.Context, dir string, ref segmentRef, target int, decoder *blockDecoder, visit func([]checkpoint.BlockRow)) (peak int, err error) {
 	f, err := openSegment(dir, ref)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
-	reads, err := decoder.scan(f, ref.FileBytes, ref.RawBytes, ref.indexWidth(), query{start: firstTime, end: endTime}, func(raw []byte, buffers int) error {
+	reads, err := decoder.scan(ctx, f, ref.FileBytes, ref.RawBytes, ref.indexWidth(), query{start: firstTime, end: endTime}, func(raw []byte, buffers int) error {
 		if len(raw) != ref.RawBytes {
 			return errLayout
 		}
@@ -245,7 +245,7 @@ func scanSnapshot(ctx context.Context, dir string, current snapshot, target int,
 		if err := ctx.Err(); err != nil {
 			return decodeWorkingSet{}, err
 		}
-		peak, err := decodeSegment(dir, ref, target, &decoder, visit)
+		peak, err := decodeSegment(ctx, dir, ref, target, &decoder, visit)
 		if err != nil {
 			return decodeWorkingSet{}, fmt.Errorf("decode %s: %w", ref.Name, err)
 		}

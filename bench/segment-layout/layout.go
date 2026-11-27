@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -186,7 +187,7 @@ type payloadReads struct {
 func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, bufferBytes int) error) (read payloadReads, err error) {
 	var decoder blockDecoder
 	defer decoder.close()
-	return decoder.scan(r, size, maxBlock, 0, q, visit)
+	return decoder.scan(context.Background(), r, size, maxBlock, 0, q, visit)
 }
 
 type blockDecoder struct {
@@ -199,7 +200,10 @@ func (d *blockDecoder) close() {
 	}
 }
 
-func (d *blockDecoder) scan(r io.ReaderAt, size int64, rawLimit, singleIndexWidth int, q query, visit func(raw []byte, bufferBytes int) error) (read payloadReads, err error) {
+func (d *blockDecoder) scan(ctx context.Context, r io.ReaderAt, size int64, rawLimit, singleIndexWidth int, q query, visit func(raw []byte, bufferBytes int) error) (read payloadReads, err error) {
+	if err := ctx.Err(); err != nil {
+		return payloadReads{}, err
+	}
 	var header [headerSize]byte
 	if size < headerSize {
 		return payloadReads{}, errLayout
@@ -219,6 +223,9 @@ func (d *blockDecoder) scan(r io.ReaderAt, size int64, rawLimit, singleIndexWidt
 	}
 	entry := make([]byte, width)
 	for i := range count {
+		if err := ctx.Err(); err != nil {
+			return payloadReads{}, err
+		}
 		if err := checkedRead(r, entry, headerSize+i*width); err != nil {
 			return payloadReads{}, fmt.Errorf("index entry %d: %w", i, err)
 		}
@@ -238,9 +245,15 @@ func (d *blockDecoder) scan(r io.ReaderAt, size int64, rawLimit, singleIndexWidt
 		if l.prune && !(*summary)(entry[32:32+len(summary{})]).mayContain(q.literal) {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return payloadReads{}, err
+		}
 		stored := make([]byte, storedSize)
 		if _, err := r.ReadAt(stored, bodyOffset); err != nil {
 			return payloadReads{}, fmt.Errorf("block %d: %w", i, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return payloadReads{}, err
 		}
 		raw, bufferBytes := stored, storedSize
 		if storedSize < rawSize {
@@ -266,6 +279,9 @@ func (d *blockDecoder) scan(r io.ReaderAt, size int64, rawLimit, singleIndexWidt
 				}
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			return payloadReads{}, err
+		}
 		if !bytes.Equal(raw[12:36], entry[:24]) {
 			return payloadReads{}, fmt.Errorf("block %d time bounds: %w", i, errLayout)
 		}
@@ -277,6 +293,9 @@ func (d *blockDecoder) scan(r io.ReaderAt, size int64, rawLimit, singleIndexWidt
 	}
 	if offset != size {
 		return payloadReads{}, errLayout
+	}
+	if err := ctx.Err(); err != nil {
+		return payloadReads{}, err
 	}
 	return read, nil
 }

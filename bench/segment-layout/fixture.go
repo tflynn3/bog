@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
@@ -93,6 +94,37 @@ func (input fixtureInput) backfills() []backfill {
 	return []backfill{{"clustered", clustered}, {"scattered", scattered}}
 }
 
+type coldBackfillFixture struct {
+	Scenario           string    `json:"scenario"`
+	Rows               int       `json:"appended_rows"`
+	Earliest           time.Time `json:"earliest_timestamp"`
+	Latest             time.Time `json:"latest_timestamp"`
+	DistinctTimestamps int       `json:"distinct_timestamps"`
+	AppendedWALBytes   uint64    `json:"appended_wal_bytes"`
+}
+
+func describeColdBackfill(b backfill) (coldBackfillFixture, error) {
+	const walFrameHeaderBytes = 16
+	body, _, err := encodeBatch(b.batch)
+	if err != nil {
+		return coldBackfillFixture{}, err
+	}
+	f := coldBackfillFixture{Scenario: b.name, Rows: len(b.batch), AppendedWALBytes: uint64(len(body) + walFrameHeaderBytes)}
+	times := make(map[time.Time]struct{}, len(b.batch))
+	for i, row := range b.batch {
+		ts := row.Row.TS.UTC()
+		times[ts] = struct{}{}
+		if i == 0 || ts.Before(f.Earliest) {
+			f.Earliest = ts
+		}
+		if i == 0 || ts.After(f.Latest) {
+			f.Latest = ts
+		}
+	}
+	f.DistinctTimestamps = len(times)
+	return f, nil
+}
+
 func (input fixtureInput) withBackfill(b backfill) []checkpoint.BlockRow {
 	rows := make([]checkpoint.BlockRow, len(input.rows), len(input.rows)+len(b.batch))
 	copy(rows, input.rows)
@@ -151,12 +183,30 @@ func queries() []query {
 
 // The oracle walks the original append input independently of packing and pruning.
 func reference(rows []checkpoint.BlockRow, q query) []checkpoint.BlockRow {
+	return referenceRows(rows, q, nil)
+}
+
+func coldReference(ctx context.Context, rows []checkpoint.BlockRow, q query) ([]checkpoint.BlockRow, error) {
+	matches := referenceRows(rows, q, ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return matches, nil
+}
+
+func referenceRows(rows []checkpoint.BlockRow, q query, ctx context.Context) []checkpoint.BlockRow {
 	var matches []checkpoint.BlockRow
-	for _, row := range rows {
+	for i, row := range rows {
+		if ctx != nil && i%1024 == 0 && ctx.Err() != nil {
+			return nil
+		}
 		if row.Row.TS.Before(q.start) || !row.Row.TS.Before(q.end) || !strings.Contains(row.Row.Line, q.literal) {
 			continue
 		}
 		matches = append(matches, row)
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return nil
 	}
 	// Stable time sort preserves input append ordering for ties.
 	slices.SortStableFunc(matches, func(a, b checkpoint.BlockRow) int {

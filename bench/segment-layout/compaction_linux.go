@@ -10,8 +10,6 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	"bog/internal/checkpoint"
@@ -269,11 +267,9 @@ func processIO(pid, field string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	for line := range strings.Lines(string(data)) {
-		key, value, ok := strings.Cut(line, ":")
-		if ok && key == field {
-			return strconv.ParseUint(strings.TrimSpace(value), 10, 64)
-		}
+	value, err := parseProcessIO(data, field)
+	if err != nil {
+		return 0, fmt.Errorf("/proc/%s/io: %w", pid, err)
 	}
-	return 0, fmt.Errorf("missing /proc/%s/io counter %s", pid, field)
+	return value, nil
 }

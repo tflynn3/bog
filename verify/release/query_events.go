@@ -15,9 +15,35 @@ import (
 
 const (
 	queryEventPackage      = "bog/verify/query-model"
-	maxQueryEventBytes     = 16 << 20                   // Per event artifact, including ignored lines.
+	maxQueryEventBytes     = 16 << 20                   // Combined wire bytes, including separators and ignored lines.
+	maxQueryEventCount     = 100_000                    // Combined records, including build and unrelated events.
 	maxQueryEventLineBytes = bufio.MaxScanTokenSize - 1 // Bytes before the newline.
 )
+
+var errQueryEventCount = errors.New("query event artifacts exceed event count limit")
+
+// A qualification owns one budget and reads its artifacts in order. Charge
+// bytes at the bounded reader, so scanner read-ahead and line endings count.
+type queryEventBudget struct {
+	byteLimit, bytesLeft   int64
+	eventLimit, eventsLeft int
+	byteOverflow           bool
+}
+
+func newQueryEventBudget(byteLimit int64, eventLimit int) *queryEventBudget {
+	return &queryEventBudget{
+		byteLimit: byteLimit, bytesLeft: byteLimit,
+		eventLimit: eventLimit, eventsLeft: eventLimit,
+	}
+}
+
+func (b *queryEventBudget) countError() error {
+	return fmt.Errorf("%w (%d events)", errQueryEventCount, b.eventLimit)
+}
+
+func (b *queryEventBudget) byteError() error {
+	return fmt.Errorf("aggregate query event budget: %w", artifactSizeError(b.byteLimit))
+}
 
 const (
 	pinnedQueryReplay = "TestPinnedQueryModelReplay"
@@ -49,26 +75,38 @@ var queryHandlerTests = []string{
 }
 
 func validateQueryQualification(ctx context.Context, model, handlers string, id identity) error {
-	if model == "" || handlers == "" {
-		missing := "-query-model-events"
-		if handlers == "" {
-			missing = "-query-handler-events"
-		}
-		return fmt.Errorf("query qualification requires both -query-model-events and -query-handler-events: missing %s: %w",
-			missing, os.ErrNotExist)
-	}
-	return errors.Join(
-		validateQueryEventFile(ctx, "query model events", model, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id),
-		validateQueryEventFile(ctx, "query handler events", handlers, queryHandlerTests, nil, id),
-	)
+	return validateQueryQualificationWithBudget(ctx, model, handlers, id, newQueryEventBudget(maxQueryEventBytes, maxQueryEventCount))
 }
 
-func validateQueryEventFile(ctx context.Context, phase, path string, tests, pinned []string, id identity) error {
-	file, _, err := openRegular(ctx, nil, path, maxQueryEventBytes)
+func validateQueryQualificationWithBudget(ctx context.Context, model, handlers string, id identity, budget *queryEventBudget) error {
+	if model == "" || handlers == "" {
+		var missing []string
+		if model == "" {
+			missing = append(missing, "-query-model-events")
+		}
+		if handlers == "" {
+			missing = append(missing, "-query-handler-events")
+		}
+		return fmt.Errorf("query qualification requires both -query-model-events and -query-handler-events: missing %s: %w",
+			strings.Join(missing, ", "), os.ErrNotExist)
+	}
+	modelErr := validateQueryEventFile(ctx, "query model events", model, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id, budget)
+	if budget.byteOverflow || errors.Is(modelErr, errQueryEventCount) {
+		return modelErr
+	}
+	handlerErr := validateQueryEventFile(ctx, "query handler events", handlers, queryHandlerTests, nil, id, budget)
+	return errors.Join(modelErr, handlerErr)
+}
+
+func validateQueryEventFile(ctx context.Context, phase, path string, tests, pinned []string, id identity, budget *queryEventBudget) error {
+	file, _, err := openRegular(ctx, nil, path, budget.bytesLeft)
 	if err != nil {
+		if errors.Is(err, errArtifactOversized) {
+			err = fmt.Errorf("aggregate query event budget (%d bytes): %w", budget.byteLimit, err)
+		}
 		return fmt.Errorf("%s: open %q: %w", phase, path, err)
 	}
-	err = validateQueryEvents(ctx, file, maxQueryEventBytes, tests, pinned, id)
+	err = validateQueryEventsWithBudget(ctx, file, budget, tests, pinned, id)
 	if err := errors.Join(err, file.Close()); err != nil {
 		return fmt.Errorf("%s: validate %q: %w", phase, path, err)
 	}
@@ -83,6 +121,10 @@ type queryTestEvent struct {
 }
 
 func validateQueryEvents(ctx context.Context, r io.Reader, limit int64, tests, pinned []string, id identity) error {
+	return validateQueryEventsWithBudget(ctx, r, newQueryEventBudget(limit, maxQueryEventCount), tests, pinned, id)
+}
+
+func validateQueryEventsWithBudget(ctx context.Context, r io.Reader, budget *queryEventBudget, tests, pinned []string, id identity) error {
 	// An empty test name denotes the package result. A parent can pass
 	// even when a required subtest skips, so require every named level.
 	required := []string{""}
@@ -108,18 +150,41 @@ func validateQueryEvents(ctx context.Context, r io.Reader, limit int64, tests, p
 	}
 	wantIdentity := fmt.Sprintf("%s binary_sha256=%s", id.Revision, id.BinarySHA256)
 
-	scanner := bufio.NewScanner(newArtifactReader(ctx, r, limit))
+	reader := newArtifactReader(ctx, r, budget.bytesLeft)
+	defer func() {
+		budget.bytesLeft = reader.remaining
+		budget.byteOverflow = reader.overflow
+	}()
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(nil, maxQueryEventLineBytes+1)
 	scanner.Split(scanQueryEventLine)
-	line := 0
-	for scanner.Scan() {
-		line++
-		if err := errors.Join(ctx.Err(), scanner.Err()); err != nil {
-			return fmt.Errorf("read Go test events at line %d: %w", line, err)
+	var observed error
+	for line := 1; ; line++ {
+		scanned := scanner.Scan()
+		// A failed read can leave an unterminated partial token. Do not
+		// interpret it as an event or mask the underlying read failure.
+		if err := scanner.Err(); err != nil || ctx.Err() != nil {
+			if reader.overflow {
+				err = budget.byteError()
+			}
+			return errors.Join(observed, fmt.Errorf("read Go test events at line %d: %w", line, errors.Join(err, ctx.Err())))
+		}
+		if !scanned {
+			break
+		}
+		if budget.eventsLeft == 0 {
+			return errors.Join(observed, fmt.Errorf("read Go test events at line %d: %w", line, budget.countError()))
+		}
+		budget.eventsLeft--
+		if observed != nil {
+			// A bad event already invalidated the artifact. Continue
+			// charging its remaining wire bytes and event records.
+			continue
 		}
 		event, err := decodeQueryEvent(scanner.Bytes())
 		if err != nil {
-			return fmt.Errorf("decode Go test event at line %d: %w", line, err)
+			observed = fmt.Errorf("decode Go test event at line %d: %w", line, err)
+			continue
 		}
 		if event.Package != queryEventPackage {
 			continue
@@ -127,10 +192,10 @@ func validateQueryEvents(ctx context.Context, r io.Reader, limit int64, tests, p
 		root, _, _ := strings.Cut(event.Test, "/")
 		switch event.Action {
 		case "fail":
-			return fmt.Errorf("%s reported failure", queryEventName(event.Test))
+			observed = fmt.Errorf("%s reported failure", queryEventName(event.Test))
 		case "skip":
 			if event.Test == "" || roots[root] {
-				return fmt.Errorf("%s reported skip", queryEventName(event.Test))
+				observed = fmt.Errorf("%s reported skip", queryEventName(event.Test))
 			}
 		case "pass":
 			if _, required := passes[event.Test]; required {
@@ -142,26 +207,28 @@ func validateQueryEvents(ctx context.Context, r io.Reader, limit int64, tests, p
 			}
 			if _, logged, found := strings.Cut(event.Output, "candidate revision="); found {
 				if strings.TrimSuffix(logged, "\n") != wantIdentity {
-					return fmt.Errorf("%s candidate identity does not match the pinned build", event.Test)
+					observed = fmt.Errorf("%s candidate identity does not match the pinned build", event.Test)
+					continue
 				}
 				identities[event.Test]++
 			}
 		}
 	}
-	if err := errors.Join(ctx.Err(), scanner.Err()); err != nil {
-		return fmt.Errorf("read Go test events at line %d: %w", line+1, err)
+	if observed != nil {
+		return observed
 	}
+	var missing []error
 	for _, test := range required {
 		if passes[test] != 1 {
-			return fmt.Errorf("%s reported %d passes, expected 1", queryEventName(test), passes[test])
+			missing = append(missing, fmt.Errorf("%s reported %d passes, expected 1", queryEventName(test), passes[test]))
 		}
 	}
 	for _, test := range pinned {
 		if identities[test] != 1 {
-			return fmt.Errorf("%s reported %d candidate identities, expected 1", test, identities[test])
+			missing = append(missing, fmt.Errorf("%s reported %d candidate identities, expected 1", test, identities[test]))
 		}
 	}
-	return nil
+	return errors.Join(missing...)
 }
 
 func scanQueryEventLine(data []byte, atEOF bool) (int, []byte, error) {

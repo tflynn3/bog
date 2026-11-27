@@ -601,3 +601,31 @@ func TestParityReportArtifactRead(t *testing.T) {
 		t.Fatalf("report one byte over the limit = %v", err)
 	}
 }
+
+func TestReportAggregatesMissingCasesWithRecordedFailures(t *testing.T) {
+	t.Parallel()
+	id := identity{1, testRevision, strings.Repeat("a", 64), capacityFixtureID}
+	detail := "startup failed\nprocess group teardown failed"
+	skip := "prerequisite failed"
+	raw, err := json.Marshal(report{id, map[string]outcome{
+		"z_probe": {Status: "fail", Detail: &detail},
+		"a_probe": {Status: "fail"},
+		"skipped": {Status: "skip", Detail: &skip},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	required := []string{"missing_z", "skipped", "z_probe", "missing_a", "a_probe", "missing_a"}
+	want := strings.Join([]string{
+		`case "a_probe": expected pass, got "fail"`,
+		`case "z_probe": expected pass, got "fail": startup failed`,
+		"process group teardown failed",
+		`case "skipped": expected pass, got "skip": prerequisite failed`,
+		`missing required case "missing_a"`,
+		`missing required case "missing_z"`,
+	}, "\n")
+	err = validateReport(raw, id, required)
+	if !errors.Is(err, errSkippedCase) || err.Error() != want {
+		t.Fatalf("validation = %v, want:\n%s", err, want)
+	}
+}

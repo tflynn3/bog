@@ -267,3 +267,81 @@ func TestBothQueryEventFilesCheckInputs(t *testing.T) {
 		})
 	}
 }
+
+func TestQueryQualificationSharesBudgetAcrossFiles(t *testing.T) {
+	t.Parallel()
+
+	id := identity{Revision: testRevision, BinarySHA256: strings.Repeat("a", 64)}
+	model := passingQueryEvents(t, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id)
+	model += "{\"Action\":\"build-output\",\"ImportPath\":\"bog/other\",\"Output\":\"ignored\"}\r\n"
+	handlers := passingQueryEvents(t, queryHandlerTests, nil, id)
+	handlers += `{"Action":"output","Package":"bog/other","Output":"ignored"}` // No final newline.
+	wireBytes := int64(len(model) + len(handlers))
+	wireEvents := strings.Count(model, "\n") + strings.Count(handlers, "\n") + 1
+
+	dir := t.TempDir()
+	modelPath, handlerPath := filepath.Join(dir, "model.jsonl"), filepath.Join(dir, "handlers.jsonl")
+	writeFixture(t, modelPath, []byte(model))
+	writeFixture(t, handlerPath, []byte(handlers))
+	for _, tc := range []struct {
+		name        string
+		bytes       int64
+		events      int
+		want        error
+		diagnostics []string
+	}{
+		{"inclusive ceilings", wireBytes, wireEvents, nil, nil},
+		{"combined byte overflow", wireBytes - 1, wireEvents, errArtifactOversized,
+			[]string{fmt.Sprintf("query handler events: open %q", handlerPath), fmt.Sprint(wireBytes - 1)}},
+		{"combined count overflow", wireBytes, wireEvents - 1, errQueryEventCount,
+			[]string{fmt.Sprintf("query handler events: validate %q", handlerPath), fmt.Sprintf("line %d", strings.Count(handlers, "\n")+1)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			budget := newQueryEventBudget(tc.bytes, tc.events)
+			err := validateQueryQualificationWithBudget(t.Context(), modelPath, handlerPath, id, budget)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("validation = %v, want %v", err, tc.want)
+			}
+			for _, diagnostic := range tc.diagnostics {
+				if !strings.Contains(err.Error(), diagnostic) {
+					t.Fatalf("validation = %v, want %q", err, diagnostic)
+				}
+			}
+			if err == nil && (budget.bytesLeft != 0 || budget.eventsLeft != 0) {
+				t.Fatalf("exact input left budget %+v", budget)
+			}
+		})
+	}
+}
+
+func TestQueryEventBudgetAfterInvalidInput(t *testing.T) {
+	t.Parallel()
+
+	failed := queryEventLine(t, "fail", "TestOptional", "")
+	ignored := queryEventLine(t, "output", "TestOptional", "ignored")
+	wire := failed + ignored + ignored
+	budget := newQueryEventBudget(int64(len(wire)), 2)
+	err := validateQueryEventsWithBudget(t.Context(), strings.NewReader(wire), budget, nil, nil, identity{})
+	want := "TestOptional reported failure\nread Go test events at line 3: query event artifacts exceed event count limit (2 events)"
+	if !errors.Is(err, errQueryEventCount) || err.Error() != want || budget.bytesLeft != 0 || budget.eventsLeft != 0 {
+		t.Fatalf("validation = %v, budget %+v, want %q with exhausted budget", err, budget, want)
+	}
+}
+
+func TestQueryEventByteBudgetAcrossReaders(t *testing.T) {
+	t.Parallel()
+
+	pass := queryEventLine(t, "pass", "", "")
+	wire := pass + queryEventLine(t, "output", "TestOptional", "ignored")
+	budget := newQueryEventBudget(int64(len(pass)+len(wire)-1), 10)
+	if err := validateQueryEventsWithBudget(t.Context(), strings.NewReader(pass), budget, nil, nil, identity{}); err != nil {
+		t.Fatal(err)
+	}
+	// The second reader exposes more bytes than were available to its
+	// open-time check. Its unterminated token is the truncated second line.
+	err := validateQueryEventsWithBudget(t.Context(), strings.NewReader(wire), budget, nil, nil, identity{})
+	want := fmt.Sprintf("read Go test events at line 2: aggregate query event budget: artifact exceeds byte limit (%d bytes)", budget.byteLimit)
+	if !errors.Is(err, errArtifactOversized) || err.Error() != want || !budget.byteOverflow || budget.bytesLeft != 0 {
+		t.Fatalf("validation = %v, budget %+v, want %q", err, budget, want)
+	}
+}

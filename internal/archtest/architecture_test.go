@@ -40,9 +40,9 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// At ddc0496f00812, cmd/bog reaches HTTP, readiness, store, and WAL on both
-// Linux targets. Promote retained libraries with measured #108 wiring and
-// activation evidence. The offline backup consumer is already registered.
+// The Cycle 174 base (c3724de2bb26f) reaches HTTP, readiness, store, and WAL
+// on both Linux targets. Record the exact #108 edges from the reviewed Storage
+// revision and promote the retained libraries with the command wiring.
 var registry = map[string]rule{
 	exportCommand:                {verifier, []string{goClient}},
 	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
@@ -89,12 +89,34 @@ func (p listedPackage) production() bool {
 }
 
 func TestLinuxArchitecture(t *testing.T) {
+	for _, problem := range retainedCutoverRoleProblems(registry) {
+		t.Error(problem)
+	}
 	for _, arch := range []string{"amd64", "arm64"} {
 		t.Run(arch, func(t *testing.T) {
 			t.Parallel()
 			checkLinuxArchitecture(t, arch)
 		})
 	}
+}
+
+// #108 lands one composition. A partial promotion would also leave the
+// constructor fitness rule inactive on a server reaching retained storage.
+func retainedCutoverRoleProblems(rules map[string]rule) []string {
+	retained := []string{"bog/internal/backup", "bog/internal/checkpoint", "bog/internal/history"}
+	var wired int
+	var pending []string
+	for _, path := range retained {
+		if rules[path].role == runtimeLibrary {
+			wired++
+		} else {
+			pending = append(pending, path)
+		}
+	}
+	if wired == 0 || len(pending) == 0 {
+		return nil
+	}
+	return []string{"partial #108 promotion: runtime registration still required for " + strings.Join(pending, ", ")}
 }
 
 func checkLinuxArchitecture(t *testing.T, arch string) {

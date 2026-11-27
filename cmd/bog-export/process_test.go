@@ -14,16 +14,23 @@ import (
 	"time"
 )
 
+func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == outputWorkerArg {
+		os.Exit(runOutputWorker())
+	}
+	os.Exit(m.Run())
+}
+
 func TestExportProcessHelper(t *testing.T) {
 	if os.Getenv("BOG_EXPORT_TEST_PROCESS") == "1" {
-		os.Args = append([]string{"bog-export"}, os.Args[3:]...)
+		os.Args = append(os.Args[:1], os.Args[3:]...)
 		main()
 	}
 }
 
 func exportProcess(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, os.Args[0], append([]string{"-test.run=^TestExportProcessHelper$", "--"}, args...)...)
-	cmd.Env = append(cmd.Environ(), "BOG_EXPORT_TEST_PROCESS=1")
+	cmd.Env = append(cmd.Environ(), "BOG_EXPORT_TEST_PROCESS=1", "GORACE=atexit_sleep_ms=0")
 	cmd.WaitDelay = time.Second
 	return cmd
 }
@@ -102,5 +109,27 @@ func TestExportProcessBrokenPipe(t *testing.T) {
 	cmd.Stdout, cmd.Stderr = writer, &stderr
 	if status := exitStatus(t, cmd.Run()); status != exitIncomplete || !strings.Contains(stderr.String(), "write stdout") {
 		t.Errorf("exit = %d, stderr = %q", status, stderr.String())
+	}
+}
+
+func TestExportProcessLargeRecord(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	row := `{"ts":"2025-01-01T00:00:02Z","line":"` + strings.Repeat("x", 8*outputChunkSize) + "\"}\n"
+	want := rowA + row + row
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		servePage(t, w, "", want)
+	}))
+	defer server.Close()
+
+	cmd := exportProcess(ctx, argsFor(server.URL)...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("export: %v, stderr = %q", err, stderr.String())
+	}
+	if stdout.String() != want || stderr.Len() > 0 {
+		t.Errorf("got %d stdout bytes, want %d exact bytes, stderr = %q", stdout.Len(), len(want), stderr.String())
 	}
 }

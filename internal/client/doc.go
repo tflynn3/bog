@@ -35,8 +35,11 @@
 // with the last failed attempt.
 // Use Client.NewBoundedWalkWithContext to bind a caller-owned context to every
 // page and retry delay. A single deadline on that context covers the entire
-// walk, including time between calls. Cancellation preserves previously
-// accepted pages and prevents further requests on that walk.
+// walk, including time between calls. Use the same context when consuming
+// rows to include downstream output in that deadline. Page retries cover
+// fetching only. Once NextPageWithRetry returns a page, the walk has advanced
+// and will not replay it if output stops partway through. Cancellation
+// preserves previously accepted pages and prevents further requests.
 //
 // # Routing and restarting a walk
 //

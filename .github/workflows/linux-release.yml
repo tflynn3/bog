@@ -40,7 +40,7 @@ jobs:
             tuning_key: GOARM64
             tuning: v8.0
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 80
+    timeout-minutes: 90
     env:
       EXPECTED_ARCH: ${{ matrix.arch }}
       EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
@@ -172,8 +172,14 @@ jobs:
             require_flags "candidate server" "$candidate_help" addr data-dir query-concurrency query-max-response-bytes query-work-budget
             (
               cd gate
-              require_tests ./verify/release TestValidateCommand TestValidateRecoveryEvidence TestValidateCutoverCapacityProof
+              require_tests ./verify/release TestValidateCommand TestValidateRecoveryEvidence \
+                TestValidateCutoverCapacityProof TestValidatePostRestoreAckCrashEvidence
               require_tests ./bench/retained-history TestStrictCutoverReportProof
+              require_tests ./verify/capacityevidence TestValidateCapacityObservations
+            )
+            (
+              cd candidate
+              require_tests ./bench/retained-history TestLivePinProbeWithRepeatedMetrics TestLiveRuntimeMetricsRoundTrip
             )
           } 2>&1 | tee "$EVIDENCE/preflight.log"
 
@@ -330,10 +336,70 @@ jobs:
 
       - name: Race-test release verifier lifecycle
         if: always() && steps.build.outcome == 'success'
-        timeout-minutes: 10
+        timeout-minutes: 14
         env:
           CGO_ENABLED: '1'
         run: |
+          candidate_storage_race() (
+            cd candidate || exit
+            local checkout_sha repetitions=3 events="$EVIDENCE/candidate-storage-race-events.jsonl"
+            checkout_sha=$(git rev-parse HEAD) || exit
+            [[ "$checkout_sha" == "$REVISION" ]] || exit 1
+            printf 'candidate storage race checkout_sha=%s arch=%s fixture=%s repetitions=%d\n' \
+              "$checkout_sha" "$EXPECTED_ARCH" "$FIXTURE" "$repetitions" || exit
+            sha256sum --check "$EVIDENCE/binary.sha256" || exit
+            cat "$EVIDENCE/binary.sha256" || exit
+            timeout --kill-after=5s 180s go test -json -race -count="$repetitions" -timeout=160s \
+              -run '^(TestQueuedGroupAndClose|TestCheckpointSegmentCeiling)$' ./internal/wal ./verify/fuzz |
+              tee "$events" || exit
+            sha256sum --check "$EVIDENCE/binary.sha256" || exit
+            python3 - "$events" "$repetitions" <<'PY'
+          import json
+          import re
+          import sys
+          from collections import Counter
+
+          path, repetitions = sys.argv[1:]
+          wal = ("bog/internal/wal", "TestQueuedGroupAndClose")
+          ceiling = ("bog/verify/fuzz", "TestCheckpointSegmentCeiling")
+          required = {
+              "cancel-staged-block", "manifest-budget", "sigkill-staged", "recover-overlap",
+              "recover-retirement", "sigkill-1", "rename-enoent", "sigkill-2",
+          }
+          worker_result = re.compile(r"\s*--- (PASS|FAIL|SKIP): TestCheckpointSegmentCeiling/(\S+) \([^)]+\)\s*")
+          passes = Counter()
+          cases = Counter()
+          with open(path, encoding="utf-8") as events:
+              for line in events:
+                  event = json.loads(line)
+                  target = (event.get("Package"), event.get("Test"))
+                  if target not in (wal, ceiling):
+                      continue
+                  action = event["Action"]
+                  if action in ("fail", "skip"):
+                      sys.exit(f"{target[1]} reported {action}")
+                  if target == ceiling and action == "output":
+                      # The ceiling test logs its subprocess's verbose test output.
+                      match = worker_result.fullmatch(event["Output"])
+                      if match and match[2] in required:
+                          if match[1] != "PASS":
+                              sys.exit(f"{ceiling[1]}/{match[2]} reported {match[1]}")
+                          cases[match[2]] += 1
+                  if action == "pass":
+                      if target == ceiling:
+                          for case in sorted(required):
+                              if cases[case] != 1:
+                                  sys.exit(f"{ceiling[1]}/{case} reported {cases[case]} passes "
+                                           f"in repetition {passes[ceiling] + 1}, expected 1")
+                          cases.clear()
+                      passes[target] += 1
+          for target in (wal, ceiling):
+              if passes[target] != int(repetitions):
+                  sys.exit(f"{target[1]} reported {passes[target]} passes, expected {repetitions}")
+          print(f"PASS {wal[1]} ({repetitions} repetitions)")
+          print(f"PASS {ceiling[1]} ({repetitions} repetitions each): {', '.join(sorted(required))}")
+          PY
+          )
           race_checkout() (
             local checkout=$1 expected_sha=$2 status=0
             shift 2
@@ -347,6 +413,7 @@ jobs:
           )
           {
             failed=0
+            candidate_storage_race || failed=1
             race_checkout candidate "$REVISION" ./internal/archtest ./verify/linux ./verify/listener \
               ./verify/release ./bench/retained-history ./verify/fuzz || failed=1
             gate_packages=(./verify/query-model)

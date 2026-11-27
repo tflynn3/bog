@@ -61,19 +61,16 @@ func startInterrupted(t *testing.T, mode, source, dest string) func() {
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^TestInterruptionWorker$", "-test.count=1")
 	cmd.Env = append(cmd.Environ(), interruptionEnv+"="+mode, sourceEnv+"="+source, destEnv+"="+dest)
 	cmd.ExtraFiles = []*os.File{writer}
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	output := new(replayWorkerLog)
+	cmd.Stdout, cmd.Stderr = output, output
+	cmd.WaitDelay = time.Second
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	// Linux associates the parent-death signal with the launching thread.
 	// Keep that thread alive until the worker is reaped.
-	runtime.LockOSThread()
-	if err := cmd.Start(); err != nil {
-		runtime.UnlockOSThread()
-		t.Fatalf("start %s worker: %v", mode, errors.Join(err, writer.Close()))
-	}
-	stopped := false
+	started, stopped := false, false
 	stop := func() {
 		t.Helper()
-		if stopped {
+		if !started || stopped {
 			return
 		}
 		stopped = true
@@ -84,13 +81,19 @@ func startInterrupted(t *testing.T, mode, source, dest string) func() {
 			killErr = nil
 		}
 		waitErr := cmd.Wait()
-		must(t, killErr)
+		must(t, errors.Join(killErr, output.limitError()))
 		var exit *exec.ExitError
 		if cancelled != nil || !errors.As(waitErr, &exit) || exit.ProcessState.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
-			t.Fatalf("interrupt %s worker: wait=%v context=%v, want SIGKILL", mode, waitErr, cancelled)
+			t.Fatalf("interrupt %s worker: wait=%v context=%v, want SIGKILL\n%s", mode, waitErr, cancelled, output.buffer.Bytes())
 		}
 	}
 	t.Cleanup(stop)
+	runtime.LockOSThread()
+	if err := cmd.Start(); err != nil {
+		runtime.UnlockOSThread()
+		t.Fatalf("start %s worker: %v", mode, errors.Join(err, writer.Close()))
+	}
+	started = true
 	must(t, writer.Close())
 	deadline, _ := ctx.Deadline()
 	must(t, reader.SetReadDeadline(deadline))

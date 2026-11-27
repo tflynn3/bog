@@ -19,6 +19,7 @@ import (
 	"bog/internal/history"
 	"bog/internal/store"
 	"bog/internal/wal"
+	querymodel "bog/verify/query-model"
 )
 
 const checkpointStage = ".bog-checkpoint-stage"
@@ -97,7 +98,16 @@ func runCheckpointCorpus(t *testing.T) {
 		checkPublicationCandidate(t, f, valid, 2, nil, checkpoint.ErrIntegrity)
 	})
 	t.Run("staging-admission", func(t *testing.T) {
-		checkPublicationCandidate(t, f, valid, 3, nil, checkpoint.ErrExhausted)
+		checkPublicationCandidate(t, f, valid, uint64(len(f.rows)), nil, checkpoint.ErrExhausted)
+	})
+	t.Run("stale-commit-marker", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "owner")
+		stale := markerAt(f.disk[commitFile], uint64(len(f.first.wal)))
+		writeFiles(t, path, files{walFile: f.full.wal, commitFile: stale})
+		want := f.first.expect([sha256.Size]byte{}, files{walFile: f.first.wal, commitFile: stale})
+		for range 2 {
+			must(t, checkReplay(t.Context(), observeReopenedWAL(path), want))
+		}
 	})
 	t.Run("interrupted-before-manifest-rename", func(t *testing.T) {
 		checkpointInterruption(t, f)
@@ -223,6 +233,10 @@ func checkpointInterruption(t *testing.T, f recoveryFixture) {
 	t.Log("phase=segments-installed-before-manifest-rename")
 	stop()
 
+	must(t, checkReplay(t.Context(), func(ctx context.Context, emit func(querymodel.Entry) error) (replayEvidence, error) {
+		return loadReplayCheckpoint(ctx, path, nil, emit)
+	}, replayExpectation{reject: checkpoint.ErrPublicationUncertain}))
+
 	log := openOwner(t, path)
 	assertWALPoint(t, log, f.disk[walFile], uint64(len(f.rows)))
 	root, dir := openPublicationDir(t, path)
@@ -246,6 +260,7 @@ func checkpointInterruption(t *testing.T, f recoveryFixture) {
 		return previous, nil
 	}))
 	assertFiles(t, path, before)
+	checkCheckpointReplay(t, f.first, historyFiles(before))
 	var catalog history.Catalog
 	t.Cleanup(func() { must(t, catalog.Close()) })
 	assertGeneration(t, &catalog, path, input[:f.firstEnd], f.rows[:1])
@@ -253,6 +268,9 @@ func checkpointInterruption(t *testing.T, f recoveryFixture) {
 	must(t, err)
 	must(t, checkpoint.CheckPublication(dir))
 	assertGeneration(t, &catalog, path, input, f.rows)
+	successor := historyFiles(readFiles(t, path))
+	checkCheckpointReplay(t, f.full, successor)
+	checkTruncatedCheckpointReplay(t, successor)
 }
 
 func interruptCheckpoint(t *testing.T, path string, park func()) {

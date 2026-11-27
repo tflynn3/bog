@@ -30,29 +30,34 @@ const (
 var recoveryEnd = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
 
 type recoveryFixture struct {
-	disk     files
-	firstEnd int
-	rows     []store.Row
+	disk        files
+	firstEnd    int
+	rows        []store.Row
+	first, full replayView
 }
 
 func newRecoveryFixture(t testing.TB, dir string) recoveryFixture {
 	t.Helper()
-	rows := []store.Row{
-		{TS: start.Add(time.Second), Line: "first durable frame"},
-		{TS: start, Line: "backfilled row"},
-		{TS: start.Add(time.Second), Line: "tied timestamp"},
-	}
+	batches := replayHistory(17)
+	var ledger committedBatchLedger
 	var s store.Store
 	log, err := wal.Open(dir, &s)
 	must(t, err)
-	firstEnd := func() int {
+	func() {
 		defer func() { must(t, log.Close()) }()
-		appendRows(t, log, rows[:1])
-		first := readArtifact(t, filepath.Join(dir, walFile))
-		appendRows(t, log, rows[1:])
-		return len(first)
+		for _, rows := range batches[:2] {
+			appendReplayBatch(t, log, &ledger, rows)
+		}
 	}()
-	return recoveryFixture{readFiles(t, dir), firstEnd, rows}
+	first, full := fixtureReplayView(t, &ledger, 1, 1), fixtureReplayView(t, &ledger, 2, 2)
+	disk := readFiles(t, dir)
+	if !bytes.Equal(disk[walFile], full.wal) {
+		t.Fatal("acknowledged fixture WAL differs from the ledger frames")
+	}
+	return recoveryFixture{
+		disk: disk, firstEnd: len(first.wal), rows: slices.Concat(batches[:2]...),
+		first: first, full: full,
+	}
 }
 
 func appendRows(t testing.TB, log *wal.Log, rows []store.Row) {

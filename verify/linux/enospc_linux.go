@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,89 +12,28 @@ import (
 	"time"
 )
 
-type diskReadiness struct {
-	ready            bool
-	reason, category string
-}
-
-var (
-	diskReady    = diskReadiness{ready: true, reason: "ready"}
-	diskPending  = diskReadiness{reason: "sampling_pending"}
-	diskLow      = diskReadiness{reason: "low_disk_headroom"}
-	diskRollback = diskReadiness{reason: "wal_rollback", category: "enospc"}
-)
-
-func (s *server) diskReadiness(ctx context.Context) (_ diskReadiness, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+s.addr+"/ready", nil)
-	if err != nil {
-		return diskReadiness{}, err
-	}
-	res, err := s.client.Do(req)
-	if err != nil {
-		return diskReadiness{}, err
-	}
-	defer func() { err = errors.Join(err, res.Body.Close()) }()
-	const maxBody = 1024
-	body, err := io.ReadAll(io.LimitReader(res.Body, maxBody+1))
-	if err != nil {
-		return diskReadiness{}, err
-	}
-	if len(body) > maxBody {
-		return diskReadiness{}, errors.New("oversized readiness response")
-	}
-	var decoded struct {
-		Ready    *bool  `json:"ready"`
-		Reason   string `json:"reason"`
-		Category string `json:"category"`
-	}
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		return diskReadiness{}, fmt.Errorf("decode readiness: %w", err)
-	}
-	if decoded.Ready == nil || decoded.Reason == "" ||
-		(*decoded.Ready && res.StatusCode != http.StatusOK) ||
-		(!*decoded.Ready && res.StatusCode != http.StatusServiceUnavailable) {
-		return diskReadiness{}, fmt.Errorf("inconsistent readiness HTTP %d: %.200q", res.StatusCode, body)
-	}
-	return diskReadiness{*decoded.Ready, decoded.Reason, decoded.Category}, nil
-}
-
-const readinessTimeout = 10 * time.Second
-const readinessPoll = 100 * time.Millisecond
-
-// Cover the five-second readiness evidence lifetime and another sample tick.
-const retargetObservation = 6 * time.Second
-
-// observeDiskReadiness allows a known transient state only before the first
-// expected sample. A stable observation fails on any subsequent divergence.
-func (s *server) observeDiskReadiness(ctx context.Context, want diskReadiness, transient diskReadiness, stableFor time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, readinessTimeout)
-	defer cancel()
-	ticker := time.NewTicker(readinessPoll)
-	defer ticker.Stop()
-	var since time.Time
-	for {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("waiting for readiness %q: %w", want.reason, err)
-		}
-		got, err := s.diskReadiness(ctx)
-		if err != nil {
-			return fmt.Errorf("probe readiness %q: %w", want.reason, err)
-		}
-		if got == want {
-			if since.IsZero() {
-				since = time.Now()
+func (s *server) observeDiskReadiness(ctx context.Context, phase string, want, transient diskReadiness, stableFor time.Duration) (last readinessObservation, err error) {
+	var evidence *readinessEvidence
+	if d := s.diagnostics; d != nil {
+		evidence = &readinessEvidence{ExpectedReason: want.reason, StableFor: stableFor}
+		d.Readiness[s.observationKey(phase)] = evidence
+		defer func() {
+			if err != nil {
+				evidence.Error = diagnosticError(err)
 			}
-			if time.Since(since) >= stableFor {
-				return ctx.Err()
-			}
-		} else if got != transient || !since.IsZero() {
-			return fmt.Errorf("readiness %+v, want %+v", got, want)
-		}
-		select {
-		case <-ctx.Done():
-		case <-ticker.C:
-		}
+		}()
 	}
+	return pollDiskReadiness(ctx, want, transient, stableFor, func(ctx context.Context) (readinessObservation, error) {
+		obs, err := readDiskReadiness(ctx, s.client, s.addr)
+		if d := s.diagnostics; d != nil {
+			obs.Lifetime = len(d.Candidates)
+		}
+		return obs, err
+	}, func(obs readinessObservation, err error) {
+		if evidence != nil {
+			s.diagnostics.observeReadiness(evidence, obs, err)
+		}
+	})
 }
 
 func diskCase(ctx context.Context, binary, root string, diag *caseDiagnostics) (diskEvidence, error) {
@@ -105,7 +42,7 @@ func diskCase(ctx context.Context, binary, root string, diag *caseDiagnostics) (
 		if err != nil {
 			return fmt.Errorf("configure candidate: %w", err)
 		}
-		s.diagnostics = diag
+		s.diagnostics, s.direction = diag, direction
 		defer func() {
 			if closeErr := s.close(); closeErr != nil {
 				err = errors.Join(err, fmt.Errorf("clean up candidate: %w", closeErr))
@@ -126,7 +63,7 @@ func checkFullToHealthy(ctx context.Context, s *server, fixture *diskFixture, pr
 	if err := s.start(ctx); err != nil {
 		return err
 	}
-	if err := s.observeDiskReadiness(ctx, diskReady, diskPending, 0); err != nil {
+	if _, err := s.observeDiskReadiness(ctx, "before_fill", diskReady, diskPending, 0); err != nil {
 		return fmt.Errorf("ready on tmpfs before fill: %w", err)
 	}
 	l, err := seed(ctx, s)
@@ -141,27 +78,22 @@ func checkFullToHealthy(ctx context.Context, s *server, fixture *diskFixture, pr
 		return fmt.Errorf("induce kernel ENOSPC: %w", err)
 	}
 	proof.ObservedENOSPC, proof.Errno = true, "ENOSPC"
-	if err := s.observeDiskReadiness(ctx, diskLow, diskReady, 0); err != nil {
+	if _, err := s.observeDiskReadiness(ctx, "before_retarget", diskLow, diskReady, 0); err != nil {
 		return fmt.Errorf("readiness before retargeting the full filesystem: %w", err)
 	}
 	if err := retargetDirectory(fixture.link, fixture.healthy); err != nil {
 		return err
 	}
-	if err := s.observeDiskReadiness(ctx, diskLow, diskReadiness{}, retargetObservation); err != nil {
+	afterRetarget, err := s.observeDiskReadiness(ctx, "after_retarget", diskLow, diskReadiness{}, retargetObservation)
+	if err != nil {
 		return fmt.Errorf("readiness after retarget: %w", err)
 	}
-	proof.FullToHealthy.ReadinessStatus = http.StatusServiceUnavailable
-	proof.FullToHealthy.ReadinessReason = diskLow.reason
+	proof.FullToHealthy.ReadinessStatus = *afterRetarget.Status
+	proof.FullToHealthy.ReadinessReason = afterRetarget.Reason
 	rows := fixtureRows("disk-rejected", 2, 1, strings.Repeat("x", 32<<10))
-	if err := s.submit(ctx, rows, "", http.StatusServiceUnavailable); err != nil {
+	if err := s.checkFullRetargetIngest(ctx, rows, proof.FullToHealthy); err != nil {
 		return err
 	}
-	proof.FullToHealthy.IngestStatus = http.StatusServiceUnavailable
-	if err := s.observeDiskReadiness(ctx, diskRollback, diskReadiness{}, 0); err != nil {
-		return fmt.Errorf("readiness after rejected ingest: %w", err)
-	}
-	proof.FullToHealthy.PostIngestReason = diskRollback.reason
-	proof.FullToHealthy.PostIngestCategory = diskRollback.category
 	l = append(l, batch{rows, rejected})
 	if _, err := s.reconcile(ctx, l, "", nil); err != nil {
 		return fmt.Errorf("queries on full filesystem: %w", err)
@@ -187,7 +119,7 @@ func checkFullToHealthy(ctx context.Context, s *server, fixture *diskFixture, pr
 		return err
 	}
 	rows = fixtureRows("space-freed", 3, 1, "")
-	if err := s.submit(ctx, rows, "", http.StatusNoContent); err != nil {
+	if err := s.submit(ctx, "space_freed", rows, "", http.StatusNoContent); err != nil {
 		return err
 	}
 	l = append(l, batch{rows, acknowledged})
@@ -206,11 +138,34 @@ func checkFullToHealthy(ctx context.Context, s *server, fixture *diskFixture, pr
 	return s.process.stop(syscall.SIGTERM)
 }
 
+func (s *server) checkFullRetargetIngest(ctx context.Context, rows []row, proof *retargetEvidence) error {
+	const phase = "retarget_ingest"
+	submitErr := s.submit(ctx, phase, rows, "", http.StatusServiceUnavailable)
+	if submitErr == nil {
+		proof.IngestStatus = http.StatusServiceUnavailable
+	}
+	// A failed response can still leave an observable WAL state while the
+	// same candidate is serving. Keep the original ingest error.
+	post, probeErr := s.observeDiskReadiness(ctx, "after_ingest", diskRollback, diskReadiness{}, 0)
+	if post.state() == diskRollback && s.diagnostics != nil {
+		s.diagnostics.confirmRollback(s.observationKey(phase), post)
+	}
+	if probeErr != nil {
+		probeErr = fmt.Errorf("readiness after rejected ingest: %w", probeErr)
+	}
+	if err := errors.Join(submitErr, probeErr); err != nil {
+		return err
+	}
+	proof.PostIngestReason = post.Reason
+	proof.PostIngestCategory = post.Category
+	return nil
+}
+
 func checkHealthyToFull(ctx context.Context, s *server, fixture *diskFixture, proof *diskEvidence) error {
 	if err := s.start(ctx); err != nil {
 		return err
 	}
-	if err := s.observeDiskReadiness(ctx, diskReady, diskPending, 0); err != nil {
+	if _, err := s.observeDiskReadiness(ctx, "before_fill", diskReady, diskPending, 0); err != nil {
 		return err
 	}
 	if err := fillFilesystem(fixture.filler); err != nil {
@@ -220,13 +175,14 @@ func checkHealthyToFull(ctx context.Context, s *server, fixture *diskFixture, pr
 	if err := retargetDirectory(fixture.link, fixture.full); err != nil {
 		return err
 	}
-	if err := s.observeDiskReadiness(ctx, diskReady, diskReadiness{}, retargetObservation); err != nil {
+	afterRetarget, err := s.observeDiskReadiness(ctx, "after_retarget", diskReady, diskReadiness{}, retargetObservation)
+	if err != nil {
 		return err
 	}
-	proof.HealthyToFull.ReadinessStatus = http.StatusOK
-	proof.HealthyToFull.ReadinessReason = diskReady.reason
+	proof.HealthyToFull.ReadinessStatus = *afterRetarget.Status
+	proof.HealthyToFull.ReadinessReason = afterRetarget.Reason
 	rows := fixtureRows("healthy-retarget", 2, 1, "")
-	if err := s.submit(ctx, rows, "", http.StatusNoContent); err != nil {
+	if err := s.submit(ctx, "retarget_ingest", rows, "", http.StatusNoContent); err != nil {
 		return err
 	}
 	proof.HealthyToFull.IngestStatus = http.StatusNoContent

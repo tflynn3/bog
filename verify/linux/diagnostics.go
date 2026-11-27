@@ -9,19 +9,26 @@ import (
 )
 
 type caseDiagnostics struct {
-	Candidates     []*processEvidence        `json:"candidates"`
-	Queries        map[string]*queryEvidence `json:"queries"`
-	ReplayDuration *time.Duration            `json:"replay_duration_ns"`
-	Unavailable    map[string]string         `json:"unavailable"`
+	Candidates     []*processEvidence                               `json:"candidates"`
+	Queries        map[string]*queryEvidence                        `json:"queries"`
+	Readiness      map[string]*readinessEvidence                    `json:"readiness,omitempty"`
+	Ingest         map[string]*observationSeries[ingestObservation] `json:"ingest,omitempty"`
+	UncertainWAL   *readinessObservation                            `json:"uncertain_wal_outcome,omitempty"`
+	ReplayDuration *time.Duration                                   `json:"replay_duration_ns"`
+	Unavailable    map[string]string                                `json:"unavailable"`
 }
 
 func newCaseDiagnostics() *caseDiagnostics {
 	return &caseDiagnostics{
-		Queries: make(map[string]*queryEvidence),
+		Queries:   make(map[string]*queryEvidence),
+		Readiness: make(map[string]*readinessEvidence),
+		Ingest:    make(map[string]*observationSeries[ingestObservation]),
 		Unavailable: map[string]string{
-			"replay_duration":       "candidate does not expose replay-only timing",
-			"storage_metrics":       "checkpoint staging and pin records are sampled by the live capacity runner",
-			"compaction_ingest_p99": "durability fixtures do not drive live compaction",
+			"replay_duration":              "candidate does not expose replay-only timing",
+			"storage_metrics":              "checkpoint staging and pin records are sampled by the live capacity runner",
+			"uncertain_wal_outcome":        "no validated recovery_required readiness response was observed",
+			"cgroup_peak_and_retired_pins": "observed separately by the live capacity runner in capacity.json",
+			"compaction_ingest_p99":        "durability fixtures do not drive live compaction",
 		},
 	}
 }
@@ -132,4 +139,62 @@ func diagnosticError(err error) string {
 	}
 	s := err.Error()
 	return s[:min(len(s), 512)]
+}
+
+// Probe keys are fixed by the fixtures. Store a constant number of samples
+// per key even when polling stability or submitting benchmark batches.
+type observationSeries[T any] struct {
+	Attempts     int `json:"attempts"`
+	First        *T  `json:"first,omitempty"`
+	Last         *T  `json:"last,omitempty"`
+	FirstFailure *T  `json:"first_failure,omitempty"`
+}
+
+func (s *observationSeries[T]) record(obs T, failed bool) {
+	s.Attempts++
+	if s.First == nil {
+		s.First = &obs
+	}
+	s.Last = &obs
+	if failed && s.FirstFailure == nil {
+		s.FirstFailure = &obs
+	}
+}
+
+type readinessEvidence struct {
+	ExpectedReason string        `json:"expected_reason"`
+	StableFor      time.Duration `json:"required_stable_ns"`
+	observationSeries[readinessObservation]
+	Error string `json:"detail,omitempty"`
+}
+
+func (d *caseDiagnostics) observeReadiness(e *readinessEvidence, obs readinessObservation, err error) {
+	if err != nil {
+		obs.Error = diagnosticError(err)
+	}
+	e.record(obs, err != nil)
+	if obs.Ready != nil && !*obs.Ready && obs.Reason == "recovery_required" && d.UncertainWAL == nil {
+		d.UncertainWAL = &obs
+		delete(d.Unavailable, "uncertain_wal_outcome")
+	}
+}
+
+func (d *caseDiagnostics) observeIngest(key string, obs ingestObservation, err error) {
+	if err != nil {
+		obs.Error = diagnosticError(err)
+	}
+	e := d.Ingest[key]
+	if e == nil {
+		e = &observationSeries[ingestObservation]{}
+		d.Ingest[key] = e
+	}
+	e.record(obs, err != nil)
+}
+
+func (d *caseDiagnostics) confirmRollback(key string, obs readinessObservation) {
+	e := d.Ingest[key]
+	if e != nil && e.Last.Outcome == ingestWALRefused && e.Last.Lifetime == obs.Lifetime && obs.state() == diskRollback {
+		e.Last.Outcome = ingestRolledBack
+		e.Last.Rollback = &obs
+	}
 }

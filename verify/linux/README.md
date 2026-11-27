@@ -125,6 +125,24 @@ and stale-cursor checks. It retains counts by client-observed admission,
 maximum phase durations, the latest attempt, and the first query failure
 when present. Case evidence still carries the ledger and retarget checks.
 
+Readiness observations include the HTTP status, parsed reason and category,
+and response timing. Ingest observations include batch size, expected and
+observed status, and the outcome seen by the client. Both use the candidate
+lifetime number and keep the first and latest samples, the first failure,
+and an attempt count for each fixture phase. The ENOSPC keys prefix the
+phase with the retarget direction. These fields are available even when a
+probe fails before query reconciliation or restart.
+
+HTTP 204 records an acknowledged durable batch. A WAL refusal followed by
+matching `wal_rollback` readiness on the same candidate records an
+observed rollback. A dropped response or the intentional SIGKILL
+interruption can leave the batch transport-ambiguous. The crash ledger
+then checks whether restart recovered all or none of the interrupted batch.
+The report records an uncertain WAL outcome only when it receives a valid
+`recovery_required` readiness response. Otherwise it keeps the reason
+under `unavailable`. Use `capacity.json` for the cgroup memory peak and
+retired-generation pin observations.
+
 For a fresh backfill deadline, read the pinned admission report in sequence.
 The release probe holds a continuation at zero receive window, verifies
 prompt rejection of a competing query and HTTP 204 for ingest, then

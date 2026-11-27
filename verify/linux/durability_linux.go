@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -21,13 +22,13 @@ func seed(ctx context.Context, s *server) (ledger, error) {
 	for i := range 3 {
 		// Names descend so sorting by line can't accidentally satisfy tie order.
 		rows := fixtureRows(fmt.Sprintf("ordered-%d", 2-i), 3, 1+i/2, "")
-		if err := s.submit(ctx, rows, "", http.StatusNoContent); err != nil {
+		if err := s.submit(ctx, "seed", rows, "", http.StatusNoContent); err != nil {
 			return nil, err
 		}
 		l = append(l, batch{rows, acknowledged})
 	}
 	rows := fixtureRows("invalid", 2, 1, "")
-	if err := s.submit(ctx, rows, "{\n", http.StatusBadRequest); err != nil {
+	if err := s.submit(ctx, "invalid_batch", rows, "{\n", http.StatusBadRequest); err != nil {
 		return nil, err
 	}
 	return append(l, batch{rows, rejected}), nil
@@ -58,6 +59,12 @@ func sigkillCase(ctx context.Context, s *server) (any, error) {
 }
 
 func (s *server) interrupt(ctx context.Context, rows []row) (err error) {
+	start := time.Now()
+	obs := ingestObservation{Rows: len(rows), Outcome: ingestNotSubmitted}
+	defer func() {
+		obs.Elapsed = time.Since(start)
+		s.recordIngest("sigkill_interrupt", obs, err)
+	}()
 	payload, err := encodeRows(rows)
 	if err != nil {
 		return err
@@ -76,18 +83,30 @@ func (s *server) interrupt(ctx context.Context, rows []row) (err error) {
 	if _, err := fmt.Fprintf(conn, "POST /ingest HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n", s.addr, len(payload)); err != nil {
 		return err
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	resp, err := http.ReadResponse(bufio.NewReader(io.LimitReader(conn, 16<<10)), nil)
 	if err != nil {
 		return err
 	}
+	if resp.StatusCode != http.StatusContinue {
+		obs.Status = &resp.StatusCode
+		elapsed := time.Since(start)
+		obs.Headers = &elapsed
+		obs.Outcome = ingestUnexpectedResponse
+		return errors.Join(fmt.Errorf("interrupted request expected HTTP 100, got %d", resp.StatusCode), resp.Body.Close())
+	}
+	obs.ContinueStatus = &resp.StatusCode
 	if err := resp.Body.Close(); err != nil {
 		return err
 	}
-	if resp.StatusCode != http.StatusContinue {
-		return fmt.Errorf("interrupted request expected HTTP 100, got %d", resp.StatusCode)
+	n, err := conn.Write(payload)
+	if n > 0 {
+		obs.Outcome = ingestTransportAmbiguous
 	}
-	if _, err := conn.Write(payload); err != nil {
+	if err != nil {
 		return err
+	}
+	if n != len(payload) {
+		return io.ErrShortWrite
 	}
 	// The request reached the server, but we deliberately never read a final
 	// status. Recovery must contain either the whole batch or none of it.
@@ -171,7 +190,7 @@ func recoveryCase(ctx context.Context, s *server) (any, error) {
 		return proof, errors.New("missing pre-backfill snapshot")
 	}
 	rows := fixtureRows("backfill", 4, 1, "")
-	if err := s.submit(ctx, rows, "", http.StatusNoContent); err != nil {
+	if err := s.submit(ctx, "backfill", rows, "", http.StatusNoContent); err != nil {
 		return proof, err
 	}
 	if _, err := s.reconcile(ctx, l, cursor, first); err != nil {

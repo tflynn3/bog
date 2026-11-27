@@ -72,7 +72,7 @@ func benchmarkCase(ctx context.Context, s *server) (any, error) {
 	start := time.Now()
 	for _, payload := range payloads {
 		sent := time.Now()
-		if _, _, err := s.request(ctx, http.MethodPost, "/ingest", payload, http.StatusNoContent); err != nil {
+		if err := s.submitPayload(ctx, "benchmark_ingest", payload, benchmarkBatch, http.StatusNoContent, sent); err != nil {
 			return proof, err
 		}
 		ingest = append(ingest, time.Since(sent))

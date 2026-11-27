@@ -123,7 +123,7 @@ func TestQueryTransportFailureEvidence(t *testing.T) {
 		closeDelimited          bool
 	}{
 		{name: "close failure", body: invalid, phase: "close", want: "close failed", closeErr: closeErr},
-		{name: "oversized response still closes", body: strings.Repeat("x", maxResponseBody+2), phase: "body", want: "response exceeds 4 MiB", closeErr: closeErr},
+		{name: "oversized response still closes", body: strings.Repeat("x", maxResponseBody+2), phase: "body", want: "response exceeds 4194304 bytes", closeErr: closeErr},
 		{name: "close-delimited response", body: invalid, phase: "validation", want: "unverifiable HTTP framing", closeDelimited: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

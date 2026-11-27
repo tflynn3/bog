@@ -5,12 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -168,6 +166,7 @@ type server struct {
 	client            *http.Client
 	process           *child
 	diagnostics       *caseDiagnostics
+	direction         diskDirection
 	current           *processEvidence
 }
 
@@ -302,47 +301,10 @@ func (s *server) startupExit() error {
 	return fmt.Errorf("candidate exited before health (%v): %s", s.process.result, s.process.logs.text())
 }
 
-// httpExchange carries the received response and transport timings. The body
-// is always closed before exchange returns, including after a partial read.
-type httpExchange struct {
-	response  *http.Response
-	body      []byte
-	headersAt *time.Duration
-	bodyAt    *time.Duration
-}
-
 const maxResponseBody = 4 << 20
 
 func (s *server) exchange(ctx context.Context, method, path string, data []byte, start time.Time) (httpExchange, error) {
-	var result httpExchange
-	req, err := http.NewRequestWithContext(ctx, method, "http://"+s.addr+path, bytes.NewReader(data))
-	if err != nil {
-		return result, err
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return result, err
-	}
-	headersAt := time.Since(start)
-	result.response, result.headersAt = resp, &headersAt
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody+1))
-	result.body = body
-	if len(body) > maxResponseBody {
-		readErr = errors.Join(readErr, errors.New("response exceeds 4 MiB"))
-	}
-	if readErr == nil {
-		bodyAt := time.Since(start)
-		result.bodyAt = &bodyAt
-	}
-	return result, errors.Join(readErr, resp.Body.Close())
-}
-
-func (r httpExchange) expectStatus(method, path string, status int) error {
-	if r.response.StatusCode != status {
-		path, _, _ = strings.Cut(path, "?")
-		return fmt.Errorf("%s %s: HTTP %d, expected %d (response %.200q)", method, path, r.response.StatusCode, status, r.body)
-	}
-	return nil
+	return exchange(ctx, s.client, s.addr, method, path, data, maxResponseBody, start)
 }
 
 func (s *server) request(ctx context.Context, method, path string, data []byte, status int) ([]byte, http.Header, error) {
@@ -356,14 +318,32 @@ func (s *server) request(ctx context.Context, method, path string, data []byte, 
 	return result.body, result.response.Header, nil
 }
 
-func (s *server) submit(ctx context.Context, rows []row, suffix string, status int) error {
+func (s *server) observationKey(phase string) string {
+	if s.direction == "" {
+		return phase
+	}
+	return string(s.direction) + "/" + phase
+}
+
+func (s *server) submit(ctx context.Context, phase string, rows []row, suffix string, status int) error {
+	start := time.Now()
 	payload, err := encodeRows(rows)
 	if err != nil {
+		s.recordIngest(phase, ingestObservation{Rows: len(rows), ExpectedStatus: &status, Outcome: ingestNotSubmitted, Elapsed: time.Since(start)}, err)
 		return err
 	}
-	body, _, err := s.request(ctx, http.MethodPost, "/ingest", append(payload, suffix...), status)
-	if err == nil && status == http.StatusServiceUnavailable && strings.TrimSpace(string(body)) != "WAL unavailable" {
-		err = fmt.Errorf("expected WAL allocation refusal, got %.200q", body)
-	}
+	return s.submitPayload(ctx, phase, append(payload, suffix...), len(rows), status, start)
+}
+
+func (s *server) submitPayload(ctx context.Context, phase string, payload []byte, rows, status int, start time.Time) error {
+	obs, err := probeIngest(ctx, s.client, s.addr, payload, rows, status, start)
+	s.recordIngest(phase, obs, err)
 	return err
+}
+
+func (s *server) recordIngest(phase string, obs ingestObservation, err error) {
+	if d := s.diagnostics; d != nil {
+		obs.Lifetime = len(d.Candidates)
+		d.observeIngest(s.observationKey(phase), obs, err)
+	}
 }

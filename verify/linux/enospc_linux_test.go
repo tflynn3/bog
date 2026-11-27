@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,125 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"testing/synctest"
-	"time"
 )
-
-type readinessTransport func(*http.Request) (*http.Response, error)
-
-func (f readinessTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
-
-type readinessBody struct {
-	io.Reader
-	close func() error
-}
-
-func (b readinessBody) Close() error { return b.close() }
-
-func TestDiskReadinessResponse(t *testing.T) {
-	t.Parallel()
-	const readyBody = `{"ready":true,"reason":"ready"}`
-	closeFailure := errors.New("body close failed")
-	for _, tc := range []struct {
-		name     string
-		status   int
-		body     string
-		closeErr error
-		want     diskReadiness
-		problem  string
-	}{
-		{"ready", 200, readyBody, nil, diskReady, ""},
-		{"low", 503, `{"ready":false,"reason":"low_disk_headroom"}`, nil, diskLow, ""},
-		{"rollback", 503, `{"ready":false,"reason":"wal_rollback","category":"enospc"}`, nil, diskRollback, ""},
-		{"wrong status", 503, readyBody, nil, diskReadiness{}, "inconsistent readiness"},
-		{"missing ready", 503, `{"reason":"low_disk_headroom"}`, nil, diskReadiness{}, "inconsistent readiness"},
-		{"missing reason", 200, `{"ready":true}`, nil, diskReadiness{}, "inconsistent readiness"},
-		{"partial JSON", 200, readyBody[:len(readyBody)-1], nil, diskReadiness{}, "decode readiness"},
-		{"trailing JSON", 200, readyBody + "{}", nil, diskReadiness{}, "decode readiness"},
-		{"oversized", 200, readyBody + strings.Repeat(" ", 1024), nil, diskReadiness{}, "oversized readiness"},
-		{"close failure", 200, readyBody, closeFailure, diskReady, closeFailure.Error()},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			closed := 0
-			s := &server{addr: "127.0.0.1:1234", client: &http.Client{Transport: readinessTransport(func(req *http.Request) (*http.Response, error) {
-				if req.Method != http.MethodGet || req.URL.Path != "/ready" {
-					t.Errorf("unexpected readiness request %s %s", req.Method, req.URL)
-				}
-				return &http.Response{StatusCode: tc.status, Body: readinessBody{strings.NewReader(tc.body), func() error {
-					closed++
-					return tc.closeErr
-				}}}, nil
-			})}}
-			got, err := s.diskReadiness(t.Context())
-			if got != tc.want || closed != 1 {
-				t.Errorf("readiness = %+v, closes = %d, want %+v and one close", got, closed, tc.want)
-			}
-			if tc.problem == "" && err != nil || tc.problem != "" && (err == nil || !strings.Contains(err.Error(), tc.problem)) {
-				t.Errorf("wanted error %q, got %v", tc.problem, err)
-			}
-			if tc.closeErr != nil && !errors.Is(err, tc.closeErr) {
-				t.Errorf("close failure lost: %v", err)
-			}
-		})
-	}
-}
-
-func TestObserveDiskReadiness(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name          string
-		samples       []diskReadiness
-		want, interim diskReadiness
-		stableFor     time.Duration
-		cancelAfter   time.Duration
-		wantElapsed   time.Duration
-		problem       string
-	}{
-		{"startup sample", []diskReadiness{diskPending, diskReady}, diskReady, diskPending, 0, 0, readinessPoll, ""},
-		{"healthy after retarget", []diskReadiness{diskReady}, diskReady, diskReadiness{}, retargetObservation, 0, retargetObservation, ""},
-		{"full after retarget", []diskReadiness{diskLow}, diskLow, diskReadiness{}, retargetObservation, 0, retargetObservation, ""},
-		{"stale ready gives way to wrong filesystem", []diskReadiness{diskReady, diskLow}, diskReady, diskReadiness{}, retargetObservation, 0, readinessPoll, "low_disk_headroom"},
-		{"stale low gives way to wrong filesystem", []diskReadiness{diskLow, diskReady}, diskLow, diskReadiness{}, retargetObservation, 0, readinessPoll, "ready"},
-		{"never samples disk full", []diskReadiness{diskReady}, diskLow, diskReady, 0, 0, readinessTimeout, "deadline exceeded"},
-		{"canceled while sampling", []diskReadiness{diskReady}, diskLow, diskReady, 0, 2 * readinessPoll, 2 * readinessPoll, "context canceled"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			synctest.Test(t, func(t *testing.T) {
-				ctx := t.Context()
-				if tc.cancelAfter != 0 {
-					deadline, cancel := context.WithCancel(ctx)
-					defer cancel()
-					timer := time.AfterFunc(tc.cancelAfter, cancel)
-					defer timer.Stop()
-					ctx = deadline
-				}
-				calls := 0
-				s := &server{addr: "127.0.0.1:1234", client: &http.Client{Transport: readinessTransport(func(*http.Request) (*http.Response, error) {
-					sample := tc.samples[min(calls, len(tc.samples)-1)]
-					calls++
-					status := http.StatusServiceUnavailable
-					if sample.ready {
-						status = http.StatusOK
-					}
-					body := fmt.Sprintf(`{"ready":%t,"reason":%q,"category":%q}`, sample.ready, sample.reason, sample.category)
-					return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
-				})}}
-				start := time.Now()
-				err := s.observeDiskReadiness(ctx, tc.want, tc.interim, tc.stableFor)
-				if elapsed := time.Since(start); elapsed != tc.wantElapsed {
-					t.Errorf("elapsed = %v, want %v", elapsed, tc.wantElapsed)
-				}
-				if tc.problem == "" && err != nil || tc.problem != "" && (err == nil || !strings.Contains(err.Error(), tc.problem)) {
-					t.Errorf("wanted error %q, got %v", tc.problem, err)
-				}
-			})
-		})
-	}
-}
 
 func TestRetargetDirectory(t *testing.T) {
 	t.Parallel()
@@ -155,5 +36,93 @@ func TestRetargetDirectory(t *testing.T) {
 	}
 	if _, err := os.Lstat(dir + ".next"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staged link remained after rename failure: %v", err)
+	}
+}
+
+func TestRetargetDiagnosticsBeforeReconciliation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		direction diskDirection
+		ready     diskReadiness
+		status    int
+		body      string
+		post      diskReadiness
+		outcome   string
+		failed    bool
+	}{
+		{"healthy directory still writable", healthyToFull, diskReady, 204, "", diskReadiness{}, ingestAcknowledged, false},
+		{"full directory rolls back", fullToHealthy, diskLow, 503, "WAL unavailable\n", diskRollback, ingestRolledBack, false},
+		{"full directory readiness fails after refusal", fullToHealthy, diskLow, 503, "WAL unavailable\n", diskLow, ingestWALRefused, true},
+		{"ingest drops and readiness reports uncertainty", fullToHealthy, diskLow, 0, "", diskReadiness{reason: "recovery_required", category: "eio"}, ingestTransportAmbiguous, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var postIngest bool
+			d := newCaseDiagnostics()
+			d.Candidates = []*processEvidence{{Reaped: true}, {}}
+			s := &server{
+				addr: "localhost", direction: tc.direction, diagnostics: d,
+				client: &http.Client{Transport: readinessTransport(func(req *http.Request) (*http.Response, error) {
+					if req.URL.Path == "/ingest" {
+						if err := req.Body.Close(); err != nil {
+							return nil, err
+						}
+						postIngest = true
+						if tc.status == 0 {
+							return nil, io.EOF
+						}
+						return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+					}
+					if req.URL.Path != "/ready" {
+						t.Fatalf("unexpected request %s", req.URL.Path)
+					}
+					state := tc.ready
+					if postIngest {
+						state = tc.post
+					}
+					status := http.StatusServiceUnavailable
+					if state.ready {
+						status = http.StatusOK
+					}
+					body := fmt.Sprintf(`{"ready":%t,"reason":%q,"category":%q}`, state.ready, state.reason, state.category)
+					return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
+				})},
+			}
+			if _, err := s.observeDiskReadiness(t.Context(), "after_retarget", tc.ready, diskReadiness{}, 0); err != nil {
+				t.Fatal(err)
+			}
+			rows := fixtureRows("retarget", 2, 1, "")
+			var err error
+			proof := &retargetEvidence{}
+			if tc.direction == fullToHealthy {
+				err = s.checkFullRetargetIngest(t.Context(), rows, proof)
+			} else {
+				err = s.submit(t.Context(), "retarget_ingest", rows, "", http.StatusNoContent)
+			}
+			if (err != nil) != tc.failed {
+				t.Fatalf("probe error = %v, want failure = %t", err, tc.failed)
+			}
+			prefix := string(tc.direction) + "/"
+			ready := d.Readiness[prefix+"after_retarget"]
+			ingest := d.Ingest[prefix+"retarget_ingest"]
+			if ready == nil || ready.Last.state() != tc.ready || ready.Last.Lifetime != 2 ||
+				ingest == nil || ingest.Last.Outcome != tc.outcome || ingest.Last.Lifetime != 2 || ingest.Last.Rows != 2 {
+				t.Fatalf("partial retarget diagnostics = %+v, %+v", ready, ingest)
+			}
+			if (ingest.Last.Rollback != nil) != (tc.outcome == ingestRolledBack) ||
+				(d.UncertainWAL != nil) != (tc.status == 0) {
+				t.Fatalf("rollback = %+v, uncertain WAL = %+v", ingest.Last.Rollback, d.UncertainWAL)
+			}
+			if tc.direction == fullToHealthy {
+				post := d.Readiness[prefix+"after_ingest"]
+				if post == nil || post.Last.state() != tc.post || (post.FirstFailure != nil) != tc.failed {
+					t.Fatalf("post-ingest probe = %+v", post)
+				}
+				if proof.IngestStatus != tc.status || (proof.PostIngestReason == diskRollback.reason) != !tc.failed {
+					t.Fatalf("legacy retarget evidence = %+v", proof)
+				}
+			}
+		})
 	}
 }

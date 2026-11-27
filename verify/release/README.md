@@ -12,8 +12,9 @@ configuration, reports, producer exit statuses, and logs.
 The admission, durability, and capacity producers take
 `-binary PATH -revision SHA -fixture ID -report PATH`.
 The release fixture ID is `linux-release-v1`. The workflow runs
-`go run ./verify/release`, restored parity, the fixed-budget backfill test,
-and strict report validation from the workflow checkout (`gate`). It runs
+`go run ./verify/release`, restored parity, the immediate post-restore crash
+and fixed-budget backfill tests, and strict report validation from the
+workflow checkout (`gate`). It runs
 `go run ./verify/linux` (#3) and `go run ./bench/retained-history` (#32) from the
 candidate checkout. The query-model race suite runs from `gate`, which
 supplies the oracle and backfill test. The sibling commands provision their
@@ -37,6 +38,7 @@ additional evidence. The following cases must pass.
 | Durability | `sigkill`, `recovery`, `enospc` |
 | Capacity | `retained_history_capacity` |
 | Recovery parity | `restored_parity` when supplied, plus `ordinary_wal_reopen` in cutover mode |
+| Immediate restored-write crash | `post_restore_ack_crash` in the native workflow |
 
 Admission also records the full saturation fixture verdict as
 `saturation_fixture`. Validation accepts archived admission reports with
@@ -223,10 +225,9 @@ restart. The `ordinary_wal_reopen` case records the row counts and append
 status.
 
 The native workflow uses `-require-cutover -parity parity.json` and runs the
-verifier tests with the race detector on Linux. Qualify the crash fixture
-against the composed #53 candidate on both native Linux runners. Strict
-validation requires both recovery cases to pass and checks these exact
-evidence fields for `linux-release-v1`.
+verifier tests with the race detector on Linux. Strict validation requires
+both recovery cases to pass and checks these exact evidence fields for
+`linux-release-v1`.
 
 | Case | Required evidence |
 | --- | --- |
@@ -235,6 +236,38 @@ evidence fields for `linux-release-v1`.
 
 Historical validation without `-require-cutover` accepts an omitted parity
 report or a schema-v1 report with a passing `restored_parity` outcome.
+
+## Immediate post-restore acknowledgment crash
+
+`TestReleasePostRestoreAckCrash` starts the pinned candidate on a fresh
+verified checkpoint-and-tail restore. It confirms listener ownership and
+posts a two-row batch with timestamp ties and a duplicate. On HTTP 204 it
+sends SIGKILL immediately, before reading or closing the response body or
+issuing another probe. The verifier requires the matching wait status and
+process-group cleanup, then restarts the same binary on the same directory.
+A fresh paginated walk must match all eight rows in the independent
+append-log oracle in timestamp and append order through exhaustion.
+
+On each architecture the gate requires an explicit passing test event and
+a nonempty `post-restore-ack-crash.json`. An absent, skipped, or failing test
+fails that native job. In the artifact, look for the top-level test `pass`
+event in `post-restore-ack-crash-events.jsonl` and the `post_restore_ack_crash`
+entry with `exit=0` and `checkout=gate` in `producers.txt`. The corresponding
+`post_restore_ack_crash.log` contains the producer output.
+
+Compare the report's revision, `binary_sha256`, and fixture with `run.txt`
+and `binary.sha256`. `run.txt` also identifies the gate revision and native
+runner. The report's `post_restore_ack_crash` case must have `status: "pass"`,
+the verified restore point, `append_status: 204`, `observed_signal: 9`,
+`replay_matched: true`, and `replay_rows: 8`. It also records true values for
+`crash_candidate_reaped`, `restart_candidate_reaped`, and `fixture_removed`.
+
+The **Require both native Linux qualifications** job is the combined result
+for the dispatched revision. For #53, require it to pass with both native
+artifacts for the same candidate and gate revisions. Each native job must
+pass immediate crash replay, strict restored parity, ENOSPC retargeting,
+fixed-budget backfill, and both live capacity scales under 128 MiB with swap
+disabled. [Immediate crash evidence contract](../../docs/adr/0027-immediate-post-restore-crash-evidence.md)
 
 ## Architecture handoff for #61
 

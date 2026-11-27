@@ -4,6 +4,17 @@ set -eu
 umask 0002
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
+export_bin=${BOG_EXPORT_BIN:-}
+case $export_bin in
+    '') ;;
+    /*)
+        if [ ! -f "$export_bin" ] || [ ! -x "$export_bin" ]; then
+            echo "BOG_EXPORT_BIN must name an executable file: $export_bin" >&2
+            exit 1
+        fi
+        ;;
+    *) echo "BOG_EXPORT_BIN must be an absolute path" >&2; exit 1 ;;
+esac
 port=${BOG_PORT:-18080}
 case $port in
     ''|*[!0-9]*) echo "BOG_PORT must be a TCP port number" >&2; exit 1 ;;
@@ -42,7 +53,7 @@ while [ "$attempt" -lt 100 ]; do
         fi
     done
     if [ -n "$owners" ] && kill -0 "$pid" 2>/dev/null &&
-        curl -q --noproxy '*' -fsS "$base/healthz" >/dev/null; then
+        curl -q --noproxy '*' --max-time 1 -fsS "$base/healthz" >/dev/null; then
         ready=1
         break
     fi
@@ -64,11 +75,11 @@ cat >"$work/rows" <<'ROWS'
 {"ts":"2025-01-01T00:00:00Z","line":"pagination first"}
 {"ts":"2025-01-01T00:00:01Z","line":"pagination second"}
 ROWS
-curl -q --noproxy '*' -fsS -X POST --data-binary @"$work/rows" "$base/ingest" >/dev/null
+curl -q --noproxy '*' --max-time 10 -fsS -X POST --data-binary @"$work/rows" "$base/ingest" >/dev/null
 start=2025-01-01T00:00:00Z
 end=2025-01-02T00:00:00Z
 contains=pagination
-curl -q --noproxy '*' -fsS -G -D "$work/headers1" -o "$work/page1" \
+curl -q --noproxy '*' --max-time 10 -fsS -G -D "$work/headers1" -o "$work/page1" \
     --data-urlencode "start=$start" --data-urlencode "end=$end" \
     --data-urlencode "contains=$contains" --data-urlencode 'limit=1' \
     --data-urlencode 'page=1' "$base/query"
@@ -77,7 +88,7 @@ if [ -z "$cursor" ]; then
     echo "First page did not return the expected Bog-Next-Cursor" >&2
     exit 1
 fi
-curl -q --noproxy '*' -fsS -G -D "$work/headers2" -o "$work/page2" \
+curl -q --noproxy '*' --max-time 10 -fsS -G -D "$work/headers2" -o "$work/page2" \
     --data-urlencode "start=$start" --data-urlencode "end=$end" \
     --data-urlencode "contains=$contains" --data-urlencode 'limit=1' \
     --data-urlencode "cursor=$cursor" "$base/query"
@@ -96,3 +107,52 @@ cat "$work/page1"
 printf '%s\n' 'Second (final) page:'
 cat "$work/page2"
 printf '%s\n' 'Pagination completed without a further cursor.'
+
+if [ -n "$export_bin" ]; then
+    # Append out of timestamp order and repeat a tied row after a different tie.
+    cat >"$work/export-ingest" <<'ROWS'
+{"ts":"2025-01-01T00:00:03Z","line":"export match repeated"}
+{"ts":"2025-01-01T00:00:02Z","line":"export match backfill"}
+{"ts":"2025-01-01T00:00:03Z","line":"export match middle"}
+{"ts":"2025-01-01T00:00:03Z","line":"export match repeated"}
+ROWS
+    curl -q --noproxy '*' --max-time 10 -fsS -X POST \
+        --data-binary @"$work/export-ingest" "$base/ingest" >/dev/null
+    cat >"$work/export-expected" <<'ROWS'
+{"ts":"2025-01-01T00:00:02Z","line":"export match backfill"}
+{"ts":"2025-01-01T00:00:03Z","line":"export match repeated"}
+{"ts":"2025-01-01T00:00:03Z","line":"export match middle"}
+{"ts":"2025-01-01T00:00:03Z","line":"export match repeated"}
+ROWS
+    head -n 1 "$work/export-expected" >"$work/export-first-row"
+
+    run_export() {
+        "$export_bin" -url "$base" -start "$start" -end "$end" \
+            -contains 'export match' -limit 1 -max-pages "$1" -timeout 10s
+    }
+
+    if ! run_export 4 >"$work/export-actual" 2>"$work/export-stderr"; then
+        echo "Export failed before completing the four-page walk" >&2
+        cat "$work/export-stderr" >&2
+        exit 1
+    fi
+    if ! cmp -s "$work/export-expected" "$work/export-actual"; then
+        echo "Export returned unexpected NDJSON:" >&2
+        cat "$work/export-actual" >&2
+        exit 1
+    fi
+    if run_export 1 >"$work/export-actual" 2>"$work/export-stderr"; then
+        echo "Export unexpectedly succeeded with a one-page budget" >&2
+        exit 1
+    fi
+    if [ ! -s "$work/export-stderr" ]; then
+        echo "Export exhausted its page budget without a diagnostic on stderr" >&2
+        exit 1
+    fi
+    if ! cmp -s "$work/export-first-row" "$work/export-actual"; then
+        echo "Export with a one-page budget did not emit exactly the first complete row:" >&2
+        cat "$work/export-actual" >&2
+        exit 1
+    fi
+    printf '%s\n' 'Export completed all four pages and preserved the first row on budget exhaustion.'
+fi

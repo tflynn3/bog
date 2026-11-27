@@ -132,6 +132,16 @@ NDJSON for successful resumes and for fresh queries and literal searches under
 both changed and restored rules. Reused witnesses leave the masking evidence
 incomplete because prior presentation can itself invalidate a cursor.
 
+Candidate observation and revision comparison decode successful query
+bodies with the same independent verifier decoder. An empty body represents
+zero rows. Each record is one newline-terminated UTF-8 JSON object with
+exactly one string value for each of the decoded keys `ts` and `line`.
+Duplicate decoded keys, unknown fields, nulls, malformed records, and trailing
+data are evidence violations. Compare decoded timestamps and lines in wire
+order, including repeated rows. A missing body for expected rows leaves
+revision evidence incomplete. On denial, the verifier still detects
+row-shaped data with extra fields or a missing final newline.
+
 Security Verification runs the independent candidate and revision
 scenarios with bounded adapters against the same clean serving revision
 on native Linux amd64 and arm64. Each runner uses its own SHA-256-pinned

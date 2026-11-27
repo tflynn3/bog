@@ -132,34 +132,34 @@ func (a *candidateAdapter) Query(ctx context.Context, request QueryRequest) (Pag
 	if values := page.Headers["Bog-Next-Cursor"]; len(values) == 1 {
 		page.NextCursor = values[0]
 	}
-	rows, err := observeQueryRows(response.Body, response.Status == http.StatusOK)
-	if err != nil {
-		return Page{}, err
+	if response.Status == http.StatusOK {
+		page.Rows, err = decodeQueryRows(response.Body)
+		if err != nil {
+			return Page{}, candidateViolation("successful query returned malformed NDJSON")
+		}
+	} else {
+		page.Rows = observeRejectedQueryRows(response.Body)
 	}
-	page.Rows = rows
 	return page, nil
 }
 
-func observeQueryRows(body []byte, success bool) ([]Row, error) {
+func observeRejectedQueryRows(body []byte) []Row {
 	var rows []Row
 	for len(body) > 0 {
-		line, rest, terminated := bytes.Cut(body, []byte("\n"))
+		line, rest, _ := bytes.Cut(body, []byte("\n"))
 		body = rest
 		var fields map[string]json.RawMessage
 		var ts, text *string
 		valid := utf8.Valid(line) && json.Unmarshal(line, &fields) == nil &&
 			json.Unmarshal(fields["ts"], &ts) == nil && ts != nil &&
 			json.Unmarshal(fields["line"], &text) == nil && text != nil
-		if success && (!terminated || !valid || len(fields) != 2) {
-			return nil, candidateViolation("successful query returned malformed NDJSON")
-		}
 		// Application errors need not be NDJSON. Still record any row-shaped
 		// data, even if it has other fields or omits a final line delimiter.
 		if valid {
 			rows = append(rows, Row{Timestamp: *ts, Line: *text})
 		}
 	}
-	return rows, nil
+	return rows
 }
 
 func (a *candidateAdapter) CreateExport(ctx context.Context, target Target) (ExportStart, error) {

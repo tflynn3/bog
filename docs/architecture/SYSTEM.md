@@ -15,18 +15,21 @@ sync, and powersafe overwrite. The ingest and query listener has no built-in
 authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
-## Observed Linux production imports
+## Declared Linux production import graph
 
-The graph was measured with the ADR 0017 listener wiring applied to
-`b08d977b50121e45acfeceae0cdf1e64794d8fd9`. `go list -deps` reports identical
-root-module production edges on Linux amd64 (v1) and arm64 (v8.0) with cgo
-disabled and the fitness suite's build settings. Arrows point from importer
-to direct dependency. Nodes with no outgoing arrows have zero direct
-root-module production imports. Test-only packages appear in the registry
-below. The graph also includes the fixture-backed stream policy verifier
-support added in #86 and the two capacity evidence edges required in the
-composed #87 revision. The fitness suite measures both #87 edges on that
-revision.
+The Mermaid graph declares the production packages and direct root-module
+imports in the executable fitness registry. Arrows point from importer to
+direct dependency. Nodes with no outgoing arrows have zero direct
+root-module production imports. Test-only packages appear in the package
+table below. The architecture suite checks the diagram against the registry
+and checks the registry against both Linux production inventories.
+
+The declaration includes the fixture-backed stream policy verifier support
+added in #86 and both #87 capacity evidence imports. The shared validator
+and directory-anchored publisher are present in the repository. #87
+qualification still requires running the strict evidence gate against the
+composed #53 runtime on both native Linux runners.
+[Shared capacity evidence boundary](../adr/0020-shared-capacity-evidence.md)
 
 ```mermaid
 flowchart TD
@@ -194,8 +197,10 @@ bodies, and retries after an ambiguous response and process restart.
 `cmd/bog-verify` consumes an immutable verified image and, for parity, a
 separately restored server held at the image's recovery point. It compares
 timestamp and line values in exact order through both terminal pages
-using the read-only backup APIs and the production Go client. It has
-read-only authority and no direct or transitive root-module production
+using the read-only backup APIs and the production Go client. Its
+authority is limited to reading the immutable image and querying the
+separate server. The server owns writable recovery and publication.
+The operator command has no direct or transitive root-module production
 path to `internal/wal`, `internal/httpapi`, or `internal/readiness`.
 The server has no production path to the Go HTTP client or independent
 query oracle. [Operator verification](../adr/0011-operator-verification-boundary.md),
@@ -220,14 +225,21 @@ qualification of the composed #53 revision is pending.
 | `bench/retained-history` | `capacity.json` | Both live scales (196,608 and 393,216 seed rows), each under a 128 MiB cgroup cap with swap disabled. Verify durable replacement at the exact cutoff, a held cursor across acknowledged backfill, exact fresh and restarted walks, and process and cgroup cleanup. Capture publication and retired pin drain evidence at the runtime observation points. |
 | `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Start the pinned binary on a verified restore, compare exact walks with the independent append-log oracle, observe 204 for new backfill, and check the held capture and exact augmented history after restart. |
 
-The producers exercise a separate pinned server process through HTTP,
-process lifecycle, and disposable filesystem fixtures. Their production
-imports have no direct or transitive root-module path to the WAL owner,
-server HTTP, or readiness. Test imports can construct fixtures. The
-append-log oracle derives expected rows independently. Operator parity
-uses the verified image as its reference.
+The three producers exercise a separate pinned server process through HTTP,
+process lifecycle, and disposable filesystem fixtures. Their Linux production
+imports have no direct or transitive root-module path to `internal/wal`,
+`internal/httpapi`, `internal/readiness`, `internal/checkpoint`,
+`internal/history`, or `internal/backup`. The exclusions apply through
+registered intermediaries and continue to apply after retained libraries
+are wired into the server. Producers may use the production HTTP client and
+shared row types. Test imports may use server and storage packages to
+construct fixtures. Restored-parity evidence comes from the pinned
+candidate and the independent append-log oracle. Operator parity uses the
+verified image as its reference.
 [Release verifier composition](../adr/0008-release-verifier-composition.md),
-[Release evidence process boundary](../adr/0013-release-evidence-process-boundary.md)
+[Release evidence process boundary](../adr/0013-release-evidence-process-boundary.md),
+[Retained storage boundary for release evidence](../adr/0021-retained-release-evidence-boundary.md),
+[Release evidence fitness test](../../internal/archtest/release_evidence_boundary_test.go)
 
 Release and capacity each verify listener ownership around the startup
 HTTP probe and at workload completion. Capacity repeats the checks after
@@ -273,7 +285,8 @@ qualification requires adapters that observe a shared-deployment implementation.
 
 ## Fitness and registry ownership
 
-Core engineering owns the architecture record and fitness registry.
+Architecture within Core Engineering owns the architecture record and
+fitness registry.
 `bog-storage` owns #53 recovery, publication, and command composition.
 `bog-query` owns the #59 HTTP paging contract. Recheck write leases at
 dispatch and at the Storage draft handoff. #60 follows the #53 command
@@ -282,18 +295,23 @@ wiring in one PR.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification)
 
-Architecture and Release Verification land the #87 imports and registry
-together. Storage and Architecture review the #53 runtime and its measured
-registry promotion in a separate composed PR. Rebase the later registry
-edit onto the first landed PR, then rerun both Linux inventories.
+Architecture coordinates the SYSTEM.md handoff with Release Verification
+for #87 and with Storage for #53. Run the full architecture suite on the
+composed #87 tree. In the separate #53 runtime wiring PR, update the diagram
+and promote staged roles once both Linux inventories show server reachability
+and the activation criteria are met. Rebase the later registry edit onto the
+first landed PR, then rerun both Linux inventories.
 [#53 package promotion handoff](../adr/0019-package-role-governance.md#53-promotion-handoff)
 
 The Architecture workflow runs `go test -count=1 ./internal/archtest`.
 The suite lists packages with `GOOS=linux`, `GOAMD64=v1`, `GOARM64=v8.0`,
 `CGO_ENABLED=0`, `GOENV=off`, empty `GOFLAGS`, `GO111MODULE=on`, and
 `GOWORK=off`, once for each target. Exact imports, cycles, package kinds,
-and server reachability are checked against both inventories. Test
-imports and nested modules are outside the root-module production registry.
+and server reachability are checked against both inventories. The diagram
+fitness test checks every declared production node and directed edge
+against the same registry. Test imports and nested modules are outside the
+root-module production registry.
+[Diagram fitness test](../../internal/archtest/system_diagram_test.go)
 
 - HTTP owns the paging seam. It cannot reach checkpoint, history, or
   backup, even through a registered intermediary. Readiness can observe

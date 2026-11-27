@@ -79,7 +79,7 @@ func (e *FixedBudgetHTTPError) Error() string {
 
 func (e *FixedBudgetHTTPError) Unwrap() error { return e.Cause }
 
-func (c FixedBudgetCase) fixture() (seed, backfill []Row, filter Filter, err error) {
+func (c FixedBudgetCase) fixture() (seed []Row, backfill [2]Row, filter Filter, err error) {
 	start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	at := func(second int, line string) Row {
 		return Row{Time: start.Add(time.Duration(second) * time.Second), Line: line}
@@ -102,20 +102,23 @@ func (c FixedBudgetCase) fixture() (seed, backfill []Row, filter Filter, err err
 		for second := 41; second <= 55; second++ {
 			seed = append(seed, at(second, "miss"))
 		}
-		return seed, []Row{at(0, "@new")}, filter, nil
+		return seed, [2]Row{at(0, "@new"), at(40, "@new late tie")}, filter, nil
 	default:
-		return nil, nil, Filter{}, errors.New("unknown fixed-budget fixture")
+		return nil, backfill, Filter{}, errors.New("unknown fixed-budget fixture")
 	}
-	return seed, []Row{at(0, "z")}, filter, nil
+	return seed, [2]Row{at(0, "z"), at(0, "new final tie")}, filter, nil
 }
 
 // RunFixedBudgetCase seeds an empty endpoint, verifies the issuing page,
-// acknowledges a matching backfill, and checks every continuation against
-// the original acknowledged prefix. It never retries or starts a fresh
-// capture. A clean opening rejection returns a distinct outcome and nil
-// error. Failures after a verified issuing page retain its progress evidence
-// and return an error, including when a continuation returns a clean 503.
-func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge AcknowledgeBatch, fetch FetchWirePage) (FixedBudgetResult, error) {
+// acknowledges a matching backfill before each resume, and checks every
+// continuation against the original acknowledged prefix. The optional hook
+// runs once after the first backfill is acknowledged and before the first
+// resume, within the walk deadline. It can observe publication while the
+// cursor is held and must honor ctx. The case never retries or starts a
+// fresh capture. A clean opening rejection returns a distinct outcome and
+// nil error. Failures after a verified issuing page retain its progress
+// evidence, including when a continuation returns a clean 503.
+func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge AcknowledgeBatch, fetch FetchWirePage, afterCapture ...AfterCapture) (FixedBudgetResult, error) {
 	result := FixedBudgetResult{Outcome: FixedBudgetIndeterminate}
 	fail := func(err error) (FixedBudgetResult, error) {
 		stage := "before opening page"
@@ -130,6 +133,9 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 	}
 	if acknowledge == nil || fetch == nil {
 		return fail(errors.New("append acknowledgement and fetch adapters are required"))
+	}
+	if len(afterCapture) > 1 {
+		return fail(errors.New("at most one post-capture hook is allowed"))
 	}
 	seed, backfill, filter, err := c.fixture()
 	if err != nil {
@@ -161,7 +167,24 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 	log.Append(seed)
 
 	var openingRejection *FixedBudgetHTTPError
+	appendBackfill := func(ctx context.Context, resume int) error {
+		batch := backfill[resume-1 : resume]
+		if err := acknowledge(ctx, batch); err != nil {
+			return fmt.Errorf("acknowledge backfill before resume %d: %w", resume, err)
+		}
+		log.Append(batch)
+		return nil
+	}
 	result.WireStats, err = VerifyWireWalk(ctx, &log, walk, func(ctx context.Context, req WireRequest) (WirePage, error) {
+		// The verifier accepted the first resume before requesting page three.
+		if result.Page == 2 {
+			if err := appendBackfill(ctx, 2); err != nil {
+				return WirePage{}, err
+			}
+			if err := ctx.Err(); err != nil {
+				return WirePage{}, err
+			}
+		}
 		result.Page++
 		result.Limit = req.Limit
 		result.HTTPStatus = 0
@@ -180,17 +203,25 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 			}
 		}
 		return page, err
-	}, func(ctx context.Context, _ string) error {
-		if err := acknowledge(ctx, backfill); err != nil {
-			return fmt.Errorf("acknowledge backfill: %w", err)
+	}, func(ctx context.Context, cursor string) error {
+		if err := appendBackfill(ctx, 1); err != nil {
+			return err
 		}
-		log.Append(backfill)
+		if len(afterCapture) == 1 && afterCapture[0] != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return afterCapture[0](ctx, cursor)
+		}
 		return nil
 	})
 	switch {
-	case err == nil:
+	case err == nil && result.Pages == walk.Limits.MaxPages:
 		result.Outcome = FixedBudgetExhausted
 		return result, nil
+	case err == nil:
+		err = fmt.Errorf("expected to exhaust on page %d, exhausted on page %d", walk.Limits.MaxPages, result.Pages)
+		result.Outcome = FixedBudgetIssuedCursor
 	case openingRejection != nil && errors.Is(err, openingRejection) && ctx.Err() == nil:
 		result.Outcome = FixedBudgetCleanRejection
 		return result, nil

@@ -24,13 +24,13 @@ func TestFixedBudgetCasesOverHTTP(t *testing.T) {
 		literal                       string
 		matches                       []string
 		seedCount                     int
-		backfill                      string
+		backfill, finalBackfill       string
 		bodyBytes                     int64
 	}
 	want := map[string]expectation{
-		"tied":       {11, 1, 1, "", []string{"c", "a", "b"}, 3, "z", 123},
-		"duplicates": {11, 1, 1, "", []string{"c", "c", "b"}, 3, "z", 123},
-		"sparse":     {314, 4, 2, "@", []string{"@last", "@tied", "@next", "@late"}, 46, "@new", 180},
+		"tied":       {11, 1, 1, "", []string{"c", "a", "b"}, 3, "z", "new final tie", 123},
+		"duplicates": {11, 1, 1, "", []string{"c", "c", "b"}, 3, "z", "new final tie", 123},
+		"sparse":     {314, 4, 2, "@", []string{"@last", "@tied", "@next", "@late"}, 46, "@new", "@new late tie", 180},
 	}
 	cases := model.FixedBudgetCases()
 	for _, c := range cases {
@@ -67,34 +67,58 @@ func TestFixedBudgetCasesOverHTTP(t *testing.T) {
 				return nil
 			}
 			var matches []string
+			hookCalls := 0
+			var openingCursor string
 			result, err := model.RunFixedBudgetCase(t.Context(), c, acknowledge, func(ctx context.Context, req model.WireRequest) (model.WirePage, error) {
 				start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 				if !req.Filter.Start.Equal(start) || !req.Filter.End.Equal(start.Add(10*time.Minute)) || req.Filter.Contains != expected.literal {
 					t.Errorf("unexpected query filter %+v", req.Filter)
 				}
 				page, err := fetch(ctx, req)
+				if req.Cursor == "" {
+					openingCursor = page.NextCursor
+				}
 				for _, row := range page.Rows {
 					matches = append(matches, row.Line)
 				}
 				return page, err
+			}, func(ctx context.Context, cursor string) error {
+				hookCalls++
+				if _, ok := ctx.Deadline(); !ok || cursor == "" || cursor != openingCursor {
+					return errors.New("post-capture hook lacks a deadline or the issuing token")
+				}
+				p.mu.Lock()
+				defer p.mu.Unlock()
+				if len(p.requests) != 3 || len(p.rows) != expected.seedCount+1 ||
+					p.rows[expected.seedCount].Line != expected.backfill {
+					return errors.New("first backfill was not acknowledged before publication")
+				}
+				return nil
 			})
 			trimmed := 0
 			if c.FirstRows < c.FirstLimit {
 				trimmed = 1
 			}
 			wantStats := model.WireStats{Pages: 3, Rows: len(expected.matches), BodyBytes: expected.bodyBytes, ByteTrimmedPages: trimmed}
-			if err != nil || result.Outcome != model.FixedBudgetExhausted || result.WireStats != wantStats ||
+			if err != nil || hookCalls != 1 || result.Outcome != model.FixedBudgetExhausted || result.WireStats != wantStats ||
 				result.Page != 3 || result.Limit != 1 || result.HTTPStatus != http.StatusOK || !slices.Equal(matches, expected.matches) {
 				t.Fatalf("result=%+v matches=%q error=%v", result, matches, err)
 			}
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			resume := fmt.Sprintf("resume:%s:1", expected.literal)
-			sequence := []string{"ingest", fmt.Sprintf("first:%s:%d", expected.literal, c.FirstLimit), "ingest", resume, resume}
+			sequence := []string{"ingest", fmt.Sprintf("first:%s:%d", expected.literal, c.FirstLimit), "ingest", resume, "ingest", resume}
 			if !slices.Equal(p.requests, sequence) {
 				t.Errorf("requests %v, want %v", p.requests, sequence)
 			}
-			if len(p.rows) != expected.seedCount+1 || p.rows[len(p.rows)-1].Line != expected.backfill || !p.rows[len(p.rows)-1].Time.Equal(p.rows[0].Time) {
+			finalTie := time.Duration(0)
+			if c.Fixture == "sparse" {
+				finalTie = 40 * time.Second
+			}
+			if len(p.rows) != expected.seedCount+2 || p.rows[expected.seedCount].Line != expected.backfill ||
+				!p.rows[expected.seedCount].Time.Equal(p.rows[0].Time) ||
+				p.rows[expected.seedCount+1].Line != expected.finalBackfill ||
+				!p.rows[expected.seedCount+1].Time.Equal(p.rows[0].Time.Add(finalTie)) {
 				t.Errorf("unexpected acknowledged fixture: %v", p.rows)
 			}
 		})
@@ -161,6 +185,11 @@ func TestFixedBudgetCaseFailures(t *testing.T) {
 					return tc.response, tc.fetchErr
 				}
 				return model.WirePage{Rows: []model.Row{row([]string{"c", "a"}[requests-1])}, BodyBytes: 41, NextCursor: cursor[requests]}, nil
+			}, func(context.Context, string) error {
+				if tc.page == 1 {
+					t.Error("post-capture hook ran before a verified opening page")
+				}
+				return nil
 			})
 			wantOutcome := model.FixedBudgetIndeterminate
 			if tc.page > 1 {
@@ -170,7 +199,7 @@ func TestFixedBudgetCaseFailures(t *testing.T) {
 				wantOutcome = model.FixedBudgetCleanRejection
 			}
 			if result.Outcome != wantOutcome || result.HTTPStatus != tc.status || result.Page != tc.page || result.Limit != 1 ||
-				result.Pages != tc.page-1 || result.Rows != tc.page-1 || acks != min(2, tc.page) || requests != tc.page {
+				result.Pages != tc.page-1 || result.Rows != tc.page-1 || acks != tc.page || requests != tc.page {
 				t.Fatalf("result=%+v append calls=%d fetch calls=%d error=%v", result, acks, requests, err)
 			}
 			if tc.clean {
@@ -199,25 +228,27 @@ func TestFixedBudgetCaseFailures(t *testing.T) {
 
 func TestFixedBudgetCaseStopsOnIngestFailure(t *testing.T) {
 	t.Parallel()
-	for _, failureAt := range []int{1, 2} {
+	for _, failureAt := range []int{1, 2, 3} {
 		t.Run(fmt.Sprint(failureAt), func(t *testing.T) {
 			t.Parallel()
 			c := model.FixedBudgetCases()[0]
 			want := errors.New("ambiguous acknowledgement")
 			acks, queries := 0, 0
-			var seed model.Row
+			var seed []model.Row
 			result, err := model.RunFixedBudgetCase(t.Context(), c, func(_ context.Context, batch []model.Row) error {
 				acks++
 				if acks == failureAt {
 					return want
 				}
-				seed = batch[0]
+				if acks == 1 {
+					seed = batch
+				}
 				return nil
 			}, func(context.Context, model.WireRequest) (model.WirePage, error) {
 				queries++
-				return model.WirePage{Rows: []model.Row{seed}, BodyBytes: 41, NextCursor: "cursor"}, nil
+				return model.WirePage{Rows: seed[queries-1 : queries], BodyBytes: 41, NextCursor: fmt.Sprint("cursor-", queries)}, nil
 			})
-			stage := []string{"seed", "backfill"}[failureAt-1]
+			stage := []string{"seed", "backfill before resume 1", "backfill before resume 2"}[failureAt-1]
 			if !errors.Is(err, want) || !strings.Contains(err.Error(), "acknowledge "+stage) || acks != failureAt || queries != failureAt-1 ||
 				result.Pages != queries || result.Page != queries {
 				t.Fatalf("result=%+v acks=%d queries=%d error=%v", result, acks, queries, err)
@@ -243,6 +274,47 @@ func TestFixedBudgetCaseCancellationDuringFetch(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) || result.Outcome != model.FixedBudgetIndeterminate || result.Page != 1 || result.HTTPStatus != 503 || acks != 1 {
 		t.Fatalf("result=%+v acks=%d error=%v", result, acks, err)
+	}
+}
+
+func TestFixedBudgetCaseStopsOnPostCaptureFailure(t *testing.T) {
+	t.Parallel()
+	for _, cancelHook := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%t", cancelHook), func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			const token = "held-opaque-token"
+			want := fmt.Errorf("publication failed for %s", token)
+			if cancelHook {
+				want = context.Canceled
+			}
+			var seed model.Row
+			acks, fetches, hooks := 0, 0, 0
+			result, err := model.RunFixedBudgetCase(ctx, model.FixedBudgetCases()[0], func(_ context.Context, batch []model.Row) error {
+				acks++
+				if acks == 1 {
+					seed = batch[0]
+				}
+				return nil
+			}, func(context.Context, model.WireRequest) (model.WirePage, error) {
+				fetches++
+				return model.WirePage{Rows: []model.Row{seed}, NextCursor: token, BodyBytes: 41}, nil
+			}, func(ctx context.Context, _ string) error {
+				hooks++
+				if cancelHook {
+					cancel()
+					<-ctx.Done()
+					return nil
+				}
+				return want
+			})
+			if !errors.Is(err, want) || strings.Contains(err.Error(), token) ||
+				result.Outcome != model.FixedBudgetIssuedCursor || result.Page != 1 || result.Pages != 1 ||
+				acks != 2 || fetches != 1 || hooks != 1 {
+				t.Fatalf("result=%+v acks=%d fetches=%d hooks=%d error=%v", result, acks, fetches, hooks, err)
+			}
+		})
 	}
 }
 

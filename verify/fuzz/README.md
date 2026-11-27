@@ -21,9 +21,9 @@ manifest SHA-256, bundle metadata SHA-256, and frame or block CRCs to reach
 length, count, and row validation inside these envelopes.
 
 Fixtures allow up to eight files of at most 256 KiB plus one byte each,
-including the oversized manifest case. Each deterministic suite runs in
-a subprocess with a 45-second parent deadline, a hard address-space limit
-256 MiB above its startup mappings, and a 1 MiB hard per-file write limit.
+including the oversized manifest case. Each deterministic corpus suite
+runs in a subprocess with a 45-second parent deadline, a hard address-space
+limit 256 MiB above its startup mappings, and a 1 MiB hard per-file write limit.
 The relative address-space limit accommodates the race runtime's initial
 virtual mappings. The same valid and malformed inputs seed the fuzz targets,
 which cap the bytes they materialize on disk.
@@ -39,7 +39,7 @@ Run these entry points on each native Linux release runner and retain the
 verbose output with the verifier race log.
 
 ```sh
-go test -race -count=1 -v -timeout=3m -run '^(TestStorageRecovery|TestCheckpointSegmentCeiling|TestInterruptedBackupRetries|TestBackupRetryRestrictiveUmask|TestRetainedExportLifecycle)$' ./verify/fuzz
+go test -race -count=1 -v -timeout=3m -run '^(TestStorageRecovery|TestCheckpointSegmentCeiling|TestInterruptedBackupRetries|TestBackupRetryRestrictiveUmask|TestRetainedExportLifecycle|TestRestoreReplayReservations)$' ./verify/fuzz
 go test -run '^$' -fuzz '^FuzzWALRecovery$' -fuzztime 30s -timeout 1m -parallel 2 ./verify/fuzz
 go test -run '^$' -fuzz '^FuzzCheckpointPublication$' -fuzztime 30s -timeout 1m -parallel 2 ./verify/fuzz
 ```
@@ -65,9 +65,31 @@ mode-zero guard. It checks that the abandoned stage survives the refusal, then
 repairs the guard and verifies recovery. Once the guard reopens successfully,
 the same case verifies recovery without repair.
 
-The deterministic suites use the subprocess limits above. Each interruption
-worker has a 12-second deadline and its own address-space and per-file limits.
-The test owns the temporary root and reaps the worker after each SIGKILL.
+The deterministic corpus suites use the subprocess limits above. Each
+interruption worker has a 12-second deadline and its own address-space
+and per-file limits. The test owns the temporary root and reaps the worker
+after each SIGKILL.
+
+## Pinned restore and bounded WAL replay
+
+`TestRestoreReplayReservations` runs in the existing `verify/fuzz` race
+step on native Linux amd64 and arm64. It uses the two-frame v1 restore
+fixture with a deadline and cancels when replay first requests the second
+frame, after decoding the first. Cancellation returns no partial result,
+restores the budget to its prior usage, and preserves the restore's file
+set and contents. A retry on the same budget and reader checks both
+logical frame ranges, append-order rows, and the next ordinal.
+
+The caller owns the directory root and keeps the image stable while
+`backup.VerifyPinnedRestore` borrows the root. The returned tail reader
+has its own lifetime. The caller keeps the tail contents stable through
+replay and closes the reader when done. Replay borrows the reader at
+absolute WAL offsets and owns its charges until success, when each
+frame's reservation passes to the caller with its rows. A retained
+reference carries the first frame's charge after the caller releases both
+frame reservations. Releasing the final reference returns usage to the
+baseline. Send production handoff defects to `bog-storage`, the #53
+runtime owner.
 
 ## Pinned export across live replacement
 

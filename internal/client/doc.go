@@ -27,7 +27,9 @@
 // and detects deterministic cycles with an anchor that can require several
 // pages to detect a repeat. Its page budget includes every accepted page,
 // including empty and terminal pages. Failed fetches leave its cursor and
-// budget intact.
+// budget intact. Use NextPageWithRetry for bounded retries of query HTTP 503
+// and interrupted delivery. Exhaustion reports ErrPageRetryExhausted along
+// with the last failed attempt.
 //
 // # Routing and restarting a walk
 //
@@ -41,11 +43,13 @@
 // and the same time bounds and filter to A. During a rolling restart, the
 // walk can continue while that issuing process and its snapshot are available.
 //
-// Cursors expire when their issuing process restarts. If A restarts or the
-// proxy sends the continuation to B, the receiving Bog rejects the cursor
+// If A restarts or the proxy sends the continuation to B, Bog rejects the cursor
 // with HTTP 400 and the body "invalid cursor\n", without delivering rows or
-// a next cursor. HTTPError.CursorRejected identifies that response. If A is
-// still available, retry a misrouted continuation there. A lost issuer may
+// a next cursor. HTTPError.CursorRejected and ErrInvalidCursor identify that
+// response. HTTP 410 "query capture expired\n" on a continuation indicates an
+// authenticated cursor with an expired or unavailable capture and is exposed
+// as ErrCaptureExpired. If A is still available, retry a misrouted continuation
+// there. A lost issuer may
 // instead surface as a transport error. If the cursor has expired or the
 // issuer is gone, start a new snapshot on a live instance by calling
 // Client.Walk or sending a query with page=1 and no cursor.

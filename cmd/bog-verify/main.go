@@ -23,13 +23,19 @@ const usage = `Usage:
   bog-verify compare -backup DIR -url URL -start TIME -end TIME
                      [-contains TEXT] [-limit 100] [-max-pages 100000]
                      [-max-page-bytes 33554432] [-timeout 5m]
+  bog-verify drill -backup DIR -url URL -start TIME -end TIME
+                   [-contains TEXT] [-limit 100] [-max-pages 100000]
+                   [-max-page-bytes 33554432] [-max-retries 3]
+                   [-retry-delay 100ms] [-timeout 5m]
 
 The reference backup must remain immutable throughout the command. Use a
 separate copy as the restored server's data directory. Query times are
 RFC3339 and the range is half-open. The filter is a case-sensitive substring.
+For drill, wait for the restart prompt, restart the restored server, then
+send SIGUSR1 to the verifier once the same URL is ready.
 
 Exit statuses:
-  0  verified backup or complete query match
+  0  verified backup, complete query match, or successful drill
   2  invalid command or options
   3  backup verification failed
   4  comparison incomplete or result could not be reported
@@ -43,6 +49,7 @@ type options struct {
 	maxPages     int
 	maxPageBytes int64
 	query        client.Query
+	retry        client.PageRetry
 }
 
 func parseOptions(mode string, args []string) (options, error) {
@@ -52,7 +59,7 @@ func parseOptions(mode string, args []string) (options, error) {
 	flags.StringVar(&opts.bundle, "backup", "", "path to immutable reference backup")
 	flags.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "overall operation deadline")
 	var start, end string
-	if mode == "compare" {
+	if mode == "compare" || mode == "drill" {
 		flags.StringVar(&opts.baseURL, "url", "", "base URL of the restored Bog server")
 		flags.StringVar(&start, "start", "", "inclusive RFC3339 timestamp")
 		flags.StringVar(&end, "end", "", "exclusive RFC3339 timestamp")
@@ -60,6 +67,10 @@ func parseOptions(mode string, args []string) (options, error) {
 		flags.IntVar(&opts.query.Limit, "limit", 100, "maximum rows per page")
 		flags.IntVar(&opts.maxPages, "max-pages", 100000, "maximum pages per stream, including the terminal page")
 		flags.Int64Var(&opts.maxPageBytes, "max-page-bytes", client.DefaultMaxPage, "maximum encoded bytes per live HTTP page")
+	}
+	if mode == "drill" {
+		flags.IntVar(&opts.retry.MaxRetries, "max-retries", 3, "maximum retries per live page")
+		flags.DurationVar(&opts.retry.Delay, "retry-delay", 100*time.Millisecond, "wait between live page attempts")
 	}
 	if err := flags.Parse(args); err != nil {
 		return options{}, err
@@ -101,6 +112,12 @@ func parseOptions(mode string, args []string) (options, error) {
 	if opts.maxPageBytes < 1 || opts.maxPageBytes == math.MaxInt64 {
 		return options{}, fmt.Errorf("-max-page-bytes must be between 1 and %d", int64(math.MaxInt64-1))
 	}
+	if opts.retry.MaxRetries < 0 {
+		return options{}, errors.New("-max-retries must be nonnegative")
+	}
+	if opts.retry.Delay < 0 {
+		return options{}, errors.New("-retry-delay must be nonnegative")
+	}
 	return opts, nil
 }
 
@@ -125,7 +142,7 @@ func execute(ctx context.Context, args []string, out io.Writer) (int, error) {
 	switch mode {
 	case "help", "-h", "--help":
 		return showHelp(out)
-	case "verify", "compare":
+	case "verify", "compare", "drill":
 	default:
 		return exitUsage, fmt.Errorf("unknown command %q (see bog-verify -h)", mode)
 	}
@@ -149,7 +166,16 @@ func execute(ctx context.Context, args []string, out io.Writer) (int, error) {
 		}
 		return report(out, fmt.Sprintf("backup verified: %s\n", formatPoint(point)))
 	}
-	return compareBackup(ctx, opts, out)
+	server, err := client.New(opts.baseURL, nil)
+	if err != nil {
+		return exitUsage, fmt.Errorf("configure server client: %w", err)
+	}
+	defer server.CloseIdleConnections()
+	server.MaxPageBytes = opts.maxPageBytes
+	if mode == "drill" {
+		return drillBackup(ctx, opts, server, signalRestart{out: out}, out)
+	}
+	return compareBackup(ctx, opts, server, out)
 }
 
 func showHelp(out io.Writer) (int, error) {

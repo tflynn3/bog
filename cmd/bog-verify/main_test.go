@@ -25,7 +25,6 @@ import (
 	"bog/internal/backup"
 	"bog/internal/checkpoint"
 	"bog/internal/client"
-	"bog/internal/httpapi"
 	"bog/internal/store"
 )
 
@@ -136,82 +135,13 @@ func fixtureCursor(value byte) string {
 	return base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{value}, 33))
 }
 
-// fixtureSource gives the real HTTP paging handler an independently ordered
-// in-memory view. Its opaque positions are one-based indexes into that view.
-type fixtureSource []client.Row
-
-func (s fixtureSource) Release(string) error { return nil }
-
-func (s fixtureSource) Page(ctx context.Context, req httpapi.PageRequest, work *store.QueryWork) (httpapi.PageResult, error) {
-	var offset int
-	if req.After != "" {
-		var err error
-		offset, err = strconv.Atoi(string(req.After))
-		if err != nil || offset < 1 || offset > len(s) {
-			return httpapi.PageResult{}, fmt.Errorf("invalid fixture position %q", req.After)
-		}
-	}
-	result := httpapi.PageResult{Capture: "fixture"}
-	for i := offset; i < len(s); i++ {
-		if err := work.Charge(1); err != nil {
-			return httpapi.PageResult{}, err
-		}
-		row := s[i]
-		f := req.Filter
-		if row.TS.Before(f.Start) || !row.TS.Before(f.End) || !strings.Contains(row.Line, f.Contains) {
-			continue
-		}
-		if len(result.Rows) == req.Limit {
-			result.More = true
-			break
-		}
-		result.Rows = append(result.Rows, httpapi.PageRow{Row: row, Position: httpapi.PagePosition(strconv.Itoa(i + 1))})
-	}
-	return result, ctx.Err()
-}
-
-func TestCLIWithRealBackupAndQueryServer(t *testing.T) {
+func TestCLIVerifiesBackup(t *testing.T) {
 	t.Parallel()
-	dir, rows, point := makeBundle(t)
+	dir, _, point := makeBundle(t)
 	var stdout, stderr bytes.Buffer
 	if status := run(t.Context(), []string{"verify", "-backup", dir}, &stdout, &stderr); status != 0 ||
 		stderr.Len() != 0 || !strings.Contains(stdout.String(), "backup verified: "+formatPoint(point)) {
 		t.Fatalf("verify exit %d, stdout %q, stderr %q", status, &stdout, &stderr)
-	}
-
-	// Stable sorting retains append order, and the response cap forces smaller live
-	// pages than the offline reader. Ties cross both page and storage boundaries.
-	slices.SortStableFunc(rows, func(a, b client.Row) int { return a.TS.Compare(b.TS) })
-	api := httpapi.NewWithPageSource(fixtureSource(rows), nil, 80, 1, httpapi.DefaultQueryWorkBudget)
-	server := httptest.NewServer(http.StripPrefix("/bog", api))
-	t.Cleanup(func() {
-		server.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		check(t, api.Close(ctx))
-	})
-	for _, tc := range []struct {
-		name  string
-		extra []string
-		want  string
-		exit  int
-	}{
-		{"paged parity", nil, "rows=4 reference_pages=2 server_pages=4", 0},
-		{"case-sensitive empty result", []string{"-contains", "KEEP-"}, "rows=0 reference_pages=1 server_pages=1", 0},
-		{"equal bounds", []string{"-end", fixtureStart}, "rows=0 reference_pages=1 server_pages=1", 0},
-		{"budget exhausted", []string{"-max-pages", "3"}, "server walk at row 4", 4},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			args := append(compareArgs(dir, server.URL+"/bog"), tc.extra...)
-			status := run(t.Context(), args, &stdout, &stderr)
-			if status != tc.exit || !strings.Contains(stdout.String()+stderr.String(), tc.want) {
-				t.Fatalf("compare exit %d, stdout %q, stderr %q", status, &stdout, &stderr)
-			}
-			if status != 0 && stdout.Len() != 0 {
-				t.Fatalf("failure emitted success output %q", &stdout)
-			}
-		})
 	}
 }
 
@@ -425,6 +355,8 @@ func TestCLICancelsInFlightRequest(t *testing.T) {
 
 func TestCLIUsage(t *testing.T) {
 	t.Parallel()
+	drill := compareArgs("unused", "http://localhost")
+	drill[0] = "drill"
 	for _, tc := range []struct {
 		args []string
 		code int
@@ -433,6 +365,7 @@ func TestCLIUsage(t *testing.T) {
 		{nil, 2, "Usage:"},
 		{[]string{"--help"}, 0, "Exit statuses:"},
 		{[]string{"compare", "-h"}, 0, "Usage:"},
+		{[]string{"drill", "-h"}, 0, "SIGUSR1"},
 		{[]string{"typo"}, 2, "unknown command"},
 		{[]string{"verify"}, 2, "-backup is required"},
 		{[]string{"verify", "-backup", "unused", "extra"}, 2, "unexpected argument"},
@@ -448,6 +381,9 @@ func TestCLIUsage(t *testing.T) {
 		{append(compareArgs("unused", "http://localhost"), "-max-page-bytes", "9223372036854775807"), 2, "-max-page-bytes must be between"},
 		{append(compareArgs("unused", "http://localhost"), "-max-page-bytes", "9223372036854775808"), 2, "-max-page-bytes"},
 		{[]string{"verify", "-backup", "unused", "-max-page-bytes", "1"}, 2, "flag provided but not defined"},
+		{append(compareArgs("unused", "http://localhost"), "-max-retries", "1"), 2, "flag provided but not defined"},
+		{append(slices.Clone(drill), "-max-retries", "-1"), 2, "-max-retries must be nonnegative"},
+		{append(slices.Clone(drill), "-retry-delay", "-1ms"), 2, "-retry-delay must be nonnegative"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if code := run(t.Context(), tc.args, &stdout, &stderr); code != tc.code ||

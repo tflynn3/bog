@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,9 +9,10 @@ import (
 )
 
 const (
-	capacityCaseName = "retained_history_capacity"
-	smallReleaseRows = 196608
-	largeReleaseRows = 393216
+	capacityCaseName             = "retained_history_capacity"
+	smallReleaseRows             = 196608
+	largeReleaseRows             = 393216
+	committedWorkloadFailureExit = 20
 
 	runnerFailure       = "infrastructure"
 	workloadFailure     = "candidate_workload"
@@ -56,6 +58,7 @@ type scaleProgress struct {
 	RecoveredRows *int              `json:"recovered_rows,omitempty"`
 	TimedOut      *bool             `json:"timed_out,omitempty"`
 	Detail        string            `json:"detail,omitempty"`
+	Cleanup       *producerCleanup  `json:"cleanup,omitempty"`
 }
 
 func newRunnerCapacity() *runnerCapacity {
@@ -66,29 +69,36 @@ func newRunnerCapacity() *runnerCapacity {
 	return evidence
 }
 
+type producerCleanup struct {
+	Status          string `json:"status"`
+	Detail          string `json:"detail,omitempty"`
+	CandidateReaped *bool  `json:"candidate_reaped,omitempty"`
+	SubtreeEmpty    *bool  `json:"subtree_empty,omitempty"`
+	SubtreeRemoved  *bool  `json:"subtree_removed,omitempty"`
+	StoreRemoved    *bool  `json:"store_removed,omitempty"`
+}
+
 type producerRecord struct {
 	Fixture struct {
 		SeedRows int `json:"seed_rows"`
 	} `json:"fixture"`
-	Status        string  `json:"status"`
-	Phase         string  `json:"phase"`
-	Detail        string  `json:"detail"`
-	TimedOut      *bool   `json:"timed_out"`
-	IngestSamples *int    `json:"ingest_samples"`
-	QuerySamples  *int    `json:"query_samples"`
-	RecoveredRows *int    `json:"recovered_rows"`
-	MemoryPeak    *uint64 `json:"cgroup_peak_memory_bytes"`
-	Cleanup       struct {
-		Status string `json:"status"`
-		Detail string `json:"detail"`
-	} `json:"cleanup"`
-	Unavailable map[string]string `json:"unavailable"`
-	Diagnostics struct {
+	Status        string            `json:"status"`
+	Workload      string            `json:"workload_status"`
+	Phase         string            `json:"phase"`
+	Detail        string            `json:"detail"`
+	TimedOut      *bool             `json:"timed_out"`
+	IngestSamples *int              `json:"ingest_samples"`
+	QuerySamples  *int              `json:"query_samples"`
+	RecoveredRows *int              `json:"recovered_rows"`
+	MemoryPeak    *uint64           `json:"cgroup_peak_memory_bytes"`
+	Cleanup       *producerCleanup  `json:"cleanup"`
+	Unavailable   map[string]string `json:"unavailable"`
+	Diagnostics   struct {
 		MemoryEvents map[string]uint64 `json:"cgroup_memory_events"`
 	} `json:"diagnostics"`
 }
 
-func (r *runnerReport) readCapacity(data []byte) (kind string, err error) {
+func (r *runnerReport) readCapacity(ctx context.Context, data []byte, exitCode int) (string, error) {
 	var wire struct {
 		SchemaVersion int    `json:"schema_version"`
 		Revision      string `json:"revision"`
@@ -112,7 +122,10 @@ func (r *runnerReport) readCapacity(data []byte) (kind string, err error) {
 	if !ok {
 		return runnerFailure, errors.New("capacity producer report is missing the live case")
 	}
-	seen := make(map[int]bool)
+	scales := r.Capacity.Scales
+	seen := make(map[int]bool, len(scales))
+	haveFailedRecord := false
+	haveWorkloadFailure := false
 	for _, record := range c.Evidence {
 		index := 0
 		rows := record.Fixture.SeedRows
@@ -121,30 +134,56 @@ func (r *runnerReport) readCapacity(data []byte) (kind string, err error) {
 		case largeReleaseRows:
 			index = 1
 		default:
-			err = errors.Join(err, fmt.Errorf("unexpected capacity scale %d", rows))
-			continue
+			return runnerFailure, fmt.Errorf("unexpected capacity scale %d", rows)
 		}
 		if seen[rows] {
-			err = errors.Join(err, fmt.Errorf("duplicate capacity scale %d", rows))
-			continue
+			return runnerFailure, fmt.Errorf("duplicate capacity scale %d", rows)
 		}
 		seen[rows] = true
-		r.Capacity.Scales[index].apply(record)
-	}
-	if err != nil {
-		return runnerFailure, err
-	}
-	for _, scale := range r.Capacity.Scales {
-		if scale.FailureKind != "" && (kind == "" || scale.FailureKind == runnerFailure) {
-			kind = scale.FailureKind
+		switch record.Workload {
+		case "", "pass", "fail", "skip":
+		default:
+			return runnerFailure, fmt.Errorf("unexpected capacity workload status %q for scale %d", record.Workload, rows)
+		}
+		switch record.Status {
+		case "pass":
+			if record.Workload != "" && record.Workload != "pass" ||
+				record.Cleanup != nil && record.Cleanup.Status == "fail" {
+				return runnerFailure, fmt.Errorf("contradictory passing capacity record for scale %d", rows)
+			}
+		case "fail":
+			if record.Phase == "" {
+				return runnerFailure, fmt.Errorf("failed capacity record has no phase for scale %d", rows)
+			}
+			haveFailedRecord = true
+		default:
+			return runnerFailure, fmt.Errorf("unexpected capacity record status %q for scale %d", record.Status, rows)
+		}
+		scales[index].apply(record)
+		if record.Workload == "fail" && scales[index].FailureKind == workloadFailure {
+			haveWorkloadFailure = true
 		}
 	}
-	if kind != "" {
-		return kind, fmt.Errorf("live capacity case failed: %s", c.Detail)
+	switch exitCode {
+	case 0:
+		if c.Status != "pass" || len(seen) != len(scales) || haveFailedRecord {
+			return runnerFailure, fmt.Errorf("expected passing live capacity evidence (case %q, %d of %d scales): %s",
+				c.Status, len(seen), len(scales), c.Detail)
+		}
+	case committedWorkloadFailureExit:
+		if c.Status != "fail" || !haveWorkloadFailure {
+			return runnerFailure, fmt.Errorf("capacity producer exit %d requires a failed live case with candidate workload failure: %s",
+				exitCode, c.Detail)
+		}
+	default:
+		return runnerFailure, fmt.Errorf("capacity producer exit %d cannot attest to proof publication", exitCode)
 	}
-	if c.Status != "pass" || len(seen) != len(releaseScales) {
-		return runnerFailure, fmt.Errorf("incomplete live capacity evidence (case %q, %d of %d scales): %s",
-			c.Status, len(seen), len(releaseScales), c.Detail)
+	if err := ctx.Err(); err != nil {
+		return cancelledFailure, err
+	}
+	r.Capacity.Scales = scales
+	if exitCode == committedWorkloadFailureExit {
+		return workloadFailure, fmt.Errorf("live capacity case failed: %s", c.Detail)
 	}
 	return "", nil
 }
@@ -153,28 +192,31 @@ func (s *scaleProgress) apply(record producerRecord) {
 	s.Phase, s.Status, s.Detail = record.Phase, record.Status, record.Detail
 	s.IngestSamples, s.QuerySamples, s.RecoveredRows = record.IngestSamples, record.QuerySamples, record.RecoveredRows
 	s.TimedOut = record.TimedOut
+	s.Cleanup = record.Cleanup
 	if record.MemoryPeak != nil {
 		s.MemoryPeak = record.MemoryPeak
 		s.PeakSource = "producer"
 	}
 	// Each fixture creates a fresh kernel cgroup. Its counters start at
 	// zero and cover both candidate lifetimes through final teardown.
-	if delta, err := oomDelta(freshOOMBaseline(), record.Diagnostics.MemoryEvents); err == nil {
+	delta, err := oomDelta(freshOOMBaseline(), record.Diagnostics.MemoryEvents)
+	if err == nil {
 		s.OOMDelta, s.OOMSource = delta, "producer"
 	}
 	if record.Status != "pass" {
 		s.FailureKind = workloadFailure
 		switch {
-		case s.OOMDelta["oom_kill"] > 0:
+		case record.Workload != "" && record.Workload != "fail",
+			record.Phase == "provision", record.Phase == "complete":
+			s.FailureKind = runnerFailure
+		case delta["oom_kill"] > 0:
 			// The workload ran out of its own cgroup memory.
-		case record.Phase == "provision", record.Cleanup.Status == "fail",
+		case record.Workload == "" && record.Cleanup != nil && record.Cleanup.Status == "fail",
 			record.Phase == "startup" && strings.Contains(record.Detail, "/cgroup.procs:"),
 			record.Phase == "measurement" && missingKernelAccounting(record.Unavailable):
 			s.FailureKind = runnerFailure
-		case record.Status != "fail":
-			s.FailureKind = runnerFailure
 		}
-		if record.Cleanup.Detail != "" {
+		if record.Cleanup != nil && record.Cleanup.Detail != "" {
 			s.Detail = strings.TrimSpace(s.Detail + "\n" + record.Cleanup.Detail)
 		}
 	}

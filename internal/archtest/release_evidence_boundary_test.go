@@ -42,8 +42,61 @@ func releaseEvidenceBoundaryProblems(rules map[string]rule) []string {
 				problems = append(problems, fmt.Sprintf("forbidden release evidence dependency: %s reaches %s", root, path))
 			}
 		}
+		if root == linuxVerifier && reached[retainedBench] {
+			problems = append(problems, fmt.Sprintf("forbidden release evidence dependency: %s reaches %s", root, retainedBench))
+		}
+		if root == retainedBench && reached[linuxVerifier] {
+			problems = append(problems, fmt.Sprintf("forbidden release evidence dependency: %s reaches %s", root, linuxVerifier))
+		}
 	}
 	return problems
+}
+
+func TestDelegatedCapacityProcessBoundary(t *testing.T) {
+	t.Parallel()
+	const externalRelay = "example.com/capacity-relay"
+	for _, pair := range [][2]string{{linuxVerifier, retainedBench}, {retainedBench, linuxVerifier}} {
+		root, target := pair[0], pair[1]
+		for _, relay := range []string{"", "bog/verify/evidencehelper", externalRelay} {
+			name := relay
+			if name == "" {
+				name = "direct"
+			}
+			t.Run(root+"/"+name, func(t *testing.T) {
+				t.Parallel()
+				rules := map[string]rule{
+					server:               {role: serverCommand},
+					operatorCommand:      {verifier, []string{"bog/internal/backup"}},
+					releaseVerifier:      {role: verifier},
+					linuxVerifier:        {role: verifier},
+					retainedBench:        {role: verifier},
+					streamPolicyVerifier: {role: verifierModel},
+				}
+				imported := target
+				if relay != "" {
+					imported = relay
+					rules[relay] = rule{verifierModel, []string{target}}
+				}
+				rules[root] = rule{verifier, []string{imported}}
+				want := []string{"forbidden release evidence dependency: " + root + " reaches " + target}
+				if relay != externalRelay {
+					if got := releaseEvidenceBoundaryProblems(rules); !slices.Equal(got, want) {
+						t.Errorf("declared boundary problems = %q, want %q", got, want)
+					}
+				}
+				packages := make(map[string]listedPackage, len(rules))
+				for path, entry := range rules {
+					packages[path] = listedPackage{GoFiles: []string{"package.go"}, Imports: entry.imports}
+				}
+				if relay == externalRelay {
+					delete(rules, relay)
+				}
+				if got := measuredCutoverBoundaryProblems(packages, rules); !slices.Equal(got, want) {
+					t.Errorf("measured boundary problems = %q, want %q", got, want)
+				}
+			})
+		}
+	}
 }
 
 func TestReleaseEvidenceBoundaryFixtures(t *testing.T) {

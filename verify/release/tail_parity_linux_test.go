@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -83,7 +82,12 @@ func runTailParityCycle(ctx context.Context, binary, dir, exported, archived, re
 ) (cycle tailParityCycle, err error) {
 	cycle.Input = input
 	flags := []string{fmt.Sprintf("-query-max-response-bytes=%d", restoredPageCap)}
-	if err := requireTailOnlyDirectory(dir); err != nil {
+	data, err := os.OpenRoot(dir)
+	if err != nil {
+		return cycle, err
+	}
+	defer func() { err = errors.Join(err, data.Close()) }()
+	if err := requireTailOnlyDirectory(data); err != nil {
 		return cycle, err
 	}
 	err = serveDirectoryWithStop(ctx, binary, dir, client, flags, (*candidateProcess).crashStop, func(ctx context.Context, base string) error {
@@ -124,10 +128,11 @@ func runTailParityCycle(ctx context.Context, binary, dir, exported, archived, re
 		return cycle, fmt.Errorf("serve writable tail and compact: %w", err)
 	}
 
-	tail, err := exportTailParityCycle(ctx, dir, exported, fixture, &cycle)
+	tail, err := exportTailParityCycle(ctx, data, exported, fixture, &cycle)
 	if err != nil {
 		return cycle, err
 	}
+	defer func() { err = errors.Join(err, tail.file.Close()) }()
 	if err := backup.Restore(ctx, exported, restored); err != nil {
 		return cycle, fmt.Errorf("restore v2 export: %w", err)
 	}
@@ -143,7 +148,11 @@ func runTailParityCycle(ctx context.Context, binary, dir, exported, archived, re
 	if err := os.Rename(exported, archived); err != nil {
 		return cycle, fmt.Errorf("archive source export: %w", err)
 	}
-	if err := requireTailOnlyDirectory(restored); err != nil {
+	restoredRoot, err := os.OpenRoot(restored)
+	if err != nil {
+		return cycle, err
+	}
+	if err := errors.Join(requireTailOnlyDirectory(restoredRoot), restoredRoot.Close()); err != nil {
 		return cycle, err
 	}
 
@@ -200,13 +209,8 @@ func runTailParityCycle(ctx context.Context, binary, dir, exported, archived, re
 	if err != nil {
 		return cycle, err
 	}
-	appended := append(bytes.Clone(fixture.suffix), probeFrame...)
-	actual, err := readTailArtifactPath(dir, tail, int64(len(appended)))
-	if err != nil {
-		return cycle, fmt.Errorf("read writable tail after restart append: %w", err)
-	}
-	if !bytes.Equal(actual, appended) {
-		return cycle, errors.New("writable tail after restart does not contain the exact exported suffix followed by the new frame")
+	if err := verifyParityRestartAppend(ctx, data, tail, probeFrame, len(probe)); err != nil {
+		return cycle, fmt.Errorf("verify selected tail after restart append: %w", err)
 	}
 	err = serveDirectory(ctx, binary, restored, client, flags, func(ctx context.Context, base string) error {
 		p := cycle.Export

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"bog/internal/client"
+	"bog/internal/httpapi"
 	model "bog/verify/query-model"
 )
 
@@ -255,7 +256,13 @@ func (w *queryFaultWriter) Flush() {
 
 func (w *queryFaultWriter) FlushError() error {
 	if w.mode == model.BeforeHeaders && w.Header().Get(cursorHeader) != "" {
-		return w.failWrite(nil)
+		// The underlying writer has only staged the status and headers.
+		// The expired deadline covers its first attempt to write to TCP.
+		err := w.failWrite(nil)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return errors.Join(httpapi.ErrQueryHeadersUnsent, err)
+		}
+		return err
 	}
 	return http.NewResponseController(w.ResponseWriter).Flush()
 }

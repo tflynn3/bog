@@ -91,6 +91,41 @@ func TestRetireQueryCaptureKeepsTerminalInputReplayableUntilRetired(t *testing.T
 	assertRetirementTerminalPage(t, requestCapturePage(a, "&cursor="+other))
 }
 
+func TestLegacyRetirementAuthenticatesExpiredCursor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		newLegacy := func() *API {
+			a := NewWithQueryLimits(captureFixtureSource().store, nil, 4096, 1, DefaultQueryWorkBudget).(*API)
+			closeRetirementTestAPI(t, a)
+			return a
+		}
+		a, foreign := newLegacy(), newLegacy()
+		token := issueCapture(t, a)
+		foreignToken := issueCapture(t, foreign)
+		path := "&cursor=" + token
+		assertRetirementTerminalPage(t, requestCapturePage(a, path))
+		time.Sleep(queryCaptureLifetime)
+		synctest.Wait()
+
+		assertQueryRejection(t, requestCapturePage(a, path), http.StatusGone, "query capture expired")
+		assertQueryRejection(t, requestCapturePage(a, path+"&contains=wrong"), http.StatusBadRequest, "invalid cursor")
+		tampered := []byte(token)
+		tampered[len(tampered)/2] = 'A'
+		if string(tampered) == token {
+			tampered[len(tampered)/2] = 'B'
+		}
+		for _, invalid := range []string{foreignToken, string(tampered), token + "A"} {
+			if err := a.RetireQueryCapture(invalid); !errors.Is(err, store.ErrInvalidQueryCursor) {
+				t.Fatalf("retiring invalid cursor returned %v", err)
+			}
+		}
+		for range 2 {
+			if err := a.RetireQueryCapture(token); err != nil {
+				t.Fatalf("retire expired cursor: %v", err)
+			}
+		}
+	})
+}
+
 func TestRetireQueryCaptureDrainsAdmittedResume(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		source := &blockingReplaySource{

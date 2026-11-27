@@ -1,7 +1,9 @@
 package querymodel_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,7 +18,7 @@ import (
 
 var captureWireLimits = model.WireLimits{MaxPageBytes: 256, MaxPages: 12, Timeout: 15 * time.Second}
 
-func newCaptureDeliveryFixture(t *testing.T, retained bool) model.CaptureDeliveryFixture {
+func newCaptureSocketIssuer(t *testing.T, retained bool) (*runtimeQueryFixture, *querySocketFixture) {
 	t.Helper()
 	f := &runtimeQueryFixture{retained: retained, budget: 32 << 10, concurrency: 4}
 	f.startIssuer()
@@ -25,7 +27,12 @@ func newCaptureDeliveryFixture(t *testing.T, retained bool) model.CaptureDeliver
 			t.Error(err)
 		}
 	})
-	s := newQuerySocketFixture(t, f.handler)
+	return f, newQuerySocketFixture(t, f.handler)
+}
+
+func newCaptureDeliveryFixture(t *testing.T, retained bool) model.CaptureDeliveryFixture {
+	t.Helper()
+	f, s := newCaptureSocketIssuer(t, retained)
 	fixture := model.CaptureDeliveryFixture{
 		Acknowledge: func(ctx context.Context, rows []model.Row) error { return acknowledgeFixtureBatch(ctx, s.client, rows) },
 		Fetch:       s.fetch, Refuse: s.refuse,
@@ -115,6 +122,66 @@ func TestRetainedCaptureRetirementDrainsAtCapacity(t *testing.T) {
 	f := newCaptureDeliveryFixture(t, true)
 	if err := model.VerifyCaptureDelivery(t.Context(), seededTraceConfig(0).Epoch, captureWireLimits, model.DrainAtCapacity, f); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestQueryCaptureCloseDrainsHeldResumeOverTCP(t *testing.T) {
+	for _, retained := range []bool{false, true} {
+		t.Run(pageSourceName(retained), func(t *testing.T) {
+			t.Parallel()
+			f, s := newCaptureSocketIssuer(t, retained)
+			issuer, ok := f.handler.(interface {
+				Close(context.Context) error
+				RetireQueryCapture(string) error
+			})
+			if !ok {
+				t.Fatalf("issuer %T does not expose query lifecycle controls", f.handler)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), captureWireLimits.Timeout)
+			defer cancel()
+			stamp := seededTraceConfig(0).Epoch
+			rows := []model.Row{{Time: stamp, Line: "first"}, {Time: stamp, Line: "terminal"}}
+			if err := acknowledgeFixtureBatch(ctx, s.client, rows); err != nil {
+				t.Fatal(err)
+			}
+			open := model.WireRequest{
+				Filter: model.Filter{Start: stamp, End: stamp.Add(time.Second)},
+				Limit:  1, MaxPageBytes: captureWireLimits.MaxPageBytes,
+			}
+			first, err := s.fetch(ctx, open)
+			if err != nil || first.NextCursor == "" {
+				t.Fatalf("opening failed to issue a cursor: %v", err)
+			}
+			resume := open
+			resume.Cursor = first.NextCursor
+			terminal, err := s.fetch(ctx, resume)
+			if err != nil || terminal.NextCursor != "" || len(terminal.Rows) != 1 || terminal.Rows[0] != rows[1] {
+				t.Fatalf("initial terminal page failed: %v", err)
+			}
+			held, err := s.holdResume(ctx, resume, func() error {
+				deadline, stop := context.WithTimeout(ctx, 30*time.Millisecond)
+				defer stop()
+				if err := issuer.Close(deadline); !errors.Is(err, context.DeadlineExceeded) {
+					return fmt.Errorf("close during held resume returned %v", err)
+				}
+				if err := issuer.RetireQueryCapture(resume.Cursor); err != nil {
+					return err
+				}
+				if err := s.refuse(ctx, resume, http.StatusGone, "query capture expired\n"); err != nil {
+					return err
+				}
+				return s.refuse(ctx, open, http.StatusServiceUnavailable, "query capacity exhausted\n")
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if held.NextCursor != "" || len(terminal.EncodedBody) == 0 || !bytes.Equal(held.EncodedBody, terminal.EncodedBody) {
+				t.Fatal("shutdown changed the held terminal response")
+			}
+			if err := issuer.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

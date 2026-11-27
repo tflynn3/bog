@@ -33,7 +33,7 @@ func writeQueryError(w http.ResponseWriter, err error) {
 func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	work := store.NewQueryWork(r.Context(), a.queryWorkBudget)
 	tokenSize := cursorTokenSize
-	if a.legacyQueryStore != nil {
+	if a.legacy != nil {
 		tokenSize = legacyCursorReservation
 	}
 	params, err := parseQuery(r, tokenSize)
@@ -41,17 +41,17 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if a.legacyQueryStore != nil && (params.page || params.cursor != "") {
-		a.legacySnapshotQuery(w, params, work)
-		return
-	}
 	ctx := r.Context()
 	if params.cursor != "" {
-		a.resumeQuery(w, ctx, params.filter, params.limit, params.cursor, work)
+		if a.legacy != nil {
+			a.resumeLegacyQuery(w, params, work)
+		} else {
+			a.resumeQuery(w, ctx, params.filter, params.limit, params.cursor, work)
+		}
 		return
 	}
 	if params.page {
-		a.startQuery(w, ctx, params.filter, params.limit, work)
+		a.openQuery(w, ctx, params, work)
 		return
 	}
 	result, err := a.captures.source.Page(ctx, PageRequest{Filter: params.filter, Limit: params.limit}, work)
@@ -73,4 +73,39 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.write(w, "")
+}
+
+func (a *API) openQuery(w http.ResponseWriter, ctx context.Context, params queryParams, work *store.QueryWork) {
+	capture, err := a.captures.reserve()
+	if err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	cursorMayHaveReached := false
+	defer func() { a.captures.done(capture, !cursorMayHaveReached) }()
+
+	var response queryResponse
+	var token string
+	if a.legacy != nil {
+		response, token, err = a.prepareLegacyOpening(capture, params, work)
+	} else {
+		response, token, err = a.prepareRetainedOpening(ctx, capture, params, work)
+	}
+	if err == nil && token != "" {
+		// Register the plan before the client can see the token. The opening
+		// request holds its reference through delivery and failure cleanup.
+		err = a.captures.publish(capture)
+	}
+	if err == nil {
+		err = work.Charge()
+	}
+	if err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	if token == "" {
+		response.write(w, "")
+		return
+	}
+	response.writeOpening(w, token, &cursorMayHaveReached)
 }

@@ -15,7 +15,7 @@ type appender interface {
 }
 type API struct {
 	captures         queryCaptures
-	legacyQueryStore *store.Store
+	legacy           *legacyPageSource
 	routes           http.Handler
 	wal              appender
 	fatal            func()
@@ -44,17 +44,20 @@ func NewWithQueryMaxResponseBytes(s *store.Store, w appender, maxBytes int) http
 // Admission returns 503 "query capacity exhausted" and the work limit returns
 // 503 "query work budget exhausted". Cancellation detected before response
 // commit returns 408 "request cancelled". These errors use plain text. Each
-// handler has its own signing key for continuation cursors.
+// handler has its own signing key for continuation cursors. The returned
+// handler is an *API and exposes Close and RetireQueryCapture.
 func NewWithQueryLimits(s *store.Store, w appender, maxBytes, concurrency int, workBudget uint64) http.Handler {
-	a := newAPIForSource(&legacyPageSource{store: s}, w, maxBytes, workBudget)
-	a.legacyQueryStore = s
-	return a.handler(concurrency)
+	source := &legacyPageSource{store: s}
+	a := newAPIForSource(source, w, maxBytes, workBudget)
+	a.legacy = source
+	a.routes = a.handler(concurrency)
+	return a
 }
 
 // NewWithPageSource installs the storage adapter for both ordinary and snapshot
 // queries. For the retained runtime, the command coordinates acquisition with
 // append and generation activation. Size workBudget for the capture, the
-// complete matching walk, and encoding. Drain HTTP and call Close before
+// certified matching prefix, and encoding. Drain HTTP and call Close before
 // closing the storage owner.
 func NewWithPageSource(source PageSource, w appender, maxBytes, concurrency int, workBudget uint64) *API {
 	a := newAPIForSource(source, w, maxBytes, workBudget)
@@ -67,7 +70,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // Close retires captures and waits for admitted capture users and source
-// releases. The caller separately stops admission and drains the HTTP server.
+// releases. The context limits the wait. The caller separately stops
+// admission and drains the HTTP server before closing the source owner.
 func (a *API) Close(ctx context.Context) error {
 	return a.captures.close(ctx)
 }

@@ -13,6 +13,10 @@ const (
 	cursorVersion     = 1
 	cursorPayloadSize = 1 + 8 + sha256.Size + 2 + 2 + sha256.Size
 	cursorSize        = cursorPayloadSize + sha256.Size
+
+	legacyCursorPayload     = 8 + 4 + sha256.Size // capture ID, match offset, filter digest
+	legacyCursorSize        = legacyCursorPayload + sha256.Size
+	legacyCursorReservation = (legacyCursorSize*8 + 5) / 6
 )
 
 var cursorTokenSize = base64.RawURLEncoding.EncodedLen(cursorSize)
@@ -92,11 +96,51 @@ func (a *API) decodeCursor(token string) (cursorData, error) {
 	return c, nil
 }
 
+type legacyCursor struct {
+	capture uint64
+	offset  int
+	filter  [sha256.Size]byte
+}
+
+// Carry the filter digest inside the MAC so retirement can authenticate
+// either format without the original query or a live registry entry.
+func (a *API) encodeLegacyCursor(c legacyCursor) string {
+	var b [legacyCursorSize]byte
+	binary.BigEndian.PutUint64(b[:8], c.capture)
+	binary.BigEndian.PutUint32(b[8:12], uint32(c.offset))
+	copy(b[12:legacyCursorPayload], c.filter[:])
+	copy(b[legacyCursorPayload:], a.cursorMAC(b[:legacyCursorPayload]))
+	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+func (a *API) decodeLegacyCursor(token string) (legacyCursor, error) {
+	var c legacyCursor
+	if len(token) != legacyCursorReservation {
+		return c, store.ErrInvalidQueryCursor
+	}
+	var b [legacyCursorSize]byte
+	n, err := base64.RawURLEncoding.Strict().Decode(b[:], []byte(token))
+	if err != nil || n != len(b) || !hmac.Equal(b[legacyCursorPayload:], a.cursorMAC(b[:legacyCursorPayload])) {
+		return c, store.ErrInvalidQueryCursor
+	}
+	c.capture = binary.BigEndian.Uint64(b[:8])
+	c.offset = int(binary.BigEndian.Uint32(b[8:12]))
+	copy(c.filter[:], b[12:legacyCursorPayload])
+	return c, nil
+}
+
 // RetireQueryCapture authenticates a continuation token and bars new resumes
 // of its capture. Admitted requests can finish before the source is released.
 // An authenticated token for an already retired capture succeeds. If the
 // capture is idle, RetireQueryCapture returns the result of releasing it.
 func (a *API) RetireQueryCapture(token string) error {
+	if a.legacy != nil {
+		cursor, err := a.decodeLegacyCursor(token)
+		if err != nil {
+			return err
+		}
+		return a.captures.retireByID(cursor.capture)
+	}
 	cursor, err := a.decodeCursor(token)
 	if err != nil {
 		return err

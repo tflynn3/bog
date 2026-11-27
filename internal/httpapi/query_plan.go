@@ -25,6 +25,14 @@ type certifiedScan struct {
 	count int
 }
 
+// An oversized match ends certification inside the final scan. Keep the
+// original scan shape so replay uses and validates the same source call.
+type certifiedOversized struct {
+	offset int
+	bytes  int
+	more   bool
+}
+
 var errPageSourceContract = errors.New("invalid result from query page source")
 
 func validOpaque(value string) bool {
@@ -50,33 +58,23 @@ func checkSnapshotScan(result PageResult, req PageRequest, work *store.QueryWork
 	return nil
 }
 
-func (a *API) startQuery(w http.ResponseWriter, ctx context.Context, filter PageFilter, limit int, work *store.QueryWork) {
-	capture, err := a.captures.reserve()
-	if err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	published := false
-	defer func() { a.captures.done(capture, !published) }()
-
-	req := PageRequest{Filter: filter, Limit: limit, Snapshot: true}
+func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture, params queryParams, work *store.QueryWork) (queryResponse, string, error) {
+	filter := params.filter
+	req := PageRequest{Filter: filter, Limit: params.limit, Snapshot: true}
 	result, err := a.captures.source.Page(ctx, req, work)
 	if err != nil {
-		writeQueryError(w, err)
-		return
+		return queryResponse{}, "", err
 	}
 	capture.sourceID = result.Capture
 	if !validOpaque(capture.sourceID) {
-		writeQueryError(w, errPageSourceContract)
-		return
+		return queryResponse{}, "", errPageSourceContract
 	}
 	capture.sourceID = strings.Clone(capture.sourceID)
 	if !result.ExpiresAt.IsZero() && result.ExpiresAt.Before(capture.deadline) {
 		capture.deadline = result.ExpiresAt
 	}
 	if !time.Now().Before(capture.deadline) {
-		writeQueryError(w, ErrCaptureExpired)
-		return
+		return queryResponse{}, "", ErrCaptureExpired
 	}
 	req.Capture = capture.sourceID
 	response := queryResponse{maxBytes: a.maxResponseBytes}
@@ -85,12 +83,10 @@ func (a *API) startQuery(w http.ResponseWriter, ctx context.Context, filter Page
 		err = response.reserveDelivery(work)
 	}
 	if err != nil {
-		writeQueryError(w, err)
-		return
+		return queryResponse{}, "", err
 	}
 	if !more {
-		response.write(w, "")
-		return
+		return response, "", nil
 	}
 
 	// Start the replay plan at the actual byte/row cut, including when the
@@ -98,28 +94,16 @@ func (a *API) startQuery(w http.ResponseWriter, ctx context.Context, filter Page
 	req.After = PagePosition(strings.Clone(string(last)))
 	req.Limit = maxQueryLimit
 	if err := a.certifyQuery(ctx, capture, req, work); err != nil {
-		writeQueryError(w, err)
-		return
+		return queryResponse{}, "", err
 	}
 	// A replay can validate one token and create another. It can hash the
 	// first anchor once, and certification already covers later positions.
 	// Reserve that allowance in the first request, whose cursor work fits it.
 	if err := work.Charge(2*cursorTokenWork, uint64(len(filter.Contains)), cursorBlockWork(len(last))); err != nil {
-		writeQueryError(w, err)
-		return
+		return queryResponse{}, "", err
 	}
 	cursor := capture.cursor(a.filterDigest(filter), 0, 0, last)
-	token := a.encodeCursor(cursor)
-	if err := work.Charge(); err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	if err := a.captures.publish(capture); err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	published = true
-	response.write(w, token)
+	return response, a.encodeCursor(cursor), nil
 }
 
 // A source may return a short scan with lookahead. Keep filling the HTTP
@@ -157,8 +141,8 @@ func (a *API) prepareFirstPage(ctx context.Context, req PageRequest, result Page
 
 // Each replay visits a subset of the certified scans, at most once per
 // request. Its encoder handles each considered row at most once. Certification
-// measures every row (including a potential byte-trimmed row), and the sum
-// of the rounded delivery charges bounds delivery of any subset.
+// measures rows through exhaustion or the first oversized match. The sum of
+// the rounded delivery charges bounds delivery of any replayable subset.
 func (a *API) certifyQuery(ctx context.Context, capture *queryCapture, req PageRequest, work *store.QueryWork) error {
 	measure := queryResponse{}
 	for len(capture.scans) < maxCertifiedScans {
@@ -174,7 +158,7 @@ func (a *API) certifyQuery(ctx context.Context, capture *queryCapture, req PageR
 		if err := checkSnapshotScan(result, req, work); err != nil {
 			return err
 		}
-		for _, row := range result.Rows {
+		for i, row := range result.Rows {
 			// Reserve row setup and any cursor anchor hashing during replay.
 			if err := work.Charge(1, cursorBlockWork(len(row.Position))); err != nil {
 				return err
@@ -184,14 +168,15 @@ func (a *API) certifyQuery(ctx context.Context, capture *queryCapture, req PageR
 				return err
 			}
 			if size > a.maxResponseBytes {
-				return &oversizedQueryRecord{a.maxResponseBytes, size}
+				capture.oversized = &certifiedOversized{offset: i, bytes: size, more: result.More}
+				break
 			}
 			if err := work.Charge(queryDeliveryWork(size)); err != nil {
 				return err
 			}
 		}
-		capture.scans = append(capture.scans, certifiedScan{req.After, len(result.Rows)})
-		if !result.More {
+		capture.scans = append(capture.scans, certifiedScan{after: req.After, count: len(result.Rows)})
+		if capture.oversized != nil || !result.More {
 			return nil
 		}
 		req.After = PagePosition(strings.Clone(string(result.Rows[len(result.Rows)-1].Position)))
@@ -259,10 +244,16 @@ func (a *API) replayQuery(ctx context.Context, capture *queryCapture, cursor cur
 		if err := checkSnapshotScan(result, req, work); err != nil {
 			return "", err
 		}
-		if len(result.Rows) != step.count || result.More != (scan+1 < len(capture.scans)) {
+		hasNextScan := scan+1 < len(capture.scans)
+		fitting, more := step.count, hasNextScan
+		var oversizedBytes int
+		if oversized := capture.oversized; !hasNextScan && oversized != nil {
+			fitting, more, oversizedBytes = oversized.offset, oversized.more, oversized.bytes
+		}
+		if len(result.Rows) != step.count || result.More != more {
 			return "", errPageSourceContract
 		}
-		if result.More && result.Rows[step.count-1].Position != capture.scans[scan+1].after {
+		if hasNextScan && result.Rows[step.count-1].Position != capture.scans[scan+1].after {
 			return "", errPageSourceContract
 		}
 		if scan == int(cursor.Scan) {
@@ -277,7 +268,13 @@ func (a *API) replayQuery(ctx context.Context, capture *queryCapture, cursor cur
 				return "", errPageSourceContract
 			}
 		}
-		rows := result.Rows[offset:min(offset+limit, step.count)]
+		if offset > fitting {
+			return "", store.ErrInvalidQueryCursor
+		}
+		if oversizedBytes != 0 && offset == fitting && response.size == 0 {
+			return "", &oversizedQueryRecord{a.maxResponseBytes, oversizedBytes}
+		}
+		rows := result.Rows[offset:min(offset+limit, fitting)]
 		n, err := response.appendRows(rows, work)
 		if err != nil {
 			return "", err
@@ -287,7 +284,7 @@ func (a *API) replayQuery(ctx context.Context, capture *queryCapture, cursor cur
 			last = rows[n-1].Position
 			limit -= n
 		}
-		if offset < step.count || (limit == 0 && result.More) {
+		if offset < step.count || (limit == 0 && hasNextScan) {
 			if err := work.Charge(cursorTokenWork, cursorBlockWork(len(last))); err != nil {
 				return "", err
 			}

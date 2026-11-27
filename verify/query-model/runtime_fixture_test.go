@@ -193,7 +193,7 @@ func (f *runtimeQueryFixture) stop() error {
 func (f *runtimeQueryFixture) closeIssuer() error {
 	closer, ok := f.handler.(interface{ Close(context.Context) error })
 	if !ok {
-		return nil
+		return fmt.Errorf("query issuer %T does not expose Close", f.handler)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

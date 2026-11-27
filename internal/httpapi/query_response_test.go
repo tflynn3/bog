@@ -102,25 +102,38 @@ func TestQueryResponseRollback(t *testing.T) {
 	}
 }
 
-func TestOversizeQueryRecordBeforeIssuingCursor(t *testing.T) {
+func TestOversizeQueryRecordAtPageHead(t *testing.T) {
 	stamp := time.Date(2025, 1, 1, 0, 0, 1, 0, time.UTC)
 	first := store.Row{TS: stamp, Line: "small"}
 	oversized := store.Row{TS: stamp, Line: strings.Repeat("<", queryStringChunk)}
-	s := new(store.Store)
-	s.Publish([]store.Row{first, oversized})
-
 	// The unescaped line could fit, but its escaped form cannot.
 	capBytes := len(oversized.Line) + len(jsonRow(t, first))
-	h := NewWithPageSource(&legacyPageSource{store: s}, nil, capBytes, DefaultQueryConcurrency, DefaultQueryWorkBudget)
-	query := func(params string) *httptest.ResponseRecorder {
-		out := httptest.NewRecorder()
-		h.ServeHTTP(out, httptest.NewRequest(http.MethodGet, queryBounds+params, nil))
-		return out
-	}
 	required := len(jsonRow(t, oversized))
 	message := fmt.Sprintf("query record exceeds response byte limit (cap %d bytes, requires %d bytes)", capBytes, required)
-	for _, limit := range []string{"1", "2"} {
-		assertQueryRejection(t, query("&page=1&limit="+limit), http.StatusUnprocessableEntity, message)
+	for _, backend := range queryBackends {
+		t.Run(backend.name, func(t *testing.T) {
+			s := new(store.Store)
+			s.Publish([]store.Row{first, oversized, {TS: stamp, Line: "small later"}})
+			a := backend.newAPI(t, s, capBytes, DefaultQueryWorkBudget)
+			closeRetirementTestAPI(t, a)
+			for _, limit := range []string{"1", "2", "3"} {
+				firstPage := requestCapturePage(a, "&page=1&limit="+limit)
+				token := assertRetainedPage(t, firstPage, jsonRow(t, first))
+				if token == "" {
+					t.Fatal("fitting prefix omitted its cursor")
+				}
+				for _, resume := range []string{"1", "1000"} {
+					assertQueryRejection(t, requestCapturePage(a, "&cursor="+token+"&limit="+resume), http.StatusUnprocessableEntity, message)
+				}
+				if err := a.RetireQueryCapture(token); err != nil {
+					t.Fatal(err)
+				}
+				assertQueryRejection(t, requestCapturePage(a, "&cursor="+token), http.StatusGone, "query capture expired")
+			}
+			for _, mode := range []string{"", "&page=1"} {
+				assertQueryRejection(t, requestCapturePage(a, "&contains=%3C"+mode), http.StatusUnprocessableEntity, message)
+			}
+		})
 	}
 }
 

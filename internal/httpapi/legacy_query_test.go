@@ -254,10 +254,10 @@ func TestLegacyCursorConcurrentReuseAndCancellation(t *testing.T) {
 func TestLegacyQueryReleasesFailedCaptures(t *testing.T) {
 	stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	s := new(store.Store)
-	s.Publish([]store.Row{{TS: stamp, Line: "a"}, {TS: stamp, Line: strings.Repeat("<", 30)}})
+	s.Publish([]store.Row{{TS: stamp, Line: strings.Repeat("<", 30)}, {TS: stamp, Line: "a"}})
 	source := &legacyPageSource{store: s}
 	a := newAPIForSource(source, nil, 96, DefaultQueryWorkBudget)
-	a.legacyQueryStore = s
+	a.legacy = source
 	h := a.handler(1)
 	path := queryBounds + "&page=1&limit=1"
 	required := len(jsonRow(t, store.Row{TS: stamp, Line: strings.Repeat("<", 30)}))
@@ -278,7 +278,7 @@ func TestLegacyQueryBoundsLiveCaptures(t *testing.T) {
 	s.Publish([]store.Row{{TS: stamp, Line: "a"}, {TS: stamp, Line: "b"}})
 	source := &legacyPageSource{store: s}
 	a := newAPIForSource(source, nil, 96, 11)
-	a.legacyQueryStore = s
+	a.legacy = source
 	h := a.handler(1)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), admissionWaitTimeout)

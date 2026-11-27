@@ -17,7 +17,9 @@ var (
 // work using the supplied budget. Replaying a captured request must reproduce
 // its rows, positions and More decision within the original scan work.
 // A failed acquisition cleans up its own resources. After a successful
-// acquisition HTTP owns Release, including when response preparation fails.
+// acquisition HTTP owns Release, including when response preparation or
+// confirmed pre-header delivery fails. HTTP holds the capture through
+// response writes and stops admitting resumes before releasing it.
 // Snapshot IDs and positions are nonempty UTF-8 strings of at most 1024 bytes.
 // More requires at least one returned row and proof of another match. Sources
 // may return fewer rows than requested, and HTTP will fill the response using
@@ -29,7 +31,9 @@ var (
 type PageSource interface {
 	Page(context.Context, PageRequest, *store.QueryWork) (PageResult, error)
 	// Release is idempotent. It bars new operations while admitted operations
-	// keep their references until they return.
+	// keep their references until they return. HTTP calls Release once per
+	// acquisition, after its final user drains. Releases of different captures
+	// may run concurrently with one another and with Page calls.
 	Release(capture string) error
 }
 

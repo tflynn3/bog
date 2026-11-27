@@ -113,6 +113,21 @@ with access to the parent. Older prefix-only stages require operator
 inspection. Successful publication removes the attempt's staging entries
 and retains the shared lock file.
 
+### Implementation boundary
+
+`internal/backup/staging.go` owns the publication sequence and the lifetime
+of the parent, guard, and locked stage handles. It fills and syncs the stage,
+reacquires the guard for final checks and rename, syncs the parent, and
+decides when an error requires preserving the claim for a retry.
+`internal/backup/staging_claim.go` owns claim creation, validation of stage
+ownership, abandoned-stage recovery, and ordered cleanup of the stage and
+its records. The claim borrows the publisher's pinned parent handles and
+returns a locked stage descriptor for the publisher to close.
+
+This split keeps the rename and durability decisions together. The publisher
+and claim code share the same guard protocol, so final cleanup relies on the
+publisher holding the guard and syncing the parent after rename.
+
 ## Verification
 
 Portable tests exercise ownership validation, cancellation while a publisher

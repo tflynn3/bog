@@ -6,17 +6,18 @@ import (
 	"time"
 
 	"bog/internal/checkpoint"
+	"bog/internal/store"
 )
 
 func TestFixtureScalesAndBackfill(t *testing.T) {
 	for _, scale := range []string{"small", "medium", "large"} {
 		t.Run(scale, func(t *testing.T) {
 			batches := scaleBatches[scale]
-			input := fixture(batches, false)
+			input := fixture(batches, false, seed)
 			if len(input.rows) != batches/4*328+5 || len(input.anchors) != batches {
 				t.Fatalf("unexpected fixture cardinality at %s", scale)
 			}
-			small := fixture(8, false)
+			small := fixture(8, false, seed)
 			// The oversized row follows the halfway point, so ordinary rows
 			// through batch three match the prefix at every standard scale.
 			prefix := small.anchors[4].Ordinal
@@ -40,7 +41,7 @@ func TestFixtureScalesAndBackfill(t *testing.T) {
 }
 
 func TestExactOracle(t *testing.T) {
-	input := fixture(64, false)
+	input := fixture(64, false, seed)
 	cases := []struct {
 		name, literal string
 		end           time.Time
@@ -70,5 +71,42 @@ func TestExactOracle(t *testing.T) {
 			assertOrdinals(input.rows, tc.initial)
 			assertOrdinals(clustered, tc.clustered)
 		})
+	}
+}
+
+func TestSeededWorkloadsAndProductionBatches(t *testing.T) {
+	for _, entropy := range []bool{false, true} {
+		for _, seed := range []uint64{0, 44, ^uint64(0)} {
+			input := fixture(64, entropy, seed)
+			repeat := fixture(64, entropy, seed)
+			if !slices.Equal(input.rows, repeat.rows) || !slices.Equal(input.anchors, repeat.anchors) ||
+				slices.Equal(input.rows, fixture(64, entropy, seed^1).rows) {
+				t.Fatalf("invalid fixture determinism with seed %d entropy %v", seed, entropy)
+			}
+			var flat []checkpoint.BlockRow
+			maxBatches := 0
+			for batch := range input.batches() {
+				payload, rows, err := encodeBatch(batch)
+				if err != nil {
+					t.Fatal(err)
+				}
+				decoded, err := store.Decode(payload)
+				if err != nil || !slices.Equal(rows, decoded) {
+					t.Fatalf("production frame changes fixture rows: %v", err)
+				}
+				if len(payload) == store.MaxBatch {
+					maxBatches++
+				}
+				flat = append(flat, batch...)
+			}
+			if maxBatches != 1 || !slices.Equal(flat, input.rows) {
+				t.Fatal("production batches do not preserve the fixture or maximum frame")
+			}
+			for i, backfill := range input.backfills() {
+				if !slices.Equal(input.withBackfill(backfill), repeat.withBackfill(repeat.backfills()[i])) {
+					t.Fatalf("nondeterministic %s backfill", backfill.name)
+				}
+			}
+		}
 	}
 }

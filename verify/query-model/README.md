@@ -19,6 +19,68 @@ committed row count, encoded bytes decoded, and the peak encoded input per
 replay batch in the fixture. Native #108 capacity evidence measures candidate
 memory and retirement against the pinned Linux runtime.
 
+## Comparable query costs
+
+`VerifyQueryCosts` uses the same launcher, adapter, and wire oracle as the
+seeded replay trace. Every budget probe starts with an empty issuer and
+acknowledges the same 112 rows in the same batches and order, including
+timestamp ties and exact duplicates. Retained trials publish at that exact
+cutoff before querying. The empty (absent literal), sparse (five matches), and
+broad (unfiltered) queries share the time range, row limit sequence of 4, 1,
+and 7, and the 256-byte response cap. Only the literal changes.
+
+The search assumes monotonic opening refusal for an identical request on
+equivalently seeded issuers. It requires a complete, framed HTTP 503 with
+the exact work-budget refusal body and no rows or cursor at the adjacent
+lower positive budget. At the issuing budget every page must match the
+ordered ledger through exhaustion. The terminal request must replay
+byte for byte at that same budget. For the empty walk the terminal request
+is the opening itself, so replay repeats the same opening and checks the
+explicitly framed empty body again.
+
+The report gives the adjacent budget settings in work units, the number
+of rows returned, and the encoded NDJSON response bytes as separate values.
+Rows, pages, and bytes count the verified walk once and exclude the refusal
+and replay. The minimum issuing budget is a per-request configuration
+threshold for this workload. The query wire has no counter for actual
+charged work. An adapter with a direct scan meter can supply a byte count
+and its source just before replay. The report divides those bytes by
+returned rows for nonempty results and omits the ratio for an empty result.
+Candidate output marks both charged work and scanned bytes unavailable.
+
+The portable race run for seed 2709 on macOS arm64 observed:
+
+| Query | Legacy refused / issuing work units | Retained fixture refused / issuing work units | Returned rows | Response bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Empty | 1487 / 1488 | 1495 / 1496 | 0 | 0 |
+| Sparse | 1713 / 1714 | 3022 / 3023 | 5 | 413 |
+| Broad | 1492 / 1493 | 3776 / 3777 | 110 | 6173 |
+
+The separate scripted HTTP fixture measured 6,487 bytes of encoded JSON
+row payload decoded during each capture. That yields 1,297.4 scanned bytes
+per sparse result row and about 58.97 per broad result row. Its work
+thresholds are scripted to test the verifier. The in-process handler trials
+and the pinned candidate trials report their own budget thresholds, and
+the scripted byte counts apply only to the scripted fixture.
+
+```sh
+go test -race -count=1 -v ./verify/query-model -run '^TestQueryCosts'
+```
+
+After #108, run the cost check on each native Linux release runner with
+`BOG_RELEASE_BINARY` and `BOG_RELEASE_REVISION` set to the clean pinned
+candidate and its full revision.
+
+```sh
+go test -json -race -count=1 ./verify/query-model -run '^TestPinnedQueryModelCosts$'
+```
+
+Collect the `pinned_query_cost` records together with the logged candidate
+revision, binary SHA-256 and architecture. Require passing events for both
+`TestPinnedQueryModelCosts/ordinary` (before seed publication) and
+`TestPinnedQueryModelCosts/retained` (after exact-cutoff seed publication).
+The retained check requires the candidate's compaction control.
+
 ## Release handoff
 
 `WirePage.EncodedBody` holds the exact bytes consumed by the HTTP validator,

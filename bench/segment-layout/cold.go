@@ -27,6 +27,7 @@ type coldReport struct {
 	Production    coldLayout     `json:"production_v1_component"`
 	Experimental  []coldLayout   `json:"experimental_layouts"`
 	Live          liveReport     `json:"live_server_compaction"`
+	Pairing       *coldPairing   `json:"pairing,omitempty"`
 }
 
 type coldFixture struct {
@@ -70,13 +71,35 @@ type coldQueryReport struct {
 }
 
 type coldSample struct {
-	ElapsedNS         int64         `json:"elapsed_ns"`
-	ReadBytes         int64         `json:"process_read_bytes"`
-	StorageReadBytes  int64         `json:"storage_read_bytes"`
-	Payload           *payloadReads `json:"experimental_payload,omitempty"`
-	DecodeBytes       *int          `json:"decode_bytes,omitempty"`
-	GoAllocationBytes uint64        `json:"go_allocation_bytes"`
-	PeakRSSBytes      uint64        `json:"worker_rss_bytes"`
+	ElapsedNS         int64            `json:"elapsed_ns"`
+	ReadBytes         int64            `json:"process_read_bytes"`
+	StorageReadBytes  int64            `json:"storage_read_bytes"`
+	Payload           *payloadReads    `json:"experimental_payload,omitempty"`
+	DecodeBytes       *int             `json:"decode_bytes,omitempty"`
+	GoAllocationBytes uint64           `json:"go_allocation_bytes"`
+	PeakRSSBytes      uint64           `json:"worker_rss_bytes"`
+	Proof             *coldSampleProof `json:"pairing,omitempty"`
+}
+
+func (s *coldSample) UnmarshalJSON(data []byte) error {
+	// Zero storage reads are valid. Require the field so a missing counter
+	// cannot become a measured zero during report or worker validation.
+	type sampleFields coldSample
+	var decoded struct {
+		sampleFields
+		StorageReadBytes *int64 `json:"storage_read_bytes"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&decoded); err != nil {
+		return err
+	}
+	if decoded.StorageReadBytes == nil {
+		return errors.New("missing cold sample storage read counter")
+	}
+	*s = coldSample(decoded.sampleFields)
+	s.StorageReadBytes = *decoded.StorageReadBytes
+	return nil
 }
 
 func coldQueries() []query {
@@ -101,6 +124,7 @@ func coldRuns(q query, runs int) int {
 }
 
 func (q *coldQueryReport) summarize() {
+	q.PeakDecodeBytes, q.PeakDecodeHeapUpperBoundBytes, q.PeakRSSBytes = nil, 0, 0
 	times := make([]int64, len(q.Samples))
 	reads := make([]int64, len(q.Samples))
 	storage := make([]int64, len(q.Samples))
@@ -128,8 +152,14 @@ func parseReadIO(data []byte) (readIO, error) {
 		var field *int64
 		switch key {
 		case "rchar":
+			if logical {
+				return readIO{}, errors.New("duplicate /proc/self/io rchar counter")
+			}
 			field, logical = &result.logical, true
 		case "read_bytes":
+			if storage {
+				return readIO{}, errors.New("duplicate /proc/self/io read_bytes counter")
+			}
 			field, storage = &result.storage, true
 		default:
 			continue
@@ -170,10 +200,19 @@ func validateBenchmarkReport(in io.Reader) error {
 	if err := json.Unmarshal(raw, &header); err != nil {
 		return err
 	}
-	if header.Version == 5 {
+	if header.Version == 5 || header.Version == pairedColdSchema {
 		var report coldReport
-		if err := json.Unmarshal(raw, &report); err != nil {
+		cold := json.NewDecoder(bytes.NewReader(raw))
+		if header.Version == pairedColdSchema {
+			cold.DisallowUnknownFields()
+		}
+		if err := cold.Decode(&report); err != nil {
 			return err
+		}
+		if header.Version == pairedColdSchema && report.Pairing != nil {
+			if err := validatePairEncoding(raw, report.Pairing); err != nil {
+				return err
+			}
 		}
 		return report.validate()
 	}
@@ -181,12 +220,36 @@ func validateBenchmarkReport(in io.Reader) error {
 }
 
 func (r coldReport) validate() error {
+	if err := r.validateColdMeasurements(); err != nil {
+		return err
+	}
+	if r.SchemaVersion == pairedColdSchema {
+		return r.validatePairs()
+	}
+	if r.Pairing != nil {
+		return errors.New("unexpected pairing in schema v5 cold report")
+	}
+	for _, l := range append([]coldLayout{r.Production}, r.Experimental...) {
+		for _, phase := range l.Phases {
+			for _, q := range phase.Queries {
+				for _, sample := range q.Samples {
+					if sample.Proof != nil {
+						return errors.New("unexpected sample pairing in schema v5 cold report")
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (r coldReport) validateColdMeasurements() error {
 	f := r.Fixture
-	if r.SchemaVersion != 5 || r.Mode != "cold" || !knownRevision(r.Revision) || r.Oracle != coldOracle ||
+	if (r.SchemaVersion != 5 && r.SchemaVersion != pairedColdSchema) || r.Mode != "cold" || !knownRevision(r.Revision) || r.Oracle != coldOracle ||
 		r.Environment["os"] != "linux" || r.Environment["cache_policy"] != coldCachePolicy ||
 		(f.Profile != "mixed" && f.Profile != "entropy") || f.Batches < 1 || f.Batches > maxBatches ||
 		f.SparseRuns < 1 || f.SparseRuns > maxRuns || f.TargetBytes != blockTarget {
-		return errors.New("invalid schema v5 cold report header")
+		return errors.New("invalid cold report header")
 	}
 	if (f.Scale == "smoke" && (f.Batches != scaleBatches["small"] || f.SparseRuns != 1)) ||
 		(f.Scale != "smoke" && f.Scale != "custom" && scaleBatches[f.Scale] != f.Batches) {
@@ -244,7 +307,8 @@ func validateColdLayout(l coldLayout, rows, runs int, production bool) error {
 		}
 		if phase.Phase != coldPhases[i] || phase.Rows != wantRows || phase.Segments < 1 || phase.ManifestBytes < 1 ||
 			phase.ReusedBytes < 0 || phase.RewrittenBytes < 1 || phase.RetiredBytes < 0 ||
-			phase.RetainedBytes != phase.ReusedBytes+phase.RewrittenBytes || (production && phase.BloomBytes != 0) {
+			phase.RetainedBytes < phase.ReusedBytes || phase.RetainedBytes-phase.ReusedBytes != phase.RewrittenBytes ||
+			(production && phase.BloomBytes != 0) {
 			return fmt.Errorf("%s/%s: invalid publication counters", l.Name, phase.Phase)
 		}
 		if i == 0 {
@@ -256,9 +320,9 @@ func validateColdLayout(l coldLayout, rows, runs int, production bool) error {
 			if production {
 				boundary = componentBoundary
 			}
-			if phase.ReusedBytes+phase.RetiredBytes != l.Phases[0].RetainedBytes ||
+			if phase.ReusedBytes > l.Phases[0].RetainedBytes || l.Phases[0].RetainedBytes-phase.ReusedBytes != phase.RetiredBytes ||
 				!validColdAmplification(phase.Rewrite, boundary) ||
-				(!production && phase.Rewrite.WrittenBytes != uint64(phase.RewrittenBytes+phase.ManifestBytes)) {
+				(!production && phase.Rewrite.WrittenBytes != uint64(phase.RewrittenBytes)+uint64(phase.ManifestBytes)) {
 				return fmt.Errorf("%s/%s: invalid rewrite amplification", l.Name, phase.Phase)
 			}
 		}

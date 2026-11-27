@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -179,4 +181,18 @@ func (input fixtureInput) successiveAppends() []backfill {
 		}
 	}
 	return appends
+}
+
+func encodeBatch(batch []checkpoint.BlockRow) ([]byte, []store.Row, error) {
+	var payload bytes.Buffer
+	enc := json.NewEncoder(&payload)
+	rows := make([]store.Row, len(batch))
+	for i, row := range batch {
+		rows[i] = row.Row
+		if err := enc.Encode(row.Row); err != nil {
+			return nil, nil, err
+		}
+	}
+	// Omit the final newline to fit the maximum-sized singleton frame.
+	return bytes.TrimSuffix(payload.Bytes(), []byte{'\n'}), rows, nil
 }

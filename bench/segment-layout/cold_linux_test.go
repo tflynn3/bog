@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"path/filepath"
@@ -24,8 +26,15 @@ func TestColdComparisonReport(t *testing.T) {
 			if err := run(t.Context(), cfg, &out); err != nil {
 				t.Fatal(err)
 			}
-			if err := validateBenchmarkReport(&out); err != nil {
+			if err := validateBenchmarkReport(bytes.NewReader(out.Bytes())); err != nil {
 				t.Fatal(err)
+			}
+			var report coldReport
+			if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+				t.Fatal(err)
+			}
+			if report.SchemaVersion != pairedColdSchema || report.Pairing == nil || len(report.Pairing.Comparisons) != 36 {
+				t.Fatalf("missing schema v6 comparisons: version %d, pairing %v", report.SchemaVersion, report.Pairing)
 			}
 			assertEmpty(t, parent)
 			if err := run(t.Context(), cfg, failedReportWriter{}); !errors.Is(err, io.ErrClosedPipe) {
@@ -34,6 +43,20 @@ func TestColdComparisonReport(t *testing.T) {
 			assertEmpty(t, parent)
 		})
 	}
+}
+
+func TestCanceledColdComparisonPublishesNothing(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	parent := t.TempDir()
+	cfg := config{cold: true, dir: parent, revision: "test", profile: "mixed", scale: "custom",
+		batches: 4, runs: 2, fixtureSeed: seed, timeout: time.Minute}
+	var out bytes.Buffer
+	if err := run(ctx, cfg, &out); !errors.Is(err, context.Canceled) || out.Len() != 0 {
+		t.Fatalf("canceled run returned %v and wrote %d bytes", err, out.Len())
+	}
+	assertEmpty(t, parent)
 }
 
 func TestColdExperimentalPruningAndOracle(t *testing.T) {

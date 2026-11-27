@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,12 +25,16 @@ type coldRequest struct {
 }
 
 type coldTarget struct {
+	name       string
 	path       string
 	production bool
 	phases     []coldPhase
 }
 
 func collectCold(ctx context.Context, cfg config) (_ coldReport, err error) {
+	if err := ctx.Err(); err != nil {
+		return coldReport{}, err
+	}
 	dir, err := os.MkdirTemp(cfg.dir, "bog-segment-cold-")
 	if err != nil {
 		return coldReport{}, err
@@ -40,13 +46,22 @@ func collectCold(ctx context.Context, cfg config) (_ coldReport, err error) {
 	}
 	env["cache_policy"] = coldCachePolicy
 	input := fixture(cfg.batches, cfg.profile == "entropy", cfg.fixtureSeed)
+	var runID [16]byte
+	if _, err := rand.Read(runID[:]); err != nil {
+		return coldReport{}, fmt.Errorf("cold pairing run ID: %w", err)
+	}
 	result := coldReport{
-		SchemaVersion: 5, Mode: "cold", Revision: cfg.revision, Environment: env,
+		SchemaVersion: pairedColdSchema, Mode: "cold", Revision: cfg.revision, Environment: env,
 		Fixture: coldFixture{cfg.profile, cfg.scale, cfg.fixtureSeed, cfg.batches, cfg.runs, blockTarget},
 		Oracle:  coldOracle, Live: liveReport{Status: "unavailable", Reason: "no pinned binary supplied"},
 	}
+	result.Pairing = &coldPairing{RunID: hex.EncodeToString(runID[:]), FixtureSHA256: coldFixtureDigest(result.Fixture, input)}
 	bursts := append([]backfill{{"initial", nil}}, input.backfills()...)
 	targets := make([]coldTarget, 1+len(layouts))
+	targets[0].name = productionV1
+	for i, l := range layouts {
+		targets[i+1].name = l.name()
+	}
 	denominators := make(map[string]uint64)
 	for phaseIndex, burst := range bursts {
 		rows := input.rows
@@ -62,7 +77,7 @@ func collectCold(ctx context.Context, cfg config) (_ coldReport, err error) {
 		if phaseIndex != 0 {
 			denominators[burst.name] = targets[0].phases[phaseIndex].Rewrite.AppendedWALBytes
 		}
-		if err := sampleColdPhase(ctx, cfg, targets, rows, phaseIndex); err != nil {
+		if err := sampleColdPhase(ctx, cfg, targets, rows, phaseIndex, result.Pairing); err != nil {
 			return coldReport{}, fmt.Errorf("%s: %w", burst.name, err)
 		}
 		if err := os.RemoveAll(targets[0].path); err != nil {
@@ -80,7 +95,10 @@ func collectCold(ctx context.Context, cfg config) (_ coldReport, err error) {
 		}
 		result.Live = live
 	}
-	return result, result.validate()
+	if err := result.sealPairs(input); err != nil {
+		return coldReport{}, err
+	}
+	return result, ctx.Err()
 }
 
 func prepareColdTargets(ctx context.Context, cfg config, dir string, burst backfill, rows []checkpoint.BlockRow, targets []coldTarget) error {
@@ -207,21 +225,30 @@ func prepareColdExperimental(ctx context.Context, dir string, burst backfill, ro
 	return pub, path, nil
 }
 
-func sampleColdPhase(ctx context.Context, cfg config, targets []coldTarget, rows []checkpoint.BlockRow, phase int) error {
+func sampleColdPhase(ctx context.Context, cfg config, targets []coldTarget, rows []checkpoint.BlockRow, phase int, pairing *coldPairing) error {
 	for qi, q := range coldQueries() {
 		want := reference(rows, q)
+		digest := coldRowsDigest(want)
 		for i := range targets {
 			pub := &targets[i].phases[phase]
 			pub.Queries = append(pub.Queries, coldQueryReport{Query: q.name, Literal: q.literal, Start: q.start, End: q.end, Matches: len(want)})
 		}
 		for sample := range coldRuns(q, cfg.runs) {
+			round := sample + 1
+			pairID := pairing.pairID(coldPhases[phase], q, round)
 			// Rotate the leading layout to reduce systematic sample-order effects.
 			for offset := range targets {
 				i := (phase + qi + sample + offset) % len(targets)
 				target := &targets[i]
 				req := coldRequest{Path: target.path, Query: q.name, Production: target.production}
-				if err := sampleColdQuery(ctx, cfg, req, want, &target.phases[phase].Queries[qi]); err != nil {
-					return fmt.Errorf("%s %s sample %d: %w", filepath.Base(req.Path), q.name, sample+1, err)
+				dst := &target.phases[phase].Queries[qi]
+				if err := sampleColdQuery(ctx, cfg, req, want, dst); err != nil {
+					return fmt.Errorf("%s %s sample %d: %w", target.name, q.name, round, err)
+				}
+				// The worker exited successfully and every row matched the
+				// oracle stream, so its ordered result has this digest.
+				dst.Samples[sample].Proof = &coldSampleProof{
+					Round: round, PairID: pairID, Layout: target.name, RowsSHA256: digest,
 				}
 			}
 		}
@@ -245,6 +272,9 @@ func sampleColdQuery(ctx context.Context, cfg config, req coldRequest, want []ch
 	})
 	if err != nil {
 		return err
+	}
+	if sample.Proof != nil {
+		return errors.New("unexpected pairing evidence in worker output")
 	}
 	dst.Samples = append(dst.Samples, sample)
 	return nil

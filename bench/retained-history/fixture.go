@@ -178,7 +178,16 @@ func (f fixture) load(ctx context.Context, s service, o options, r *result, dir 
 	if err != nil {
 		return err
 	}
-	_, err = f.runBackfill(ctx, s, o, r, dir, scattered, f.newWalk(f.SeedRows, true), generation)
+	var held *walk
+	if o.requireSlowOverlap {
+		if s.acknowledged == nil || s.acknowledged.rows() != f.SeedRows {
+			return errors.New("slow response workload requires the full acknowledged seed ledger")
+		}
+		held = f.newWalk(s.acknowledged.rows(), false)
+	} else {
+		held = f.newWalk(f.SeedRows, true)
+	}
+	_, err = f.runBackfill(ctx, s, o, r, dir, scattered, held, generation)
 	return err
 }
 

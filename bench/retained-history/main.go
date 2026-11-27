@@ -105,7 +105,7 @@ type report struct {
 type options struct {
 	binary, revision, fixture, report, mode, workDir, cgroupParent, control string
 	timeout                                                                 time.Duration
-	requireCorrelation                                                      bool
+	requireCorrelation, requireSlowOverlap                                  bool
 }
 
 func pinBinary(source, dest, revision string) (digest string, err error) {
@@ -169,6 +169,7 @@ func run(ctx context.Context, args []string, publish func(string, report) error)
 	f := flag.NewFlagSet("retained-history", flag.ContinueOnError)
 	f.StringVar(&correlatedReport, "validate-capacity-correlation", "", "require correlated capacity proof in an existing report")
 	f.BoolVar(&o.requireCorrelation, "require-capacity-correlation", false, "require replay, pin age, capacity credit, and cgroup peak for each live replacement")
+	f.BoolVar(&o.requireSlowOverlap, "require-slow-response-overlap", false, "qualify the live slow-response, cancellation, and reclamation workload")
 	f.StringVar(&cutoverReport, "validate-cutover", "", "validate the cutover proof in an existing capacity report")
 	f.StringVar(&o.binary, "binary", "", "absolute path to pinned Linux Bog binary")
 	f.StringVar(&o.revision, "revision", "", "full lowercase commit SHA")
@@ -200,6 +201,9 @@ func run(ctx context.Context, args []string, publish func(string, report) error)
 	}
 	if o.requireCorrelation && o.mode != "live" {
 		return errors.New("-require-capacity-correlation requires live mode")
+	}
+	if o.requireSlowOverlap && o.mode != "live" {
+		return errors.New("-require-slow-response-overlap requires live mode")
 	}
 	source, sourceErr := os.Stat(o.binary)
 	if dest, destErr := os.Stat(o.report); sourceErr == nil && destErr == nil && os.SameFile(source, dest) {

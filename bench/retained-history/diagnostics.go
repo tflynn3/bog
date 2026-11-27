@@ -53,7 +53,7 @@ func recordQuery(phases map[string]*queryPhase, name string, q queryAttempt, err
 		if p.Failure == nil {
 			p.Failure = &q
 		}
-	} else {
+	} else if q.Body != nil {
 		q.Phase = "complete"
 	}
 	p.Last = q
@@ -90,14 +90,36 @@ func (q *queryAttempt) observeHeaders(res *http.Response, elapsed time.Duration)
 }
 
 func (q *queryAttempt) observeRejection(body []byte) {
-	if q.Status == nil || *q.Status != http.StatusServiceUnavailable || q.HasCursor {
+	if q.Status == nil || q.HasCursor {
 		return
 	}
-	switch strings.TrimSpace(string(body)) {
-	case "query capacity exhausted":
-		q.Admission = "capacity_rejection"
-	case "query work budget exhausted":
-		q.Admission = "work_budget_rejection"
+	message := strings.TrimSpace(string(body))
+	switch *q.Status {
+	case http.StatusServiceUnavailable:
+		switch message {
+		case "query capacity exhausted":
+			q.Admission = "capacity_rejection"
+		case "query work budget exhausted":
+			q.Admission = "work_budget_rejection"
+		case "query response capacity exhausted":
+			q.Admission = "response_capacity_rejection"
+		case "query scan capacity exhausted":
+			q.Admission = "scan_capacity_rejection"
+		case "query capture capacity exhausted":
+			q.Admission = "capture_capacity_rejection"
+		}
+	case http.StatusGone:
+		if message == "query capture expired" {
+			q.Admission = "retired_or_expired_capture"
+		}
+	case http.StatusUnprocessableEntity:
+		if strings.HasPrefix(message, "query record exceeds response byte limit") {
+			q.Admission = "record_too_large"
+		}
+	case http.StatusRequestTimeout:
+		if message == "request cancelled" {
+			q.Admission = "request_cancelled"
+		}
 	}
 }
 
@@ -116,6 +138,7 @@ type candidateEvidence struct {
 }
 
 type capacityDiagnostics struct {
+	SlowResponses     *slowResponseEvidence  `json:"slow_responses,omitempty"`
 	Backfills         []*backfillTimeline    `json:"backfill_timelines,omitempty"`
 	Queries           map[string]*queryPhase `json:"queries"`
 	Candidates        []*candidateEvidence   `json:"candidates"`

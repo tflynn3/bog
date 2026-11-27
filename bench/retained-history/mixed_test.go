@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,7 +40,7 @@ func TestMixedLoadCorrelatesBothWorkloads(t *testing.T) {
 	testMixedLoad(t, "", func(context.Context) (uint64, error) { return 768, nil })
 }
 
-func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) (uint64, error)) {
+func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) (uint64, error), slowCase ...string) {
 	t.Helper()
 	correlated := readPeak != nil
 	f := fixture{2048, 32, 64, 8, 1024, true}
@@ -50,7 +52,24 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 	ctx, cancel := context.WithCancelCause(t.Context())
 	defer cancel(nil)
 	var mu sync.Mutex
-	var appended, snapshot []row
+	var appended []row
+	snapshots := make(map[int][]row)
+	retired := make(map[int]bool)
+	trial := testRestartTrial(t)
+	scenario := ""
+	slowEnabled := len(slowCase) != 0
+	if slowEnabled {
+		scenario = slowCase[0]
+	}
+	var livePaused, openedPaused int
+	var restarting bool
+	oldManifest := filepath.Join(trial.dir, manifestPrefix+strings.Repeat("a", 64))
+	nextManifest := filepath.Join(trial.dir, manifestPrefix+strings.Repeat("b", 64))
+	if slowEnabled {
+		if err := os.WriteFile(oldManifest, []byte("predecessor"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var generation uint64
 	var covered int
 	var capture int
@@ -76,7 +95,19 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 						return
 					}
 					op.retired = true
+					if slowEnabled && scenario == "early_reclamation" && op == scatter {
+						if err := os.Remove(oldManifest); err != nil {
+							t.Error(err)
+						}
+					}
 				}
+				var id, offset int
+				if _, err := fmt.Sscanf(cursor, "%d:%d", &id, &offset); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				retired[id] = true
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
@@ -112,6 +143,11 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 					}
 					generation++
 					covered, op.running = cutoff, false
+					if slowEnabled && op == scatter {
+						if err := os.WriteFile(nextManifest, []byte("successor"), 0600); err != nil {
+							t.Error(err)
+						}
+					}
 					if failure == "bad_publication" && op == scatter {
 						covered--
 					}
@@ -133,7 +169,7 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 			}{compaction{generation, covered, len(appended), state}, map[string]uint64{"staging_used_bytes": 0}}
 			if op != nil && cutoff == op.cutoff && state == "complete" {
 				reply.Metrics["retired_generation_pins"] = 1
-				if op.retired {
+				if op.retired && (!slowEnabled || op == cluster || livePaused == 0) {
 					reply.Metrics["retired_generation_pins"] = 0
 					op.postRetirementReplies++
 				}
@@ -224,6 +260,17 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 			}
 			mu.Lock()
 			active := op
+			if slowEnabled && scenario != "false_saturation" &&
+				(livePaused == 2 || scenario == "cancel_slot_leak" && openedPaused == 2 && livePaused == 1) {
+				mu.Unlock()
+				http.Error(w, "query capacity exhausted", http.StatusServiceUnavailable)
+				return
+			}
+			if slowEnabled && retired[cursorCapture] {
+				mu.Unlock()
+				http.Error(w, "query capture expired", http.StatusGone)
+				return
+			}
 			overlap := offset == 1 && active != nil && active.running
 			mu.Unlock()
 			if overlap {
@@ -237,16 +284,17 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 			mu.Lock()
 			if offset == 0 {
 				capture++
-				snapshot = nil
+				cursorCapture = capture
+				var snapshot []row
 				for _, r := range appended {
 					if !r.TS.Before(start) && r.TS.Before(end) && strings.Contains(r.Line, q.Get("contains")) {
 						snapshot = append(snapshot, r)
 					}
 				}
 				slices.SortStableFunc(snapshot, func(a, b row) int { return a.TS.Compare(b.TS) })
-			} else if cursorCapture != capture {
-				t.Error("continuation reused the wrong capture")
+				snapshots[cursorCapture] = snapshot
 			}
+			snapshot := snapshots[cursorCapture]
 			if offset < 0 || offset > len(snapshot) {
 				mu.Unlock()
 				t.Error("query offset outside snapshot")
@@ -256,7 +304,8 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 			stop := min(offset+limit, len(snapshot))
 			page := slices.Clone(snapshot[offset:stop])
 			var differentBytes bool
-			if offset > 0 && active != nil && !active.running && covered == active.cutoff && !active.retired {
+			if offset > 0 && active != nil && !active.running && covered == active.cutoff && !active.retired &&
+				(!slowEnabled || !end.Equal(epoch.Add(17*time.Millisecond))) {
 				active.resumed = true
 				if stop == len(snapshot) {
 					if active.terminalCursor == "" {
@@ -276,8 +325,15 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 			if failure == "bad_fresh" && active == scatter && active.retired && q.Get("contains") == "" && offset == 0 {
 				page[0].Line = "wrong fresh row"
 			}
+			if scenario == "different_resume_bytes" && openedPaused == 2 && livePaused == 1 {
+				differentBytes = true
+			}
+			if (scenario == "lost_duplicate" && openedPaused == 2 && livePaused == 0 && end.Equal(epoch.Add(17*time.Millisecond)) ||
+				scenario == "restart_duplicate" && restarting) && len(page) > 2 {
+				page[1] = page[2]
+			}
 			if stop < len(snapshot) {
-				w.Header().Set("Bog-Next-Cursor", fmt.Sprintf("%d:%d", capture, stop))
+				w.Header().Set("Bog-Next-Cursor", fmt.Sprintf("%d:%d", cursorCapture, stop))
 			}
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/x-ndjson")
@@ -302,17 +358,112 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 	defer srv.Close()
 	s := newService(srv.URL)
 	defer s.client.CloseIdleConnections()
-	trial := testRestartTrial(t)
 	s.acknowledged = &trial.ledger
 	s.client.Timeout = 2 * time.Second
 	s.readMemoryPeak = readPeak
 	s.readMemoryCurrent = func(context.Context) (uint64, error) { return f.MemoryBytes / 2, nil }
 	r := result{Diagnostics: &capacityDiagnostics{Queries: make(map[string]*queryPhase)}}
 	s.queryPhases = r.Diagnostics.Queries
-	err := f.load(ctx, s, options{mode: "live", control: "/compact", requireCorrelation: correlated}, &r, trial.dir)
+	if slowEnabled {
+		s.openPaused = func(_ context.Context, path, phase string, framing pageFraming) (pausedResponse, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if !strings.Contains(path, "cursor=") || framing.bytes < 64<<10 || framing.next == "" {
+				return nil, errors.New("invalid paused request")
+			}
+			livePaused++
+			openedPaused++
+			return &testPausedResponse{
+				read: func() (socketPressure, error) {
+					if scenario == "no_socket_pressure" {
+						return socketPressure{}, errors.New("simulated absent backpressure")
+					}
+					return socketPressure{4096}, nil
+				},
+				close: sync.OnceValue(func() error {
+					mu.Lock()
+					defer mu.Unlock()
+					livePaused--
+					if livePaused == 0 && openedPaused == 3 && scatter.retired && scenario != "early_reclamation" {
+						return os.Remove(oldManifest)
+					}
+					return nil
+				}),
+			}, nil
+		}
+	}
+	err := f.load(ctx, s, options{mode: "live", control: "/compact", requireCorrelation: correlated, requireSlowOverlap: slowEnabled}, &r, trial.dir)
 	clustered, scattered := r.Diagnostics.Backfills[0], r.Diagnostics.Backfills[1]
 	if clustered.Status != "pass" || clustered.PinDrain.Status != "observed" || !clustered.FreshVisible || !clustered.HeldExhausted || !clustered.TerminalBytesEqual {
 		t.Fatalf("incomplete clustered evidence: %+v (load error %v)", clustered, err)
+	}
+	if slowEnabled {
+		mu.Lock()
+		live := livePaused
+		mu.Unlock()
+		if live != 0 {
+			t.Fatalf("%d paused requests leaked", live)
+		}
+		e := r.Diagnostics.SlowResponses
+		switch scenario {
+		case "", "restart_duplicate":
+			if err != nil {
+				t.Fatalf("live workload failed in %s: %v", e.Phase, err)
+			}
+			if err := trial.prepare(f, r.Compaction); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			restarting = true
+			mu.Unlock()
+			err = e.verifyRestart(ctx, s, "/compact", f, trial)
+			if scenario == "restart_duplicate" {
+				assertSlowFailure(t, e, err, "restart_parity", "row mismatch")
+				return
+			}
+			if err != nil || e.Status != "pass" || len(e.Memory) != 6 {
+				t.Fatalf("incomplete slow-response evidence %+v: %v", e, err)
+			}
+			for name, m := range e.Memory {
+				if m.Samples < 2 || m.Peak != f.MemoryBytes/2 || m.Ended <= m.Started {
+					t.Errorf("incomplete memory phase %s: %+v", name, m)
+				}
+			}
+			want := []string{
+				"broad_cursor_live", "first_write_backpressured", "selective_cursor_live",
+				"ingest_acknowledged_during_maintenance", "replacement_published", "parallel_write_backpressured",
+				"first_write_spans_publication", "both_query_slots_occupied", "first_request_cancelled",
+				"same_cursor_retry_exact", "parallel_write_survived_first_cancellation", "held_broad_exact",
+				"held_selective_exact", "retirement_write_backpressured", "retired_cursor_barred_with_live_pin",
+				"retired_request_cancelled", "predecessor_pins_drained", "predecessor_manifest_reclaimed",
+				"fresh_exact", "fresh_selective_exact", "restart_exact", "restart_selective_exact",
+			}
+			if len(e.Events) != len(want) {
+				t.Fatalf("got %d evidence events, want %d", len(e.Events), len(want))
+			}
+			for i, name := range want {
+				if e.Events[i].Name != name || (i > 0 && e.Events[i].Elapsed < e.Events[i-1].Elapsed) {
+					t.Errorf("event %d = %+v, want %s in order", i, e.Events[i], name)
+				}
+			}
+			if s.queryPhases["slow_saturation"].Admissions["capacity_rejection"] != 1 ||
+				s.queryPhases["slow_retired_cursor"].Admissions["retired_or_expired_capture"] != 1 {
+				t.Fatal("missing measured query rejection reasons")
+			}
+		case "no_socket_pressure":
+			assertSlowFailure(t, e, err, "replacement_overlap", "absent backpressure")
+		case "false_saturation":
+			assertSlowFailure(t, e, err, "replacement_overlap", "expected capacity_rejection")
+		case "cancel_slot_leak":
+			assertSlowFailure(t, e, err, "cancellation_and_retry", "recover query capacity")
+		case "different_resume_bytes":
+			assertSlowFailure(t, e, err, "cancellation_and_retry", "changed the complete body")
+		case "lost_duplicate":
+			assertSlowFailure(t, e, err, "held_parity", "row mismatch")
+		case "early_reclamation":
+			assertSlowFailure(t, e, err, "retirement_and_reclamation", "observe predecessor before cancellation")
+		}
+		return
 	}
 	if failure != "" {
 		earlyFailure := failure == "bad_publication" || failure == "timeout"
@@ -395,5 +546,33 @@ func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) 
 	if r.IngestSamples != f.TailRows/f.BatchRows || r.QuerySamples < 2 || r.Compaction == nil ||
 		r.Compaction.CoveredRows != f.SeedRows+f.BatchRows || r.Compaction.CommittedRows != f.SeedRows+f.TailRows {
 		t.Fatalf("incomplete mixed evidence: %+v", r)
+	}
+}
+
+type testPausedResponse struct {
+	read  func() (socketPressure, error)
+	close func() error
+}
+
+func (p *testPausedResponse) pressure(context.Context) (socketPressure, error) { return p.read() }
+func (p *testPausedResponse) abort() error                                     { return p.close() }
+
+func TestSlowResponseScenario(t *testing.T) {
+	for _, tc := range []string{"", "no_socket_pressure", "false_saturation", "cancel_slot_leak", "different_resume_bytes", "lost_duplicate", "early_reclamation", "restart_duplicate"} {
+		name := tc
+		if name == "" {
+			name = "success"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			testMixedLoad(t, "", nil, tc)
+		})
+	}
+}
+
+func assertSlowFailure(t *testing.T, e *slowResponseEvidence, err error, phase, detail string) {
+	t.Helper()
+	if err == nil || e == nil || e.Status != "fail" || e.Phase != phase || !strings.Contains(e.Failure, detail) {
+		t.Fatalf("want failure in %s containing %q, got %+v: %v", phase, detail, e, err)
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json/jsontext"
 	"errors"
@@ -10,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"bog/verify/capacityevidence"
 )
 
 type backfillCompaction struct {
@@ -46,27 +49,20 @@ func readCompactionObservation(ctx context.Context, client *http.Client, base, m
 }
 
 func decodeCompactionObservation(body []byte, requirePins bool) (compactionObservation, error) {
-	var got compactionObservation
-	var metrics jsontext.Value
-	fields := map[string]any{
-		"state":          &got.state,
-		"generation":     &got.generation,
-		"covered_rows":   &got.covered,
-		"committed_rows": &got.committed,
-	}
-	if requirePins {
-		fields["metrics"] = &metrics
-	}
-	if _, err := decodeFields(body, fields); err != nil {
+	observation, metrics, err := capacityevidence.DecodeCompactionStatus(body)
+	if err != nil {
 		return compactionObservation{}, err
 	}
-	if got.state != "running" && got.state != "complete" {
-		return compactionObservation{}, fmt.Errorf("unexpected state %q", got.state)
-	}
-	if got.covered < 0 || got.committed < got.covered {
-		return compactionObservation{}, fmt.Errorf("invalid row counters: covered=%d committed=%d", got.covered, got.committed)
-	}
+	got := compactionObservation{backfillCompaction: backfillCompaction{
+		state:      observation.State,
+		generation: observation.Generation,
+		covered:    observation.CoveredRows,
+		committed:  observation.CommittedRows,
+	}}
 	if requirePins {
+		if len(metrics) == 0 || bytes.Equal(metrics, []byte("null")) {
+			return compactionObservation{}, errors.New(`missing or null "metrics"`)
+		}
 		if _, err := decodeFields(metrics, map[string]any{"retired_generation_pins": &got.retiredGenerationPins}); err != nil {
 			return compactionObservation{}, fmt.Errorf("compaction metrics: %w", err)
 		}
@@ -88,6 +84,9 @@ func TestDecodeCompactionObservation(t *testing.T) {
 	}{
 		{name: "publication without metrics", body: snapshot, want: published},
 		{name: "publication with optional null metrics", body: withMetrics("null"), want: published},
+		{name: "publication ignores nested metric issues", body: withMetrics(`{"retired_generation_pins":"1","retired_generation_pins":0}`), want: published},
+		{name: "duplicate metrics envelope member even for publication", body: strings.TrimSuffix(withMetrics("null"), "}") + `,"metrics":{}}`,
+			wantErr: `duplicate compaction status member "metrics"`},
 		{name: "zero predecessor", body: `{"state":"running","generation":0,"covered_rows":0,"committed_rows":0,"extra":true}`,
 			want: compactionObservation{backfillCompaction: backfillCompaction{state: "running"}}},
 		{name: "positive pin count", body: withMetrics(`{"retired_generation_pins":2,"pending_compactions":0}`), requirePins: true,
@@ -100,6 +99,8 @@ func TestDecodeCompactionObservation(t *testing.T) {
 		{name: "null pin count", body: withMetrics(`{"retired_generation_pins":null}`), requirePins: true, wantErr: `missing or null "retired_generation_pins"`},
 		{name: "mis-cased pin count", body: withMetrics(`{"Retired_Generation_Pins":0}`), requirePins: true, wantErr: `missing or null "retired_generation_pins"`},
 		{name: "duplicate pin count", body: withMetrics(`{"retired_generation_pins":1,"retired_generation_pins":0}`), requirePins: true, wantErr: "duplicate"},
+		{name: "quoted pin count", body: withMetrics(`{"retired_generation_pins":"0"}`), requirePins: true, wantErr: "retired_generation_pins"},
+		{name: "overflow pin count", body: withMetrics(`{"retired_generation_pins":18446744073709551616}`), requirePins: true, wantErr: "retired_generation_pins"},
 		{name: "negative pin count", body: withMetrics(`{"retired_generation_pins":-1}`), requirePins: true, wantErr: "retired_generation_pins"},
 		{name: "duplicate generation with escaped name", body: strings.Replace(snapshot, `"generation":7`, `"generation":7,"generatio\u006e":8`, 1),
 			wantErr: "duplicate"},
@@ -169,8 +170,15 @@ func TestReadCompactionObservation(t *testing.T) {
 		name, method, action, body, wantErr string
 		status                              int
 		closeErr                            error
+		requirePins                         bool
+		wantPins                            uint64
 	}{
 		{name: "status", method: http.MethodGet, action: "status", status: http.StatusOK, body: snapshot},
+		{name: "positive pin status", method: http.MethodGet, action: "status", status: http.StatusOK,
+			body: strings.TrimSuffix(snapshot, "}") + `,"metrics":{"retired_generation_pins":3}}`, requirePins: true, wantPins: 3},
+		{name: "missing pin status", method: http.MethodGet, action: "status", status: http.StatusOK,
+			body: strings.TrimSuffix(snapshot, "}") + `,"metrics":{"retired_generation_pins":null}}`, requirePins: true,
+			wantErr: `invalid compaction status cutoff 8: compaction metrics:`},
 		{name: "start", method: http.MethodPost, action: "start", status: http.StatusOK, body: snapshot},
 		{name: "non-200", method: http.MethodGet, action: "status", status: http.StatusServiceUnavailable, body: "not available",
 			wantErr: "compaction status cutoff 8 returned HTTP 503: not available"},
@@ -193,7 +201,7 @@ func TestReadCompactionObservation(t *testing.T) {
 				}
 				return &http.Response{StatusCode: tc.status, Body: body}, nil
 			})}
-			got, err := readCompactionObservation(t.Context(), client, "http://127.0.0.1", tc.method, tc.action, 8, false)
+			got, err := readCompactionObservation(t.Context(), client, "http://127.0.0.1", tc.method, tc.action, 8, tc.requirePins)
 			if calls != 1 || !body.closed {
 				t.Fatalf("requests = %d, body closed = %t, want one request and a closed body", calls, body.closed)
 			}
@@ -204,7 +212,7 @@ func TestReadCompactionObservation(t *testing.T) {
 				if tc.closeErr != nil && !errors.Is(err, tc.closeErr) {
 					t.Fatalf("error = %v, want wrapped close error", err)
 				}
-			} else if want := (compactionObservation{backfillCompaction: backfillCompaction{"complete", 7, 8, 10}}); err != nil || got != want {
+			} else if want := (compactionObservation{backfillCompaction: backfillCompaction{"complete", 7, 8, 10}, retiredGenerationPins: tc.wantPins}); err != nil || got != want {
 				t.Fatalf("observation = %+v, error = %v, want %+v", got, err, want)
 			}
 		})

@@ -235,16 +235,25 @@ func TestFilesystemTimelineSealsIndependentObservations(t *testing.T) {
 }
 
 func TestCompactionProtocolAndPartialTimeline(t *testing.T) {
+	const published = `{"state":"complete","generation":4,"covered_rows":128,"committed_rows":192}`
+	withMetrics := func(metrics string) string {
+		return strings.TrimSuffix(published, "}") + `,"metrics":` + metrics + "}"
+	}
 	for _, tc := range []struct {
 		name, last string
 		want       string
 	}{
-		{"missing generation", `{"state":"complete","covered_rows":128,"committed_rows":192}`, "invalid compaction"},
+		{"missing generation", `{"state":"complete","covered_rows":128,"committed_rows":192}`, `missing or null "generation"`},
+		{"null coverage", strings.Replace(published, `"covered_rows":128`, `"covered_rows":null`, 1), `missing or null "covered_rows"`},
+		{"mis-cased commit count", strings.Replace(published, "committed_rows", "Committed_Rows", 1), `missing or null "committed_rows"`},
+		{"repeated generation", strings.Replace(published, `"generation":4`, `"generation":3,"generation":4`, 1), `duplicate compaction status member "generation"`},
+		{"repeated metrics", withMetrics(`null,"metrics":{"retired_generation_pins":1}`), `duplicate compaction status member "metrics"`},
+		{"trailing value", published + " {}", "unexpected trailing data after compaction status"},
 		{"regressed generation", `{"state":"complete","generation":3,"covered_rows":128,"committed_rows":192,"metrics":{"pending_compactions":1,"oldest_pinned_generation":"` + testPinnedGeneration + `"}}`, "unexpected compaction cutoff or generation"},
 		{"wrong cutoff", `{"state":"complete","generation":4,"covered_rows":129,"committed_rows":192}`, "unexpected compaction cutoff or generation"},
 		{"oversized response", strings.Repeat("x", 64<<10+1), "response exceeds"},
 		{"timeout", "", "deadline exceeded"},
-		{"complete", `{"state":"complete","generation":4,"covered_rows":128,"committed_rows":192,"metrics":{"retired_generation_pins":1}}`, ""},
+		{"complete", withMetrics(`{"retired_generation_pins":1,"pending_compactions":2,"pending_compactions":0,"future":{"extra":true}}`), ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			statusStarted := make(chan struct{})
@@ -277,9 +286,16 @@ func TestCompactionProtocolAndPartialTimeline(t *testing.T) {
 					p.PinDrain.Held == nil || *p.PinDrain.Held != 1 {
 					t.Fatalf("invalid completion: %+v, %v", p.Publication, err)
 				}
+				if len(p.Samples) != 2 || p.Samples[1].Event != "publication" || p.Samples[1].StatusError != "" {
+					t.Fatalf("unexpected publication timeline: %+v", p.Samples)
+				}
+				m := p.Samples[1].Candidate
+				if m.PendingCompactions != nil || m.Unavailable[pendingCompactionsMetric] != "candidate supplied a duplicate metric" {
+					t.Fatalf("duplicate metric lost its field-level diagnostic: %+v", m)
+				}
 				return
 			}
-			if err == nil || !strings.Contains(err.Error(), tc.want) || p.Publication != nil ||
+			if err == nil || !strings.Contains(err.Error(), tc.want) || p.Publication != nil || p.PinDrain.Held != nil ||
 				len(p.Samples) != 2 || p.Samples[0].Event != "overlap" || p.Samples[1].StatusError == "" {
 				t.Fatalf("unexpected partial evidence: %+v, %v", p.Samples, err)
 			}

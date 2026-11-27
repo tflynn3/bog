@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"bog/verify/capacityevidence"
 )
 
 type row struct {
@@ -317,24 +319,16 @@ func (s service) compact(ctx context.Context, path, action string, cutoff int) (
 	if res.StatusCode != http.StatusOK {
 		return reply, fmt.Errorf("live compaction %s HTTP %d: %.200s", action, res.StatusCode, data)
 	}
-	// Presence matters even when the accepted cutoff and initial generation
-	// are zero. Decode the required fields separately from optional metrics.
-	var wire struct {
-		State         *string         `json:"state"`
-		Generation    *uint64         `json:"generation"`
-		CoveredRows   *int            `json:"covered_rows"`
-		CommittedRows *int            `json:"committed_rows"`
-		Metrics       json.RawMessage `json:"metrics"`
+	observation, metrics, err := capacityevidence.DecodeCompactionStatus(data)
+	if err != nil {
+		return reply, fmt.Errorf("invalid compaction %s: %w", action, err)
 	}
-	if err := json.Unmarshal(data, &wire); err != nil {
-		return reply, fmt.Errorf("decode compaction %s: %w", action, err)
-	}
-	if wire.State == nil || wire.Generation == nil || wire.CoveredRows == nil || wire.CommittedRows == nil ||
-		(*wire.State != "running" && *wire.State != "complete") ||
-		*wire.CoveredRows < 0 || *wire.CommittedRows < *wire.CoveredRows {
-		return reply, fmt.Errorf("invalid compaction %s state or row counters", action)
-	}
-	return compactionReply{compaction: compaction{*wire.Generation, *wire.CoveredRows, *wire.CommittedRows, *wire.State}, Metrics: wire.Metrics}, nil
+	return compactionReply{compaction: compaction{
+		Generation:    observation.Generation,
+		CoveredRows:   observation.CoveredRows,
+		CommittedRows: observation.CommittedRows,
+		State:         observation.State,
+	}, Metrics: metrics}, nil
 }
 
 func (s service) controlRequest(ctx context.Context, method, path string, params url.Values) (*http.Response, []byte, error) {

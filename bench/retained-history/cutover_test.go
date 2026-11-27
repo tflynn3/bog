@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,16 +18,21 @@ func passingCutoverReport() report {
 			b.HeldRows, b.FreshRows = b.HeldCutoff/2, b.FinalCutoff
 			b.HeldExhausted, b.TerminalRetried, b.CaptureRetired = true, true, true
 			b.FreshVisible, b.FreshExact = true, true
-			b.Publication = &publicationProof{Generation: uint64(i + 1), UpperBound: time.Millisecond}
+			b.Publication = &publicationProof{Generation: uint64(i + 1), LowerBound: 4 * time.Millisecond, UpperBound: 7 * time.Millisecond}
 			rows := b.FinalCutoff - b.HeldCutoff
 			b.Acknowledged = &backfillAcknowledgements{Rows: rows, Batches: rows / f.BatchRows}
 			b.PinDrain = pinDrainProof{Status: "observed", Held: new(uint64(1)), After: new(uint64)}
 			status := &compaction{b.Publication.Generation, b.RequestedCutoff, b.FinalCutoff, "complete"}
 			b.Samples = []phaseSample{
-				{Event: "publication", Status: status, RequestSent: new(time.Millisecond)},
-				{Event: "before_retirement", Status: status, RequestSent: new(2 * time.Millisecond),
+				{Event: "compaction_start", Status: &compaction{uint64(i), b.HeldCutoff, b.RequestedCutoff, "running"},
+					RequestSent: new(time.Millisecond), Elapsed: 2 * time.Millisecond},
+				{Event: "overlap", Status: &compaction{uint64(i), b.HeldCutoff, b.FinalCutoff, "running"},
+					RequestSent: new(5 * time.Millisecond), Elapsed: 6 * time.Millisecond,
+					Memory: &memoryCurrentSample{ReadStart: 3 * time.Millisecond, ReadEnd: 4 * time.Millisecond, Bytes: new(f.MemoryBytes / 4)}},
+				{Event: "publication", Status: status, RequestSent: new(7 * time.Millisecond), Elapsed: 8 * time.Millisecond},
+				{Event: "before_retirement", Status: status, RequestSent: new(9 * time.Millisecond), Elapsed: 10 * time.Millisecond,
 					Candidate: runtimeSample{RetiredPins: new(uint64(1))}},
-				{Event: "after_retirement", Status: status, RequestSent: new(3 * time.Millisecond),
+				{Event: "after_retirement", Status: status, RequestSent: new(11 * time.Millisecond), Elapsed: 12 * time.Millisecond,
 					Candidate: runtimeSample{RetiredPins: new(uint64)}},
 			}
 		}
@@ -78,8 +84,24 @@ func TestStrictCutoverReportProof(t *testing.T) {
 		{"missing drained value", "observed zero", func(_ *result, b *backfillTimeline) { b.PinDrain.After = nil }},
 		{"positive drained value", "observed zero", func(_ *result, b *backfillTimeline) { *b.PinDrain.After = 1 }},
 		{"lost status samples", "matching status samples", func(_ *result, b *backfillTimeline) { b.Samples = nil }},
-		{"different generation sampled", "matching status samples", func(_ *result, b *backfillTimeline) { b.Samples[0].Status.Generation++ }},
-		{"drained status before held", "matching status samples", func(_ *result, b *backfillTimeline) { b.Samples[1], b.Samples[2] = b.Samples[2], b.Samples[1] }},
+		{"different generation sampled", "matching status samples", func(_ *result, b *backfillTimeline) { b.Samples[2].Status.Generation++ }},
+		{"drained status before held", "matching status samples", func(_ *result, b *backfillTimeline) { b.Samples[3], b.Samples[4] = b.Samples[4], b.Samples[3] }},
+		{"startup-only memory", "live memory evidence", func(_ *result, b *backfillTimeline) {
+			b.Samples[0].Memory, b.Samples[1].Memory = b.Samples[1].Memory, nil
+		}},
+		{"completed-state memory", "running status", func(_ *result, b *backfillTimeline) { b.Samples[1].Status.State = "complete" }},
+		{"wrong running generation", "running status", func(_ *result, b *backfillTimeline) { b.Samples[1].Status.Generation++ }},
+		{"memory before start reply", "mis-timed", func(_ *result, b *backfillTimeline) { b.Samples[1].Memory.ReadStart = time.Millisecond }},
+		{"memory after status send", "mis-timed", func(_ *result, b *backfillTimeline) { b.Samples[1].Memory.ReadEnd = b.Samples[1].Elapsed }},
+		{"reversed memory times", "mis-timed", func(_ *result, b *backfillTimeline) { b.Samples[1].Memory.ReadEnd = time.Millisecond }},
+		{"overlap after publication", "timed overlap", func(_ *result, b *backfillTimeline) { b.Samples[1].Elapsed = b.Samples[2].Elapsed }},
+		{"sampler failure", "sampling failed", func(_ *result, b *backfillTimeline) {
+			b.Samples[1].Memory.Bytes, b.Samples[1].Memory.Error = nil, "memory.current: permission denied"
+		}},
+		{"missing live bytes", "out-of-limit", func(_ *result, b *backfillTimeline) { b.Samples[1].Memory.Bytes = nil }},
+		{"zero live bytes", "out-of-limit", func(_ *result, b *backfillTimeline) { *b.Samples[1].Memory.Bytes = 0 }},
+		{"over cap live bytes", "out-of-limit", func(r *result, b *backfillTimeline) { *b.Samples[1].Memory.Bytes = r.Fixture.MemoryBytes + 1 }},
+		{"live bytes at cap", "", func(r *result, b *backfillTimeline) { *b.Samples[1].Memory.Bytes = r.Fixture.MemoryBytes }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := passingCutoverReport()
@@ -96,6 +118,20 @@ func TestStrictCutoverReportProof(t *testing.T) {
 				t.Fatalf("validation error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestCutoverRequiresOverlapMemoryForEveryTimeline(t *testing.T) {
+	for scale, f := range fixtures("live") {
+		for pattern, b := range newBackfillTimelines(f) {
+			t.Run(fmt.Sprintf("%d/%s", f.SeedRows, b.Pattern), func(t *testing.T) {
+				r := passingCutoverReport()
+				r.Cases[capacityCase].Evidence[scale].Diagnostics.Backfills[pattern].Samples[1].Memory = nil
+				if err := r.validateCutover(); err == nil || !strings.Contains(err.Error(), b.Pattern+" backfill: missing live memory.current overlap evidence") {
+					t.Fatalf("validation error = %v, want missing overlap rejection for %s", err, b.Pattern)
+				}
+			})
+		}
 	}
 }
 

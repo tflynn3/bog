@@ -44,6 +44,45 @@ func TestMemoryLimitReadback(t *testing.T) {
 	}
 }
 
+func TestReadCandidateMemoryCurrent(t *testing.T) {
+	for _, tc := range []struct {
+		name, contents, wantError string
+		canceled, exited          bool
+	}{
+		{name: "read current bytes", contents: "4096\n"},
+		{name: "kernel file absent", wantError: "memory.current"},
+		{name: "invalid value", contents: "max\n", wantError: "read memory.current"},
+		{name: "canceled", canceled: true, wantError: "context canceled"},
+		{name: "candidate exited", exited: true, wantError: "candidate exited"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			group := t.TempDir()
+			if tc.contents != "" {
+				if err := os.WriteFile(filepath.Join(group, "memory.current"), []byte(tc.contents), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			p := &child{done: make(chan struct{})}
+			if tc.exited {
+				close(p.done)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tc.canceled {
+				cancel()
+			}
+			got, err := readCandidateMemoryCurrent(ctx, p, group)
+			if tc.wantError == "" {
+				if err != nil || got != 4096 {
+					t.Fatalf("memory.current = %d, %v, want 4096", got, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantError) || got != 0 {
+				t.Fatalf("memory.current = %d, %v, want error containing %q", got, err, tc.wantError)
+			}
+		})
+	}
+}
+
 func TestCollectCgroupOOMCount(t *testing.T) {
 	for _, tc := range []struct {
 		name, events string

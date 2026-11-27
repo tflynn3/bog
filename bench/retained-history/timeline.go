@@ -13,6 +13,7 @@ const (
 	compactionPollInterval = 30 * time.Millisecond
 	timelineSampleInterval = 100 * time.Millisecond
 	timelineSampleLimit    = 64
+	liveMemorySampleLimit  = 16 // per timeline, including attempted reads
 	drainBudget            = 2 * time.Second
 	diagnosticRequestLimit = 250 * time.Millisecond
 )
@@ -109,13 +110,21 @@ func observeStorage(dir string, now time.Time) (sample filesystemSample, err err
 }
 
 type phaseSample struct {
-	Event       string           `json:"event"`
-	Elapsed     time.Duration    `json:"elapsed_ns"`
-	RequestSent *time.Duration   `json:"request_sent_ns"`
-	Status      *compaction      `json:"status"`
-	StatusError string           `json:"status_error,omitempty"`
-	Candidate   runtimeSample    `json:"candidate_status_metrics"`
-	Filesystem  filesystemSample `json:"filesystem"`
+	Event       string               `json:"event"`
+	Elapsed     time.Duration        `json:"elapsed_ns"`
+	RequestSent *time.Duration       `json:"request_sent_ns"`
+	Status      *compaction          `json:"status"`
+	StatusError string               `json:"status_error,omitempty"`
+	Candidate   runtimeSample        `json:"candidate_status_metrics"`
+	Filesystem  filesystemSample     `json:"filesystem"`
+	Memory      *memoryCurrentSample `json:"cgroup_memory_current,omitempty"`
+}
+
+type memoryCurrentSample struct {
+	ReadStart time.Duration `json:"read_start_ns"`
+	ReadEnd   time.Duration `json:"read_end_ns"`
+	Bytes     *uint64       `json:"bytes"`
+	Error     string        `json:"error,omitempty"`
 }
 
 type publicationProof struct {
@@ -178,10 +187,10 @@ func newBackfillTimeline(pattern string, held, cutoff, final int) *backfillTimel
 
 func (t *backfillTimeline) add(sample phaseSample) {
 	if len(t.Samples) == timelineSampleLimit {
-		// There are only a fixed number of named boundary samples. Retain
-		// them and the initial half of the timeline, then rotate poll samples.
+		// Keep named boundaries, memory evidence, and the initial half of
+		// the timeline. Rotate the other poll samples.
 		for i := timelineSampleLimit / 2; i < len(t.Samples); i++ {
-			if t.Samples[i].Event == "status_poll" || t.Samples[i].Event == "drain_poll" {
+			if t.Samples[i].Memory == nil && (t.Samples[i].Event == "status_poll" || t.Samples[i].Event == "drain_poll") {
 				copy(t.Samples[i:], t.Samples[i+1:])
 				t.Samples = t.Samples[:len(t.Samples)-1]
 				break
@@ -203,6 +212,7 @@ type backfillProbe struct {
 	startSent    time.Time
 	lastRunning  time.Time
 	lastPoll     time.Time
+	memoryReads  int
 }
 
 func (p *backfillProbe) recordAcknowledgements(f fixture, writes []ingestSample) {
@@ -236,6 +246,8 @@ func (p *backfillProbe) record(event string, sent, received time.Time, c compact
 		sample.StatusError = diagnosticError(err)
 	} else if sent.IsZero() {
 		err = errors.New("no candidate status requested at this boundary")
+	} else if c.State == "running" {
+		sample.Memory = c.memory
 	}
 	sample.Candidate = readRuntimeMetrics(c.Metrics, err)
 	var storageErr error
@@ -258,8 +270,28 @@ func (p *backfillProbe) boundary(event string) {
 }
 
 func (p *backfillProbe) request(ctx context.Context, action string) (compactionReply, time.Time, time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		now := time.Now()
+		return compactionReply{}, now, now, err
+	}
+	var memory *memoryCurrentSample
+	if p.readMemoryCurrent != nil && action == "status" && !p.startSent.IsZero() && p.Publication == nil &&
+		p.memoryReads < liveMemorySampleLimit && time.Since(p.lastPoll) >= timelineSampleInterval {
+		// A running start reply has already been processed. Read before the
+		// next status request so a running reply brackets the whole read.
+		p.memoryReads++
+		start := time.Now()
+		value, err := p.readMemoryCurrent(ctx)
+		memory = &memoryCurrentSample{ReadStart: start.Sub(p.origin), ReadEnd: time.Since(p.origin)}
+		if err != nil {
+			memory.Error = diagnosticError(err)
+		} else {
+			memory.Bytes = &value
+		}
+	}
 	sent := time.Now()
 	c, err := p.compact(ctx, p.control, action, p.RequestedCutoff)
+	c.memory = memory
 	return c, sent, time.Now(), err
 }
 
@@ -324,9 +356,9 @@ func (p *backfillProbe) waitPublication(ctx context.Context, previous uint64) (c
 	}
 }
 
-func (p *backfillProbe) validateRunning(c compaction, previous uint64, committed int) error {
-	if c.State != "running" || c.Generation != previous || c.CoveredRows != p.HeldCutoff ||
-		c.CommittedRows < committed || c.CommittedRows > p.FinalCutoff {
+func (t *backfillTimeline) validateRunning(c compaction, previous uint64, committed int) error {
+	if c.State != "running" || c.Generation != previous || c.CoveredRows != t.HeldCutoff ||
+		c.CommittedRows < committed || c.CommittedRows > t.FinalCutoff {
 		return fmt.Errorf("unexpected running compaction state: %+v", c)
 	}
 	return nil

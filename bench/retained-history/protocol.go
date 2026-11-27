@@ -21,9 +21,10 @@ type row struct {
 }
 
 type service struct {
-	base        string
-	client      *http.Client
-	queryPhases map[string]*queryPhase
+	base              string
+	client            *http.Client
+	queryPhases       map[string]*queryPhase
+	readMemoryCurrent func(context.Context) (uint64, error)
 }
 
 func newService(base string) service {
@@ -253,6 +254,7 @@ type compaction struct {
 type compactionReply struct {
 	compaction
 	Metrics json.RawMessage `json:"metrics"`
+	memory  *memoryCurrentSample
 }
 
 func (s service) compact(ctx context.Context, path, action string, cutoff int) (compactionReply, error) {
@@ -285,7 +287,7 @@ func (s service) compact(ctx context.Context, path, action string, cutoff int) (
 		*wire.CoveredRows < 0 || *wire.CommittedRows < *wire.CoveredRows {
 		return reply, fmt.Errorf("invalid compaction %s state or row counters", action)
 	}
-	return compactionReply{compaction{*wire.Generation, *wire.CoveredRows, *wire.CommittedRows, *wire.State}, wire.Metrics}, nil
+	return compactionReply{compaction: compaction{*wire.Generation, *wire.CoveredRows, *wire.CommittedRows, *wire.State}, Metrics: wire.Metrics}, nil
 }
 
 func (s service) controlRequest(ctx context.Context, method, path string, params url.Values) (*http.Response, []byte, error) {

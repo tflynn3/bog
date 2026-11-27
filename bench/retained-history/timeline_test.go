@@ -68,6 +68,157 @@ func TestTimelineLimitKeepsBoundariesAndLatestPolls(t *testing.T) {
 	}
 }
 
+func TestTimelinePreservesMemoryDuringPollRotation(t *testing.T) {
+	timeline := newBackfillTimeline("clustered", 64, 128, 192)
+	for range timelineSampleLimit / 2 {
+		timeline.add(phaseSample{Event: "status_poll"})
+	}
+	memory := &memoryCurrentSample{Bytes: new(uint64(42))}
+	timeline.add(phaseSample{Event: "status_poll", Memory: memory})
+	for range 2 * timelineSampleLimit {
+		timeline.add(phaseSample{Event: "status_poll"})
+	}
+	timeline.add(phaseSample{Event: "publication"})
+	if len(timeline.Samples) != timelineSampleLimit || timeline.Samples[timelineSampleLimit/2].Memory != memory ||
+		timeline.Samples[timelineSampleLimit-1].Event != "publication" {
+		t.Fatal("timeline rotation lost memory evidence or publication")
+	}
+}
+
+func TestTimelineSamplesMemoryBeforeRunningStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name, state string
+		readErr     error
+	}{
+		{name: "running", state: "running"},
+		{name: "already published", state: "complete"},
+		{name: "read failure", state: "running", readErr: errors.New("read memory.current failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reads atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method == http.MethodPost {
+					if reads.Load() != 0 {
+						t.Error("sampled memory during the start request")
+					}
+					if _, err := fmt.Fprint(w, `{"state":"running","generation":3,"covered_rows":64,"committed_rows":128}`); err != nil {
+						t.Error(err)
+					}
+					return
+				}
+				if reads.Load() != 1 {
+					t.Error("status request was sent before the memory read")
+				}
+				generation, covered := 3, 64
+				if tc.state == "complete" {
+					generation, covered = 4, 128
+				}
+				if _, err := fmt.Fprintf(w, `{"state":%q,"generation":%d,"covered_rows":%d,"committed_rows":192}`, tc.state, generation, covered); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer srv.Close()
+			s := newService(srv.URL)
+			defer s.client.CloseIdleConnections()
+			s.readMemoryCurrent = func(context.Context) (uint64, error) {
+				reads.Add(1)
+				return 42, tc.readErr
+			}
+			p := backfillProbe{backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
+				service: s, control: "/compact", dir: t.TempDir(), origin: time.Now()}
+			c, sent, received, err := p.request(t.Context(), "start")
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.startSent, p.lastRunning = sent, sent
+			p.record("compaction_start", sent, received, c, nil)
+			if _, err := p.pollPublication(t.Context(), 3, true); err != nil {
+				t.Fatal(err)
+			}
+			start, status := p.Samples[0], p.Samples[1]
+			m := status.Memory
+			if start.Memory != nil || status.StatusError != "" || reads.Load() != 1 {
+				t.Fatalf("memory sampling changed status evidence: %+v", p.Samples)
+			}
+			if tc.state == "complete" {
+				if m != nil || status.Event != "publication" {
+					t.Fatalf("recorded memory for a completed operation: %+v", status)
+				}
+				return
+			}
+			if m == nil || m.ReadStart < start.Elapsed || m.ReadEnd < m.ReadStart || m.ReadEnd > *status.RequestSent {
+				t.Fatalf("memory read was not bracketed by running status: %+v", status)
+			}
+			if tc.readErr != nil {
+				if m.Error != tc.readErr.Error() || m.Bytes != nil {
+					t.Fatalf("lost memory read failure: %+v", m)
+				}
+			} else if m.Error != "" || m.Bytes == nil || *m.Bytes != 42 {
+				t.Fatalf("invalid memory sample: %+v", m)
+			}
+		})
+	}
+}
+
+func TestTimelineMemoryReadStopsWithContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	s := newService("http://unused.invalid")
+	defer s.client.CloseIdleConnections()
+	reads := 0
+	s.readMemoryCurrent = func(ctx context.Context) (uint64, error) {
+		reads++
+		cancel()
+		return 0, ctx.Err()
+	}
+	p := backfillProbe{backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
+		service: s, control: "/compact", dir: t.TempDir(), origin: time.Now(), startSent: time.Now()}
+	for range 2 {
+		if _, _, _, err := p.request(ctx, "status"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("status error = %v, want cancellation", err)
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("memory read %d times across cancellation, want 1", reads)
+	}
+}
+
+func TestTimelineMemoryReadCadenceAndLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := fmt.Fprint(w, `{"state":"running","generation":3,"covered_rows":64,"committed_rows":192}`); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer srv.Close()
+	s := newService(srv.URL)
+	defer s.client.CloseIdleConnections()
+	reads := 0
+	s.readMemoryCurrent = func(context.Context) (uint64, error) {
+		reads++
+		return 42, nil
+	}
+	p := backfillProbe{backfillTimeline: newBackfillTimeline("scattered", 64, 128, 192),
+		service: s, control: "/compact", dir: t.TempDir(), origin: time.Now()}
+	checkStatus := func(wantSample bool) {
+		t.Helper()
+		c, _, _, err := p.request(t.Context(), "status")
+		if err != nil || (c.memory != nil) != wantSample {
+			t.Fatalf("status memory = %+v, error = %v, want sample = %t", c.memory, err, wantSample)
+		}
+	}
+	checkStatus(false) // capability probe before any compaction start
+	p.startSent = time.Now()
+	for i := range liveMemorySampleLimit + 1 {
+		p.lastPoll = time.Now().Add(-timelineSampleInterval)
+		checkStatus(i < liveMemorySampleLimit)
+		p.lastPoll = time.Now()
+		checkStatus(false)
+	}
+	if reads != liveMemorySampleLimit {
+		t.Fatalf("got %d reads, want %d", reads, liveMemorySampleLimit)
+	}
+}
+
 func TestFilesystemTimelineSealsIndependentObservations(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Unix(1700000000, 0)

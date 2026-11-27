@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"syscall"
+	"time"
 )
 
 // The native gate runs this check from its own checkout. A report from an
@@ -106,7 +107,11 @@ func (r result) validateCutover(f fixture) error {
 		return errors.New("missing clustered and scattered backfill evidence")
 	}
 	for i, want := range expected {
-		if err := r.Diagnostics.Backfills[i].validateCutover(want, f); err != nil {
+		t := r.Diagnostics.Backfills[i]
+		if err := t.validateCutover(want, f); err != nil {
+			return fmt.Errorf("%s backfill: %w", want.Pattern, err)
+		}
+		if err := t.validateLiveMemory(f.MemoryBytes); err != nil {
 			return fmt.Errorf("%s backfill: %w", want.Pattern, err)
 		}
 	}
@@ -140,6 +145,62 @@ func (t *backfillTimeline) validateCutover(want *backfillTimeline, f fixture) er
 		return errors.New("require a positive held predecessor pin count and an observed zero after retirement")
 	}
 	return t.validateStatusSamples()
+}
+
+func (t *backfillTimeline) validateLiveMemory(limit uint64) error {
+	var start *phaseSample
+	var lastRunning time.Duration
+	var count int
+	var overlap, publication bool
+	for i := range t.Samples {
+		s := &t.Samples[i]
+		c := s.Status
+		switch s.Event {
+		case "compaction_start":
+			if start != nil || publication || s.StatusError != "" || s.RequestSent == nil ||
+				*s.RequestSent < 0 || s.Elapsed <= *s.RequestSent || c == nil ||
+				c.Generation >= t.Publication.Generation || c.CommittedRows != t.RequestedCutoff ||
+				t.validateRunning(*c, c.Generation, t.RequestedCutoff) != nil {
+				return errors.New("live memory evidence requires a valid running compaction start")
+			}
+			start, lastRunning = s, s.Elapsed
+		case "publication":
+			if !overlap {
+				return errors.New("missing live memory.current overlap evidence")
+			}
+			if s.RequestSent == nil || *s.RequestSent < lastRunning || s.Elapsed <= *s.RequestSent {
+				return errors.New("live memory evidence requires a timed overlap before publication")
+			}
+			publication = true
+		}
+		m := s.Memory
+		if m == nil {
+			continue
+		}
+		count++
+		committed := min(t.RequestedCutoff+(t.RequestedCutoff-t.HeldCutoff), t.FinalCutoff)
+		if count > liveMemorySampleLimit || start == nil || publication ||
+			(s.Event != "overlap" && s.Event != "status_poll") ||
+			s.StatusError != "" || c == nil || s.RequestSent == nil ||
+			t.validateRunning(*c, start.Status.Generation, committed) != nil {
+			return errors.New("live memory evidence requires bounded samples paired with running status")
+		}
+		if m.ReadStart < lastRunning || m.ReadEnd < m.ReadStart || m.ReadEnd > *s.RequestSent || s.Elapsed <= *s.RequestSent {
+			return errors.New("mis-timed live memory evidence outside running compaction observations")
+		}
+		if m.Error != "" {
+			return fmt.Errorf("live memory.current sampling failed: %s", m.Error)
+		}
+		if m.Bytes == nil || *m.Bytes == 0 || *m.Bytes > limit {
+			return errors.New("missing or out-of-limit live memory.current bytes")
+		}
+		lastRunning = s.Elapsed
+		overlap = overlap || s.Event == "overlap"
+	}
+	if !overlap || !publication {
+		return errors.New("missing live memory.current overlap evidence")
+	}
+	return nil
 }
 
 func (t *backfillTimeline) validateStatusSamples() error {

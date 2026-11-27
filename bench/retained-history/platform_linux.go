@@ -167,6 +167,26 @@ func readCgroupUint(group, name string) (uint64, error) {
 	return value, nil
 }
 
+func readCandidateMemoryCurrent(ctx context.Context, p *child, group string) (uint64, error) {
+	check := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if p.exited() {
+			return errors.New("candidate exited during memory.current sampling")
+		}
+		return nil
+	}
+	if err := check(); err != nil {
+		return 0, err
+	}
+	value, err := readCgroupUint(group, "memory.current")
+	if err := errors.Join(err, check()); err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
 func writeCgroupFile(group, name, value string) error {
 	file, err := os.OpenFile(filepath.Join(group, name), os.O_WRONLY, 0)
 	if err != nil {
@@ -465,6 +485,11 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 		return p, err
 	}
 	r.StartReady = &elapsed
+	if o.mode == "live" {
+		probe.readMemoryCurrent = func(ctx context.Context) (uint64, error) {
+			return readCandidateMemoryCurrent(ctx, p, group)
+		}
+	}
 	return p, f.load(work, probe, o, r, dir)
 }
 

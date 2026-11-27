@@ -11,8 +11,9 @@ Dispatch the workflow from a revision containing the #70 fixed-budget
 probes, with the full 40-character lowercase SHA of the final candidate.
 The workflow records its own revision and runs admission, restored parity,
 `TestReleaseFixedBudgetBackfill`, and report validation from that checkout.
-The query-model race suite also runs from the workflow checkout that provides
-the oracle. Durability and capacity run from the candidate checkout.
+Release Verification owns the query-model race suite, which runs from the
+workflow checkout that provides the oracle. Durability and capacity run
+from the candidate checkout.
 [Release verifier contract](../../verify/release/README.md)
 
 Both Ubuntu 24.04 runners must pass. The amd64 job uses `ubuntu-24.04`
@@ -29,6 +30,17 @@ producers. Both native jobs require an explicit passing event for
 `TestReleaseFixedBudgetBackfill` from `go test -json`. The test event stream,
 logs, and producer status record the gate checkout and candidate identity.
 The backfill test adds test-event evidence alongside the schema-v1 reports.
+
+Each native job also supplies its pinned binary and the full candidate
+revision to the existing query-model race suite. The gate checks the
+binary against its build-time SHA-256 before and after the run, and matches
+the revision and digest logged by `TestPinnedQueryModelReplay` to that build.
+It requires an explicit passing event for each of
+`TestPinnedQueryModelReplay/ordinary` and `TestPinnedQueryModelReplay/retained`.
+A skip, failed or missing event, or candidate identity mismatch fails the
+job. The gate uploads `query-model-events.jsonl` alongside the fixed-budget
+backfill events and producer evidence. Run both native jobs against the
+same reviewed #108 activation SHA when it is available.
 
 The gate requires both capacity fixtures, with 196,608 and 393,216 seed
 rows, and both ENOSPC retarget directions on each runner. The durability

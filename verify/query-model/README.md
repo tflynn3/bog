@@ -31,16 +31,26 @@ must detect. The original terminal witness is copied before the replay.
 terminal witnesses whenever either is supplied. `RunStrictFixedBudgetCase`
 always requires both.
 
-The native #108 release workflow already runs this package from its gate
-checkout. `TestPinnedQueryModelReplay` uses the workflow's `BINARY` and
-`REVISION` to observe the same pinned candidate over its HTTP listener.
-The ordinary trial runs without activating compaction. The retained trial
-uses the opt-in compaction control and requires exact cutoff activation.
-A candidate without that control leaves shipped retained qualification
-pending. #108 remains the release gate for compaction, writable restart,
-and native capacity evidence.
+Each native release job runs this package with the race detector from the
+gate checkout. It passes its pinned executable as `BOG_RELEASE_BINARY` and
+the full candidate SHA as `BOG_RELEASE_REVISION` to
+`TestPinnedQueryModelReplay`. The ordinary trial runs without activating
+compaction. The retained trial uses the opt-in compaction control and
+requires exact cutoff activation.
 
-To run just the pinned query check on a native Linux runner, set
+The amd64 and arm64 jobs each require explicit passing Go test events for
+`TestPinnedQueryModelReplay/ordinary` and `TestPinnedQueryModelReplay/retained`.
+A skip, including the skip for a candidate without compaction control,
+fails qualification. A failed or missing event or an identity mismatch
+also fails qualification. The gate verifies the executable against
+`binary.sha256` before and after the race run and checks the test's logged
+revision and digest against the pinned build. Each job uploads
+`query-model-events.jsonl` with its existing release evidence, including
+the separate `TestReleaseFixedBudgetBackfill` wire replay events.
+
+To inspect just the pinned query check on native Linux, set
 `BOG_RELEASE_BINARY` to the pinned executable and `BOG_RELEASE_REVISION`
-to its clean build revision, then run
-`go test -v -race ./verify/query-model -run '^TestPinnedQueryModelReplay$'`.
+to its full clean build revision, then run
+`go test -json -race -count=1 ./verify/query-model -run '^TestPinnedQueryModelReplay$'`.
+Check the individual subtest events because a skipped subtest can leave
+`go test` with a zero exit status.

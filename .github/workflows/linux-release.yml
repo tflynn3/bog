@@ -336,7 +336,7 @@ jobs:
 
       - name: Race-test release verifier lifecycle
         if: always() && steps.build.outcome == 'success'
-        timeout-minutes: 14
+        timeout-minutes: 19
         env:
           CGO_ENABLED: '1'
         run: |
@@ -411,16 +411,76 @@ jobs:
             printf 'race checkout=%s checkout_sha=%s exit=%d\n' "$checkout" "$checkout_sha" "$status" || exit
             exit "$status"
           )
+          gate_query_race() (
+            cd gate || exit
+            local checkout_sha status=0 events="$EVIDENCE/query-model-events.jsonl"
+            checkout_sha=$(git rev-parse HEAD) || exit
+            printf 'race checkout=gate checkout_sha=%s revision=%s arch=%s\n' \
+              "$checkout_sha" "$REVISION" "$EXPECTED_ARCH" || exit
+            [[ "$checkout_sha" == "$GITHUB_WORKFLOW_SHA" ]] || exit 1
+            sha256sum --check "$EVIDENCE/binary.sha256" || exit
+            # These variables also enable standalone release producer tests.
+            export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION"
+            timeout --kill-after=5s 285s go test -json -race -count=1 ./verify/query-model |
+              tee "$events" || status=$?
+            printf 'race checkout=gate checkout_sha=%s exit=%d\n' "$checkout_sha" "$status" || exit
+            sha256sum --check "$EVIDENCE/binary.sha256" || exit
+            python3 - "$events" "$REVISION" "$BINARY" "$EVIDENCE/binary.sha256" <<'PY' || exit
+          import json
+          import re
+          import sys
+          from collections import Counter
+          from pathlib import Path
+
+          path, revision, binary, checksum = sys.argv[1:]
+          digest, separator, recorded_binary = Path(checksum).read_text(encoding="utf-8").rstrip("\n").partition("  ")
+          if not re.fullmatch(r"[0-9a-f]{40}", revision):
+              sys.exit("Expected a full lowercase candidate revision")
+          if not separator or recorded_binary != binary or not re.fullmatch(r"[0-9a-f]{64}", digest):
+              sys.exit("Recorded checksum does not identify the pinned candidate binary")
+
+          parent = "TestPinnedQueryModelReplay"
+          required = (f"{parent}/ordinary", f"{parent}/retained")
+          passes = Counter()
+          identities = 0
+          with open(path, encoding="utf-8") as events:
+              for line in events:
+                  event = json.loads(line)
+                  if event.get("Package") != "bog/verify/query-model":
+                      continue
+                  test = event.get("Test")
+                  if test != parent and test not in required:
+                      continue
+                  action = event["Action"]
+                  if action in ("fail", "skip"):
+                      sys.exit(f"{test} reported {action}")
+                  if test in required and action == "pass":
+                      passes[test] += 1
+                  if test == parent and action == "output":
+                      _, marker, identity = event["Output"].partition("candidate revision=")
+                      if marker:
+                          if identity.rstrip("\n") != f"{revision} binary_sha256={digest}":
+                              sys.exit(f"{parent} candidate identity does not match the pinned build")
+                          identities += 1
+          for test in required:
+              if passes[test] != 1:
+                  sys.exit(f"{test} reported {passes[test]} passes, expected 1")
+          if identities != 1:
+              sys.exit(f"{parent} reported {identities} candidate identities, expected 1")
+          print(f"PASS {required[0]} and {required[1]} for {revision} ({digest})")
+          PY
+            exit "$status"
+          )
           {
             failed=0
             candidate_storage_race || failed=1
             race_checkout candidate "$REVISION" ./internal/archtest ./verify/linux ./verify/listener \
               ./verify/release ./bench/retained-history ./verify/fuzz || failed=1
-            gate_packages=(./verify/query-model)
+            gate_query_race || failed=1
             if [[ "$GITHUB_WORKFLOW_SHA" != "$REVISION" ]]; then
-              gate_packages+=(./verify/listener ./verify/release ./bench/retained-history)
+              race_checkout gate "$GITHUB_WORKFLOW_SHA" ./verify/listener \
+                ./verify/release ./bench/retained-history || failed=1
             fi
-            race_checkout gate "$GITHUB_WORKFLOW_SHA" "${gate_packages[@]}" || failed=1
             exit "$failed"
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 

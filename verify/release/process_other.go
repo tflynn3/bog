@@ -2,10 +2,16 @@
 
 package main
 
-import "os/exec"
+import "errors"
 
-func waitCandidate(cmd *exec.Cmd, cleanGroup func() error) (error, error) {
-	err := cmd.Wait()
-	cleanGroup() // The teardown caller receives the cached cleanup result.
-	return err, nil
+func candidatePlatform() error {
+	return errors.New("candidate lifecycle and listener verification require Linux")
+}
+
+func candidateExited(_ int, _ bool) (bool, error) {
+	return false, candidatePlatform()
+}
+
+func candidateOwnsListener(_, _ int) (bool, error) {
+	return false, candidatePlatform()
 }

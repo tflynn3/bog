@@ -161,7 +161,9 @@ func TestFixedBudgetWireVerdict(t *testing.T) {
 				}
 				writeWireResponse(t, w, wire)
 			})
-			launch := func(_ context.Context, _ int, check func(string) error) error { return check(server.URL) }
+			launch := func(ctx context.Context, _ int, check func(context.Context, string) error) error {
+				return check(ctx, server.URL)
+			}
 			stats, err := findBudgetWalk(t.Context(), server.Client(), 1, launch)
 			cases := make(map[string]outcome)
 			verdictErr := record(cases, "work_budget", stats, err)

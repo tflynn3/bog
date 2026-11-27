@@ -34,6 +34,23 @@ additional evidence. The following cases must pass.
 | Capacity | `retained_history_capacity` |
 | Restored image | `restored_parity` |
 
+Admission also records the full saturation fixture verdict as
+`saturation_fixture`. Validation accepts archived admission reports with
+the original cases. When the fixture verdict is present, it must pass.
+Failures include startup, candidate exit and process-group teardown, and
+fixture-root removal. The primary probe error appears first when cleanup
+also fails. Restored parity includes the same lifecycle and fixture cleanup
+checks in its case.
+
+Before sending a health request, the Linux verifier matches the reserved
+loopback address and port to listening sockets in the candidate's own file
+descriptors. Any matching foreign listener fails the fixture. The verifier
+checks ownership again after health and after the workload. It observes
+exit independently of probing and reserves the leader PID through
+process-group teardown. The verifier requests its stop with SIGHUP and
+requires a matching exit. Normal exits and SIGKILL, including escalation
+after a teardown timeout, fail the fixture.
+
 The durability report validator requires these fields in the `enospc` case's
 `evidence` object.
 
@@ -76,6 +93,17 @@ time to stop, reads hierarchical `cgroup.events`, and uses
 removing cgroups bottom-up. The cleanup deadline is independent of the
 workload deadline. A workload failure can carry successful cleanup
 evidence, which still fails the capacity case.
+
+For cutover qualification, pass `validate -require-cutover` with the
+usual report arguments or set `BOG_RELEASE_REQUIRE_CUTOVER=1`. Both live
+records must carry passing clustered and scattered backfill timelines under
+`diagnostics.backfill_timelines`. The validator checks acknowledged
+backfill, held-cursor exhaustion, fresh visibility, publication at the
+expected cutoff, and publication lag bounds against the sampled events.
+It requires a positive retired pin count while the cursor is held and a
+zero count after exhaustion in the producer's drain samples. Standard
+validation reads archived schema-v1 capacity reports without those
+timelines.
 
 Set `BOG_TEST_CGROUP_PARENT` to a delegated cgroup v2 parent with memory
 and I/O enabled for its children to run the kernel regression tests.

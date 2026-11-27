@@ -16,6 +16,13 @@ const (
 	capacityBatch     = 64
 )
 
+type compactionEvidence struct {
+	State         string `json:"state"`
+	Generation    uint64 `json:"generation"`
+	CoveredRows   int    `json:"covered_rows"`
+	CommittedRows int    `json:"committed_rows"`
+}
+
 // This is the release-side contract for the benchmark's schema-v1 live
 // evidence. Positive values and explicit booleans make missing and null
 // measurements fail closed while permitting additional diagnostic fields.
@@ -27,18 +34,14 @@ type capacityEvidence struct {
 		BatchRows   int    `json:"batch_rows"`
 		MemoryBytes uint64 `json:"memory_limit_bytes"`
 	} `json:"fixture"`
-	Status        string `json:"status"`
-	Workload      string `json:"workload_status"`
-	Phase         string `json:"phase"`
-	TimedOut      *bool  `json:"timed_out"`
-	RecoveredRows int    `json:"recovered_rows"`
-	Compaction    struct {
-		State         string `json:"state"`
-		Generation    uint64 `json:"generation"`
-		CoveredRows   int    `json:"covered_rows"`
-		CommittedRows int    `json:"committed_rows"`
-	} `json:"compaction"`
-	Cleanup struct {
+	Status        string             `json:"status"`
+	Workload      string             `json:"workload_status"`
+	Phase         string             `json:"phase"`
+	TimedOut      *bool              `json:"timed_out"`
+	RecoveredRows int                `json:"recovered_rows"`
+	Compaction    compactionEvidence `json:"compaction"`
+	Diagnostics   jsontext.Value     `json:"diagnostics"`
+	Cleanup       struct {
 		Status          string `json:"status"`
 		CandidateReaped bool   `json:"candidate_reaped"`
 		SubtreeEmpty    bool   `json:"subtree_empty"`
@@ -60,7 +63,7 @@ type capacityEvidence struct {
 	Unavailable   map[string]string             `json:"unavailable"`
 }
 
-func validateCapacity(rawMode, outcome jsontext.Value, fixture string) error {
+func validateCapacity(rawMode, outcome jsontext.Value, fixture string, requireCutover bool) error {
 	var mode string
 	if err := json.Unmarshal(rawMode, &mode); err != nil || mode != "live" || fixture != capacityFixtureID {
 		return errors.New("capacity requires live mode and fixture linux-release-v1")
@@ -80,14 +83,14 @@ func validateCapacity(rawMode, outcome jsontext.Value, fixture string) error {
 			return fmt.Errorf("unexpected or duplicate capacity fixture size %d", size)
 		}
 		seen[size] = true
-		if err := r.validate(); err != nil {
+		if err := r.validate(requireCutover); err != nil {
 			return fmt.Errorf("capacity fixture %d: %w", size, err)
 		}
 	}
 	return nil
 }
 
-func (r capacityEvidence) validate() error {
+func (r capacityEvidence) validate(requireCutover bool) error {
 	f := r.Fixture
 	if f.TailRows != capacityTail || f.LineBytes != 1024 || f.BatchRows != capacityBatch || f.MemoryBytes != capacityMemory {
 		return errors.New("incorrect fixture dimensions or memory limit")
@@ -130,6 +133,9 @@ func (r capacityEvidence) validate() error {
 				return fmt.Errorf("invalid I/O counter %q for device %q", name, device)
 			}
 		}
+	}
+	if requireCutover {
+		return r.validateCutover()
 	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -125,7 +126,7 @@ func TestValidateRetargetEvidence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = validateReportWithRetarget(raw, id, durabilityCases, tc.strict)
+			err = validateReportWithOptions(raw, id, durabilityCases, validationOptions{requireRetarget: tc.strict})
 			if tc.problem == "" && err != nil || tc.problem != "" && (err == nil || !strings.Contains(err.Error(), tc.problem)) {
 				t.Fatalf("wanted %q, got %v", tc.problem, err)
 			}
@@ -135,6 +136,7 @@ func TestValidateRetargetEvidence(t *testing.T) {
 
 func TestValidateCommand(t *testing.T) {
 	t.Setenv("BOG_RELEASE_REQUIRE_RETARGET", "")
+	t.Setenv("BOG_RELEASE_REQUIRE_CUTOVER", "")
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "candidate")
 	data := []byte("prebuilt candidate")
@@ -187,6 +189,18 @@ func TestValidateCommand(t *testing.T) {
 	if err := run(t.Context(), args); err != nil {
 		t.Fatal(err)
 	}
+	cutoverArgs := append(append([]string(nil), args...), "-require-cutover")
+	if err := run(t.Context(), cutoverArgs); err == nil || !strings.Contains(err.Error(), "cutover diagnostics") {
+		t.Fatalf("cutover flag accepted archived capacity report: %v", err)
+	}
+	t.Setenv("BOG_RELEASE_REQUIRE_CUTOVER", "1")
+	if err := run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "cutover diagnostics") {
+		t.Fatalf("cutover environment accepted archived capacity report: %v", err)
+	}
+	writeFixture(t, filepath.Join(dir, "capacity.json"), cutoverCapacityReport(id))
+	if err := run(t.Context(), args); err != nil {
+		t.Fatalf("cutover rejected producer evidence: %v", err)
+	}
 	missing := filepath.Join(dir, "capacity.json")
 	if err := os.Remove(missing); err != nil {
 		t.Fatal(err)
@@ -223,12 +237,43 @@ func TestAdmissionPublishesStartupFailure(t *testing.T) {
 		t.Fatalf("wrong identity: %+v", got.identity)
 	}
 	for name, status := range map[string]string{
-		"one_slot_saturation": "fail", "work_budget": "fail",
+		"one_slot_saturation": "fail", "work_budget": "fail", saturationFixtureCase: "fail",
 		"ingest_during_saturation": "skip", "cursor_resume": "skip",
 	} {
 		if got.Cases[name].Status != status || got.Cases[name].Detail == nil {
 			t.Errorf("%s: wanted %s with detail, got %+v", name, status, got.Cases[name])
 		}
+	}
+}
+
+func TestAdmissionReportRetainsFixtureAndProbeFailures(t *testing.T) {
+	t.Parallel()
+	id := identity{1, testRevision, strings.Repeat("a", 64), capacityFixtureID}
+	cases := make(map[string]outcome)
+	for _, name := range admissionCases {
+		cases[name] = outcome{Status: "pass"}
+	}
+	primary := errors.New("primary probe problem")
+	combined := addFixtureCleanup(primary, "/fixture", func(string) error {
+		return errors.New("cleanup problem")
+	})
+	err := record(cases, saturationFixtureCase, nil, combined)
+	if !errors.Is(err, primary) {
+		t.Fatalf("record lost original probe failure: %v", err)
+	}
+	skip := "prerequisite failed"
+	cases["cursor_resume"] = outcome{Status: "skip", Detail: &skip}
+	path := filepath.Join(t.TempDir(), "admission.json")
+	if err := writeReport(path, report{id, cases}); err != nil {
+		t.Fatal(err)
+	}
+	err = validateFile(path, id, admissionCases, validationOptions{})
+	if err == nil || !strings.HasPrefix(err.Error(), `case "saturation_fixture": expected pass, got "fail": primary probe problem`) ||
+		!strings.Contains(err.Error(), "cleanup problem") || !strings.Contains(err.Error(), skip) {
+		t.Fatalf("incorrect validation diagnostic: %v", err)
+	}
+	if err := writeReport(path+"/admission.json", report{id, cases}); err == nil || !strings.Contains(err.Error(), "write release report") {
+		t.Fatalf("report write failure was lost: %v", err)
 	}
 }
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,7 +22,10 @@ func run(ctx context.Context, args []string) error {
 	revision := flags.String("revision", "", "full candidate commit SHA")
 	fixture := flags.String("fixture", "", "release fixture ID")
 	var output, admission, durability, capacity, parity string
+	var opts validationOptions
 	if validate {
+		opts.requireRetarget = os.Getenv("BOG_RELEASE_REQUIRE_RETARGET") == "1"
+		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require publication and retired pin drain evidence from live capacity")
 		flags.StringVar(&admission, "admission", "", "admission report")
 		flags.StringVar(&durability, "durability", "", "durability report")
 		flags.StringVar(&capacity, "capacity", "", "capacity report")
@@ -53,12 +55,12 @@ func run(ctx context.Context, args []string) error {
 			{"durability", durability, durabilityCases},
 			{"capacity", capacity, capacityCases},
 		} {
-			if checkErr := validateFile(check.path, id, check.cases); checkErr != nil {
+			if checkErr := validateFile(check.path, id, check.cases, opts); checkErr != nil {
 				err = errors.Join(err, fmt.Errorf("%s report: %w", check.name, checkErr))
 			}
 		}
 		if parity != "" {
-			if checkErr := validateFile(parity, id, []string{"restored_parity"}); checkErr != nil {
+			if checkErr := validateFile(parity, id, []string{"restored_parity"}, opts); checkErr != nil {
 				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
 			}
 		}
@@ -75,11 +77,7 @@ func run(ctx context.Context, args []string) error {
 			results.Cases[name] = outcome{Status: "skip", Detail: &detail}
 		}
 	}
-	data, err := json.MarshalIndent(results, "", "  ")
-	if err == nil {
-		err = os.WriteFile(output, append(data, '\n'), 0600)
-	}
-	return errors.Join(probeErr, err)
+	return errors.Join(probeErr, writeReport(output, results))
 }
 
 func main() {

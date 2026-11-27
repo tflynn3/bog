@@ -8,15 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 )
 
@@ -217,116 +212,6 @@ func requireSnapshot(ctx context.Context, client *http.Client, base, cursor stri
 	}
 }
 
-func serve(ctx context.Context, binary string, client *http.Client, flags []string, check func(string) error) (err error) {
-	dir, err := os.MkdirTemp("", "bog-release-")
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
-	return serveDirectory(ctx, binary, dir, client, flags, check)
-}
-
-func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(string) error) (err error) {
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	addr := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		return err
-	}
-	cmd := exec.CommandContext(ctx, binary, append([]string{"-data-dir", dir, "-addr", addr}, flags...)...)
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	var killOnce sync.Once
-	var killErr error
-	cmd.Cancel = func() error {
-		killOnce.Do(func() {
-			killErr = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			if errors.Is(killErr, syscall.ESRCH) {
-				killErr = os.ErrProcessDone
-			}
-		})
-		return killErr
-	}
-	cmd.WaitDelay = 3 * time.Second
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	cleanGroup := func() error {
-		err := cmd.Cancel()
-		if errors.Is(err, os.ErrProcessDone) {
-			return nil
-		}
-		return err
-	}
-	done := make(chan struct{})
-	var waitErr, observeErr error
-	go func() {
-		waitErr, observeErr = waitCandidate(cmd, cleanGroup)
-		close(done)
-	}()
-	defer func() {
-		// The leader may have exited while its group is still running.
-		killErr := cleanGroup()
-		timer := time.NewTimer(3 * time.Second)
-		defer timer.Stop()
-		select {
-		case <-done:
-			var exited *exec.ExitError
-			if errors.As(waitErr, &exited) {
-				if status, ok := exited.Sys().(syscall.WaitStatus); ok && status.Signal() == syscall.SIGKILL {
-					err = errors.Join(err, killErr, observeErr)
-					return
-				}
-			}
-			err = errors.Join(err, killErr, observeErr, fmt.Errorf("candidate exited unexpectedly: %v", waitErr))
-		case <-timer.C:
-			err = errors.Join(err, killErr, errors.New("timed out reaping candidate"))
-		}
-	}()
-
-	base := "http://" + addr
-	startup, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	for {
-		select {
-		case <-done:
-			return fmt.Errorf("candidate exited before health check: %v", waitErr)
-		default:
-		}
-		res, probeErr := request(startup, client, http.MethodGet, base+"/healthz", nil)
-		if probeErr == nil {
-			if res.status != http.StatusOK {
-				return fmt.Errorf("startup health returned HTTP %d", res.status)
-			}
-			select {
-			case <-done:
-				return fmt.Errorf("candidate exited during health check: %v", waitErr)
-			default:
-			}
-			if err := startup.Err(); err != nil {
-				return fmt.Errorf("startup health: %w", err)
-			}
-			return check(base)
-		}
-		if err := startup.Err(); err != nil {
-			return fmt.Errorf("startup health: %w (last probe: %v)", err, probeErr)
-		}
-		var netErr *net.OpError
-		if !errors.As(probeErr, &netErr) || !errors.Is(netErr, syscall.ECONNREFUSED) {
-			return fmt.Errorf("startup health: %w", probeErr)
-		}
-		select {
-		case <-startup.Done():
-			return fmt.Errorf("startup health: %w (last probe: %v)", startup.Err(), probeErr)
-		case <-done:
-			return fmt.Errorf("candidate exited before health check: %v", waitErr)
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-}
-
 func record(cases map[string]outcome, name string, evidence any, err error) error {
 	raw, encodeErr := json.Marshal(evidence)
 	err = errors.Join(err, encodeErr)
@@ -357,17 +242,18 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
 		seed[i] = row{start.Add(time.Duration(i) * time.Second).Format(time.RFC3339), fmt.Sprintf("seed-%04d-%s", i, padding)}
 	}
 
-	saturationErr := serve(ctx, binary, client, []string{"-query-concurrency=1"}, func(base string) error {
+	saturationErr := serve(ctx, binary, client, []string{"-query-concurrency=1"}, func(ctx context.Context, base string) error {
 		return probeSaturation(ctx, client, base, seed, cases)
 	})
 	if _, ok := cases["one_slot_saturation"]; !ok {
 		saturationErr = record(cases, "one_slot_saturation", nil, saturationErr)
 	}
+	saturationErr = record(cases, saturationFixtureCase, nil, saturationErr)
 	var budgetProof struct {
 		rejection
 		FixedBudgetWalk budgetWalkProof `json:"fixed_budget_walk"`
 	}
-	rejectionErr := serve(ctx, binary, client, []string{"-query-concurrency=1", "-query-work-budget=1"}, func(base string) error {
+	rejectionErr := serve(ctx, binary, client, []string{"-query-concurrency=1", "-query-work-budget=1"}, func(ctx context.Context, base string) error {
 		if _, err := ingest(ctx, client, base, seed[:batchRows]); err != nil {
 			return err
 		}

@@ -46,13 +46,14 @@ func TestReleaseRestoredParity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	results := report{id, make(map[string]outcome)}
-	proof, probeErr := restoredParity(ctx, binary, t.TempDir())
+	var proof parityProof
+	probeErr := withFixtureRoot(func(root string) error {
+		var err error
+		proof, err = restoredParity(ctx, binary, root)
+		return err
+	})
 	probeErr = record(results.Cases, restoredParityCase, proof, probeErr)
-	data, err := json.MarshalIndent(results, "", "  ")
-	if err == nil {
-		err = os.WriteFile(path, append(data, '\n'), 0600)
-	}
-	if err := errors.Join(probeErr, err); err != nil {
+	if err := errors.Join(probeErr, writeReport(path, results)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -104,7 +105,7 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 	// the first page, where a resume against a fresh snapshot would see it.
 	added := querymodel.Row{Time: rows[1].Time, Line: "after restore [match]"}
 	var staleCursor string
-	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
+	err = serveDirectory(ctx, binary, dir, client, flags, func(ctx context.Context, base string) error {
 		pager, err := newReleasePager(base, client, restoredPageCap)
 		if err != nil {
 			return err
@@ -144,7 +145,7 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 	if err != nil {
 		return proof, fmt.Errorf("serve restored image: %w", err)
 	}
-	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
+	err = serveDirectory(ctx, binary, dir, client, flags, func(ctx context.Context, base string) error {
 		if err := requireStaleCursorRejection(ctx, client, base, staleCursor); err != nil {
 			return fmt.Errorf("resume cursor from before restart: %w", err)
 		}

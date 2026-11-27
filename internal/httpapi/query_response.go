@@ -5,6 +5,7 @@ import (
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"unicode/utf8"
 
@@ -19,11 +20,27 @@ const (
 // queryResponse buffers complete records until the status and cursor can be
 // committed. Each record's allocation is exact and never copies earlier rows.
 type queryResponse struct {
+	reserved queryReservation
 	rows     [][]byte
 	size     int
 	maxBytes int
 	scratch  bytes.Buffer
 	encoder  jsontext.Encoder
+}
+
+// The byte budget measures encoded record backing arrays. Each query slot
+// also bounds the row headers (maxQueryLimit) and encoder scratch (one chunk
+// per encoder; certification uses a second encoder).
+func (a *API) newQueryResponse() queryResponse {
+	return queryResponse{
+		maxBytes: a.maxResponseBytes,
+		reserved: queryReservation{budget: &a.initResources().response},
+	}
+}
+
+func (b *queryResponse) release() {
+	b.rows = nil
+	b.reserved.release()
 }
 
 // appendRow reports the exact encoded size when the first row doesn't fit.
@@ -47,6 +64,9 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 // the whole line and may borrow scratch from the immediately preceding
 // measurement. Publish the record only after assembly succeeds.
 func (b *queryResponse) appendMeasuredRow(stamp []byte, line string, size int, escaped []byte, work *store.QueryWork) error {
+	if err := b.reserved.grow(uint64(size)); err != nil {
+		return err
+	}
 	record := make([]byte, 0, size)
 	record = append(record, queryRecordPrefix...)
 	record = append(record, stamp...)
@@ -104,6 +124,9 @@ func (b *queryResponse) measureRow(row store.Row, remaining int, allowEarlyExit 
 		payload, err := b.escapeChunk(line[:n])
 		if err != nil {
 			return nil, 0, false, err
+		}
+		if len(payload) > math.MaxInt-size {
+			return nil, 0, false, ErrQueryResponseCapacityExhausted
 		}
 		size += len(payload)
 		line = line[n:]

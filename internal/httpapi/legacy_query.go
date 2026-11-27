@@ -47,8 +47,11 @@ func (a *API) resumeLegacyQuery(w http.ResponseWriter, params queryParams, work 
 		writeQueryError(w, store.ErrInvalidQueryCursor)
 		return
 	}
-	response, next, err := plan.replay(offset, params.limit, a.maxResponseBytes, work)
+	response := a.newQueryResponse()
+	defer response.release()
+	next, err := plan.replayInto(&response, offset, params.limit, work)
 	if err != nil {
+		response.release()
 		writeQueryError(w, err)
 		return
 	}
@@ -57,65 +60,79 @@ func (a *API) resumeLegacyQuery(w http.ResponseWriter, params queryParams, work 
 		token = a.encodeLegacyCursor(legacyCursor{cursor.capture, next, filter})
 	}
 	if err := work.Charge(); err != nil {
+		response.release()
 		writeQueryError(w, err)
 		return
 	}
 	response.write(w, token)
 }
 
-func (a *API) prepareLegacyOpening(capture *queryCapture, params queryParams, work *store.QueryWork) (queryResponse, string, error) {
+func (a *API) prepareLegacyOpening(capture *queryCapture, params queryParams, response *queryResponse, work *store.QueryWork) (string, error) {
 	filter := params.filter
+	// Each match consumes at least one work unit. Reserve space for growing
+	// the ordinal array (including during copies), encoded sizes, and scan
+	// setup before capturing the store view. Published lines are borrowed.
+	maxMatches := min(uint64(maxLegacyMatches), a.queryWorkBudget)
+	scan := queryReservation{budget: &a.initResources().scan}
+	if err := scan.grow((64 << 10) + 32*maxMatches); err != nil {
+		return "", err
+	}
+	defer scan.release()
 	matches, err := a.legacy.store.CapturePositionedMatches(filter.Start, filter.End, filter.Contains, maxLegacyMatches, work)
 	if err != nil {
-		return queryResponse{}, "", err
+		return "", err
 	}
 	plan := &legacyQueryPlan{matches: matches, sizes: make([]int, matches.Len())}
-	response, err := plan.prepare(params.limit, a.maxResponseBytes, uint64(len(filter.Contains)), a.queryWorkBudget, work)
-	if err != nil {
-		return queryResponse{}, "", err
+	if err := plan.prepareInto(response, params.limit, uint64(len(filter.Contains)), a.queryWorkBudget, work); err != nil {
+		return "", err
 	}
 	first := len(response.rows)
 	if first == len(plan.sizes) {
-		return response, "", nil
+		return "", nil
 	}
 	if err := work.Charge(legacyCursorWork, uint64(len(filter.Contains))); err != nil {
-		return queryResponse{}, "", err
+		return "", err
 	}
+	// Retain the ordinal capacity (including growth slack) and size array
+	// until the capture's owner drops them. Return the transient allowance.
+	scan.keep((4 << 10) + 24*uint64(matches.Len()))
 	capture.sourceID = a.legacy.retain(legacyView{plan: plan})
-	return response, a.encodeLegacyCursor(legacyCursor{capture.id, first, a.filterDigest(filter)}), nil
+	capture.legacyScan = scan
+	scan = queryReservation{}
+	return a.encodeLegacyCursor(legacyCursor{capture.id, first, a.filterDigest(filter)}), nil
 }
 
-// prepare measures each record once, prepares the longest opening prefix,
+// prepareInto measures each record once, prepares the longest opening prefix,
 // and certifies the work for all prefixes a resume could emit. The scan's
 // per-match fixed charge also covers match metadata and record setup.
 // Measurement reserves the line-byte work and supplies the escaped payload
 // directly for opening records that fit in one chunk.
-func (p *legacyQueryPlan) prepare(limit, byteCap int, literalWork, budget uint64, work *store.QueryWork) (queryResponse, error) {
-	response := queryResponse{maxBytes: byteCap}
+func (p *legacyQueryPlan) prepareInto(response *queryResponse, limit int, literalWork, budget uint64, work *store.QueryWork) error {
+	byteCap := response.maxBytes
 	first := true
 	var window legacyReplayWindow
 	for i := range p.sizes {
 		if err := work.Charge(); err != nil {
-			return queryResponse{}, err
+			return err
 		}
 		row := p.matches.At(i).Row
 		stamp, size, _, err := response.measureRow(row, byteCap, false, work)
 		if err != nil {
-			return queryResponse{}, err
+			return err
 		}
 		p.sizes[i] = size
 		if size > byteCap {
 			if i == 0 {
-				return queryResponse{}, &oversizedQueryRecord{byteCap, size}
+				return &oversizedQueryRecord{byteCap, size}
 			}
 			if !first {
 				if err := window.certify(i, size, byteCap, literalWork, budget); err != nil {
-					return queryResponse{}, err
+					return err
 				}
 			}
 			// Keep the barrier's exact size. No continuation can cross it.
 			p.sizes = p.sizes[:i+1]
-			return response, response.reserveDelivery(work)
+			return response.reserveDelivery(work)
 		}
 		if first && i < limit && size <= byteCap-response.size {
 			var escaped []byte
@@ -123,7 +140,7 @@ func (p *legacyQueryPlan) prepare(limit, byteCap int, literalWork, budget uint64
 				escaped = response.escapedChunkPayload()
 			}
 			if err := response.appendMeasuredRow(stamp, row.Line, size, escaped, work); err != nil {
-				return queryResponse{}, err
+				return err
 			}
 			continue
 		}
@@ -131,16 +148,16 @@ func (p *legacyQueryPlan) prepare(limit, byteCap int, literalWork, budget uint64
 			first = false
 			window.start = i
 		} else if err := window.certify(i, size, byteCap, literalWork, budget); err != nil {
-			return queryResponse{}, err
+			return err
 		}
 		window.add(p, i, size, byteCap, legacyRecordWork(row))
 	}
 	if !first {
 		if err := window.certify(len(p.sizes), 0, byteCap, literalWork, budget); err != nil {
-			return queryResponse{}, err
+			return err
 		}
 	}
-	return response, response.reserveDelivery(work)
+	return response.reserveDelivery(work)
 }
 
 type legacyReplayWindow struct {
@@ -181,37 +198,37 @@ func legacyRecordWork(row store.Row) uint64 {
 	return 1 + uint64(len(row.Line))
 }
 
-func (p *legacyQueryPlan) replay(offset, limit, byteCap int, work *store.QueryWork) (queryResponse, int, error) {
-	response := queryResponse{maxBytes: byteCap}
+func (p *legacyQueryPlan) replayInto(response *queryResponse, offset, limit int, work *store.QueryWork) (int, error) {
+	byteCap := response.maxBytes
 	end := min(offset+limit, len(p.sizes))
 	for offset < end {
 		if err := work.Charge(1); err != nil {
-			return queryResponse{}, 0, err
+			return 0, err
 		}
 		size := p.sizes[offset]
 		if size > byteCap-response.size {
 			if response.size == 0 {
-				return queryResponse{}, 0, &oversizedQueryRecord{byteCap, size}
+				return 0, &oversizedQueryRecord{byteCap, size}
 			}
 			break
 		}
 		row := p.matches.At(offset).Row
 		if err := work.Charge(uint64(len(row.Line))); err != nil {
-			return queryResponse{}, 0, err
+			return 0, err
 		}
 		stamp, err := row.TS.MarshalJSON()
 		if err != nil {
-			return queryResponse{}, 0, err
+			return 0, err
 		}
 		if err := response.appendMeasuredRow(stamp, row.Line, size, nil, work); err != nil {
-			return queryResponse{}, 0, err
+			return 0, err
 		}
 		offset++
 	}
 	if offset < len(p.sizes) {
 		if err := work.Charge(legacyCursorWork); err != nil {
-			return queryResponse{}, 0, err
+			return 0, err
 		}
 	}
-	return response, offset, response.reserveDelivery(work)
+	return offset, response.reserveDelivery(work)
 }

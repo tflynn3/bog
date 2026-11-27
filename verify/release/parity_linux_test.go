@@ -307,27 +307,10 @@ func checkParityWalks(ctx context.Context, pager *releasePager, log *querymodel.
 	return nil
 }
 
-// parityFetch adapts production-client results at the verifier boundary. The
-// pager bounds bytes while reading and verifies media type and cursor framing.
-// ADR 0006 also requires the shipped server to declare the exact body length.
 func parityFetch(pager *releasePager) querymodel.FetchWirePage {
 	return func(ctx context.Context, req querymodel.WireRequest) (querymodel.WirePage, error) {
-		if !req.Filter.Start.Equal(pager.query.Start) || !req.Filter.End.Equal(pager.query.End) ||
-			req.MaxPageBytes != pager.client.MaxPageBytes {
-			return querymodel.WirePage{}, errors.New("oracle bounds differ from the configured release pager")
-		}
-		page, res, err := pager.fetch(ctx, req.Filter.Contains, req.Limit, req.Cursor)
-		if err != nil {
-			return querymodel.WirePage{}, err
-		}
-		if res.ContentLength < 0 || res.Header.Get("Content-Length") == "" {
-			return querymodel.WirePage{}, errors.New("missing exact Content-Length on query response")
-		}
-		rows := make([]querymodel.Row, len(page.Rows))
-		for i, r := range page.Rows {
-			rows[i] = querymodel.Row{Time: r.TS, Line: r.Line}
-		}
-		return querymodel.WirePage{Rows: rows, NextCursor: page.NextCursor, BodyBytes: res.ContentLength}, nil
+		page, _, err := fetchOraclePage(ctx, pager, req)
+		return page, err
 	}
 }
 

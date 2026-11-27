@@ -312,14 +312,51 @@ jobs:
         env:
           BOG_RELEASE_REQUIRE_RETARGET: '1'
         run: |
+          validate_release() {
+            go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
+              -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
+              -capacity "$EVIDENCE/capacity.json" -parity "$1"
+          }
+          check_crash_validation() (
+            local variant output
+            check_dir=$(mktemp -d "$RUNNER_TEMP/bog-parity-validation.XXXXXXXX") || exit
+            trap 'rm -f -- "$check_dir/missing.json" "$check_dir/malformed.json" && rmdir -- "$check_dir"' EXIT
+            python3 - "$EVIDENCE/parity.json" "$check_dir" <<'PY' || exit
+          import json
+          import sys
+          from pathlib import Path
+
+          source, destination = map(Path, sys.argv[1:])
+          report = json.loads(source.read_text(encoding="utf-8"))
+          cases = report["cases"]
+          crash = cases.pop("post_restore_ack_crash", None)
+          if not isinstance(crash, dict) or crash.get("status") != "pass":
+              sys.exit("parity.json must contain a passing post_restore_ack_crash case")
+          (destination / "missing.json").write_text(json.dumps(report), encoding="utf-8")
+          cases["post_restore_ack_crash"] = {
+              **crash, "evidence": {**crash["evidence"], "append_status": "204"}
+          }
+          (destination / "malformed.json").write_text(json.dumps(report), encoding="utf-8")
+          PY
+            for variant in missing malformed; do
+              if output=$(validate_release "$check_dir/$variant.json" 2>&1) ||
+                [[ "$output" != *'restored parity report:'*'post_restore_ack_crash'* ]]; then
+                printf 'Strict validator did not reject %s post_restore_ack_crash evidence\n%s\n' "$variant" "$output" >&2
+                exit 1
+              fi
+              printf 'Strict validator rejected %s post_restore_ack_crash evidence\n%s\n' "$variant" "$output"
+            done
+          )
           {
             failed=0
             sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
             checkout_sha=$(git rev-parse HEAD)
             printf 'release validator checkout=gate checkout_sha=%s\n' "$checkout_sha"
-            go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
-              -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
-              -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
+            if validate_release "$EVIDENCE/parity.json"; then
+              check_crash_validation || failed=1
+            else
+              failed=1
+            fi
             printf 'capacity validator checkout=gate checkout_sha=%s\n' "$checkout_sha"
             go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1
             exit "$failed"

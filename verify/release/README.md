@@ -12,8 +12,9 @@ configuration, reports, producer exit statuses, and logs.
 The admission, durability, and capacity producers take
 `-binary PATH -revision SHA -fixture ID -report PATH`.
 The release fixture ID is `linux-release-v1`. The workflow runs
-`go run ./verify/release`, restored parity, the fixed-budget backfill test,
-and strict report validation from the workflow checkout (`gate`). It runs
+`go run ./verify/release`, the combined restored parity test, the
+fixed-budget backfill test, and strict report validation from the workflow
+checkout (`gate`). It runs
 `go run ./verify/linux` (#3) and `go run ./bench/retained-history` (#32) from the
 candidate checkout. The query-model race suite runs from `gate`, which
 supplies the oracle and backfill test. The sibling commands provision their
@@ -36,7 +37,7 @@ additional evidence. The following cases must pass.
 | Admission | `one_slot_saturation`, `ingest_during_saturation`, `cursor_resume`, `work_budget` |
 | Durability | `sigkill`, `recovery`, `enospc` |
 | Capacity | `retained_history_capacity` |
-| Recovery parity | `restored_parity` when supplied, plus `ordinary_wal_reopen` in cutover mode |
+| Recovery parity | `restored_parity` when supplied, plus `ordinary_wal_reopen` and `post_restore_ack_crash` in cutover mode |
 
 Admission also records the full saturation fixture verdict as
 `saturation_fixture`. Validation accepts archived admission reports with
@@ -223,18 +224,51 @@ restart. The `ordinary_wal_reopen` case records the row counts and append
 status.
 
 The native workflow uses `-require-cutover -parity parity.json` and runs the
-verifier tests with the race detector on Linux. Qualify the crash fixture
-against the composed #53 candidate on both native Linux runners. Strict
-validation requires both recovery cases to pass and checks these exact
-evidence fields for `linux-release-v1`.
+verifier tests with the race detector on Linux. Strict validation requires
+all three recovery cases to pass and checks these evidence fields for
+`linux-release-v1`.
 
 | Case | Required evidence |
 | --- | --- |
 | `ordinary_wal_reopen` | `reopened_rows` = 3, `append_status` = 204, `restart_rows` = 6 |
 | `restored_parity` | `captured_rows` = 6, `held_capture_rows` = 6, `post_restore_204` = true, `post_append_rows` = 7, `restart_rows` = 7 |
+| `post_restore_ack_crash` | Verified checkpoint-and-tail point, `append_status` = 204, `observed_signal` = 9, `replay_matched` = true, `replay_rows` = 8, and true for `crash_candidate_reaped`, `restart_candidate_reaped`, and `fixture_removed` |
 
 Historical validation without `-require-cutover` accepts an omitted parity
 report or a schema-v1 report with a passing `restored_parity` outcome.
+
+## Immediate post-restore acknowledgment crash
+
+`TestReleaseRestoredParity` runs the immediate crash probe on its own fresh
+verified checkpoint-and-tail restore. The probe starts the pinned candidate,
+confirms listener ownership, and posts a two-row batch with timestamp ties
+and a duplicate. On HTTP 204 it sends SIGKILL immediately, before reading
+or closing the response body or issuing another probe. The verifier
+requires the matching wait status and
+process-group cleanup, then restarts the same binary on the same directory.
+A fresh paginated walk must match all eight rows in the independent
+append-log oracle in timestamp and append order through exhaustion.
+
+On each architecture, look for the explicit `TestReleaseRestoredParity`
+`pass` event in `parity-events.jsonl` and the `parity` entry with `exit=0`
+and `checkout=gate` in `producers.txt`. An absent, skipped, or failing test
+fails the native job. The producer archives all three recovery outcomes in
+`parity.json` and its output in `parity.log`.
+
+Compare the report's revision, `binary_sha256`, and fixture with `run.txt`
+and `binary.sha256`. `run.txt` also identifies the gate revision and native
+runner. In `validation.log`, check that strict validation accepted the
+archived report and rejected two checks made with temporary copies. One
+omits `post_restore_ack_crash` and the other supplies the acknowledgment
+status as a JSON string. Native qualification depends on the combined
+producer and strict validator from the ADR 0027 handoff.
+
+The **Require both native Linux qualifications** job is the combined result
+for the dispatched revision. For #53, require it to pass with both native
+artifacts for the same candidate and gate revisions. Each native job must
+pass immediate crash replay, strict restored parity, ENOSPC retargeting,
+fixed-budget backfill, and both live capacity scales under 128 MiB with swap
+disabled. [Immediate crash evidence contract](../../docs/adr/0027-immediate-post-restore-crash-evidence.md)
 
 ## Architecture handoff for #61
 

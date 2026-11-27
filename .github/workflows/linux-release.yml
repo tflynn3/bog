@@ -108,8 +108,32 @@ jobs:
           go-version: '1.27.0'
           cache: false
 
+      - name: Preflight native delegated capacity runner
+        id: runner_preflight
+        working-directory: gate
+        timeout-minutes: 5
+        run: |
+          {
+            verifier="${BINARY%/*}/bog-runner-verifier"
+            timeout --kill-after=5s 2m go build -trimpath -o "$verifier" ./verify/linux || {
+              printf 'Runner preflight verifier build failed (failure_kind=infrastructure).\n' >&2
+              exit 1
+            }
+            status=0
+            timeout --signal=TERM --kill-after=30s 30s bash verify/linux/delegated-runner.sh "$verifier" preflight \
+              -arch "$EXPECTED_ARCH" -revision "$REVISION" -fixture "$FIXTURE" \
+              -report "$EVIDENCE/runner-preflight.json" || status=$?
+            if [[ ! -s "$EVIDENCE/runner-preflight.json" ]]; then
+              printf 'Runner preflight produced no report (exit=%d). Check verifier build and systemd delegation.\n' "$status" >&2
+              exit 1
+            fi
+            cat "$EVIDENCE/runner-preflight.json"
+            exit "$status"
+          } 2>&1 | tee "$EVIDENCE/runner-preflight.log"
+
       - name: Build pinned candidate
         id: build
+        if: steps.runner_preflight.outcome == 'success'
         working-directory: candidate
         timeout-minutes: 6
         run: |
@@ -238,39 +262,40 @@ jobs:
               if rmdir -- "$work"; then
                 printf 'capacity_fixture_parent_removed=%s\n' "$work" || status=1
               else
-                printf 'capacity_fixture_cleanup_failed=%s\n' "$work" >&2
+                printf 'capacity_fixture_parent_left_nonempty=%s\n' "$work" >&2
                 if (( status == 0 )); then status=1; fi
+                if [[ -s "$EVIDENCE/capacity-runner.json" ]]; then
+                  if rm -rf --one-file-system -- "$work"; then
+                    printf 'capacity_fixture_parent_removed_after_failure=%s\n' "$work"
+                  else
+                    printf 'capacity_fixture_cleanup_failed=%s\n' "$work" >&2
+                  fi
+                fi
               fi
               exit "$status"
             }
             trap cleanup EXIT
-            timeout --kill-after=5s 2m go build -trimpath -o "$work/capacity" ./bench/retained-history || exit
-            sudo -n systemd-run --quiet --wait --pipe --collect --expand-environment=no \
-              --uid="$runner_uid" --gid="$runner_gid" -p 'Delegate=memory io' -p DelegateSubgroup=runner \
-              -p RuntimeMaxSec=24min -p TimeoutStopSec=10s \
-              /bin/bash -euo pipefail -c '
-                work=$1 evidence=$2
-                shift 2
-                read -r unified </proc/self/cgroup
-                if [[ "$unified" != 0::/*/runner ]]; then
-                  echo "Capacity requires a delegated cgroup v2 runner subgroup" >&2
-                  exit 1
-                fi
-                group="/sys/fs/cgroup${unified#0::}"
-                parent="${group%/*}"
-                if ! printf "+memory +io\n" > "$parent/cgroup.subtree_control"; then
-                  echo "Capacity requires delegated cgroup v2 memory and I/O controllers" >&2
-                  exit 1
-                fi
-                {
-                  printf "capacity_mode=live\ncapacity_cgroup=%s\ncapacity_work_dir=%s\n" "$parent" "$work"
-                  cat "$parent/cgroup.controllers" "$parent/cgroup.subtree_control"
-                  findmnt --target "$work"
-                  df -h "$work"
-                } | tee "$evidence/capacity-runner.txt"
-                exec "$work/capacity" "$@" -mode live -cgroup-parent "$parent" \
-                  -work-dir "$work" -report "$evidence/capacity.json"
-              ' capacity "$work" "$EVIDENCE" "${common[@]}"
+            timeout --kill-after=5s 2m go build -trimpath -o "$work/capacity" ./bench/retained-history || {
+              printf 'Capacity producer build failed (failure_kind=infrastructure).\n' >&2
+              exit 1
+            }
+            read -r digest _ < "$EVIDENCE/binary.sha256" || exit
+            sha256sum --check "$EVIDENCE/binary.sha256" || exit
+            {
+              printf 'capacity_mode=live\ncapacity_work_dir=%s\n' "$work" || exit
+              findmnt --target "$work" || exit
+              df -h "$work" || exit
+            } | tee "$EVIDENCE/capacity-runner.txt" || exit
+            status=0
+            bash ../gate/verify/linux/delegated-runner.sh "${BINARY%/*}/bog-runner-verifier" capacity \
+              -arch "$EXPECTED_ARCH" -sha256 "$digest" "${common[@]}" \
+              -producer "$work/capacity" -work-dir "$work" -capacity-report "$EVIDENCE/capacity.json" \
+              -report "$EVIDENCE/capacity-runner.json" || status=$?
+            if [[ ! -s "$EVIDENCE/capacity-runner.json" ]]; then
+              printf 'Capacity service produced no runner evidence (exit=%d). Check systemd service output.\n' "$status" >&2
+              exit 1
+            fi
+            exit "$status"
           )
           run_candidate_test() (
             local test=$1 events=$2
@@ -441,7 +466,7 @@ jobs:
             query_race candidate "$REVISION" query-handler-events.jsonl \
               -run '^(TestQuery104.*|TestQueryCaptureSurvivesFailedOpeningWrite|TestRetainedCaptureRetirementDrainsAtCapacity)$' || failed=1
             if [[ "$GITHUB_WORKFLOW_SHA" != "$REVISION" ]]; then
-              race_checkout gate "$GITHUB_WORKFLOW_SHA" ./verify/listener \
+              race_checkout gate "$GITHUB_WORKFLOW_SHA" ./verify/linux ./verify/listener \
                 ./verify/release ./bench/retained-history || failed=1
             fi
             exit "$failed"

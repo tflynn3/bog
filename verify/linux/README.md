@@ -165,3 +165,27 @@ responses are recorded as validation failures even though both response
 timings are available. A completed rejection identifies the HTTP refusal
 when available. Use candidate exit, logs, and memory counters to correlate
 process failure with the query. [Release admission fixture](../release/README.md#admission-fixture)
+
+## Native capacity runner preflight
+
+Before building the candidate, each native release job runs the gate's
+`verify/linux preflight` command as the runner user in a transient systemd
+service. The service delegates memory and I/O and puts the verifier in the
+`runner` subgroup. The preflight enables both controllers in the delegated
+parent, creates a disposable sibling, and reads back `memory.max=134217728`
+and `memory.swap.max=0`. It verifies that the I/O statistics are readable and
+moves a gated probe process into the sibling. It exercises `cgroup.kill`,
+reaps the process, observes an empty subtree, and removes it. The preflight
+report records the kernel architecture, address-space limit, controls and
+cleanup. A failed preflight blocks the candidate build.
+
+The capacity step uses the same delegated service settings and repeats the
+probe in the service where the existing live capacity producer will run.
+`capacity-runner.json` records the candidate revision, binary SHA-256, native
+architecture, and progress at 196,608 and 393,216 seed rows. It includes
+per-scale kernel memory peaks and OOM-event deltas from the producer's
+fresh cgroups. If the producer stops before writing its report, the runner
+keeps any live samples tied to a fixture and the delegation-wide counter
+deltas. Unobserved scales remain explicit. The runner records infrastructure,
+candidate workload, verifier address-space, and cancellation failures.
+Both existing strict validators still consume the producer's `capacity.json`.

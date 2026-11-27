@@ -14,6 +14,9 @@ import (
 )
 
 func run(ctx context.Context, args []string) (err error) {
+	if len(args) > 0 && (args[0] == "preflight" || args[0] == "capacity") {
+		return runDelegated(ctx, args[0], args[1:])
+	}
 	flags := flag.NewFlagSet("durability", flag.ContinueOnError)
 	binary := flags.String("binary", "", "absolute path to the pinned Bog executable")
 	revision := flags.String("revision", "", "full candidate commit SHA")

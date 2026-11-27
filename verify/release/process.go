@@ -180,7 +180,13 @@ func (p *candidateProcess) checkRunning() error {
 }
 
 func (p *candidateProcess) requireListener(port int) error {
-	listening, err := listener.Owns(p.process.Pid, port)
+	return p.requireListenerOn(port, listener.Owns)
+}
+
+type listenerOwner func(pid, port int) (bool, error)
+
+func (p *candidateProcess) requireListenerOn(port int, owns listenerOwner) error {
+	listening, err := owns(p.process.Pid, port)
 	if err != nil {
 		return err
 	}
@@ -191,6 +197,10 @@ func (p *candidateProcess) requireListener(port int) error {
 }
 
 func (p *candidateProcess) awaitHealth(ctx context.Context, client *http.Client, base string, port int) error {
+	return p.awaitHealthOn(ctx, client, base, port, listener.Owns)
+}
+
+func (p *candidateProcess) awaitHealthOn(ctx context.Context, client *http.Client, base string, port int, owns listenerOwner) error {
 	startup, cancel := context.WithTimeout(ctx, candidateStartupTimeout)
 	defer cancel()
 	ticker := time.NewTicker(candidatePollInterval)
@@ -199,7 +209,7 @@ func (p *candidateProcess) awaitHealth(ctx context.Context, client *http.Client,
 		if err := startup.Err(); err != nil {
 			return fmt.Errorf("startup health: %w", context.Cause(startup))
 		}
-		owned, err := listener.Owns(p.process.Pid, port)
+		owned, err := owns(p.process.Pid, port)
 		if err != nil {
 			return fmt.Errorf("startup listener: %w", err)
 		}
@@ -214,7 +224,7 @@ func (p *candidateProcess) awaitHealth(ctx context.Context, client *http.Client,
 			if res.status != http.StatusOK {
 				return fmt.Errorf("startup health returned HTTP %d", res.status)
 			}
-			return p.requireListener(port)
+			return p.requireListenerOn(port, owns)
 		}
 		select {
 		case <-startup.Done():
@@ -251,20 +261,40 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 }
 
 func serveDirectoryWithStop(ctx context.Context, binary, dir string, client *http.Client, flags []string, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string) error) error {
-	return serveDirectoryOn(ctx, binary, dir, client, flags, candidateBind{}, stopAfterProbe, check)
+	return serveDirectoryOn(ctx, binary, dir, client, flags, "", stopAfterProbe, check)
 }
 
-type candidateBind struct {
-	ip     net.IP // nil defaults to IPv4 loopback
-	verify func(pid, port int) error
-}
-
-func serveDirectoryOn(ctx context.Context, binary, dir string, client *http.Client, flags []string, bind candidateBind, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string) error) (err error) {
-	loopback := net.IPv4(127, 0, 0, 1)
-	if bind.ip == nil {
-		bind.ip = loopback
+// candidateListenConfig keeps the reservation, probe address and kernel
+// ownership inspection on the same address family.
+func candidateListenConfig(bind listener.Bind) (network, listenHost, probeHost string, err error) {
+	switch bind {
+	case "", listener.BindLoopback:
+		return "tcp4", string(listener.BindLoopback), string(listener.BindLoopback), nil
+	case listener.BindWildcard:
+		return "tcp4", string(bind), string(listener.BindLoopback), nil
+	case listener.BindIPv6Loopback:
+		return "tcp6", string(bind), string(bind), nil
+	default:
+		return "", "", "", fmt.Errorf("unsupported release listener bind %q", bind)
 	}
-	reservation, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: bind.ip})
+}
+
+func serveDirectoryOn(ctx context.Context, binary, dir string, client *http.Client, flags []string, bind listener.Bind, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string) error) error {
+	return serveDirectoryWithCandidate(ctx, binary, dir, client, flags, bind, stopAfterProbe, func(ctx context.Context, base string, _ int) error {
+		return check(ctx, base)
+	})
+}
+
+func serveDirectoryWithCandidate(ctx context.Context, binary, dir string, client *http.Client, flags []string, bind listener.Bind, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string, int) error) (err error) {
+	network, listenHost, probeHost, err := candidateListenConfig(bind)
+	if err != nil {
+		return err
+	}
+	owns := listener.Owns
+	if bind != "" {
+		owns = func(pid, port int) (bool, error) { return listener.OwnsBind(pid, port, bind) }
+	}
+	reservation, err := net.ListenTCP(network, &net.TCPAddr{IP: net.ParseIP(listenHost)})
 	if err != nil {
 		return fmt.Errorf("reserve release listener: %w", err)
 	}
@@ -292,26 +322,18 @@ func serveDirectoryOn(ctx context.Context, binary, dir string, client *http.Clie
 	}()
 
 	// Use loopback for HTTP even when the child listens on a wildcard.
-	probeAddr := net.TCPAddr{IP: loopback, Port: addr.Port}
+	probeAddr := net.TCPAddr{IP: net.ParseIP(probeHost), Port: addr.Port}
 	base := "http://" + probeAddr.String()
-	if err := p.awaitHealth(probes, client, base, addr.Port); err != nil {
+	if err := p.awaitHealthOn(probes, client, base, addr.Port, owns); err != nil {
 		return err
 	}
 	if err := probes.Err(); err != nil {
 		return err
 	}
-	if bind.verify != nil {
-		if err := bind.verify(p.process.Pid, addr.Port); err != nil {
-			return err
-		}
-	}
-	probeErr := check(probes, base)
+	probeErr := check(probes, base, p.process.Pid)
 	// Keep the probe diagnostic first even when the listener or process
 	// disappeared during the last request.
-	err = errors.Join(probeErr, p.requireListener(addr.Port))
-	if err == nil && bind.verify != nil {
-		err = bind.verify(p.process.Pid, addr.Port)
-	}
+	err = errors.Join(probeErr, p.requireListenerOn(addr.Port, owns))
 	probeComplete = err == nil
 	return err
 }

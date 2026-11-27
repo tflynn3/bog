@@ -31,7 +31,7 @@ func TestListenerSocketTable(t *testing.T) {
 			if !tc.malformed {
 				line += " tx timer retr uid timeout 123"
 			}
-			inodes, err := listenerSockets(line, port, tc.ipv6)
+			inodes, err := listenerSockets(line, port, tc.ipv6, false)
 			if (err != nil) != tc.malformed || !slices.Equal(inodes, tc.want) {
 				t.Fatalf("inodes %v, error %v", inodes, err)
 			}
@@ -46,7 +46,7 @@ func TestListenerSocketTableRecordsEveryMatchingInode(t *testing.T) {
   1: 0100007F:1F90 0100007F:E1B1 01 0 0 0 1000 0 130
   2: 00000000:1F90 00000000:0000 0A 0 0 0 1000 0 131
   3: 0100007F:1F91 00000000:0000 0A 0 0 0 1000 0 132`
-	got, err := listenerSockets(lines, 8080, false)
+	got, err := listenerSockets(lines, 8080, false, false)
 	if err != nil || !slices.Equal(got, []listenerSocket{{inode: 129, bind: BindLoopback}, {inode: 131, bind: BindWildcard}}) {
 		t.Fatalf("inodes %v, error %v", got, err)
 	}
@@ -56,7 +56,7 @@ func TestListenerSocketTableRejectsInvalidInodes(t *testing.T) {
 	t.Parallel()
 	for _, inode := range []string{"0", "-1", "not-an-inode", "18446744073709551616"} {
 		line := "0: 0100007F:1F90 remote 0A tx timer retr uid timeout " + inode
-		if got, err := listenerSockets(line, 8080, false); got != nil || err == nil {
+		if got, err := listenerSockets(line, 8080, false, false); got != nil || err == nil {
 			t.Errorf("inode %q produced %v, %v", inode, got, err)
 		}
 	}
@@ -76,9 +76,23 @@ func TestOwnsRejectsInvalidEndpoint(t *testing.T) {
 
 func TestOwnsBindRejectsInvalidBind(t *testing.T) {
 	t.Parallel()
-	for _, bind := range []Bind{"", "127.0.0.2", "::", "::1"} {
+	for _, bind := range []Bind{"", "127.0.0.2", "::", "::2"} {
 		if owned, err := OwnsBind(1, 8080, bind); owned || err == nil || !strings.Contains(err.Error(), "invalid expected") {
 			t.Errorf("OwnsBind(1, 8080, %q) = %t, %v", bind, owned, err)
 		}
+	}
+}
+
+func TestIPv6LoopbackSocketTable(t *testing.T) {
+	t.Parallel()
+	const table = `0: 00000000000000000000000001000000:1F90 remote 0A 0 0 0 1000 0 123
+1: 00000000000000000000000000000000:1F90 remote 0A 0 0 0 1000 0 124
+2: 0000000000000000FFFF00000100007F:1F90 remote 0A 0 0 0 1000 0 125
+3: 00000000000000000000000001000000:1F91 remote 0A 0 0 0 1000 0 126
+4: 00000000000000000000000001000000:1F90 remote 01 0 0 0 1000 0 127`
+	got, err := listenerSockets(table, 8080, true, true)
+	want := []listenerSocket{{inode: 123, bind: BindIPv6Loopback}, {inode: 124, bind: "::", ipv6Wildcard: true}}
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("IPv6 probe sockets = %v, %v, want %v", got, err, want)
 	}
 }

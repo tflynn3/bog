@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"bog/verify/listener"
 )
 
 func TestCandidateExitProvenance(t *testing.T) {
@@ -95,5 +97,26 @@ func TestFixtureRootIsRemovedAfterFailure(t *testing.T) {
 	}
 	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("fixture root remained: stat = %v", err)
+	}
+}
+
+func TestCandidateListenConfig(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		bind                   listener.Bind
+		network, listen, probe string
+	}{
+		{"", "tcp4", "127.0.0.1", "127.0.0.1"},
+		{listener.BindLoopback, "tcp4", "127.0.0.1", "127.0.0.1"},
+		{listener.BindWildcard, "tcp4", "0.0.0.0", "127.0.0.1"},
+		{listener.BindIPv6Loopback, "tcp6", "::1", "::1"},
+	} {
+		network, listen, probe, err := candidateListenConfig(tc.bind)
+		if err != nil || network != tc.network || listen != tc.listen || probe != tc.probe {
+			t.Errorf("bind %q = (%q, %q, %q, %v), want (%q, %q, %q, nil)", tc.bind, network, listen, probe, err, tc.network, tc.listen, tc.probe)
+		}
+	}
+	if _, _, _, err := candidateListenConfig("::"); err == nil {
+		t.Fatal("accepted an unsupported IPv6 wildcard bind")
 	}
 }

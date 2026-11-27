@@ -312,18 +312,10 @@ the exact fixture bounds and digests and requires the second input to
 match the first export. The producer verifies both archived exports
 again after the second cycle.
 
-The proposed #108 Storage handoff uses a regular file named
-`bog.authority` with a JSON envelope containing `payload` and `sha256`.
-The checksum is lowercase hexadecimal SHA-256 over the exact encoded
-payload bytes. The payload carries `version` (2), `generation` (the
-manifest digest used in `bog-checkpoint-<digest>`), `covered_offset`,
-`next_ordinal`, `committed_end`, `committed_ordinal`, `suffix_sha256`,
-`tail` (a `bog.wal.tail-*` basename), `tail_base`, `tail_device`, and
-`tail_inode`. The device and inode are unsigned integers from the
-selected file descriptor. This release fixture requires the physical tail
-to start at the checkpoint's covered offset and end exactly at the
-selected committed end. Storage must confirm this encoding with Release
-Verification before native qualification of the composed revision.
+The proposed #108 Storage handoff specifies the versioned `bog.authority`
+envelope and how the verifier checks the selected file. Storage
+confirmation is pending before native qualification of the composed
+revision. [ADR 0038 — Writable authority verification](../../docs/adr/0038-writable-authority-verification.md)
 
 Historical validation without `-require-cutover` accepts an omitted parity
 report or a schema-v1 report with a passing `restored_parity` outcome.

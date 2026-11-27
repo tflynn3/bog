@@ -18,6 +18,7 @@ type queryCapture struct {
 	deadline time.Time
 	sourceID string
 	scans    []certifiedScan
+	legacy   *legacyQueryPlan
 
 	// The registry lock protects lifetime state. The source ID and scan plan
 	// are immutable after publication.

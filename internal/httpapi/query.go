@@ -32,17 +32,9 @@ func writeQueryError(w http.ResponseWriter, err error) {
 
 func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	work := store.NewQueryWork(r.Context(), a.queryWorkBudget)
-	tokenSize := cursorTokenSize
-	if a.legacyQueryStore != nil {
-		tokenSize = legacyCursorReservation
-	}
-	params, err := parseQuery(r, tokenSize)
+	params, err := parseQuery(r, cursorTokenSize)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if a.legacyQueryStore != nil && (params.page || params.cursor != "") {
-		a.legacySnapshotQuery(w, params, work)
 		return
 	}
 	ctx := r.Context()
@@ -51,7 +43,11 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if params.page {
-		a.startQuery(w, ctx, params.filter, params.limit, work)
+		if a.legacyQueryStore != nil {
+			a.startLegacyQuery(w, ctx, params.filter, params.limit, work)
+		} else {
+			a.startQuery(w, ctx, params.filter, params.limit, work)
+		}
 		return
 	}
 	result, err := a.captures.source.Page(ctx, PageRequest{Filter: params.filter, Limit: params.limit}, work)

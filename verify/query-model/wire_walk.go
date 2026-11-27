@@ -1,7 +1,9 @@
 package querymodel
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -31,6 +33,10 @@ type WireWalk struct {
 	// FirstPageRows optionally requires a known positive fixture page size.
 	// Zero leaves the opening row count to the row and byte ceilings.
 	FirstPageRows int
+
+	// ExactNDJSON requires the adapter to return the actual response body.
+	// The oracle checks the canonical encoding and the longest fitting prefix.
+	ExactNDJSON bool
 }
 
 // WireRequest asks the adapter to fetch exactly one complete page. An empty
@@ -49,6 +55,7 @@ type WirePage struct {
 	Rows       []Row
 	NextCursor string
 	BodyBytes  int64
+	NDJSON     []byte
 }
 
 // FetchWirePage is the boundary between the independent model and a transport.
@@ -231,8 +238,14 @@ func VerifyWireWalk(ctx context.Context, log *Log, walk WireWalk, fetch FetchWir
 		}
 		step.fetched = true
 		step.rows, step.bodyBytes, step.continued = len(page.Rows), page.BodyBytes, page.NextCursor != ""
-		if err := checkWirePage(req, page, matches[stats.Rows:], stats.Rows, seen); err != nil {
+		remaining := matches[stats.Rows:]
+		if err := checkWirePage(req, page, remaining, stats.Rows, seen); err != nil {
 			return stats, trace.failure(err)
+		}
+		if walk.ExactNDJSON {
+			if err := checkWireNDJSON(req, page, remaining); err != nil {
+				return stats, trace.failure(err)
+			}
 		}
 		if err := ctx.Err(); err != nil {
 			return stats, trace.failure(err)
@@ -267,6 +280,42 @@ func VerifyWireWalk(ctx context.Context, log *Log, walk WireWalk, fetch FetchWir
 		}
 	}
 	return stats, trace.failure(ErrWirePageBudget)
+}
+
+func checkWireNDJSON(req WireRequest, page WirePage, remaining []Entry) error {
+	if int64(len(page.NDJSON)) != page.BodyBytes {
+		return fmt.Errorf("captured %d NDJSON bytes, want %d", len(page.NDJSON), page.BodyBytes)
+	}
+	body := page.NDJSON
+	budget := req.MaxPageBytes
+	n := len(page.Rows)
+	// Check one additional record to prove a short page reached the byte cap.
+	for i := 0; i < min(len(remaining), req.Limit, n+1); i++ {
+		entry := remaining[i]
+		record, err := json.Marshal(struct {
+			Time time.Time `json:"ts"`
+			Line string    `json:"line"`
+		}{entry.Time, entry.Line})
+		if err != nil {
+			return err
+		}
+		record = append(record, '\n')
+		if i == n {
+			if int64(len(record)) <= budget {
+				return fmt.Errorf("page omitted a record at append ordinal %d that fits within the byte cap", entry.Ordinal)
+			}
+			break
+		}
+		if !bytes.HasPrefix(body, record) {
+			return fmt.Errorf("NDJSON differs at append ordinal %d", entry.Ordinal)
+		}
+		body = body[len(record):]
+		budget -= int64(len(record))
+	}
+	if len(body) != 0 {
+		return errors.New("unexpected bytes after the last NDJSON record")
+	}
+	return nil
 }
 
 func checkWirePage(req WireRequest, page WirePage, remaining []Entry, offset int, seen map[string]int) error {

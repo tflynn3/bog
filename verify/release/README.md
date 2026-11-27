@@ -58,20 +58,27 @@ fixture, even if escalation to SIGKILL succeeds.
 
 ## Capacity control scope
 
-Both native jobs require an explicit passing event for
-`TestReleaseCapacityControlScope` against the pinned candidate. The test
-starts two children in separate disposable data directories. It binds
-one to `127.0.0.1` with `BOG_CAPACITY_CONTROL` unset and the other to
-`0.0.0.0` with `BOG_CAPACITY_CONTROL=1`. It verifies listener ownership
-and the actual bind in the Linux TCP tables, including a dual-stack
-wildcard. HTTP probes use `127.0.0.1` in both cases.
+Dispatch from a workflow ref containing this probe and pass the full
+composed #53 candidate SHA as `revision`. Both native jobs require an
+explicit passing event for `TestReleaseCapacityControlScope` against the
+pinned candidate. The test
+starts three children in separate disposable data directories. Each
+child must acknowledge ingest of one seed row.
 
-Each child acknowledges ingest of a seed row before the test requests
-`GET /_capacity/compaction?action=status&cutoff=1` and
-`POST /_capacity/compaction?action=start&cutoff=1`. Both requests must
-return HTTP 404, and the candidate must pass `/healthz` before and after
-the workload. The existing live capacity workload supplies positive
-proof that an opted-in loopback candidate accepts compaction.
+| Bind | `BOG_CAPACITY_CONTROL` | Required behavior |
+| --- | --- | --- |
+| `127.0.0.1` | Unset | Status and start at cutoff 1 both return HTTP 404. |
+| `0.0.0.0` | `1` | Status and start at cutoff 1 both return HTTP 404. |
+| `127.0.0.1` | `1` | Status at cutoff 0 reports a complete predecessor with zero covered rows and one committed row. Start at cutoff 1 and bounded status polling must yield a newer complete generation with exactly one covered row and one committed row. |
+
+All requests use `127.0.0.1`. For each child, the verifier checks listener
+ownership and the actual bind in the Linux TCP tables, including the
+dual-stack wildcard case. It checks `/healthz` before and after the
+workload and requires successful child teardown and fixture cleanup.
+The positive case costs one additional launch and fixture directory per
+architecture, with a five-second deadline for start and status polling.
+The live capacity workload also verifies replacement and restart under
+the 128 MiB cap at both fixture sizes.
 
 The artifacts include `capacity-control-scope-events.jsonl`,
 `capacity_control_scope.log`, and the producer entry in `producers.txt`.

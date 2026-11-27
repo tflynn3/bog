@@ -15,7 +15,10 @@ import (
 	"time"
 )
 
-const capacityOptIn = "BOG_CAPACITY_CONTROL"
+const (
+	capacityOptIn     = "BOG_CAPACITY_CONTROL"
+	capacityScopeSeed = "capacity scope seed"
+)
 
 func TestReleaseCapacityControlScope(t *testing.T) {
 	binary := os.Getenv("BOG_RELEASE_BINARY")
@@ -29,12 +32,14 @@ func TestReleaseCapacityControlScope(t *testing.T) {
 	t.Logf("candidate revision=%s binary_sha256=%s fixture=%s", id.Revision, id.BinarySHA256, id.Fixture)
 
 	for _, tc := range []struct {
-		name  string
-		ip    net.IP
-		optIn string
+		name    string
+		ip      net.IP
+		optIn   string
+		visible bool
 	}{
 		{name: "loopback_without_opt_in", ip: net.IPv4(127, 0, 0, 1)},
 		{name: "wildcard_with_opt_in", ip: net.IPv4zero, optIn: "1"},
+		{name: "loopback_with_opt_in", ip: net.IPv4(127, 0, 0, 1), optIn: "1", visible: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setenv registers restoration and prevents parallel execution. The
@@ -70,11 +75,7 @@ func TestReleaseCapacityControlScope(t *testing.T) {
 			err := withFixtureRoot(func(dir string) error {
 				return serveDirectoryOn(ctx, binary, dir, client, nil, bind, (*candidateProcess).stop,
 					func(ctx context.Context, base string) error {
-						// Commit a row so cutoff=1 is valid if the route is exposed.
-						if _, err := ingest(ctx, client, base, []row{{TS: fixtureStart, Line: "capacity scope seed"}}); err != nil {
-							return fmt.Errorf("seed compaction cutoff: %w", err)
-						}
-						return checkCapacityControlAbsent(ctx, t, client, base)
+						return probeCapacityControl(ctx, t, client, base, tc.visible)
 					})
 			})
 			if err != nil {
@@ -82,6 +83,38 @@ func TestReleaseCapacityControlScope(t *testing.T) {
 			}
 		})
 	}
+}
+
+func probeCapacityControl(ctx context.Context, t *testing.T, client *http.Client, base string, visible bool) error {
+	t.Helper()
+	// Commit a row so cutoff=1 is valid for all three launches.
+	if _, err := ingest(ctx, client, base, []row{{TS: fixtureStart, Line: capacityScopeSeed}}); err != nil {
+		return fmt.Errorf("seed compaction cutoff: %w", err)
+	}
+	if !visible {
+		return checkCapacityControlAbsent(ctx, t, client, base)
+	}
+	probeErr := checkCapacityControlPresent(ctx, t, client, base)
+	return errors.Join(probeErr, checkCapacityHTTPStatus(ctx, t, client, base, http.MethodGet, "/healthz", http.StatusOK))
+}
+
+func checkCapacityControlPresent(ctx context.Context, t *testing.T, client *http.Client, base string) error {
+	t.Helper()
+	const cutoff = 1
+	previous, err := readBackfillCompaction(ctx, client, base, http.MethodGet, "status", 0)
+	if err != nil {
+		return fmt.Errorf("read compaction predecessor: %w", err)
+	}
+	if previous.state != "complete" || previous.covered != 0 || previous.committed != cutoff {
+		return fmt.Errorf("unexpected compaction predecessor after %d acknowledged row: %+v", cutoff, previous)
+	}
+	t.Logf("compaction predecessor: %+v", previous)
+	published, err := publishBackfillGeneration(ctx, client, base, cutoff, &previous)
+	if err != nil {
+		return fmt.Errorf("publish compaction at cutoff %d: %w", cutoff, err)
+	}
+	t.Logf("compaction published: %+v", published)
+	return nil
 }
 
 func checkCapacityControlAbsent(ctx context.Context, t *testing.T, client *http.Client, base string) error {
@@ -95,18 +128,22 @@ func checkCapacityControlAbsent(ctx context.Context, t *testing.T, client *http.
 		{http.MethodPost, "/_capacity/compaction?action=start&cutoff=1", http.StatusNotFound},
 		{http.MethodGet, "/healthz", http.StatusOK},
 	} {
-		res, err := request(ctx, client, probe.method, base+probe.path, nil)
-		if err != nil {
-			probeErr = errors.Join(probeErr, fmt.Errorf("%s %s: %w", probe.method, probe.path, err))
-			continue
-		}
-		t.Logf("%s %s returned HTTP %d", probe.method, probe.path, res.status)
-		if res.status != probe.want {
-			probeErr = errors.Join(probeErr, fmt.Errorf("%s %s returned HTTP %d, want %d: %.200s",
-				probe.method, probe.path, res.status, probe.want, res.body))
-		}
+		probeErr = errors.Join(probeErr, checkCapacityHTTPStatus(ctx, t, client, base, probe.method, probe.path, probe.want))
 	}
 	return probeErr
+}
+
+func checkCapacityHTTPStatus(ctx context.Context, t *testing.T, client *http.Client, base, method, path string, want int) error {
+	t.Helper()
+	res, err := request(ctx, client, method, base+path, nil)
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", method, path, err)
+	}
+	t.Logf("%s %s returned HTTP %d", method, path, res.status)
+	if res.status != want {
+		return fmt.Errorf("%s %s returned HTTP %d, want %d: %.200s", method, path, res.status, want, res.body)
+	}
+	return nil
 }
 
 // listener.Owns establishes ownership for IPv4 HTTP. Match the child's
@@ -256,6 +293,67 @@ func TestCheckCapacityControlAbsent(t *testing.T) {
 			client := server.Client()
 			client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 			err := checkCapacityControlAbsent(ctx, t, client, server.URL)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestProbeCapacityControlPresent(t *testing.T) {
+	t.Parallel()
+	predecessor := backfillTestCompaction("complete", 7, 0, 1)
+	running := backfillTestCompaction("running", 7, 0, 1)
+	published := backfillTestCompaction("complete", 8, 1, 1)
+	missing := lengthResponse(http.StatusNotFound, "", "missing")
+	healthy := lengthResponse(http.StatusOK, "", "")
+
+	for _, tc := range []struct {
+		name    string
+		replies []string
+		health  string
+		wantErr string
+	}{
+		{"running then complete", []string{backfillTestAck, predecessor, running, running, published}, healthy, ""},
+		{"complete at start and status", []string{backfillTestAck, predecessor, published, published}, healthy, ""},
+		{"seed refused", []string{lengthResponse(http.StatusServiceUnavailable, "", "")}, "", "ingest returned HTTP 503"},
+		{"status route absent", []string{backfillTestAck, missing}, healthy, "status cutoff 0 returned HTTP 404"},
+		{"start route absent", []string{backfillTestAck, predecessor, missing}, healthy, "start cutoff 1 returned HTTP 404"},
+		{"poll route absent", []string{backfillTestAck, predecessor, running, missing}, healthy, "status cutoff 1 returned HTTP 404"},
+		{"malformed predecessor", []string{backfillTestAck, lengthResponse(http.StatusOK, "", "{")}, healthy, "decode compaction status"},
+		{"predecessor still running", []string{backfillTestAck, running}, healthy, "unexpected compaction predecessor"},
+		{"predecessor already covers seed", []string{backfillTestAck, published}, healthy, "unexpected compaction predecessor"},
+		{"predecessor missing seed", []string{backfillTestAck, backfillTestCompaction("complete", 7, 0, 0)}, healthy, "unexpected compaction predecessor"},
+		{"predecessor has extra rows", []string{backfillTestAck, backfillTestCompaction("complete", 7, 0, 2)}, healthy, "unexpected compaction predecessor"},
+		{"stale generation", []string{backfillTestAck, predecessor, running, backfillTestCompaction("complete", 7, 1, 1)}, healthy, "unexpected compaction state"},
+		{"wrong coverage", []string{backfillTestAck, predecessor, running, backfillTestCompaction("complete", 8, 0, 1)}, healthy, "unexpected compaction state"},
+		{"wrong committed rows", []string{backfillTestAck, predecessor, running, backfillTestCompaction("complete", 8, 1, 2)}, healthy, "unexpected compaction state"},
+		{"missing publication counter", []string{backfillTestAck, predecessor, running, lengthResponse(http.StatusOK, "", `{"state":"complete","generation":8,"covered_rows":1}`)}, healthy, "invalid compaction status"},
+		{"health failed after publication", []string{backfillTestAck, predecessor, running, published}, lengthResponse(http.StatusServiceUnavailable, "", ""), "GET /healthz returned HTTP 503"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			requests := []backfillRequest{
+				{path: "/ingest", batch: []row{{TS: fixtureStart, Line: capacityScopeSeed}}},
+				{path: "/_capacity/compaction?action=status&cutoff=0"},
+				{path: "/_capacity/compaction?action=start&cutoff=1"},
+				{path: "/_capacity/compaction?action=status&cutoff=1"},
+				{path: "/_capacity/compaction?action=status&cutoff=1"},
+			}
+			requests = requests[:len(tc.replies)]
+			replies := tc.replies
+			if tc.health != "" {
+				requests = append(requests, backfillRequest{path: "/healthz"})
+				replies = append(replies, tc.health)
+			}
+			client := &http.Client{Transport: scriptedBackfillTransport(t, requests, replies)}
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			err := probeCapacityControl(ctx, t, client, "http://127.0.0.1", true)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatal(err)

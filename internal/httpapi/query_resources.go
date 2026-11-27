@@ -112,6 +112,19 @@ func (r *queryReservation) release() {
 	r.keep(0)
 }
 
+// Store borrows the opening request's reservation while building its match
+// list, so scratch and retained capacity compete for the same scan budget.
+func (r *queryReservation) ReserveQueryBytes(n uint64) error {
+	return r.grow(n)
+}
+
+func (r *queryReservation) ReleaseQueryBytes(n uint64) {
+	if n > r.bytes {
+		panic("query reservation cannot release more than its charge")
+	}
+	r.keep(r.bytes - n)
+}
+
 // keep returns the excess after the allocation it covered has been consumed.
 // The owner may only keep up to its current charge.
 func (r *queryReservation) keep(n uint64) {

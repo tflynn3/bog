@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"math/bits"
 	"net/http"
 
 	"bog/internal/store"
@@ -9,6 +10,11 @@ import (
 const (
 	legacyCursorWork = 1 // fixed-size signing or authentication and registry access
 	maxLegacyMatches = maxCertifiedScans * maxQueryLimit
+
+	// Run setup is bounded by the number of publication levels. The scan
+	// meters history-sized arrays separately. Published rows are borrowed.
+	legacyPlanSetupBytes   = 64 << 10
+	legacyPlanCaptureBytes = 4 << 10
 )
 
 // A legacy capture records the exact ordered matches, including exhaustion,
@@ -69,17 +75,16 @@ func (a *API) resumeLegacyQuery(w http.ResponseWriter, params queryParams, work 
 
 func (a *API) prepareLegacyOpening(capture *queryCapture, params queryParams, response *queryResponse, work *store.QueryWork) (string, error) {
 	filter := params.filter
-	// Each match consumes at least one work unit. Reserve space for growing
-	// the ordinal array (including during copies), encoded sizes, and scan
-	// setup before capturing the store view. Published lines are borrowed.
-	maxMatches := min(uint64(maxLegacyMatches), a.queryWorkBudget)
 	scan := queryReservation{budget: &a.initResources().scan}
-	if err := scan.grow((64 << 10) + 32*maxMatches); err != nil {
+	if err := scan.grow(legacyPlanSetupBytes); err != nil {
 		return "", err
 	}
 	defer scan.release()
-	matches, err := a.legacy.store.CapturePositionedMatches(filter.Start, filter.End, filter.Contains, maxLegacyMatches, work)
+	matches, err := a.legacy.store.CapturePositionedMatchesWithMemory(filter.Start, filter.End, filter.Contains, maxLegacyMatches, work, &scan)
 	if err != nil {
+		return "", err
+	}
+	if err := scan.grow(uint64(matches.Len()) * (bits.UintSize / 8)); err != nil {
 		return "", err
 	}
 	plan := &legacyQueryPlan{matches: matches, sizes: make([]int, matches.Len())}
@@ -93,9 +98,9 @@ func (a *API) prepareLegacyOpening(capture *queryCapture, params queryParams, re
 	if err := work.Charge(legacyCursorWork, uint64(len(filter.Contains))); err != nil {
 		return "", err
 	}
-	// Retain the ordinal capacity (including growth slack) and size array
-	// until the capture's owner drops them. Return the transient allowance.
-	scan.keep((4 << 10) + 24*uint64(matches.Len()))
+	// The backing arrays remain charged at capacity, including when an
+	// oversized record shortened the visible size slice.
+	scan.ReleaseQueryBytes(legacyPlanSetupBytes - legacyPlanCaptureBytes)
 	capture.sourceID = a.legacy.retain(legacyView{plan: plan})
 	capture.legacyScan = scan
 	scan = queryReservation{}

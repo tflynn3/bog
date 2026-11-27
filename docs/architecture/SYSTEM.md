@@ -17,10 +17,9 @@ sync, and powersafe overwrite. The ingest and query listener has no built-in
 authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
-The Linux amd64 and arm64 production inventories at the ADR 0052
-adoption, based on `4ca40d3f92ef7dace84c58bb43bc663cb766b0f5`,
-agree on the 21 root-module production packages and 27 direct imports
-between them shown below.
+The Linux amd64 and arm64 production inventories at
+`c7582ec1b74d56cafd37a72f68c7ddccda5cf0e3` agree on the 21 root-module
+production packages and 27 direct imports between them shown below.
 The entire root-module closure of `cmd/bog` consists of the command plus
 HTTP, readiness, store, and WAL. The command recovers an ordinary WAL into
 an in-memory store. Writable restore, live replacement, and retained
@@ -134,13 +133,18 @@ flowchart TD
 
 ## Retained-history handoff
 
-#108 must compose the retained `PageSource` in `cmd/bog` and inject it through
-`httpapi.NewWithPageSource`. Core Engineering owns the HTTP paging contract,
-including admission, cursor authentication and expiry, fixed-budget
-certification through exhaustion, and NDJSON framing.
+#108 must compose a command-local `httpapi.PageSource` and inject it through
+`httpapi.NewWithPageSource`. The source implements `Page` with the caller's
+query work budget and an idempotent `Release`. It reproduces ordered rows,
+positions, and exhaustion for the same captured request. Core Engineering
+owns HTTP admission, cursor authentication and expiry, fixed-budget
+certification through exhaustion or the first individually oversized
+match, and NDJSON framing. After successful acquisition, HTTP owns the
+capture release and calls the source after the final HTTP user drains.
 The adapter pins the validated generation and the matching durable,
-query-visible suffix together under WAL owner synchronization. At the
-measured revision, `wal.Log.Capture` pins the published WAL prefix, its
+query-visible suffix with its WAL identity and exact byte and ordinal
+bounds under WAL owner synchronization. At the measured revision,
+`wal.Log.Capture` pins the published WAL prefix, its
 exclusive byte end, and next append ordinal under the WAL mutex. The
 reviewed wiring must show how the command selects the matching
 generation and suffix bounds in the same synchronization scope as append
@@ -148,7 +152,7 @@ publication and activation. A held cursor
 keeps its original view across replacement while fresh walks see later
 commits. The earlier of the source expiry and HTTP deadline governs new
 resumes. Admitted paging and export operations keep their references to
-completion. [Runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
+completion. [Runtime interfaces](../adr/0015-retained-history-runtime-cutover.md#runtime-interfaces),
 [Fixed-budget continuations](../adr/0006-fixed-budget-query-continuations.md)
 
 At cutover, `cmd/bog` must classify and validate ordinary WAL, retained
@@ -175,21 +179,25 @@ reference drain.
 [Independent recovery-view consumers](../adr/0037-independent-recovery-view-consumers.md)
 
 At cutover, the command passes an independently opened, unlocked handle
-to `readiness.NewHandlerForDirectory`. Open it relative to the locked WAL
-directory so `Fstatfs` still samples the active filesystem after the
-configured path is retargeted. An independent open gives probes a
-separate file description from the locked one.
+to `readiness.NewHandlerForDirectory` and owns the probe handle's lifetime.
+Open it relative to the locked WAL directory so `Fstatfs` still samples
+the active filesystem after the configured path is retargeted. An
+independent open gives probes a separate file description from the
+locked one.
 
 The cutover's opt-in loopback capacity control uses the same publication path.
 Charge replay and whole-batch append reservations before reading or
 writing the tail. Charge capture, pin, and staging capacity before doing
 work. Credit reclaimed capacity after durable publication and activation
 and once references to the covered data drain. Stop admitting new work
-during shutdown and cancel readiness sampling before closing the probe
-handle. Drain HTTP, then close the HTTP API to retire captures and wait
-for admitted readers and source releases. Drain storage work before
-closing the WAL owner and releasing the directory lock. Review cleanup
-on startup failure and lock retention on failed drain.
+during shutdown, stop scheduling maintenance, and cancel readiness probes
+before draining HTTP. Keep an in-flight probe from delaying HTTP or storage
+drain. After HTTP drains, call `Close(ctx)` on the issuing API with a
+deadline to retire captures and wait for admitted readers and source
+releases. Drain admitted appends, publication, and exports and close the
+probe handle before closing the WAL owner and releasing the directory lock.
+Review startup failure cleanup. A failed drain keeps the WAL and lock held
+until process exit.
 [Query delivery and shutdown](../adr/0039-query-delivery-and-retained-cutover.md),
 [Resource admission](../adr/0010-retained-resource-admission.md),
 [Storage budget interfaces](../../internal/history/LIMITS.md)
@@ -321,7 +329,17 @@ each job.
 | `bench/retained-history` | `capacity.json` | Both live scales (196,608 and 393,216 seed rows), each under a 128 MiB cgroup cap with swap disabled. Verify durable replacement at the exact cutoff, a held cursor across acknowledged backfill, exact fresh and restarted walks, and process and cgroup cleanup. Capture publication and retired pin drain evidence at the runtime observation points. |
 | `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Record ordinary WAL reopen, restored parity, immediate post-ack crash, and two-cycle tail-only parity as four outcomes in the existing candidate-bound report. |
 | `verify/release` / `TestReleaseFixedBudgetBackfill` and `TestReleaseCapacityControlScope` | Passing test events | Exercise fixed-budget paging through backfill and replacement. Check that capacity routes are available only with explicit opt-in on the loopback listener. |
+| `verify/release` / `TestReleaseRetainedShutdown` (gate checkout) | `retained-shutdown-events.jsonl`, `retained_shutdown` in `producers.txt` | Require explicit test and package passes under race against each runner's pinned candidate binary, with SHA-256 checks before and after. Across replacement, observe one retired predecessor pin and a backpressured continuation holding the sole query slot. Require listener close and lock retention during SIGTERM drain, exact terminal NDJSON, successful exit and reaping, and exact replay of acknowledged rows after restart on the same directory. |
 | `verify/query-model` / `TestPinnedQueryModelReplay` | `query-model-events.jsonl` | Require passing seeded ordinary and retained walks, exact terminal replay, and a candidate identity matching the revision and binary checksum on each runner. |
+
+Each native job requires one successful `retained_shutdown` manifest
+record bound to the candidate revision, native architecture, and pinned
+gate SHA. The test-event checker requires one pass each for
+`TestReleaseRetainedShutdown` and `bog/verify/release` and rejects skips
+and failures. Storage also supplies command-level evidence of resource
+closure order and lock retention on failed drain.
+[Retained shutdown gate](../adr/0048-release-gate-evidence-checks.md#retained-shutdown),
+[Command-level shutdown evidence](../adr/0039-query-delivery-and-retained-cutover.md#native-retained-shutdown)
 
 Strict cutover validation requires all four `parity.json` outcomes on each
 native runner. Every recovery walk compares exact order and multiplicity
@@ -428,7 +446,7 @@ revision. #108 remains the release gate.
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification),
 [Tail-only recovery contract](../adr/0035-tail-only-retained-recovery-contract.md)
 
-The constructor fitness guard landed in `b27b41ff9fcd46f3497725b052075e8353a0ede7`.
+ADR 0053 tightens the constructor fitness guard introduced by ADR 0040.
 Storage carries #47 and #15 in #108 and coordinates role promotion with
 Core Architecture in the reviewed command wiring PR. Recheck write leases
 at dispatch and at the Storage handoff. At the reviewed Storage SHA,
@@ -442,7 +460,7 @@ measured revision, diagram, and role table. Preserve the operator backup
 edge and the exporter and release evidence registrations.
 Require the architecture suite to pass on the combined revision before
 merging the wiring PR.
-[Landed constructor guard](https://github.com/tflynn3/bog/commit/b27b41ff9fcd46f3497725b052075e8353a0ede7),
+[Required constructor calls](../adr/0053-retained-serving-constructor-calls.md),
 [Package role governance](../adr/0019-package-role-governance.md),
 [Retained runtime promotion](../adr/0049-retained-runtime-promotion.md),
 [Exporter integration handoff](../adr/0032-operator-export-boundary.md#integration-and-qualification)
@@ -453,10 +471,11 @@ WAL suffix under the owner's synchronization. Core Engineering reviews
 paging and capture release after the final reference drains. Storage also
 traces readiness to a fresh, unlocked open relative to the pinned WAL
 directory and verifies that the command cancels probes before closing the
-descriptor. Release Verification still needs exact held, fresh, and restart
-walks across replacement and acknowledged backfill, plus readiness and
-ingest against the active WAL filesystem after path retargets in both
-directions, on the same composed revision on both native Linux targets.
+descriptor. Storage supplies the command-level startup and drain evidence
+for the reviewed composition. On both native Linux targets, Release
+Verification needs exact held, fresh, and restart walks across replacement
+and acknowledged backfill, plus readiness and ingest against the active
+WAL filesystem after path retargets in both directions.
 [Promotion evidence](../adr/0040-retained-runtime-constructor-boundary.md#runtime-evidence),
 [Native release evidence](#release-evidence)
 
@@ -474,15 +493,18 @@ independently. The measured walk also follows external production imports.
 [Diagram fitness test](../../internal/archtest/system_diagram_test.go)
 
 - When any of checkpoint, history, or backup has the runtime library role
-  or appears in the measured server closure, `cmd/bog` must reference
-  `readiness.NewHandlerForDirectory` and exclude `readiness.NewHandler`.
+  or appears in the measured server closure, `cmd/bog` must call
+  `readiness.NewHandlerForDirectory` and exclude every reference to
+  `readiness.NewHandler`.
   When history meets either condition, `cmd/bog` must
-  also reference `httpapi.NewWithPageSource` and exclude `httpapi.New`,
-  `httpapi.NewWithQueryMaxResponseBytes`, and `httpapi.NewWithQueryLimits`.
+  also call `httpapi.NewWithPageSource` and exclude every reference to
+  `httpapi.New`, `httpapi.NewWithQueryMaxResponseBytes`, and
+  `httpapi.NewWithQueryLimits`.
   The typed scan checks the selected production Go files independently
-  for Linux amd64 and arm64. The fully staged baseline may use the
-  compatibility constructors.
-  [Constructor boundary](../adr/0040-retained-runtime-constructor-boundary.md),
+  for Linux amd64 and arm64. Direct calls count inside command-local
+  wrappers and through aliased or dot imports. The fully staged baseline
+  may use the compatibility constructors.
+  [Constructor calls](../adr/0053-retained-serving-constructor-calls.md),
   [Constructor fitness test](../../internal/archtest/retained_runtime_wiring_test.go)
 - HTTP owns the paging seam. It cannot reach checkpoint, history, or
   backup, even through a registered intermediary. Readiness can observe

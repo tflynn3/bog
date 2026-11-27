@@ -268,11 +268,13 @@ func testMixedLoad(t *testing.T, failure string) {
 	defer srv.Close()
 	s := newService(srv.URL)
 	defer s.client.CloseIdleConnections()
+	trial := testRestartTrial(t)
+	s.acknowledged = &trial.ledger
 	s.client.Timeout = 2 * time.Second
 	s.readMemoryCurrent = func(context.Context) (uint64, error) { return f.MemoryBytes / 2, nil }
 	r := result{Diagnostics: &capacityDiagnostics{Queries: make(map[string]*queryPhase)}}
 	s.queryPhases = r.Diagnostics.Queries
-	err := f.load(ctx, s, options{mode: "live", control: "/compact"}, &r, t.TempDir())
+	err := f.load(ctx, s, options{mode: "live", control: "/compact"}, &r, trial.dir)
 	clustered, scattered := r.Diagnostics.Backfills[0], r.Diagnostics.Backfills[1]
 	if clustered.Status != "pass" || clustered.PinDrain.Status != "observed" || !clustered.FreshVisible || !clustered.HeldExhausted {
 		t.Fatalf("incomplete clustered evidence: %+v (load error %v)", clustered, err)
@@ -316,8 +318,15 @@ func testMixedLoad(t *testing.T, failure string) {
 	if !resumed {
 		t.Fatal("both captured cursors must survive publication")
 	}
-	if n, err := f.recover(t.Context(), s); err != nil || n != f.SeedRows+f.TailRows {
-		t.Fatalf("recover: %d %v", n, err)
+	if err := trial.prepare(f, r.Compaction); err != nil {
+		t.Fatal(err)
+	}
+	if err := trial.verify(t.Context(), s, "/compact", f); err != nil {
+		t.Fatal(err)
+	}
+	if proof := trial.evidence.Ledger; proof.Batches != (f.SeedRows+f.TailRows)/f.BatchRows ||
+		proof.MatchedSuffix != f.TailRows-f.BatchRows || proof.Status != "pass" {
+		t.Fatalf("mixed load did not preserve the append ledger: %+v", proof)
 	}
 	if d := r.Diagnostics; d.RunningSamples < 1 || d.RunningSamples >= r.IngestSamples ||
 		d.RunningIngestP99 == nil || d.OpeningCompaction.State != "running" || d.OverlapCompaction.State != "running" ||

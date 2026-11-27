@@ -69,8 +69,14 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 	}
 	// A gate keeps the candidate from running before it enters the cgroup.
 	// This also works on Linux environments that filter clone3.
+	dataDir := dir
+	if mode == "live" {
+		// Resolve the store from the same working directory whose kernel
+		// identity the runner checks after each successful readiness probe.
+		dataDir = "."
+	}
 	args := []string{"-c", `read -r gate && [ "$gate" = start ] && exec "$@"`, "capacity",
-		binary, "-addr", addr.String(), "-data-dir", dir}
+		binary, "-addr", addr.String(), "-data-dir", dataDir}
 	if mode == "live" {
 		args = append(args, "-query-work-budget", strconv.FormatUint(liveQueryWorkBudget, 10))
 	}
@@ -209,6 +215,7 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 		}, resources: resources{Unavailable: make(map[string]string)}}
 	if o.mode == "live" {
 		r.Diagnostics.Backfills = newBackfillTimelines(f)
+		r.Diagnostics.Restart = newRestartEvidence()
 	}
 	err := func() (err error) {
 		if err := ctx.Err(); err != nil {
@@ -229,6 +236,26 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 				err = errors.Join(err, removeErr)
 			}
 		}()
+		var trial *restartTrial
+		if e := r.Diagnostics.Restart; e != nil {
+			trial, err = pinRestartTrial(dir, e)
+			if err != nil {
+				e.Phase = "pin_directory"
+				e.finish(err)
+				return fmt.Errorf("pin generation-replacement trial directory: %w", err)
+			}
+			defer func() {
+				if closeErr := trial.handle.Close(); closeErr != nil {
+					if err == nil {
+						e.Phase = "close_directory"
+					}
+					err = errors.Join(err, fmt.Errorf("close trial directory: %w", closeErr))
+				}
+				if e.Status == "running" {
+					e.finish(err)
+				}
+			}()
+		}
 		r.disk(dir)
 		group, err := openGroup(o.cgroupParent, f.MemoryBytes, &r.resources)
 		var p *child
@@ -258,9 +285,16 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 
 		candidate = &candidateEvidence{Lifetime: "startup"}
 		r.Diagnostics.Candidates = append(r.Diagnostics.Candidates, candidate)
-		p, err = r.exercise(ctx, o, binary, dir, group, f, candidate)
+		p, err = r.exercise(ctx, o, binary, dir, group, f, candidate, trial)
 		if err != nil {
 			return err
+		}
+		if trial != nil {
+			trial.evidence.Status = "running"
+			r.Phase = "restart_prepare"
+			if err := trial.prepare(f, r.Compaction); err != nil {
+				return err
+			}
 		}
 		// Drain the first lifetime before restarting with the same data and
 		// measurement cgroup. Final teardown also removes the subtree.
@@ -272,12 +306,19 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 		if stopped.CandidateReaped {
 			p = nil
 		}
+		if trial != nil {
+			if err := trial.beforeStart(stopped, errors.Join(err, earlyCleanupErr)); err != nil {
+				r.Phase = trial.evidence.Phase
+				return fmt.Errorf("before restart: %w", err)
+			}
+			trial.evidence.Phase = "restart_startup"
+		}
 		if err != nil || earlyCleanupErr != nil {
 			return err
 		}
 		candidate = &candidateEvidence{Lifetime: "restart"}
 		r.Diagnostics.Candidates = append(r.Diagnostics.Candidates, candidate)
-		p, err = r.exercise(ctx, o, binary, dir, group, f, candidate)
+		p, err = r.exercise(ctx, o, binary, dir, group, f, candidate, trial)
 		return err
 	}()
 	r.Diagnostics.markMissing(o.mode)
@@ -319,7 +360,8 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 	return r
 }
 
-func (r *result) exercise(ctx context.Context, o options, binary, dir, group string, f fixture, candidate *candidateEvidence) (_ *child, err error) {
+func (r *result) exercise(ctx context.Context, o options, binary, dir, group string, f fixture,
+	candidate *candidateEvidence, trial *restartTrial) (_ *child, err error) {
 	r.Phase = candidate.Lifetime
 	if err := ctx.Err(); err != nil {
 		candidate.StartupError = diagnosticError(err)
@@ -374,13 +416,38 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 	}()
 	elapsed := time.Since(start)
 	candidate.Ready = &elapsed
+	if trial != nil {
+		info, statErr := os.Stat(fmt.Sprintf("/proc/%d/cwd", p.cmd.Process.Pid))
+		var identity *directoryIdentity
+		if statErr == nil {
+			identity, statErr = trial.compareDirectory(info)
+		}
+		if candidate.Lifetime == "restart" {
+			trial.evidence.Restarted = identity
+			trial.evidence.Phase = "restart_directory"
+		}
+		if statErr != nil {
+			return p, fmt.Errorf("%s candidate directory: %w", candidate.Lifetime, statErr)
+		}
+	}
 	if candidate.Lifetime == "restart" {
 		r.RestartReady = &elapsed
 		r.Phase = "recovery_walk"
+		if trial != nil {
+			err = trial.verify(work, probe, o.control, f)
+			r.RecoveredRows = trial.evidence.Ledger.Matched
+			if err == nil {
+				trial.evidence.Phase = "restart_completion"
+			}
+			return p, err
+		}
 		r.RecoveredRows, err = f.recover(work, probe)
 		return p, err
 	}
 	r.StartReady = &elapsed
+	if trial != nil {
+		probe.acknowledged = &trial.ledger
+	}
 	if o.mode == "live" {
 		probe.readMemoryCurrent = func(ctx context.Context) (uint64, error) {
 			return readCandidateMemoryCurrent(ctx, p, group)

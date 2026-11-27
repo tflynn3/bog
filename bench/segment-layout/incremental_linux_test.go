@@ -2,10 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
+	"time"
+
+	"bog/internal/checkpoint"
 )
 
 func TestIncrementalReport(t *testing.T) {
@@ -74,5 +81,94 @@ func TestIncrementalReport(t *testing.T) {
 			previous = pub
 		}
 	}
+	if err := validateQualificationJSON(bytes.NewReader(out.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	if got.Baseline.Name != productionV1 {
+		t.Fatalf("wrong baseline: %s", got.Baseline.Name)
+	}
+	input := fixture(cfg.batches, false, cfg.fixtureSeed)
+	phases := append([]backfill{{"initial", input.rows}}, input.successiveAppends()...)
+	var history []checkpoint.BlockRow
+	for i, phase := range phases {
+		history = append(history, phase.batch...)
+		readRows := history
+		if i > 0 {
+			readRows = history[:len(history)-len(phase.batch)]
+		}
+		var expectedWAL uint64
+		if i == 0 {
+			for batch := range input.batches() {
+				expectedWAL += fixtureFrameBytes(t, batch)
+			}
+		} else {
+			expectedWAL = fixtureFrameBytes(t, phase.batch)
+		}
+		candidates := []publicationResult{got.Baseline.Publications[i]}
+		for _, item := range got.Layouts {
+			candidates = append(candidates, item.Publications[i])
+		}
+		for _, pub := range candidates {
+			for j, literal := range []string{sparseLiteral, denseLiteral} {
+				q := query{literal: literal, start: firstTime, end: endTime}
+				scan := pub.Queries[j]
+				if scan.MatchingRows != len(reference(readRows, q)) {
+					t.Fatalf("%s: incorrect %s result count: %+v", phase.name, scan.Query, scan)
+				}
+				for _, sample := range scan.Samples {
+					if sample.WriteAmplification.AppendedWALBytes != expectedWAL {
+						t.Fatalf("%s: wrote %d WAL bytes, want %d", phase.name, sample.WriteAmplification.AppendedWALBytes, expectedWAL)
+					}
+				}
+			}
+		}
+	}
 	assertEmpty(t, parent)
+	reportPath := filepath.Join(parent, "report.json")
+	if err := os.WriteFile(reportPath, out.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(t.Context(), config{validateReport: reportPath}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fixtureFrameBytes(t *testing.T, rows []checkpoint.BlockRow) uint64 {
+	t.Helper()
+	payload, _, err := encodeBatch(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return uint64(len(payload) + 16)
+}
+
+func TestQualificationTrialCancellationCleansWorkDirectory(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := qualifyTrial(ctx, dir, qualificationRequest{Timeout: time.Second}, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled trial, got %v", err)
+	}
+	assertEmpty(t, dir)
+}
+
+func TestQualificationJoinsReaderAndWriterErrors(t *testing.T) {
+	writerErr := errors.New("writer")
+	readerErr := errors.New("reader")
+	readerStarted := make(chan struct{})
+	_, err := timeQualification(t.Context(), 1, func() error {
+		select {
+		case <-readerStarted:
+			return writerErr
+		case <-time.After(time.Second):
+			return errors.New("reader did not start")
+		}
+	}, func() error {
+		close(readerStarted)
+		return readerErr
+	})
+	if !errors.Is(err, writerErr) || !errors.Is(err, readerErr) {
+		t.Fatalf("expected both errors, got %v", err)
+	}
 }

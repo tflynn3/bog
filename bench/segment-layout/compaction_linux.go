@@ -130,7 +130,7 @@ type publicationRun struct {
 	publisher *checkpoint.Publisher
 }
 
-func withSeededPublication(ctx context.Context, dir string, input fixtureInput, run func(publicationRun, *checkpoint.Manifest) error) (err error) {
+func withPublication(dir string, run func(publicationRun, *os.File) error) (err error) {
 	log, err := wal.Open(dir, &store.Store{})
 	if err != nil {
 		return err
@@ -147,6 +147,23 @@ func withSeededPublication(ctx context.Context, dir string, input fixtureInput, 
 	}
 	defer func() { err = errors.Join(err, handle.Close()) }()
 	p := publicationRun{log, checkpoint.NewPublisher(root, handle, checkpoint.NewBudget(checkpoint.Limits{checkpoint.StagingBytes: ^uint64(0)}))}
+	return run(p, handle)
+}
+
+func withSeededPublication(ctx context.Context, dir string, input fixtureInput, run func(publicationRun, *checkpoint.Manifest) error) error {
+	return withPublication(dir, func(p publicationRun, _ *os.File) error {
+		if err := p.seed(ctx, input); err != nil {
+			return err
+		}
+		initial, _, err := p.publish(ctx, nil, len(input.rows))
+		if err != nil || run == nil {
+			return err
+		}
+		return run(p, initial)
+	})
+}
+
+func (p publicationRun) seed(ctx context.Context, input fixtureInput) error {
 	for batch := range input.batches() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -155,11 +172,7 @@ func withSeededPublication(ctx context.Context, dir string, input fixtureInput, 
 			return err
 		}
 	}
-	initial, _, err := p.publish(ctx, nil, len(input.rows))
-	if err != nil || run == nil {
-		return err
-	}
-	return run(p, initial)
+	return nil
 }
 
 func (p publicationRun) append(batch []checkpoint.BlockRow) error {

@@ -95,15 +95,17 @@ func TestSuccessiveSnapshotsAndDecodeBound(t *testing.T) {
 				for i, phase := range append([]backfill{{"initial", input.rows}}, input.successiveAppends()...) {
 					id := fmt.Sprintf("%02d", i)
 					var pinned []checkpoint.BlockRow
-					write := func() (string, error) {
-						return publishSegments(t.Context(), dir, id, previous, phase.batch, l, target)
-					}
 					var path string
+					write := func() error {
+						var err error
+						path, err = publishSegments(t.Context(), dir, id, previous, phase.batch, l, target)
+						return err
+					}
 					var err error
 					if i == 0 {
-						path, err = write()
+						err = write()
 					} else {
-						path, _, _, err = compactWithQuery(t.Context(), func() error {
+						_, _, _, err = compactWithQuery(t.Context(), func() error {
 							var err error
 							pinned, err = querySnapshot(t.Context(), dir, previous, target, wide)
 							return err

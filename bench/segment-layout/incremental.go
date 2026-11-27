@@ -278,23 +278,6 @@ func checkSnapshotRows(got, want []checkpoint.BlockRow) error {
 	return nil
 }
 
-func removeTrial(dir, manifest string, before, after snapshot) error {
-	if _, err := accountSegments(before, after); err != nil {
-		return err
-	}
-	old := make(map[string]bool, len(before.Segments))
-	for _, ref := range before.Segments {
-		old[ref.Name] = true
-	}
-	err := os.Remove(manifest)
-	for _, ref := range after.Segments {
-		if !old[ref.Name] {
-			err = errors.Join(err, os.Remove(filepath.Join(dir, ref.Name)))
-		}
-	}
-	return err
-}
-
 type compactionLatency struct {
 	Query        string  `json:"query"`
 	MatchingRows int     `json:"matching_rows"`
@@ -312,32 +295,31 @@ func (m *compactionLatency) add(elapsed, overlap time.Duration) error {
 	return nil
 }
 
-func compactWithQuery(ctx context.Context, q func() error, compact func() (string, error)) (string, time.Duration, time.Duration, error) {
-	type result struct {
-		path       string
+// compactWithQuery dispatches a ready reader and measures the actual
+// intersection of the two operations. Both must return before cleanup.
+func compactWithQuery(ctx context.Context, scan, publish func() error) (queryTime, publicationTime, overlap time.Duration, err error) {
+	type interval struct {
 		start, end time.Time
 		err        error
 	}
-	start := make(chan struct{})
-	started := make(chan struct{})
-	done := make(chan result, 1)
+	ready := make(chan struct{})
+	startScan := make(chan struct{})
+	done := make(chan interval, 1)
 	go func() {
-		<-start
-		close(started)
-		began := time.Now()
-		path, err := compact()
-		done <- result{path, began, time.Now(), err}
+		close(ready)
+		<-startScan
+		start := time.Now()
+		err := scan()
+		done <- interval{start, time.Now(), err}
 	}()
-	dispatchStart := time.Now()
-	close(start)
-	<-started
-	queryStart := time.Now()
-	queryErr := q()
-	queryEnd := time.Now()
-	written := <-done
-	return written.path, queryEnd.Sub(dispatchStart),
-		compactionOverlap(queryStart, queryEnd, written.start, written.end),
-		errors.Join(queryErr, written.err, ctx.Err())
+	<-ready
+	start := time.Now()
+	close(startScan)
+	publishErr := publish()
+	end := time.Now()
+	read := <-done
+	return read.end.Sub(read.start), end.Sub(start), compactionOverlap(read.start, read.end, start, end),
+		errors.Join(publishErr, read.err, ctx.Err())
 }
 
 func compactionOverlap(queryStart, queryEnd, writerStart, writerEnd time.Time) time.Duration {

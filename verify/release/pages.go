@@ -12,23 +12,37 @@ import (
 )
 
 type releasePager struct {
-	client *client.Client
-	query  client.Query
+	client      *client.Client
+	query       client.Query
+	pageTimeout time.Duration
 }
 
 type pageResponseKey struct{}
 
-type pageTransport struct{ http.RoundTripper }
+type pageTransport struct {
+	http.RoundTripper
+	observe func(*http.Request, *http.Response)
+}
 
 func (t pageTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	res, err := t.RoundTripper.RoundTrip(req)
 	if capture, ok := req.Context().Value(pageResponseKey{}).(**http.Response); ok {
 		*capture = res
 	}
+	if err == nil && res != nil && t.observe != nil {
+		t.observe(req, res)
+	}
 	return res, err
 }
 
 func newReleasePager(base string, raw *http.Client, byteCap int) (*releasePager, error) {
+	return newReleasePagerWithObserver(base, raw, byteCap, nil)
+}
+
+// Each page uses the earliest of the parent deadline, the verifier page
+// timeout, and a positive caller timeout. The same context covers the request
+// and body reads. FetchPage owns redirects, page acceptance, and body close.
+func newReleasePagerWithObserver(base string, raw *http.Client, byteCap int, observe func(*http.Request, *http.Response)) (*releasePager, error) {
 	start, err := time.Parse(time.RFC3339, fixtureStart)
 	if err != nil {
 		return nil, err
@@ -44,17 +58,23 @@ func newReleasePager(base string, raw *http.Client, byteCap int) (*releasePager,
 	// The candidate listens on loopback HTTP. Observe its response on the
 	// same request the client validates, leaving body reads and close to it.
 	transport := new(http.Transport)
-	transport.RegisterProtocol("http", pageTransport{underlying})
+	transport.RegisterProtocol("http", pageTransport{RoundTripper: underlying, observe: observe})
 	production, err := client.New(base, transport)
 	if err != nil {
 		return nil, err
 	}
 	production.MaxPageBytes = int64(byteCap)
-	return &releasePager{production, client.Query{Start: start, End: end}}, nil
+	pageTimeout := queryDeadline
+	if raw.Timeout > 0 {
+		pageTimeout = min(pageTimeout, raw.Timeout)
+	}
+	return &releasePager{
+		client: production, query: client.Query{Start: start, End: end}, pageTimeout: pageTimeout,
+	}, nil
 }
 
 func (p *releasePager) fetch(ctx context.Context, filter string, limit int, cursor string) (client.Page, *http.Response, error) {
-	ctx, cancel := context.WithTimeout(ctx, queryDeadline)
+	ctx, cancel := context.WithTimeout(ctx, p.pageTimeout)
 	defer cancel()
 	var res *http.Response
 	query := p.query

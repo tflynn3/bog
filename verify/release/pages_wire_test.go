@@ -72,6 +72,153 @@ func wireServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	return server
 }
 
+func TestReleasePagerDeadlinePrecedence(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                 string
+		parent, caller, want time.Duration
+	}{
+		{name: "parent wins", parent: queryDeadline / 2, caller: queryDeadline, want: queryDeadline / 2},
+		{name: "caller wins", parent: 2 * queryDeadline, caller: queryDeadline / 2, want: queryDeadline / 2},
+		{name: "page wins", parent: 3 * queryDeadline, caller: 2 * queryDeadline, want: queryDeadline},
+		{name: "zero caller timeout", want: queryDeadline},
+		{name: "negative caller timeout", caller: -time.Second, want: queryDeadline},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			var parentDeadline time.Time
+			if tc.parent > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tc.parent)
+				defer cancel()
+				parentDeadline, _ = ctx.Deadline()
+			}
+			var deadline time.Time
+			var hasDeadline bool
+			stop := errors.New("stop after observing deadline")
+			raw := &http.Client{Timeout: tc.caller, Transport: budgetRoundTripper(func(req *http.Request) (*http.Response, error) {
+				deadline, hasDeadline = req.Context().Deadline()
+				return nil, stop
+			})}
+			pager, err := newReleasePager("http://127.0.0.1", raw, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := time.Now()
+			_, _, err = pager.fetch(ctx, "", 1, "")
+			after := time.Now()
+			if !errors.Is(err, stop) || !hasDeadline {
+				t.Fatalf("request deadline = %v (present=%t), error = %v", deadline, hasDeadline, err)
+			}
+			earliest, latest := before.Add(tc.want), after.Add(tc.want)
+			if tc.parent == tc.want {
+				earliest, latest = parentDeadline, parentDeadline
+			}
+			if deadline.Before(earliest) || deadline.After(latest) {
+				t.Errorf("request deadline = %v, want between %v and %v", deadline, earliest, latest)
+			}
+		})
+	}
+}
+
+func TestReleasePagerWireBounds(t *testing.T) {
+	t.Parallel()
+	testReleasePagerWireBounds(t, newReleasePager, nil)
+}
+
+func testReleasePagerWireBounds(t *testing.T, newPager func(string, *http.Client, int) (*releasePager, error),
+	observe func(context.Context, *[]byte) context.Context) {
+	t.Helper()
+	record := fmt.Sprintf("{\"ts\":%q,\"line\":\"a\"}\n", fixtureStart)
+	t.Run("caller timeout during body read", func(t *testing.T) {
+		const callerTimeout = queryDeadline / 4
+		release := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			w.Header().Set("Content-Length", fmt.Sprint(len(record)))
+			if _, err := io.WriteString(w, record[:1]); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				t.Error(err)
+				return
+			}
+			select {
+			case <-req.Context().Done():
+			case <-release:
+			}
+		}))
+		t.Cleanup(server.Close)
+		defer close(release)
+		raw := server.Client()
+		raw.Timeout = callerTimeout
+		transport := raw.Transport
+		pager, err := newPager(server.URL, raw, len(record))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 2*queryDeadline)
+		defer cancel()
+		var captured []byte
+		if observe != nil {
+			ctx = observe(ctx, &captured)
+		}
+		start := time.Now()
+		page, res, err := pager.fetch(ctx, "", 1, "")
+		if elapsed := time.Since(start); !errors.Is(err, context.DeadlineExceeded) || elapsed >= queryDeadline ||
+			res == nil || res.StatusCode != http.StatusOK || len(page.Rows) != 0 || page.NextCursor != "" {
+			t.Fatalf("stalled response returned page=%+v, response=%v, error=%v after %v", page, res, err, elapsed)
+		}
+		if observe != nil && captured == nil {
+			t.Error("observer missed the stalled response")
+		}
+		if raw.Transport != transport || raw.Timeout != callerTimeout || raw.CheckRedirect != nil {
+			t.Error("pager changed the caller's HTTP client")
+		}
+	})
+	t.Run("redirect to valid NDJSON", func(t *testing.T) {
+		var redirects, destination atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			switch req.URL.Path {
+			case "/query":
+				redirects.Add(1)
+				w.Header().Set("Location", "/destination")
+				w.WriteHeader(http.StatusFound)
+			case "/destination":
+				destination.Add(1)
+				w.Header().Set("Content-Type", "application/x-ndjson")
+				if _, err := io.WriteString(w, record); err != nil {
+					t.Error(err)
+				}
+			default:
+				t.Errorf("unexpected request path %q", req.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		t.Cleanup(server.Close)
+		pager, err := newPager(server.URL, server.Client(), len(record))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := t.Context()
+		var captured []byte
+		if observe != nil {
+			ctx = observe(ctx, &captured)
+		}
+		page, res, err := pager.fetch(ctx, "", 1, "")
+		var httpErr *client.HTTPError
+		if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusFound ||
+			res == nil || res.StatusCode != http.StatusFound || len(page.Rows) != 0 || page.NextCursor != "" {
+			t.Errorf("redirect returned page=%+v, response=%v, error=%v", page, res, err)
+		}
+		if redirects.Load() != 1 || destination.Load() != 0 || captured != nil {
+			t.Errorf("redirect requests=%d, destination requests=%d, captured=%q", redirects.Load(), destination.Load(), captured)
+		}
+	})
+}
+
 func TestFixedBudgetWireVerdict(t *testing.T) {
 	t.Parallel()
 	const ndjson = "Content-Type: application/x-ndjson\r\n"

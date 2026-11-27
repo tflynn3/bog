@@ -36,24 +36,6 @@ func fetchOraclePage(ctx context.Context, pager *releasePager, req querymodel.Wi
 
 type oracleBodyKey struct{}
 
-type oracleBodyTransport struct {
-	http.RoundTripper
-	byteCap int
-}
-
-// Observe the response body consumed by FetchPage on this request. The
-// production client still drives every read and owns the close result.
-func (t oracleBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	res, err := t.RoundTripper.RoundTrip(req)
-	if err == nil && res != nil && res.StatusCode == http.StatusOK && res.Body != nil {
-		if body, ok := req.Context().Value(oracleBodyKey{}).(*[]byte); ok {
-			*body = make([]byte, 0, t.byteCap)
-			res.Body = oracleBodyReader{ReadCloser: res.Body, captured: body}
-		}
-	}
-	return res, err
-}
-
 type oracleBodyReader struct {
 	io.ReadCloser
 	captured *[]byte
@@ -72,11 +54,13 @@ func newObservedOraclePager(base string, raw *http.Client, byteCap int) (*releas
 	if byteCap <= 0 {
 		return nil, errors.New("oracle body observation requires a positive byte cap")
 	}
-	transport := raw.Transport
-	if transport == nil {
-		transport = http.DefaultTransport
-	}
-	return newReleasePager(base, &http.Client{Transport: oracleBodyTransport{transport, byteCap}}, byteCap)
+	return newReleasePagerWithObserver(base, raw, byteCap, func(req *http.Request, res *http.Response) {
+		// FetchPage drives the reads and owns the close result.
+		if body, ok := req.Context().Value(oracleBodyKey{}).(*[]byte); ok && res.StatusCode == http.StatusOK && res.Body != nil {
+			*body = make([]byte, 0, byteCap)
+			res.Body = oracleBodyReader{ReadCloser: res.Body, captured: body}
+		}
+	})
 }
 
 type oracleTestBody struct {
@@ -88,6 +72,13 @@ type oracleTestBody struct {
 func (b *oracleTestBody) Close() error {
 	b.closes++
 	return b.closeErr
+}
+
+func TestObservedOraclePagerWireBounds(t *testing.T) {
+	t.Parallel()
+	testReleasePagerWireBounds(t, newObservedOraclePager, func(ctx context.Context, body *[]byte) context.Context {
+		return context.WithValue(ctx, oracleBodyKey{}, body)
+	})
 }
 
 func TestOraclePagerObservesClientBody(t *testing.T) {
@@ -105,6 +96,7 @@ func TestOraclePagerObservesClientBody(t *testing.T) {
 		{name: "empty body", status: http.StatusOK},
 		{name: "past cap", payload: record + "x", status: http.StatusOK, chunked: true, wantErr: client.ErrPageBytes},
 		{name: "close failure", payload: record, status: http.StatusOK, closeErr: closeErr, wantErr: closeErr},
+		{name: "clean 503", payload: budgetRejectionBody, status: http.StatusServiceUnavailable},
 		{name: "503 close failure", payload: budgetRejectionBody, status: http.StatusServiceUnavailable, closeErr: closeErr, wantErr: closeErr},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -138,18 +130,23 @@ func TestOraclePagerObservesClientBody(t *testing.T) {
 			}
 			var captured []byte
 			page, err := fetchBackfillPage(context.WithValue(t.Context(), oracleBodyKey{}, &captured), pager, req)
-			if !errors.Is(err, tc.wantErr) || (err != nil && (len(page.Rows) != 0 || page.NextCursor != "" || page.BodyBytes != 0)) {
-				t.Fatalf("page = %+v, %v, want %v", page, err, tc.wantErr)
+			if err != nil && (len(page.Rows) != 0 || page.NextCursor != "" || page.BodyBytes != 0) {
+				t.Fatalf("failed fetch returned a page: %+v, %v", page, err)
 			}
 			if requests != 1 || body.closes != 1 {
 				t.Fatalf("requests=%d closes=%d, want one of each", requests, body.closes)
 			}
 			if tc.status != http.StatusOK {
 				var statusErr *querymodel.FixedBudgetHTTPError
-				if captured != nil || !errors.As(err, &statusErr) || statusErr.CleanBudgetRejection {
-					t.Fatalf("failed 503 recorded as evidence: captured=%q error=%v", captured, err)
+				if captured != nil || !errors.As(err, &statusErr) || statusErr.StatusCode != tc.status ||
+					statusErr.CleanBudgetRejection != (tc.closeErr == nil) ||
+					(tc.wantErr != nil && !errors.Is(err, tc.wantErr)) {
+					t.Fatalf("wrong 503 classification: captured=%q error=%v", captured, err)
 				}
 				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("page = %+v, %v, want %v", page, err, tc.wantErr)
 			}
 			if want := tc.payload[:min(len(tc.payload), len(record))]; captured == nil || string(captured) != want || cap(captured) != len(record) {
 				t.Fatalf("observed body = %q (cap %d), want %q (cap %d)", captured, cap(captured), want, len(record))

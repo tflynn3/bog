@@ -13,9 +13,10 @@ type stagingDeclaration struct {
 	activation string
 }
 
-// Both Linux inventories at 62d13b7fa374 leave the retained libraries outside
+// Both Linux inventories at cde0efe7ec7b leave the retained libraries outside
 // cmd/bog. Remove each #108 declaration with its role change when the reviewed
-// Storage revision shows reachability and satisfies ADR 0049.
+// Storage revision shows reachability and satisfies ADR 0049. Keyed ingest
+// and the policy engine have separate production activation criteria.
 var stagedPackages = map[string]stagingDeclaration{
 	"bog/internal/checkpoint": {
 		owner:      "bog-storage",
@@ -32,6 +33,10 @@ var stagedPackages = map[string]stagingDeclaration{
 	"bog/internal/idempotency": {
 		owner:      "bog-storage",
 		activation: "The production WAL atomically commits and recovers retry records with their batches. HTTP ingest verifies concurrent same-key submissions, conflicting bodies, and retry after an ambiguous response and restart.",
+	},
+	streamPolicyEngine: {
+		owner:      "Core Engineering (#137)",
+		activation: "The serving integration in ADR 0050 passes independent native Linux amd64 and arm64 conformance for scoped admission and paging, durable redaction and replay, export and writable restore, and scoped retry where keyed ingest is enabled.",
 	},
 }
 
@@ -88,6 +93,11 @@ func TestStagedPackageDeclarationFixtures(t *testing.T) {
 			name:  "missing declaration",
 			rules: map[string]rule{backup: {role: staged}},
 			want:  []string{"staged package bog/internal/backup has no staging declaration"},
+		},
+		{
+			name:  "staged stream-policy engine requires its own declaration",
+			rules: map[string]rule{streamPolicyEngine: {role: staged}},
+			want:  []string{"staged package " + streamPolicyEngine + " has no staging declaration"},
 		},
 		{
 			name:         "owner is whitespace",

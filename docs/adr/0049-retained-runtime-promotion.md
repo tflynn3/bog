@@ -1,35 +1,56 @@
 # ADR 0049 — Retained runtime promotion
 
-**Status** — Baseline remeasured for Cycle 193. The reviewed #108 Storage
-handoff, package promotions, and native qualification are pending.
+**Status** — Cycle 195 baseline measured on Linux amd64 and arm64 at
+`cde0efe7ec7b037ef0fae856b52aa0b0a514dc4d`. The Storage handoff is
+blocked on a reviewed #108 wiring SHA. Checkpoint, history, and backup
+remain staged. Native qualification is pending on both architectures and
+#108 remains the release gate.
+[Storage cutover issue](https://github.com/tflynn3/bog/issues/108)
 
 ## Context
 
-At `62d13b7fa3744feb213d227de10e8ee2b496b4a7`, the Linux amd64 and arm64
-inventories agree on 19 root-module production packages and 23 direct
+At `cde0efe7ec7b037ef0fae856b52aa0b0a514dc4d`, the Linux amd64 and arm64
+inventories agree on 20 root-module production packages and 23 direct
 imports. The server's four direct root-module imports, HTTP, readiness,
 store, and WAL, are also its entire root-module dependency closure.
-`cmd/bog.run` opens the ordinary WAL into a `store.Store` and installs
-`newReadyHandler`. That helper passes the store to
-`httpapi.NewWithQueryLimits` and the configured path to
-`readiness.NewHandler`. `wal.Log.Capture` pins the published WAL prefix
-and its bounds under the WAL mutex. The serving path has no adapter
-that pairs this capture with a retained generation.
 History imports checkpoint and store.
 Checkpoint and backup each import store. The operator command already
 imports backup for offline image verification. Checkpoint, history, and
-backup remain staged at this revision.
-[Measured system graph](../architecture/SYSTEM.md#declared-linux-production-import-graph)
+backup remain staged at this revision. The newly landed
+`internal/streampolicy` has zero direct root-module imports and has its
+own staging declaration. `verify/stream-policy` remains independent.
+[Measured system graph](../architecture/SYSTEM.md#declared-linux-production-import-graph),
+[Stream-policy decision boundary](0050-stream-policy-decision-boundary.md)
 
 ## Storage handoff
 
 Core Architecture owns the record and fitness changes. Storage owns
 #108's recovery, publication, and command wiring, including #47's
-shutdown cleanup and #15's startup filesystem diagnostics. Recheck the
-active write leases at handoff and bind the evidence to the reviewed
-Storage SHA. The measured base supplies the topology before cutover.
-The reviewed wiring SHA and its activation evidence are required for
-each role change.
+shutdown cleanup and #15's startup filesystem diagnostics. Core Query
+reviews the page source and capture lifecycle. Core Engineering names the
+query execution and security integration owners within `bog`. Recheck
+the active write leases at dispatch and at the Storage handoff. The Cycle
+195 dispatch context puts the exclusive lease at `council/planning/**`
+and records zero overlap with the architecture track's four paths.
+
+The measured command still opens the ordinary WAL and uses the
+compatibility HTTP and readiness constructors. The source and fixtures
+below establish the component contracts at the baseline. The serving
+call paths and native observations require the reviewed wiring SHA.
+
+| Boundary | Observed at the measured base | Evidence pending on the Storage SHA |
+| --- | --- | --- |
+| Query capture | `wal.Log.Capture` pins the published WAL file and snapshots its committed end and next ordinal under the WAL mutex. `history.Catalog.AcquireCurrentUntil` acquires a generation reader under catalog synchronization. `newReadyHandler` serves the legacy store through `httpapi.NewWithQueryLimits`. | Trace `httpapi.NewWithPageSource` to the command adapter that acquires both pins under the same owner synchronization as append publication and generation activation. Verify that the last admitted user releases the source. |
+| Readiness | `newReadyHandler` passes the configured path to `readiness.NewHandler`. The separate `readiness.NewHandlerForDirectory` calls `Fstatfs` on its caller-supplied descriptor. Its fixtures exercise a path retarget and cancellation during a blocked probe. | Trace the served descriptor back to an independent open relative to the pinned WAL directory. Verify matching directory identity, probe cancellation before descriptor close, and readiness and ingest after path retargets in both directions. |
+| Shutdown | `cmd/bog.run` cancels probes, drains HTTP, and calls `wal.Log.Close` on successful drain. A failed HTTP drain leaves the lock held until process exit. `httpapi.API.Close` retires captures and waits for admitted users and source releases. Its fixtures cover an admitted read and a blocked source release. | Trace the command closing HTTP admission, draining HTTP and `API.Close`, then draining admitted maintenance and export work before WAL close. Verify startup error cleanup and lock retention on failed drain. |
+
+[Command startup and shutdown](../../cmd/bog/main.go),
+[Current paging and readiness call sites](../../cmd/bog/ready.go),
+[WAL capture](../../internal/wal/capture_linux.go),
+[History generation acquisition](../../internal/history/history.go),
+[Readiness descriptor fixtures](../../internal/readiness/wal_linux_test.go),
+[Admitted capture drain](../../internal/httpapi/query_captures_test.go),
+[Source release deadline](../../internal/httpapi/query_delivery_test.go)
 
 ## Decision
 
@@ -74,7 +95,8 @@ Storage SHA and the corresponding activation evidence is available.
 | `internal/history` | Serve ordered checkpoint and suffix rows through the command-owned page source. Demonstrate a held cursor through replacement and acknowledged backfill, plus exact fresh and restarted walks and final pin drain. |
 | `internal/backup` | Use backup APIs in server composition. Start writable on a verified restore, acknowledge a new append, and demonstrate exact HTTP parity after restart. Preserve `cmd/bog-verify`'s direct offline import. |
 
-Keep idempotency staged until its separate keyed-ingest criteria are met.
+Keep idempotency and the stream-policy engine staged until their
+separate production activation criteria are met.
 Operator backup consumption leaves the backup library staged until
 server reachability and its writable restore evidence are available.
 The release producers continue to exercise a separate pinned process and
@@ -103,8 +125,9 @@ command owns the sequencing and cleanup across package interfaces.
 Core Architecture and Storage review the exact direct edges and server
 closure from both Linux inventories and update the fitness registry,
 staging declarations, SYSTEM.md graph and table, and measured SHA in the
-same PR. Run the architecture suite on the combined revision before
-merge. Run `go vet ./internal/archtest`,
+same wiring PR. Preserve the direct offline backup edge, the independent
+verifier registrations, and the staged stream-policy engine. Before merge,
+run `go vet ./internal/archtest`,
 `go test -race -count=1 ./internal/archtest`, and
 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...`. The suite checks
 production boundaries, cycles, orphan registrations, package reachability
@@ -126,8 +149,10 @@ and intact successor storage. The release fixture exercises the
 verifier's ability to detect a retained predecessor and a stalled reader.
 
 The Linux inventories measure topology and the cross-build verifies
-compilation. Record the native amd64 and arm64 verdicts against the
-composed candidate revision and each runner's binary checksum. Both are
-pending. #108 remains the release gate.
+compilation. The baseline checks cover the measured graph and staging
+update. At integration, hand the clean composed SHA to Release
+Verification for the workflow's `revision` input. Record both native
+verdicts against that SHA and each runner's binary checksum. The
+composed SHA and both verdicts are pending. #108 remains the release gate.
 [System fitness and registry ownership](../architecture/SYSTEM.md#fitness-and-registry-ownership),
 [Native release evidence](../architecture/SYSTEM.md#release-evidence)

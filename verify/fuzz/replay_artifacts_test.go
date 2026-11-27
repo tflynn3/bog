@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"time"
 
 	"bog/internal/backup"
@@ -21,7 +22,13 @@ import (
 
 // readReplayFiles caps both the bytes passed to artifact readers and the byte
 // evidence retained by the oracle. The caller owns a private, stable fixture.
-func readReplayFiles(ctx context.Context, path string) (_ files, err error) {
+func readReplayFiles(ctx context.Context, path string) (files, error) {
+	return readReplayDirectory(ctx, path, "")
+}
+
+// child, when set, must be the sole subdirectory. The caller inventories it
+// separately with the same file and byte limits.
+func readReplayDirectory(ctx context.Context, path, child string) (_ files, err error) {
 	root, err := os.OpenRoot(path)
 	if err != nil {
 		return nil, err
@@ -31,18 +38,23 @@ func readReplayFiles(ctx context.Context, path string) (_ files, err error) {
 	if err != nil {
 		return nil, err
 	}
-	entries, err := dir.ReadDir(replayMaxFiles + 1)
+	entryLimit := replayMaxFiles
+	if child != "" {
+		entryLimit++
+	}
+	entries, err := dir.ReadDir(entryLimit + 1)
 	if errors.Is(err, io.EOF) {
 		err = nil
 	}
 	if err := errors.Join(err, dir.Close()); err != nil {
 		return nil, err
 	}
-	if len(entries) > replayMaxFiles {
+	if len(entries) > entryLimit {
 		return nil, fmt.Errorf("%w: %s has too many files", errReplayLimit, path)
 	}
 	image := make(files, len(entries))
 	remaining := replayMaxImageBytes
+	foundChild := child == ""
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -51,6 +63,10 @@ func readReplayFiles(ctx context.Context, path string) (_ files, err error) {
 		info, err := entry.Info()
 		if err != nil {
 			return nil, err
+		}
+		if name == child && info.IsDir() {
+			foundChild = true
+			continue
 		}
 		if !info.Mode().IsRegular() {
 			return nil, fmt.Errorf("non-regular replay artifact %q", name)
@@ -72,6 +88,9 @@ func readReplayFiles(ctx context.Context, path string) (_ files, err error) {
 		}
 		image[name] = payload
 		remaining -= len(payload)
+	}
+	if !foundChild {
+		return nil, fmt.Errorf("missing replay subdirectory %q", child)
 	}
 	return image, nil
 }
@@ -279,4 +298,11 @@ func (w *replayWorkerLog) limitError() error {
 		return fmt.Errorf("%w: worker output exceeds %d bytes", errReplayLimit, replayWorkerLogBytes)
 	}
 	return nil
+}
+
+func runBoundedReplayWorker(cmd *exec.Cmd) ([]byte, error) {
+	output := new(replayWorkerLog)
+	cmd.Stdout, cmd.Stderr = output, output
+	err := cmd.Run()
+	return output.buffer.Bytes(), errors.Join(err, output.limitError())
 }

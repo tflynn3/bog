@@ -341,3 +341,20 @@ func checkReplay(ctx context.Context, observe artifactObservation, want replayEx
 	}
 	return compareReplayFiles(got.files, want.files)
 }
+
+func signMetadata(b []byte) {
+	sum := sha256.Sum256(b[:96])
+	copy(b[96:128], sum[:])
+}
+
+func fixFrameHeader(b []byte) {
+	le.PutUint32(b[12:16], crc32.Checksum(b[:12], crcTable))
+}
+
+func frameLength(b []byte, n uint32) []byte {
+	out := slices.Clone(b)
+	le.PutUint32(out[:4], n)
+	le.PutUint32(out[4:8], ^n)
+	fixFrameHeader(out)
+	return out
+}

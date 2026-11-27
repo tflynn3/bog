@@ -212,3 +212,39 @@ input. Artifact observation has a five-second deadline, caps individual files
 at 32 KiB and total file bytes at 64 KiB, and verifies rows as they are read.
 The Linux worker deadlines and resource limits also apply to these cases.
 Portable oracle unit and reader tests run with `go test -race ./verify/fuzz`.
+
+## Malformed retained recovery
+
+Run the deterministic seed 92 corpus with verbose output to collect one
+`retained_recovery` JSON record per case.
+
+```sh
+go test -race -count=1 -v -run '^TestRetainedMalformedRecovery$' ./verify/fuzz
+```
+
+The corpus builds a predecessor and successor over the same committed WAL.
+A valid successor is the positive control. Pinned restore rejects truncated
+metadata, an end before the checkpoint, mismatched generations, missing
+segments, and an invalid length in the second committed frame. A huge
+declared tail must be refused by replay admission. Offline verification and
+restore must also reject those images. The case with the malformed second
+frame additionally checks that suffix replay returns no partial output and
+releases its reservations after decoding the first frame.
+
+Interrupted checkpoint recovery can keep the validated predecessor when a
+damaged successor manifest has yet to become authoritative. It removes the
+owned losing segment and staging and preserves the unclaimed segment. A
+damaged or missing committed manifest, or a truncated ownership intent,
+requires rejection and preservation of the candidate namespace. The oracle
+checks the predecessor's checkpoint rows, exact WAL suffix frames, and
+merged timestamp and append-ordinal order. Restore refusals also exercise an
+attempt to overwrite the prior valid image and verify its bytes and replay.
+
+Each case owns a fresh worker and private fixture. The worker has a five-second
+case deadline, a 16 MiB cumulative Go allocation ceiling and a 16 KiB replay
+admission limit. The parent enforces a ten-second subprocess deadline and
+removes its scratch directory after reaping the worker. Linux workers also
+use the corpus address-space and per-file limits. Each verdict records the
+validated generation and replay boundary, row and suffix-frame counts, time,
+allocation, and fixture cleanup. In rejection cases the reported generation
+belongs to the independently replayed predecessor.

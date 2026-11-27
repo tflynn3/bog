@@ -61,6 +61,7 @@ var registry = map[string]rule{
 	"bog/bench/retained-history": {verifier, []string{listenerVerifier}},
 	listenerVerifier:             {verifierModel, nil},
 	"bog/verify/query-model":     {verifierModel, nil},
+	streamPolicyVerifier:         {verifierModel, nil},
 }
 
 type listedPackage struct {

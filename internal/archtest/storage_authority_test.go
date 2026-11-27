@@ -23,6 +23,7 @@ func storageAuthorityProblems(rules map[string]rule) []string {
 		checkpoint  = "bog/internal/checkpoint"
 		history     = "bog/internal/history"
 		idempotency = "bog/internal/idempotency"
+		store       = "bog/internal/store"
 		wal         = "bog/internal/wal"
 	)
 	packages := ruleImportGraph(rules)
@@ -30,6 +31,16 @@ func storageAuthorityProblems(rules map[string]rule) []string {
 	retained := []string{backup, checkpoint, history}
 	walPeers := append(retained, idempotency)
 	var problems []string
+	storeReachable := reachableImports(packages, store)
+	for _, to := range slices.Sorted(maps.Keys(storeReachable)) {
+		// The measured graph preserves root-module roles and includes
+		// unclassified external relays. Inventory parity checks that all
+		// root-module production packages have a production role.
+		kind := rules[to].role
+		if to != store && kind != "" && kind != testOnly {
+			problems = append(problems, fmt.Sprintf("forbidden store dependency: %s reaches %s", store, to))
+		}
+	}
 	for _, from := range walPeers {
 		reached := reachableImports(packages, from)
 		if reached[wal] {

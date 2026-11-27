@@ -96,7 +96,7 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 			var budgets []int
 			client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 			defer client.CloseIdleConnections()
-			launch := func(_ context.Context, budget int, check func(string) error) error {
+			launch := func(ctx context.Context, budget int, check func(context.Context, string) error) error {
 				budgets = append(budgets, budget)
 				pages := tc.pages
 				if pages == nil {
@@ -150,7 +150,7 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 					}
 				}))
 				defer srv.Close()
-				err := check(srv.URL)
+				err := check(ctx, srv.URL)
 				if got := int(calls.Load()); got != 1+len(pages) {
 					t.Errorf("budget %d received %d requests, want %d", budget, got, 1+len(pages))
 				}
@@ -263,7 +263,7 @@ func TestFindBudgetWalk(t *testing.T) {
 			client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 			defer client.CloseIdleConnections()
 			launched := 0
-			launch := func(_ context.Context, budget int, check func(string) error) error {
+			launch := func(ctx context.Context, budget int, check func(context.Context, string) error) error {
 				launched++
 				if budget != launched {
 					t.Errorf("launch %d used budget %d", launched, budget)
@@ -316,7 +316,7 @@ func TestFindBudgetWalk(t *testing.T) {
 					}
 				}))
 				defer srv.Close()
-				err := check(srv.URL)
+				err := check(ctx, srv.URL)
 				if got := int(calls.Load()); got != 1+len(pages) {
 					t.Errorf("budget %d received %d requests, want %d", budget, got, 1+len(pages))
 				}
@@ -328,6 +328,13 @@ func TestFindBudgetWalk(t *testing.T) {
 			}
 			if legacyBudgetCounts(got) != tc.want {
 				t.Errorf("evidence = %+v, want %+v", got, tc.want)
+			}
+			if tc.name == "empty continuation" {
+				failure := got.FirstBrokenContinuation
+				if failure == nil || failure.Page != 2 || failure.HTTPStatus != http.StatusOK ||
+					failure.Detail != "page 2: empty query page with next cursor" {
+					t.Errorf("empty continuation diagnostic = %+v", failure)
+				}
 			}
 			wantLaunches := tc.rejections
 			if len(tc.pages) > 0 {
@@ -354,9 +361,9 @@ func TestFindBudgetWalkStopsOnCancellation(t *testing.T) {
 	defer srv.Close()
 
 	launches := 0
-	_, err := findBudgetWalk(ctx, srv.Client(), 3, func(_ context.Context, _ int, check func(string) error) error {
+	_, err := findBudgetWalk(ctx, srv.Client(), 3, func(ctx context.Context, _ int, check func(context.Context, string) error) error {
 		launches++
-		return check(srv.URL)
+		return check(ctx, srv.URL)
 	})
 	if launches != 1 || !errors.Is(err, context.Canceled) {
 		t.Fatalf("launches = %d, error = %v; want one launch and cancellation", launches, err)
@@ -442,10 +449,10 @@ func TestSparseBudgetWalkStopsOnRunFailure(t *testing.T) {
 			defer server.Close()
 			runErr := errors.New("candidate process failed")
 			launches := 0
-			launch := func(_ context.Context, _ int, check func(string) error) error {
+			launch := func(ctx context.Context, _ int, check func(context.Context, string) error) error {
 				launches++
 				if !tc.startup {
-					if err := check(server.URL); err != nil {
+					if err := check(ctx, server.URL); err != nil {
 						t.Errorf("unexpected fixture setup error: %v", err)
 					}
 				}

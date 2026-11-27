@@ -3,11 +3,13 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	stdjson "encoding/json"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +20,7 @@ import (
 
 const schemaVersion = 1
 const capacityCase = "retained_history_capacity"
+const saturationFixtureCase = "saturation_fixture"
 
 var fullRevision = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -91,11 +94,16 @@ func decodeFields(data []byte, fields map[string]any) (map[string]jsontext.Value
 	return object, nil
 }
 
-func validateReport(data []byte, expected identity, required []string) error {
-	return validateReportWithRetarget(data, expected, required, false)
+type validationOptions struct {
+	requireRetarget bool
+	requireCutover  bool
 }
 
-func validateReportWithRetarget(data []byte, expected identity, required []string, requireRetarget bool) error {
+func validateReport(data []byte, expected identity, required []string) error {
+	return validateReportWithOptions(data, expected, required, validationOptions{})
+}
+
+func validateReportWithOptions(data []byte, expected identity, required []string, opts validationOptions) error {
 	var got identity
 	var cases map[string]jsontext.Value
 	fields, err := decodeFields(data, map[string]any{
@@ -113,17 +121,31 @@ func validateReportWithRetarget(data []byte, expected identity, required []strin
 			return fmt.Errorf("missing required case %q", name)
 		}
 	}
-	for name, raw := range cases {
-		mandatory := slices.Contains(required, name)
-		if err := validateOutcome(raw, mandatory, mandatory && name == "enospc", requireRetarget); err != nil {
-			return fmt.Errorf("case %q: %w", name, err)
+	// Prefer failed probes and cleanup details to skipped prerequisites.
+	// Retain all malformed or failing cases in stable order for diagnosis.
+	var failures, skips []error
+	for _, name := range slices.Sorted(maps.Keys(cases)) {
+		raw := cases[name]
+		mandatory := slices.Contains(required, name) || name == saturationFixtureCase
+		if err := validateOutcome(raw, mandatory, mandatory && name == "enospc", opts.requireRetarget); err != nil {
+			problem := fmt.Errorf("case %q: %w", name, err)
+			if errors.Is(err, errSkippedCase) {
+				skips = append(skips, problem)
+			} else {
+				failures = append(failures, problem)
+			}
 		}
 	}
+	if err := errors.Join(append(failures, skips...)...); err != nil {
+		return err
+	}
 	if slices.Contains(required, capacityCase) {
-		return validateCapacity(fields["mode"], cases[capacityCase], got.Fixture)
+		return validateCapacity(fields["mode"], cases[capacityCase], got.Fixture, opts.requireCutover)
 	}
 	return nil
 }
+
+var errSkippedCase = errors.New("expected pass, got \"skip\"")
 
 func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC, requireRetarget bool) error {
 	var status string
@@ -131,9 +153,9 @@ func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC, requireRetarg
 	if err != nil {
 		return err
 	}
-	if detail, ok := fields["detail"]; ok {
-		var text *string
-		if err := json.Unmarshal(detail, &text); err != nil || text == nil {
+	var detail *string
+	if rawDetail, ok := fields["detail"]; ok {
+		if err := json.Unmarshal(rawDetail, &detail); err != nil || detail == nil {
 			return errors.New("detail must be a string")
 		}
 	}
@@ -141,7 +163,14 @@ func validateOutcome(raw jsontext.Value, mandatory, requireENOSPC, requireRetarg
 	case "pass":
 	case "fail", "skip":
 		if mandatory {
-			return fmt.Errorf("expected pass, got %q", status)
+			statusErr := errSkippedCase
+			if status == "fail" {
+				statusErr = errors.New("expected pass, got \"fail\"")
+			}
+			if detail != nil && *detail != "" {
+				return fmt.Errorf("%w: %s", statusErr, *detail)
+			}
+			return statusErr
 		}
 	default:
 		return fmt.Errorf("unknown status %q", status)
@@ -196,7 +225,7 @@ func validateRetarget(evidence map[string]jsontext.Value) error {
 	return nil
 }
 
-func validateFile(path string, expected identity, required []string) (err error) {
+func validateFile(path string, expected identity, required []string, opts validationOptions) (err error) {
 	file, err := openRegular(path)
 	if err != nil {
 		return err
@@ -210,10 +239,18 @@ func validateFile(path string, expected identity, required []string) (err error)
 	if len(data) > maxReport {
 		return errors.New("report exceeds 16 MiB")
 	}
-	if os.Getenv("BOG_RELEASE_REQUIRE_RETARGET") == "1" {
-		return validateReportWithRetarget(data, expected, required, true)
+	return validateReportWithOptions(data, expected, required, opts)
+}
+
+func writeReport(path string, results report) error {
+	data, err := stdjson.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode release report: %w", err)
 	}
-	return validateReport(data, expected, required)
+	if err := os.WriteFile(path, append(data, '\n'), 0600); err != nil {
+		return fmt.Errorf("write release report %q: %w", path, err)
+	}
+	return nil
 }
 
 func openRegular(path string) (*os.File, error) {

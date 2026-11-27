@@ -78,7 +78,9 @@ func TestBudgetRejectionWire(t *testing.T) {
 					writeWireResponse(t, w, tc.wire)
 				})
 				if walk {
-					launch := func(_ context.Context, _ int, check func(string) error) error { return check(server.URL) }
+					launch := func(ctx context.Context, _ int, check func(context.Context, string) error) error {
+						return check(ctx, server.URL)
+					}
 					stats, err := findBudgetWalk(t.Context(), server.Client(), 1, launch)
 					if len(stats.Probes) != 1 || stats.FirstCursorBudget != 0 || stats.ExactThresholdBudget != 0 ||
 						stats.Pages != 0 || stats.Rows != 0 || stats.FirstBrokenContinuation != nil {

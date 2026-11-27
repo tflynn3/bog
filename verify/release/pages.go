@@ -90,6 +90,9 @@ func checkPageRows(got []client.Row, want []row) error {
 }
 
 func checkBudgetPage(page client.Page, want []row, terminal bool, seen map[string]bool) error {
+	if len(page.Rows) == 0 && page.NextCursor != "" {
+		return fmt.Errorf("empty query page with next cursor")
+	}
 	if err := checkPageRows(page.Rows, want); err != nil {
 		return err
 	}

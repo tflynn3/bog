@@ -45,7 +45,7 @@ type budgetFixture struct {
 	firstRows, byteCap      int
 }
 
-type budgetLaunch func(context.Context, int, func(string) error) error
+type budgetLaunch func(context.Context, int, func(context.Context, string) error) error
 
 type budgetProbeOutcome string
 
@@ -158,7 +158,7 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
 	ctx, cancel := context.WithTimeout(ctx, budgetWalkDeadline)
 	defer cancel()
 	launch := func(byteCap int) budgetLaunch {
-		return func(ctx context.Context, budget int, check func(string) error) error {
+		return func(ctx context.Context, budget int, check func(context.Context, string) error) error {
 			flags := []string{"-query-concurrency=1", "-query-work-budget=" + strconv.Itoa(budget)}
 			if byteCap > 0 {
 				flags = append(flags, "-query-max-response-bytes="+strconv.Itoa(byteCap))
@@ -224,7 +224,7 @@ func tryBudgetWalk(ctx context.Context, raw *http.Client, launch budgetLaunch, b
 	probe := budgetProbe{Budget: budget, Outcome: probeIndeterminate}
 	runErr := ctx.Err()
 	if runErr == nil {
-		runErr = launch(ctx, budget, func(base string) error {
+		runErr = launch(ctx, budget, func(ctx context.Context, base string) error {
 			var err error
 			probe, err = runBudgetWalk(ctx, raw, base, budget, fixture)
 			return err

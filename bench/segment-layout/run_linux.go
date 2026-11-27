@@ -206,7 +206,14 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return errors.Join(validateQualificationJSON(f), f.Close())
+		return errors.Join(validateBenchmarkReport(f), f.Close())
+	}
+	if cfg.cold {
+		result, err := collectCold(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(out).Encode(result)
 	}
 	if cfg.incremental {
 		result, err := collectIncremental(ctx, cfg)

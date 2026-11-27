@@ -21,14 +21,6 @@ import (
 	"bog/verify/listener"
 )
 
-type liveReport struct {
-	Status       string                   `json:"status"`
-	Reason       string                   `json:"reason,omitempty"`
-	Revision     string                   `json:"revision,omitempty"`
-	BinarySHA256 string                   `json:"binary_sha256,omitempty"`
-	Measurements []publicationMeasurement `json:"measurements,omitempty"`
-}
-
 func pinBinary(source, target, revision string) (digest string, err error) {
 	if sha, err := hex.DecodeString(revision); err != nil || len(sha) != 20 {
 		return "", errors.New("require a full candidate Git revision")
@@ -82,7 +74,7 @@ func measureLive(ctx context.Context, cfg config, dir string, input fixtureInput
 			return liveReport{}, err
 		}
 		trialCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
-		sample, unavailable, err := liveTrial(trialCtx, binary, data, input, burst, denominators[burst.name])
+		sample, unavailable, err := liveTrial(trialCtx, binary, data, input, burst, denominators[burst.name], cfg.cold)
 		cancel()
 		if err != nil {
 			return liveReport{}, fmt.Errorf("%s live compaction: %w", burst.name, err)
@@ -102,7 +94,7 @@ func measureLive(ctx context.Context, cfg config, dir string, input fixtureInput
 	return result, nil
 }
 
-func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burst backfill, denominator uint64) (publicationMeasurement, string, error) {
+func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burst backfill, denominator uint64, queryParity bool) (publicationMeasurement, string, error) {
 	if err := withSeededPublication(ctx, dir, input, nil); err != nil {
 		return publicationMeasurement{}, "", err
 	}
@@ -111,6 +103,7 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 		return publicationMeasurement{}, "", err
 	}
 	count := len(input.rows) + len(burst.batch)
+	rows := input.withBackfill(burst)
 	var sample publicationMeasurement
 	var unavailable string
 	err = withCandidate(ctx, binary, dir, func(s liveService) (err error) {
@@ -161,11 +154,16 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 		if after < before {
 			return errors.New("server write_bytes counter decreased")
 		}
+		if queryParity {
+			if err := s.checkPublishedQueries(ctx, rows); err != nil {
+				return err
+			}
+		}
 		if err := s.requireListener(); err != nil {
 			return err
 		}
 		sample = publicationMeasurement{
-			Scenario: burst.name, CoveredRows: count, ElapsedNS: elapsed.Nanoseconds(),
+			Scenario: burst.name, CoveredRows: count, ElapsedNS: elapsed.Nanoseconds(), HTTPQueryParity: queryParity,
 			WriteAmplification: writeAmplification(after-before, denominator, liveBoundary),
 		}
 		return nil
@@ -173,7 +171,7 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 	if err != nil || unavailable != "" {
 		return sample, unavailable, err
 	}
-	return sample, "", verifyPublished(dir, input.withBackfill(burst))
+	return sample, "", verifyPublished(dir, rows)
 }
 
 func withCandidate(ctx context.Context, binary, dir string, run func(liveService) error) (err error) {

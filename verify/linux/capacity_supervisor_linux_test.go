@@ -33,11 +33,11 @@ exit 3`,
 			kind: runnerFailure, exit: 3,
 		},
 		{
-			name: "cancellation leaves partial proof untrusted",
-			script: `trap 'cp "$BOG_TEST_PROOF_SOURCE" "$report"; exit 7' TERM
+			name: "cancellation wins over reserved exit with a valid proof",
+			script: `trap 'cp "$BOG_TEST_PROOF_SOURCE" "$report" && exit 20' TERM
 printf ready > "$BOG_TEST_PRODUCER_READY"
 while :; do :; done`,
-			kind: cancelledFailure, exit: 7,
+			kind: cancelledFailure, exit: 20,
 		},
 	} {
 		// This test gives each subprocess its own fixture and environment.
@@ -50,8 +50,7 @@ while :; do :; done`,
 			if err := os.WriteFile(producer, []byte(producerReportScript+tc.script+"\n"), 0700); err != nil {
 				t.Fatal(err)
 			}
-			partial := capacityFixture("fail", `{"fixture":{"seed_rows":196608},"status":"pass","phase":"complete",
-				"cgroup_peak_memory_bytes":4100,"diagnostics":{"cgroup_memory_events":{"oom":0,"oom_kill":0}}}`)
+			partial := failedSupervisorProof()
 			if err := os.WriteFile(source, partial, 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -410,6 +409,142 @@ func passingSupervisorProof() []byte {
 			`{"fixture":{"seed_rows":393216},"status":"pass","phase":"complete","cgroup_peak_memory_bytes":8192}`)
 }
 
+func failedSupervisorProof() []byte {
+	return capacityFixture("fail", `{"fixture":{"seed_rows":196608},"status":"fail","phase":"seed","workload_status":"fail",
+		"detail":"candidate exited during seed","cgroup_peak_memory_bytes":134217728,
+		"diagnostics":{"cgroup_memory_events":{"oom":2,"oom_kill":1}},
+		"cleanup":{"status":"pass","candidate_reaped":true,"subtree_empty":true,"subtree_removed":true,"store_removed":true}}`)
+}
+
+func TestDelegatedCapacityProofOutcome(t *testing.T) {
+	const proofName = "capacity.json"
+	if scenario := os.Getenv("BOG_TEST_CAPACITY_OUTCOME"); scenario != "" {
+		dir := os.NewFile(3, "inherited proof directory")
+		descriptor := reportpublication.BorrowDirectory(dir)
+		var ops reportpublication.Directory = descriptor
+		proof := failedSupervisorProof()
+		switch scenario {
+		case "old producer", "contradictory passing proof":
+			proof = passingSupervisorProof()
+		case "malformed proof":
+			proof = []byte("{")
+		case "uncertain publication":
+			ops = unsyncedProofDirectory{descriptor}
+		}
+		state, publishErr := reportpublication.Publish(t.Context(), ops, proofName, proof, reportpublication.CreateOnly)
+		if closeErr := dir.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if scenario == "uncertain publication" {
+			if state != reportpublication.DurabilityUncertain || !errors.Is(publishErr, syscall.EIO) {
+				t.Fatalf("proof commit = %q, %v", state, publishErr)
+			}
+			os.Exit(13)
+		}
+		if state != reportpublication.DurablyPublished || publishErr != nil {
+			t.Fatalf("proof commit = %q, %v", state, publishErr)
+		}
+		switch scenario {
+		case "old producer":
+			return
+		case "signaled after publication":
+			if err := syscall.Kill(os.Getpid(), syscall.SIGKILL); err != nil {
+				t.Fatal(err)
+			}
+			t.Fatal("SIGKILL did not terminate the producer")
+		}
+		os.Exit(20)
+	}
+
+	for _, tc := range []struct {
+		name, kind, detail string
+		exit               int
+	}{
+		{"old producer", "", "", 0},
+		{"committed workload failure", workloadFailure, "live capacity case failed: fixture detail", 20},
+		{"malformed proof", runnerFailure, "decode capacity producer report", 20},
+		{"contradictory passing proof", runnerFailure, "requires a failed live case", 20},
+		{"uncertain publication", runnerFailure, "capacity producer did not complete successfully", 13},
+		{"signaled after publication", runnerFailure, "capacity producer did not complete successfully", -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			producer := filepath.Join(dir, "producer")
+			script := producerReportScript + `exec "$BOG_TEST_GO_BINARY" -test.run '^TestDelegatedCapacityProofOutcome$'` + "\n"
+			if err := os.WriteFile(producer, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("BOG_TEST_GO_BINARY", executable)
+			t.Setenv("BOG_TEST_CAPACITY_OUTCOME", tc.name)
+			path := filepath.Join(dir, proofName)
+			dest, err := openReportDestination(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := dest.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			r := newCapacityTestReport()
+			r.Probe.Parent = dir
+			files := controlFiles{read: func(path string) ([]byte, error) {
+				if path == filepath.Join(dir, "memory.events") {
+					return []byte("oom 0\noom_kill 0\n"), nil
+				}
+				return nil, os.ErrNotExist
+			}}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			unobserved := r.Capacity.Scales
+			err = r.runCapacity(ctx, files, producer, "/candidate", dir, dest)
+			if r.FailureKind != tc.kind || tc.detail == "" && err != nil ||
+				tc.detail != "" && (err == nil || !strings.Contains(err.Error(), tc.detail)) {
+				t.Fatalf("verdict = %q, %v, want %q, %q", r.FailureKind, err, tc.kind, tc.detail)
+			}
+			if tc.exit == -1 {
+				if r.Capacity.ExitCode != nil || r.Capacity.Signal != syscall.SIGKILL.String() {
+					t.Fatalf("signaled producer = %+v", r.Capacity)
+				}
+			} else if r.Capacity.ExitCode == nil || *r.Capacity.ExitCode != tc.exit || r.Capacity.Signal != "" {
+				t.Fatalf("producer exit = %+v, want %d", r.Capacity, tc.exit)
+			}
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("producer left no proof for the supervisor: %v", err)
+			}
+			small, large := r.Capacity.Scales[0], r.Capacity.Scales[1]
+			switch tc.name {
+			case "old producer":
+				if small.Status != "pass" || large.Status != "pass" || small.PeakSource != "producer" || large.PeakSource != "producer" {
+					t.Fatalf("old producer scales = %+v", r.Capacity.Scales)
+				}
+			case "committed workload failure":
+				if small.Status != "fail" || small.Phase != "seed" || small.FailureKind != workloadFailure ||
+					small.MemoryPeak == nil || *small.MemoryPeak != releaseMemoryLimit || small.PeakSource != "producer" ||
+					!reflect.DeepEqual(small.OOMDelta, map[string]uint64{"oom": 2, "oom_kill": 1}) || small.OOMSource != "producer" ||
+					small.Cleanup == nil || small.Cleanup.StoreRemoved == nil || !*small.Cleanup.StoreRemoved ||
+					!reflect.DeepEqual(large, unobserved[1]) {
+					t.Fatalf("diagnostic scales = %+v", r.Capacity.Scales)
+				}
+			default:
+				if !reflect.DeepEqual(r.Capacity.Scales, unobserved) {
+					t.Fatalf("rejected proof changed scale evidence: %+v", r.Capacity.Scales)
+				}
+			}
+		})
+	}
+}
+
+type unsyncedProofDirectory struct {
+	reportpublication.DescriptorDirectory
+}
+
+func (unsyncedProofDirectory) Sync() error { return syscall.EIO }
+
 func TestDelegatedCapacityRejectsCompetingProof(t *testing.T) {
 	const failureExit = 13
 	const proofName = "capacity.json"
@@ -428,7 +563,7 @@ func TestDelegatedCapacityRejectsCompetingProof(t *testing.T) {
 	}
 	// Verify the competing bytes would satisfy the supervisor if decoded.
 	control := newCapacityTestReport()
-	if kind, err := control.readCapacity(competing); kind != "" || err != nil {
+	if kind, err := control.readCapacity(t.Context(), competing, 0); kind != "" || err != nil {
 		t.Fatalf("fixture proof = %q, %v", kind, err)
 	}
 	parent := t.TempDir()

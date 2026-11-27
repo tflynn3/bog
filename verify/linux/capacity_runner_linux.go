@@ -62,26 +62,35 @@ func (r *runnerReport) runCapacity(ctx context.Context, files controlFiles, prod
 	if accountingErr != nil {
 		r.Capacity.AccountingError = accountingErr.Error()
 	}
+	var exitErr *exec.ExitError
+	committedFailure := errors.As(waitErr, &exitErr) && exitErr.ExitCode() == committedWorkloadFailureExit
+	// The exit status attests to this writer's commit. A competing writer
+	// can leave schema-valid bytes after a failed create-only publication.
 	switch {
-	case waitErr != nil && verifierReserveFailure(r.Capacity.Output):
-		r.FailureKind = addressSpaceFailure
 	case ctx.Err() != nil:
 		r.FailureKind = cancelledFailure
-		waitErr = errors.Join(waitErr, ctx.Err())
-	case waitErr != nil:
+		return errors.Join(fmt.Errorf("capacity producer did not complete successfully: %w", errors.Join(ctx.Err(), waitErr)), accountingErr)
+	case waitErr != nil && !committedFailure:
 		r.FailureKind = runnerFailure
-	}
-	// Only a successful producer can attest that it committed the proof.
-	// A conflicting writer may have published schema-valid bytes.
-	if waitErr != nil {
+		if verifierReserveFailure(r.Capacity.Output) {
+			r.FailureKind = addressSpaceFailure
+		}
 		return errors.Join(fmt.Errorf("capacity producer did not complete successfully: %w", waitErr), accountingErr)
 	}
 	data, err := readProducerProof(proof)
+	if ctx.Err() != nil {
+		r.FailureKind = cancelledFailure
+		return errors.Join(ctx.Err(), waitErr, err, accountingErr)
+	}
 	if err != nil {
 		r.FailureKind = runnerFailure
 		return errors.Join(fmt.Errorf("read capacity producer report: %w", err), accountingErr)
 	}
-	kind, reportErr := r.readCapacity(data)
+	exitCode := 0
+	if committedFailure {
+		exitCode = committedWorkloadFailureExit
+	}
+	kind, reportErr := r.readCapacity(ctx, data, exitCode)
 	r.FailureKind = kind
 	return errors.Join(reportErr, accountingErr)
 }

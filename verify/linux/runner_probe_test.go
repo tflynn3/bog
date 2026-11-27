@@ -197,36 +197,43 @@ func TestRemoveProbeGroupRetriesBusy(t *testing.T) {
 
 func TestRunnerReportPublication(t *testing.T) {
 	t.Parallel()
+	write := func(path string, result any) error {
+		dest, err := openReportDestination(path)
+		if err != nil {
+			return err
+		}
+		return dest.publish(t.Context(), result)
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "report.json")
 	if err := os.WriteFile(path, []byte("previous"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeRunnerReport(path, make(chan int)); err == nil || !strings.Contains(err.Error(), "replacement not published") {
+	if err := write(path, make(chan int)); err == nil || !strings.Contains(err.Error(), "replacement not published") {
 		t.Fatalf("invalid JSON result: %v", err)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil || string(raw) != "previous" {
 		t.Fatalf("previous report = %q, %v", raw, err)
 	}
-	if err := writeRunnerReport(dir+"/missing/result.json", "ignored"); err == nil || !strings.Contains(err.Error(), "replacement not published") {
+	if err := write(dir+"/missing/result.json", "ignored"); err == nil || !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("missing directory result: %v", err)
 	}
-	if err := writeRunnerReport(path, "replacement"); err != nil {
+	if err := write(path, "replacement"); err != nil {
 		t.Fatal(err)
 	}
 	raw, err = os.ReadFile(path)
 	if err != nil || string(raw) != "\"replacement\"\n" {
 		t.Fatalf("new report = %q, %v", raw, err)
 	}
-	if err := writeRunnerReport(dir+"/.", "ignored"); err == nil {
+	if err := write(dir+"/.", "ignored"); err == nil {
 		t.Fatal("accepted a directory target")
 	}
 	blocked := filepath.Join(dir, "directory")
 	if err := os.Mkdir(blocked, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeRunnerReport(blocked, "cannot replace directory"); err == nil ||
+	if err := write(blocked, "cannot replace directory"); err == nil ||
 		!strings.Contains(err.Error(), "replacement not published") {
 		t.Fatalf("failed rename = %v", err)
 	}

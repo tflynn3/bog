@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func (r *runnerReport) runCapacity(ctx context.Context, files controlFiles, producer, binary, work, proof string) error {
+func (r *runnerReport) runCapacity(ctx context.Context, files controlFiles, producer, binary, work string, proof *reportDestination) error {
 	work, err := filepath.EvalSymlinks(work)
 	if err != nil {
 		return fmt.Errorf("resolve capacity work directory: %w", err)
@@ -26,9 +26,13 @@ func (r *runnerReport) runCapacity(ctx context.Context, files controlFiles, prod
 	}
 	// Keep this supervisor and the producer in the runner subgroup. Only
 	// the benchmark's two candidate fixtures belong under the 128 MiB cap.
+	// ExtraFiles maps the validated proof directory to descriptor 3 in
+	// the producer. It opens this parent itself before staging its report.
+	proofPath := "/proc/self/fd/3/" + proof.name
 	cmd := exec.CommandContext(ctx, producer, "-binary", binary, "-revision", r.Revision,
 		"-fixture", r.Fixture, "-mode", "live", "-cgroup-parent", r.Probe.Parent,
-		"-work-dir", work, "-report", proof)
+		"-work-dir", work, "-report", proofPath)
+	cmd.ExtraFiles = []*os.File{proof.dir}
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 15 * time.Second
 	var output limitedLog
@@ -59,7 +63,7 @@ func (r *runnerReport) runCapacity(ctx context.Context, files controlFiles, prod
 		r.Capacity.AccountingError = accountingErr.Error()
 	}
 	kind := runnerFailure
-	data, reportErr := os.ReadFile(proof)
+	data, reportErr := readProducerProof(proof)
 	if reportErr == nil {
 		kind, reportErr = r.readCapacity(data)
 	} else {
@@ -75,6 +79,27 @@ func (r *runnerReport) runCapacity(ctx context.Context, files controlFiles, prod
 		r.FailureKind = kind
 	}
 	return errors.Join(waitErr, reportErr, accountingErr)
+}
+
+// readProducerProof opens the published entry relative to the same directory
+// passed to the producer. Require its regular file rather than following a
+// substituted symlink or blocking on a FIFO.
+func readProducerProof(proof *reportDestination) (_ []byte, err error) {
+	fd, err := syscall.Openat(int(proof.dir.Fd()), proof.name,
+		syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open capacity proof", Path: proof.path, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), proof.path)
+	defer func() { err = errors.Join(err, f.Close()) }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("capacity proof %q must be a regular file", proof.path)
+	}
+	return io.ReadAll(f)
 }
 
 func (r *runnerCapacity) observeUntilExit(files controlFiles, parent, work string, wait <-chan error) error {

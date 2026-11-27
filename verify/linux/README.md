@@ -187,5 +187,19 @@ per-scale kernel memory peaks and OOM-event deltas from the producer's
 fresh cgroups. If the producer stops before writing its report, the runner
 keeps any live samples tied to a fixture and the delegation-wide counter
 deltas. Unobserved scales remain explicit. The runner records infrastructure,
-candidate workload, verifier address-space, and cancellation failures.
-Both existing strict validators still consume the producer's `capacity.json`.
+candidate workload and verifier address-space failures.
+
+Capacity mode requires two unused output entries with existing parent
+directories. The runner opens both parents before checking the candidate or
+starting probes. Relative paths are resolved from the launch directory.
+The same parent directory and basename identify one entry even when the
+paths use different symlinked parents. The producer receives an open
+descriptor for its report directory, and the runner collects proof there
+after the producer exits. Both outputs stay in their opened directories if
+the configured paths are retargeted during the run.
+
+The runner syncs and closes its staging file before renaming it, then syncs
+the parent directory. Cancellation before rename preserves prior runner
+evidence and removes staging. A directory sync failure after rename reports
+that the replacement is visible with uncertain durability. Both existing
+strict validators still consume the producer's `capacity.json`.

@@ -36,6 +36,44 @@ func (c *Client) NewBoundedWalk(q Query, maxPages int) (*BoundedWalk, error) {
 	return &BoundedWalk{client: c, query: q, maxPages: maxPages, window: 1}, nil
 }
 
+// ContextBoundedWalk is a pull-based BoundedWalk with one context for its
+// entire lifetime. Use one caller at a time. A canceled walk cannot resume,
+// and any pages already returned remain accepted.
+type ContextBoundedWalk struct {
+	ctx  context.Context
+	walk *BoundedWalk
+}
+
+// NewBoundedWalkWithContext prepares a walk that uses ctx for all page
+// requests, response reads, and retry waits. Set a deadline on ctx before
+// calling this method to bound the whole walk, including time between pages.
+// The caller owns cancellation. ctx must be non-nil and maxPages must be
+// positive, including the terminal page. Construction performs no I/O.
+func (c *Client) NewBoundedWalkWithContext(ctx context.Context, q Query, maxPages int) (*ContextBoundedWalk, error) {
+	if ctx == nil {
+		return nil, errors.New("nil query walk context")
+	}
+	walk, err := c.NewBoundedWalk(q, maxPages)
+	if err != nil {
+		return nil, err
+	}
+	return &ContextBoundedWalk{ctx: ctx, walk: walk}, nil
+}
+
+// NextPage returns the next validated page using the walk's context. It
+// returns io.EOF after the terminal page. Cancellation before a page is
+// accepted leaves the walk's cursor and page budget unchanged.
+func (w *ContextBoundedWalk) NextPage() (Page, error) {
+	return w.walk.NextPage(w.ctx)
+}
+
+// NextPageWithRetry fetches the next page and retries as described by
+// BoundedWalk.NextPageWithRetry. The walk's context governs all attempts
+// and waits. Use errors.Is to identify cancellation and deadline errors.
+func (w *ContextBoundedWalk) NextPageWithRetry(retry PageRetry) (Page, error) {
+	return w.walk.NextPageWithRetry(w.ctx, retry)
+}
+
 // NextPage returns a validated page, including the terminal page, then io.EOF.
 // A failed fetch leaves the cursor and budget unchanged. If the last allowed
 // page has a continuation, the next call returns ErrPageBudget before fetching.

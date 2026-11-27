@@ -33,6 +33,10 @@
 // budget intact. Use NextPageWithRetry for bounded retries of query HTTP 503
 // and interrupted delivery. Exhaustion reports ErrPageRetryExhausted along
 // with the last failed attempt.
+// Use Client.NewBoundedWalkWithContext to bind a caller-owned context to every
+// page and retry delay. A single deadline on that context covers the entire
+// walk, including time between calls. Cancellation preserves previously
+// accepted pages and prevents further requests on that walk.
 //
 // # Routing and restarting a walk
 //

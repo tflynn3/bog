@@ -129,6 +129,9 @@ func TestObserveDiskReadiness(t *testing.T) {
 					t.Fatalf("readiness samples: %+v (calls=%d)", evidence, calls)
 				}
 				wantDivergence := strings.HasPrefix(tc.name, "stale")
+				if _, mismatch := errors.AsType[readinessMismatch](err); mismatch != wantDivergence {
+					t.Fatalf("readiness mismatch = %t, want %t (err: %v)", mismatch, wantDivergence, err)
+				}
 				if (evidence.FirstFailure != nil) != wantDivergence || diag.UncertainWAL != nil {
 					t.Fatalf("unexpected failure or WAL evidence: %+v, %+v", evidence, diag.UncertainWAL)
 				}

@@ -79,6 +79,10 @@ const readinessPoll = 100 * time.Millisecond
 // Cover the five-second readiness evidence lifetime and another sample tick.
 const retargetObservation = 6 * time.Second
 
+type readinessMismatch struct{ error }
+
+func (e readinessMismatch) Unwrap() error { return e.error }
+
 // A known transient state is allowed only before the first expected sample.
 func pollDiskReadiness(ctx context.Context, want, transient diskReadiness, stableFor time.Duration,
 	probe func(context.Context) (readinessObservation, error), record func(readinessObservation, error),
@@ -95,6 +99,7 @@ func pollDiskReadiness(ctx context.Context, want, transient diskReadiness, stabl
 		}
 		got, err := probe(ctx)
 		last = got
+		err = errors.Join(err, ctx.Err())
 		if err != nil {
 			record(got, err)
 			return got, fmt.Errorf("probe readiness %q: %w", want.reason, err)
@@ -109,7 +114,7 @@ func pollDiskReadiness(ctx context.Context, want, transient diskReadiness, stabl
 				return got, ctx.Err()
 			}
 		case state != transient || !since.IsZero():
-			err := fmt.Errorf("readiness %+v, want %+v", state, want)
+			err := readinessMismatch{fmt.Errorf("readiness %+v, want %+v", state, want)}
 			record(got, err)
 			return got, err
 		default:

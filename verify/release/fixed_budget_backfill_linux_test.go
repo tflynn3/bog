@@ -308,6 +308,10 @@ func readBackfillCompaction(ctx context.Context, raw *http.Client, base, method,
 }
 
 func publishBackfillGeneration(ctx context.Context, raw *http.Client, base string, cutoff int, previous *backfillCompaction) (backfillCompaction, error) {
+	return publishReleaseGeneration(ctx, raw, base, cutoff, cutoff, previous)
+}
+
+func publishReleaseGeneration(ctx context.Context, raw *http.Client, base string, cutoff, committed int, previous *backfillCompaction) (backfillCompaction, error) {
 	ctx, cancel := context.WithTimeout(ctx, backfillPublicationTimeout)
 	defer cancel()
 	if previous == nil {
@@ -321,7 +325,7 @@ func publishBackfillGeneration(ctx context.Context, raw *http.Client, base strin
 		return backfillCompaction{}, fmt.Errorf("cutoff %d must extend predecessor coverage: %+v", cutoff, *previous)
 	}
 	validate := func(c backfillCompaction) error {
-		if c.committed == cutoff &&
+		if c.committed == committed &&
 			(c.state == "complete" && c.generation > previous.generation && c.covered == cutoff ||
 				c.state == "running" && c.generation == previous.generation && c.covered == previous.covered) {
 			return nil

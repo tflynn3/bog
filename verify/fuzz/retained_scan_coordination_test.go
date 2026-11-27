@@ -4,11 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
-
 	"time"
 )
 
@@ -29,22 +28,15 @@ func (s *scanHeapSamples) sample() {
 	s.observe(scanHeapAlloc())
 }
 
-func scanHeapAlloc() uint64 {
-	var stats runtime.MemStats
-	runtime.ReadMemStats(&stats)
-	return stats.HeapAlloc
-}
+func scanHeapAlloc() uint64 { return readScanMemoryStats(false).heap }
 
-func scanLiveHeap() uint64 {
-	runtime.GC()
-	return scanHeapAlloc()
-}
+func scanLiveHeap() uint64 { return readScanMemoryStats(true).heap }
 
-// Each scan announces arrival from its visitor and sends one result after
-// all storage defers have run. The deferred join consumes every unfinished
-// result under one timeout, including when a scan or the coordinator fails.
-func coordinateScanMemoryWorkers(parent context.Context, joinTimeout time.Duration, count int, ticks <-chan time.Time, sample func(),
-	scan func(context.Context, int, func()) error, paused func() error) (err error) {
+// A worker reports arrival once, then waits until every worker has reached
+// the same point. Results arrive only after the scan has released its pin.
+func coordinateScanMemoryWorkers(parent context.Context, joinTimeout time.Duration, count int,
+	ticks <-chan time.Time, sample func(), cancelAtBarrier bool,
+	scan func(context.Context, int, func() error) error, paused func() error) (err error) {
 	ctx, cancel := context.WithCancel(parent)
 	type result struct {
 		index int
@@ -52,43 +44,61 @@ func coordinateScanMemoryWorkers(parent context.Context, joinTimeout time.Durati
 	}
 	arrivals := make(chan struct{}, count)
 	results := make(chan result, count)
+	resume := make(chan struct{})
 	for index := range count {
 		go func() {
-			results <- result{index, scan(ctx, index, func() { arrivals <- struct{}{} })}
+			results <- result{index, scan(ctx, index, sync.OnceValue(func() error {
+				arrivals <- struct{}{}
+				select {
+				case <-resume:
+					return ctx.Err()
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}))}
 		}()
 	}
 
 	finished := 0
 	defer func() {
-		cancel()
+		if err != nil {
+			cancel()
+		}
+		defer cancel()
 		drain, stop := context.WithTimeout(context.Background(), joinTimeout)
 		defer stop()
 		for finished < count {
 			select {
 			case r := <-results:
 				finished++
-				if r.err != context.Canceled {
-					err = errors.Join(err, fmt.Errorf("scan %d returned %v after shutdown, want context.Canceled", r.index, r.err))
+				if r.err != nil && (err == nil || r.err != ctx.Err()) {
+					err = errors.Join(err, fmt.Errorf("scan %d: %w", r.index, r.err))
 				}
+			case <-ticks:
+				sample()
 			case <-drain.Done():
 				err = errors.Join(err, fmt.Errorf("joined %d/%d scans: %w", finished, count, drain.Err()))
 				return
 			}
 		}
+		err = errors.Join(err, parent.Err())
 	}()
 
 	for ready := 0; ready < count; {
 		select {
 		case <-arrivals:
 			ready++
+		case <-ticks:
+			sample()
 		case r := <-results:
 			finished++
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return fmt.Errorf("scan %d exited before cancellation: %v", r.index, r.err)
-		case <-ticks:
-			sample()
+			if r.err != nil {
+				return fmt.Errorf("scan %d exited before the barrier: %w", r.index, r.err)
+			}
+			return fmt.Errorf("scan %d completed before the barrier", r.index)
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -96,7 +106,15 @@ func coordinateScanMemoryWorkers(parent context.Context, joinTimeout time.Durati
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errors.Join(paused(), ctx.Err())
+	if err := paused(); err != nil {
+		return err
+	}
+	if cancelAtBarrier {
+		cancel()
+	}
+	close(resume)
+
+	return nil
 }
 
 func TestScanMemoryHeapSamples(t *testing.T) {
@@ -116,11 +134,13 @@ func TestCoordinateScanMemoryWorkers(t *testing.T) {
 		early       bool
 		preCanceled bool
 		pausedErr   error
+		cancel      bool
 		wantError   string
 	}{
-		{name: "all materialized"},
+		{name: "all resumed"},
+		{name: "all canceled", cancel: true},
 		{name: "paused snapshot failed", pausedErr: pausedFailure, wantError: pausedFailure.Error()},
-		{name: "early scan error", early: true, wantError: "exited before cancellation"},
+		{name: "early scan error", early: true, wantError: "exited before the barrier"},
 		{name: "parent canceled", preCanceled: true, wantError: "context canceled"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,8 +155,8 @@ func TestCoordinateScanMemoryWorkers(t *testing.T) {
 			sampled := make(chan struct{})
 			var active, released atomic.Int32
 			paused := false
-			err := coordinateScanMemoryWorkers(ctx, time.Second, count, ticks, func() { close(sampled) },
-				func(ctx context.Context, index int, arrive func()) error {
+			err := coordinateScanMemoryWorkers(ctx, time.Second, count, ticks, func() { close(sampled) }, tc.cancel,
+				func(ctx context.Context, index int, arrive func() error) error {
 					defer released.Add(1)
 					select {
 					case <-sampled:
@@ -148,9 +168,14 @@ func TestCoordinateScanMemoryWorkers(t *testing.T) {
 					}
 					active.Add(1)
 					defer active.Add(-1)
-					arrive()
-					<-ctx.Done()
-					return ctx.Err()
+					err := arrive()
+					if tc.pausedErr == nil && tc.cancel && err != context.Canceled {
+						return fmt.Errorf("barrier returned %v during cancellation", err)
+					}
+					if err == context.Canceled {
+						return nil // The coordinator has separate error paths.
+					}
+					return err
 				},
 				func() error {
 					paused = true
@@ -182,13 +207,13 @@ func TestCoordinateScanMemoryWorkersBoundsJoin(t *testing.T) {
 	defer cancel()
 	release := make(chan struct{})
 	exited := make(chan struct{}, 2)
-	err := coordinateScanMemoryWorkers(ctx, 25*time.Millisecond, 2, nil, nil,
-		func(ctx context.Context, _ int, arrive func()) error {
+	err := coordinateScanMemoryWorkers(ctx, 25*time.Millisecond, 2, nil, nil, false,
+		func(ctx context.Context, _ int, arrive func() error) error {
 			defer func() { exited <- struct{}{} }()
-			arrive()
+			_ = arrive()
 			<-release
 			return ctx.Err()
-		}, func() error { return nil },
+		}, func() error { return errors.New("barrier failed") },
 	)
 	close(release)
 	for range cap(exited) {

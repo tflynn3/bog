@@ -89,7 +89,7 @@ func startPinnedQuery(ctx context.Context, raw *http.Client, command func(string
 		if err != nil {
 			return nil, errors.Join(collisions, fmt.Errorf("start candidate on %s: %w", addr, err))
 		}
-		probeErr := p.awaitHealth(ctx, raw)
+		probeErr := p.awaitHealth(ctx, raw, p.ownsBind)
 		if probeErr == nil {
 			return p, nil
 		}
@@ -180,31 +180,27 @@ func (p *pinnedQueryCandidate) ownsBind() (bool, error) {
 	return listener.OwnsBind(p.cmd.Process.Pid, p.addr.Port, listener.BindLoopback)
 }
 
-func (p *pinnedQueryCandidate) awaitHealth(ctx context.Context, raw *http.Client) error {
+func (p *pinnedQueryCandidate) awaitHealth(ctx context.Context, raw *http.Client, observeBind func() (bool, error)) error {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
+	var collision error
 	for {
 		select {
 		case <-p.done:
-			return errPinnedQueryPreProbeExit
+			return errors.Join(errPinnedQueryPreProbeExit, collision)
 		default:
 		}
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("waiting for candidate listener: %w", err)
+			return errors.Join(collision, fmt.Errorf("waiting for candidate listener: %w", err))
 		}
-		owned, err := p.ownsBind()
+		owned, err := observeBind()
 		if err != nil {
-			// A foreign listener may be observed before the child attempts its
-			// bind. Wait for its exit without sending any HTTP to this port.
 			if !p.possibleBindCollision(err) {
 				return err
 			}
-			select {
-			case <-p.done:
-				return errors.Join(errPinnedQueryPreProbeExit, err)
-			case <-ctx.Done():
-				return errors.Join(err, fmt.Errorf("waiting for candidate exit: %w", ctx.Err()))
-			}
+			// The port can become available while the child is still
+			// initializing. Keep polling, without probing the foreign socket.
+			collision, owned = err, false
 		}
 		if owned {
 			status, _, err := pinnedRequest(ctx, raw, http.MethodGet, p.baseURL()+"/healthz")
@@ -214,7 +210,7 @@ func (p *pinnedQueryCandidate) awaitHealth(ctx context.Context, raw *http.Client
 			if status != http.StatusOK {
 				return fmt.Errorf("candidate health returned HTTP %d", status)
 			}
-			owned, err := p.ownsBind()
+			owned, err := observeBind()
 			if err != nil {
 				return err
 			}
@@ -225,9 +221,9 @@ func (p *pinnedQueryCandidate) awaitHealth(ctx context.Context, raw *http.Client
 		}
 		select {
 		case <-p.done:
-			return errPinnedQueryPreProbeExit
+			return errors.Join(errPinnedQueryPreProbeExit, collision)
 		case <-ctx.Done():
-			return fmt.Errorf("waiting for candidate listener: %w", ctx.Err())
+			return errors.Join(collision, fmt.Errorf("waiting for candidate listener: %w", ctx.Err()))
 		case <-ticker.C:
 		}
 	}
@@ -420,6 +416,17 @@ func TestPinnedQueryCandidateChild(t *testing.T) {
 		os.Exit(1)
 	}
 
+	if mode == "wait-for-bind" {
+		gate := os.NewFile(3, "candidate-bind-gate")
+		if gate == nil {
+			t.Fatal("missing bind gate")
+		}
+		var ready [1]byte
+		_, readErr := io.ReadFull(gate, ready[:])
+		if err := errors.Join(readErr, gate.Close()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	l, err := net.Listen("tcp", addr)
 	if mode == "collision" || mode == "close-error" {
 		if !errors.Is(err, syscall.EADDRINUSE) {

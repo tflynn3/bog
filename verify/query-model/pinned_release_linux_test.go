@@ -27,22 +27,7 @@ var errNoCompaction = errors.New("candidate has no retained compaction control")
 // The native linux-release race step already runs this package from the gate
 // checkout and supplies BINARY, the same pinned executable used by admission.
 func TestPinnedQueryModelReplay(t *testing.T) {
-	binary, revision := os.Getenv("BOG_RELEASE_BINARY"), os.Getenv("BOG_RELEASE_REVISION")
-	if binary == "" && os.Getenv("GITHUB_WORKFLOW_SHA") != "" {
-		binary, revision = os.Getenv("BINARY"), os.Getenv("REVISION")
-	}
-	if binary == "" {
-		t.Skip("pinned Linux release candidate required")
-	}
-	binary, err := filepath.Abs(binary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	digest, err := pinnedQueryDigest(binary, revision)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("candidate revision=%s binary_sha256=%x", revision, digest)
+	binary := pinnedQueryTestBinary(t)
 
 	for _, retained := range []bool{false, true} {
 		name := "ordinary"
@@ -81,6 +66,50 @@ func TestPinnedQueryModelReplay(t *testing.T) {
 	}
 }
 
+func pinnedQueryTestBinary(t *testing.T) string {
+	t.Helper()
+	binary, revision := os.Getenv("BOG_RELEASE_BINARY"), os.Getenv("BOG_RELEASE_REVISION")
+	if binary == "" && os.Getenv("GITHUB_WORKFLOW_SHA") != "" {
+		binary, revision = os.Getenv("BINARY"), os.Getenv("REVISION")
+	}
+	if binary == "" {
+		t.Skip("pinned Linux release candidate required")
+	}
+	binary, err := filepath.Abs(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := pinnedQueryDigest(binary, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("candidate revision=%s binary_sha256=%x", revision, digest)
+
+	return binary
+}
+
+func TestPinnedQueryModel104(t *testing.T) {
+	requireQuery104(t)
+	binary := pinnedQueryTestBinary(t)
+	for _, retained := range []bool{false, true} {
+		t.Run(pageSourceName(retained), func(t *testing.T) {
+			for _, limit := range []int{1, 10} {
+				t.Run(fmt.Sprintf("opening-limit-%d", limit), func(t *testing.T) {
+					t.Parallel()
+					ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+					defer cancel()
+					err := withPinnedQueryEndpoint(t, ctx, binary, t.TempDir(), 32<<10, retained, func(f model.CaptureDeliveryFixture) error {
+						return model.VerifyFittingPages(ctx, seededTraceConfig(0).Epoch, captureWireLimits, limit, f)
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		})
+	}
+}
+
 func pinnedQueryDigest(binary, revision string) ([]byte, error) {
 	info, err := buildinfo.ReadFile(binary)
 	if err != nil {
@@ -105,6 +134,13 @@ func pinnedQueryDigest(binary, revision string) ([]byte, error) {
 
 func servePinnedQuery(t *testing.T, ctx context.Context, binary, dir string, budget int, retained bool, run func(model.QueryTraceAdapter) error) error {
 	t.Helper()
+	return withPinnedQueryEndpoint(t, ctx, binary, dir, budget, retained, func(f model.CaptureDeliveryFixture) error {
+		return run(model.QueryTraceAdapter{Acknowledge: f.Acknowledge, Fetch: f.Fetch, Publish: f.Publish})
+	})
+}
+
+func withPinnedQueryEndpoint(t *testing.T, ctx context.Context, binary, dir string, budget int, retained bool, run func(model.CaptureDeliveryFixture) error) error {
+	t.Helper()
 	command := func(addr string) *exec.Cmd {
 		cmd := exec.Command(binary, "-addr="+addr, "-data-dir="+dir, "-query-concurrency=1",
 			"-query-max-response-bytes=256", "-query-work-budget="+strconv.Itoa(budget))
@@ -123,9 +159,12 @@ func servePinnedQuery(t *testing.T, ctx context.Context, binary, dir string, bud
 		if err != nil {
 			return err
 		}
-		adapter := model.QueryTraceAdapter{
+		fixture := model.CaptureDeliveryFixture{
 			Acknowledge: func(ctx context.Context, rows []model.Row) error { return acknowledgeFixtureBatch(ctx, c, rows) },
 			Fetch:       fetch,
+			Refuse: func(ctx context.Context, q model.WireRequest, status int, body string) error {
+				return observeQueryRefusal(ctx, raw, base, q, status, body)
+			},
 		}
 		if retained {
 			control := pinnedCompaction{raw: raw, base: base}
@@ -143,9 +182,9 @@ func servePinnedQuery(t *testing.T, ctx context.Context, binary, dir string, bud
 				return errors.New("compaction trial did not start at an empty published point")
 			}
 			control.last = initial
-			adapter.Publish = control.publish
+			fixture.Publish = control.publish
 		}
-		return run(adapter)
+		return run(fixture)
 	})
 }
 

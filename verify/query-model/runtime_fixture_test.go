@@ -71,6 +71,7 @@ type runtimeQueryFixture struct {
 	mu          sync.Mutex
 	retained    bool
 	budget      int
+	concurrency int
 	journal     [][]byte
 	covered     int
 	active      fixtureGeneration
@@ -159,17 +160,21 @@ func (f *runtimeQueryFixture) Release(id string) error {
 	return nil
 }
 
-func (f *runtimeQueryFixture) start() error {
+func (f *runtimeQueryFixture) startIssuer() {
 	if f.active.store == nil {
 		f.active.store = new(store.Store)
 	}
 	f.captures = make(map[string]fixtureCapture)
 	if f.retained {
-		f.api = httpapi.NewWithPageSource(f, f, 256, 1, uint64(f.budget))
+		f.api = httpapi.NewWithPageSource(f, f, 256, max(1, f.concurrency), uint64(f.budget))
 		f.handler = f.api
 	} else {
-		f.handler = httpapi.NewWithQueryLimits(f.active.store, f, 256, 1, uint64(f.budget))
+		f.handler = httpapi.NewWithQueryLimits(f.active.store, f, 256, max(1, f.concurrency), uint64(f.budget))
 	}
+}
+
+func (f *runtimeQueryFixture) start() error {
+	f.startIssuer()
 	f.server = httptest.NewServer(f.handler)
 	var err error
 	f.client, f.fetch, err = newWitnessClient(f.server.URL, f.server.Client().Transport, 256)
@@ -182,12 +187,17 @@ func (f *runtimeQueryFixture) stop() error {
 	}
 	f.server.Close()
 	f.server = nil
-	if f.api == nil {
+	return f.closeIssuer()
+}
+
+func (f *runtimeQueryFixture) closeIssuer() error {
+	closer, ok := f.handler.(interface{ Close(context.Context) error })
+	if !ok {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err := f.api.Close(ctx)
+	err := closer.Close(ctx)
 	f.api = nil
 	f.mu.Lock()
 	defer f.mu.Unlock()

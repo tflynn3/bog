@@ -54,3 +54,48 @@ to its full clean build revision, then run
 `go test -json -race -count=1 ./verify/query-model -run '^TestPinnedQueryModelReplay$'`.
 Check the individual subtest events because a skipped subtest can leave
 `go test` with a zero exit status.
+
+## Issue #104 HTTP handoff
+
+The regular race suite exercises a real loopback TCP response with a delivered
+cursor and truncated body. The fixture flushes headers and a body prefix,
+then forces the next socket write to fail. It checks the original suffix and
+exact terminal replay after backfill and, for the retained fixture, publication.
+The retained retirement check fills all 64 capture slots, holds two admitted
+resumes during retirement, and checks that capacity returns only when both
+handlers finish. The native Linux startup regression holds a foreign listener
+through two ownership polls and checks that the first HTTP probe runs after
+the child owns the port.
+
+Run the strict #104 handler suite on the HTTP candidate:
+
+```sh
+BOG_QUERY_VERIFY_104=1 go test -race -count=1 ./verify/query-model -run '^TestQuery104'
+```
+
+On each native Linux runner, qualify the same clean candidate used for release
+replay. Set `BOG_RELEASE_BINARY` and `BOG_RELEASE_REVISION` to the executable
+and full revision before running:
+
+```sh
+BOG_QUERY_VERIFY_104=1 go test -json -race -count=1 ./verify/query-model \
+  -run '^(TestQuery104.*|TestPinnedQueryModel104|TestPinnedQueryCandidate.*)$'
+```
+
+Require passing subtest events for both page limits in both pinned modes.
+The retained pinned trial requires compaction control and verifies the exact
+published cutoff. Socket fault injection and the paused resumes run against
+the real HTTP handlers in the fixture process.
+
+On base revision `447e996525352ef5dd44d5eae1de09b4cbd53d53`, the strict handler
+run observed these failures:
+
+- With 63 live captures, the faulted request delivered zero response bytes and
+  the server observed a socket write timeout. The next opening returned
+  `503 query capacity exhausted` on both issuers.
+- At 64 live legacy captures, terminal replay succeeded before retirement.
+  The legacy constructor returned an `*http.ServeMux` with no
+  `RetireQueryCapture` method.
+- With a 256-byte response cap, both issuers returned 422 on the opening
+  request for both row limits. The diagnostic reported a 748-byte record
+  and the wire walker accepted zero fitting rows.

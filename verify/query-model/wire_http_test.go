@@ -158,6 +158,10 @@ func (p *fixturePeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if body.Len()+len(encoded)+1 > p.trimCap {
+			if body.Len() == 0 {
+				http.Error(w, fmt.Sprintf("query record exceeds response byte limit (cap %d bytes, requires %d bytes)", p.trimCap, len(encoded)+1), http.StatusUnprocessableEntity)
+				return
+			}
 			break
 		}
 		body.Write(encoded)

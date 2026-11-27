@@ -33,20 +33,24 @@ func runDelegated(ctx context.Context, mode string, args []string) (err error) {
 	if err := f.Parse(args); err != nil {
 		return err
 	}
-	if f.NArg() != 0 || !revisionPattern.MatchString(*revision) || *fixture != fixtureID || !filepath.IsAbs(*out) {
-		return fmt.Errorf("require -arch, -revision, -fixture %s and absolute -report", fixtureID)
+	if f.NArg() != 0 || !revisionPattern.MatchString(*revision) || *fixture != fixtureID || *out == "" {
+		return fmt.Errorf("require -arch, -revision, -fixture %s and -report", fixtureID)
 	}
 	if mode == "capacity" {
-		for _, path := range []string{*binary, *producer, *work, *proof} {
+		for _, path := range []string{*binary, *producer, *work} {
 			if !filepath.IsAbs(path) {
-				return errors.New("capacity requires absolute -binary, -producer, -work-dir and -capacity-report")
+				return errors.New("capacity requires absolute -binary, -producer and -work-dir")
 			}
 		}
-		if err := checkRunnerDestinations(*out, *proof, *binary, *producer); err != nil {
-			return err
+		if *proof == "" {
+			return errors.New("capacity requires -capacity-report")
 		}
 	} else if *binary != "" || *digest != "" || *producer != "" || *work != "" || *proof != "" {
 		return errors.New("capacity flags require the capacity subcommand")
+	}
+	dest, err := openRunnerDestinations(*out, *proof, *binary, *producer)
+	if err != nil {
+		return err
 	}
 	r := runnerReport{SchemaVersion: 1, Revision: *revision, Fixture: *fixture, Status: "pass",
 		Probe: runnerProbe{Arch: runtime.GOARCH}}
@@ -54,6 +58,9 @@ func runDelegated(ctx context.Context, mode string, args []string) (err error) {
 		r.Capacity = newRunnerCapacity()
 	}
 	defer func() {
+		if dest.proof != nil {
+			err = errors.Join(err, dest.proof.Close())
+		}
 		if err != nil {
 			r.Status, r.Detail = "fail", err.Error()
 			if r.FailureKind == "" {
@@ -63,9 +70,12 @@ func runDelegated(ctx context.Context, mode string, args []string) (err error) {
 				}
 			}
 		}
-		err = errors.Join(err, writeRunnerReport(*out, r))
+		err = errors.Join(err, dest.report.publish(ctx, r))
 	}()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if mode == "capacity" {
 		identity, err := newReport(*binary, *revision, *fixture)
 		if err != nil {
@@ -92,24 +102,7 @@ func runDelegated(ctx context.Context, mode string, args []string) (err error) {
 	if mode == "preflight" {
 		return nil
 	}
-	return r.runCapacity(ctx, files, *producer, *binary, *work, *proof)
-}
-
-func checkRunnerDestinations(report, proof, binary, producer string) error {
-	for _, path := range []string{proof, binary, producer} {
-		if filepath.Clean(report) == filepath.Clean(path) {
-			return errors.New("runner report must have a separate destination")
-		}
-	}
-	for _, path := range []string{report, proof} {
-		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-			if err == nil {
-				return fmt.Errorf("evidence destination already exists: %s", path)
-			}
-			return err
-		}
-	}
-	return nil
+	return r.runCapacity(ctx, files, *producer, *binary, *work, dest.proof)
 }
 
 func checkCandidateELF(binary, arch string) (err error) {

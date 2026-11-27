@@ -121,7 +121,7 @@ func validateReport(data []byte, expected identity, required []string) error {
 func validateReportWithOptions(data []byte, expected identity, required []string, opts validationOptions) error {
 	var got identity
 	var cases map[string]jsontext.Value
-	fields, err := decodeFields(data, map[string]any{
+	_, err := decodeFields(data, map[string]any{
 		"schema_version": &got.SchemaVersion, "revision": &got.Revision,
 		"binary_sha256": &got.BinarySHA256, "fixture": &got.Fixture, "cases": &cases,
 	})
@@ -159,13 +159,7 @@ func validateReportWithOptions(data []byte, expected identity, required []string
 		return err
 	}
 	if slices.Contains(required, capacityCase) {
-		if opts.requireCutover {
-			if err := capacityevidence.ValidateReport(data); err != nil {
-				return err
-			}
-			return validateCutoverMeasurements(cases[capacityCase])
-		}
-		return validateCapacity(fields["mode"], cases[capacityCase], got.Fixture)
+		return validateCapacityReport(data, opts.requireCutover)
 	}
 	return nil
 }

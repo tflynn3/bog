@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"strings"
 	"testing"
@@ -39,6 +41,7 @@ func TestValidateCapacityEvidence(t *testing.T) {
 		{"legacy mode", `"mode":"live"`, `"mode":"legacy"`, "live mode"},
 		{"missing evidence", evidence, "", "evidence"},
 		{"null evidence", evidence, `,"evidence":null`, "evidence"},
+		{"empty evidence array", evidence, `,"evidence":[]`, "exactly one"},
 		{"object instead of array", evidence, `,"evidence":{}`, "evidence"},
 		{"smaller size only", evidence, `,"evidence":[` + capacityRecord(196608) + "]", "exactly one"},
 		{"extra fixture", evidence, strings.TrimSuffix(evidence, "]") + "," + capacityRecord(8192) + "]", "exactly one"},
@@ -85,5 +88,41 @@ func TestValidateCapacityEvidence(t *testing.T) {
 				t.Fatalf("wanted %q, got %v", tc.problem, err)
 			}
 		})
+	}
+}
+
+func TestReleaseCapacityCutoverRequiresMeasurementsAtBothScales(t *testing.T) {
+	data := producerCutoverReport(t)
+	id := identity{schemaVersion, strings.Repeat("a", 40), strings.Repeat("b", 64), capacityFixtureID}
+	opts := validationOptions{requireCutover: true}
+	if err := validateReportWithOptions(data, id, capacityCases, opts); err != nil {
+		t.Fatalf("producer report rejected: %v", err)
+	}
+
+	var envelope struct {
+		identity
+		Mode  string             `json:"mode"`
+		Cases map[string]outcome `json:"cases"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	var records []map[string]jsontext.Value
+	if err := json.Unmarshal(envelope.Cases[capacityCase].Evidence, &records); err != nil {
+		t.Fatal(err)
+	}
+	delete(records[1], "peak_descriptors")
+	evidence, err := json.Marshal(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.Cases[capacityCase] = outcome{Status: "pass", Evidence: evidence}
+	mutated, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "capacity record 2: missing or invalid resource measurements"
+	if err := validateReportWithOptions(mutated, id, capacityCases, opts); err == nil || err.Error() != want {
+		t.Fatalf("strict release validation = %v, want %q", err, want)
 	}
 }

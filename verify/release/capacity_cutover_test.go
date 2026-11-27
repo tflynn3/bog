@@ -76,9 +76,9 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
 	}{
 		{"admission", admissionCases, nil},
 		{"durability", durabilityCases, map[string]jsontext.Value{"enospc": jsontext.Value(proofJSON)}},
-		{"parity", []string{ordinaryWALCase, restoredParityCase, capacityCrashCase}, map[string]jsontext.Value{
+		{"parity", cutoverParityCases, map[string]jsontext.Value{
 			ordinaryWALCase: jsontext.Value(ordinaryWALJSON), restoredParityCase: jsontext.Value(restoredParityJSON),
-			capacityCrashCase: jsontext.Value(capacityCrashJSON),
+			capacityCrashCase: jsontext.Value(capacityCrashJSON), tailOnlyParityCase: testTailParityEvidence(t, nil),
 		}},
 	} {
 		path := filepath.Join(dir, companion.name+".json")

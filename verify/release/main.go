@@ -25,7 +25,7 @@ func run(ctx context.Context, args []string) error {
 	var opts validationOptions
 	if validate {
 		opts.requireRetarget = os.Getenv("BOG_RELEASE_REQUIRE_RETARGET") == "1"
-		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require live capacity, recovery parity, and immediate post-restore crash evidence")
+		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require live capacity, recovery parity, immediate post-restore crash, and two-cycle tail-only evidence")
 		flags.StringVar(&admission, "admission", "", "admission report")
 		flags.StringVar(&durability, "durability", "", "durability report")
 		flags.StringVar(&capacity, "capacity", "", "capacity report")

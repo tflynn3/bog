@@ -20,7 +20,7 @@ const (
 	postRestoreCrashRows  = parityFixtureRows + 2
 )
 
-var cutoverParityCases = []string{restoredParityCase, ordinaryWALCase, postRestoreAckCrashCase}
+var cutoverParityCases = []string{restoredParityCase, ordinaryWALCase, postRestoreAckCrashCase, tailOnlyParityCase}
 
 type ordinaryWALProof struct {
 	ReopenedRows int `json:"reopened_rows"`

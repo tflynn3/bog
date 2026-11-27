@@ -37,7 +37,7 @@ additional evidence. The following cases must pass.
 | Admission | `one_slot_saturation`, `ingest_during_saturation`, `cursor_resume`, `work_budget` |
 | Durability | `sigkill`, `recovery`, `enospc` |
 | Capacity | `retained_history_capacity` |
-| Recovery parity | `restored_parity` when supplied, plus `ordinary_wal_reopen` in cutover mode |
+| Recovery parity | `restored_parity` when supplied, plus `ordinary_wal_reopen`, `post_restore_ack_crash`, and `tail_only_two_cycle_parity` in cutover mode |
 
 Admission also records the full saturation fixture verdict as
 `saturation_fixture`. Validation accepts archived admission reports with
@@ -275,15 +275,35 @@ restart. The `ordinary_wal_reopen` case records the row counts and append
 status.
 
 The native workflow uses `-require-cutover -parity parity.json` and runs the
-verifier tests with the race detector on Linux. Qualify the crash fixture
-against the composed #53 candidate on both native Linux runners. Strict
-validation requires both recovery cases to pass and checks these exact
-evidence fields for `linux-release-v1`.
+verifier tests with the race detector on Linux. Strict validation requires
+all four recovery cases to pass and checks the evidence against
+`linux-release-v1` on both native runners.
 
 | Case | Required evidence |
 | --- | --- |
 | `ordinary_wal_reopen` | `reopened_rows` = 3, `append_status` = 204, `restart_rows` = 6 |
 | `restored_parity` | `captured_rows` = 6, `held_capture_rows` = 6, `post_restore_204` = true, `post_append_rows` = 7, `restart_rows` = 7 |
+
+The `tail_only_two_cycle_parity` case starts from a verified v1 restore
+with a nonempty checkpoint and tail. In each cycle, the pinned candidate
+holds an HTTP cursor, acknowledges two batches with timestamp ties and
+backfill, then compacts through the first batch. The held and fresh walks
+must match the independent append-log oracle. After the candidate exits,
+the test uses the installed v2 manifest and exact rebased tail to export
+through `backup.ExportRecoveryView`. It verifies and restores each export,
+moves the source bundle aside before startup, and compares terminal walks
+from the original restarted directory and the separate restore. A probe
+append on the restarted directory must extend the observed physical tail
+with the exact frame at the recovered next ordinal.
+
+Cycle two starts from cycle one's verified export, at its advanced logical
+base with a nonempty carried suffix. The report records both input and
+export recovery points, consumed-frame and suffix digests, logical tail
+bases and physical sizes, append acknowledgments, and held, fresh,
+restarted, and separately restored row counts. Strict validation checks
+the exact fixture bounds and digests and requires the second input to
+match the first export. The producer verifies both archived exports
+again after the second cycle.
 
 Historical validation without `-require-cutover` accepts an omitted parity
 report or a schema-v1 report with a passing `restored_parity` outcome.

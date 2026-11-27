@@ -258,6 +258,7 @@ func TestValidatePostRestoreAckCrashEvidence(t *testing.T) {
 			cases := map[string]outcome{
 				restoredParityCase: {Status: "pass", Evidence: jsontext.Value(restoredParityJSON)},
 				ordinaryWALCase:    {Status: "pass", Evidence: jsontext.Value(ordinaryWALJSON)},
+				tailOnlyParityCase: {Status: "pass", Evidence: testTailParityEvidence(t, nil)},
 			}
 			if tc.status != "" {
 				proof := strings.Replace(crashProofJSON, tc.from, tc.to, 1)
@@ -381,6 +382,16 @@ func TestValidateCommand(t *testing.T) {
 		t.Fatalf("cutover accepted parity without immediate crash proof: %v", err)
 	}
 	parity.Cases[postRestoreAckCrashCase] = outcome{Status: "pass", Evidence: jsontext.Value(crashProofJSON)}
+	if err := writeReport(parityPath, parity); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(t.Context(), append(parityArgs, "-require-cutover=false")); err != nil {
+		t.Fatalf("historical parity without two-cycle proof rejected: %v", err)
+	}
+	if err := run(t.Context(), parityArgs); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("missing required case %q", tailOnlyParityCase)) {
+		t.Fatalf("cutover accepted parity without two-cycle proof: %v", err)
+	}
+	parity.Cases[tailOnlyParityCase] = outcome{Status: "pass", Evidence: testTailParityEvidence(t, nil)}
 	if err := writeReport(parityPath, parity); err != nil {
 		t.Fatal(err)
 	}

@@ -42,6 +42,7 @@ func TestReleaseRestoredParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv(capacityOptIn, "1")
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	if err := writeParityReport(ctx, binary, path, id); err != nil {
@@ -67,7 +68,14 @@ func writeParityReport(ctx context.Context, binary, path string, id identity) er
 	ordinaryErr = record(results.Cases, ordinaryWALCase, ordinary, ordinaryErr)
 	crashProof, crashErr := postRestoreAckCrash(ctx, binary)
 	crashErr = record(results.Cases, postRestoreAckCrashCase, crashProof, crashErr)
-	return errors.Join(probeErr, ordinaryErr, crashErr, writeReport(path, results))
+	var tailProof tailParityProof
+	tailErr := withFixtureRoot(func(root string) error {
+		var err error
+		tailProof, err = tailOnlyParity(ctx, binary, root)
+		return err
+	})
+	tailErr = record(results.Cases, tailOnlyParityCase, tailProof, tailErr)
+	return errors.Join(probeErr, ordinaryErr, crashErr, tailErr, writeReport(path, results))
 }
 
 func TestParityReportPublishesAllOutcomesOnStartFailure(t *testing.T) {
@@ -188,16 +196,12 @@ func ordinaryWALParity(ctx context.Context, binary, dir string) (proof ordinaryW
 }
 
 func parityRows() []querymodel.Row {
-	early := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
-	tie, late := early.Add(time.Second), early.Add(2*time.Second)
-	return []querymodel.Row{
-		{Time: late, Line: "checkpoint " + strings.Repeat("x", 110)},
-		{Time: tie, Line: "duplicate [match]"},
-		{Time: tie, Line: "duplicate [match]"},
-		{Time: tie, Line: "tail " + strings.Repeat("y", 110)},
-		{Time: early, Line: "backfill [match]"},
-		{Time: tie, Line: "duplicate [match]"},
+	data := parityFixtureData()
+	rows := make([]querymodel.Row, 0, len(data))
+	for _, r := range data {
+		rows = append(rows, querymodel.Row{Time: fixtureTime(r.second), Line: r.line})
 	}
+	return rows
 }
 
 func parityWireRow(r querymodel.Row) row {

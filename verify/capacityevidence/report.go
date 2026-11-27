@@ -27,12 +27,15 @@ type fixture struct {
 	MemoryBytes uint64 `json:"memory_limit_bytes"`
 }
 
-type compactionEvidence struct {
+// CompactionObservation is a snapshot of the candidate's checkpoint state and row counts.
+type CompactionObservation struct {
 	State         string `json:"state"`
 	Generation    uint64 `json:"generation"`
 	CoveredRows   int    `json:"covered_rows"`
 	CommittedRows int    `json:"committed_rows"`
 }
+
+type compactionEvidence = CompactionObservation
 
 type record struct {
 	Fixture       fixture            `json:"fixture"`

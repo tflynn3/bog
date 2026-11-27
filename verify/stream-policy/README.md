@@ -1,5 +1,8 @@
 # Stream policy conformance
 
+Security Verification within Core Engineering owns the stream policy
+conformance runner and its fixture coverage.
+
 `streampolicy.Run` checks the proposed shared-deployment contract on one
 disposable target. Provision the canonical scopes, grants, and redactors from
 `ReferenceFixture()`, then supply query, ingest, restart/replay, and export
@@ -15,6 +18,13 @@ in-memory target with serialized committed frames.
 | Pre-append redaction | Committed bytes, exact replayed rows, query results, and export bytes and rows preserve the expected retained line and replacement. The plain and JSON-escaped Unicode markers must be absent. A two-row batch with an unavailable redactor leaves neither row committed. |
 | Scoped export | Authorized create and download have exact scoped records, including a positive control for a principal with only export permission. The observer verifies the artifact and authenticated manifest, then reports the source scope and policy versions. |
 
+Export downloads pair an existing artifact ID with a missing ID under each
+fixture selector and an unknown selector. This includes the selector where the
+caller has export permission for a different stream than the existing artifact.
+Every download in these pairs must return the same 403 with identical body and
+application headers and no artifact bytes, records, manifest, or verification
+evidence. Denied creates have their own uniform 403 and yield no artifact ID.
+
 Observers preserve the complete observed application response for each call and
 exclude transport-only metadata such as Date. The replay observer reads the
 complete committed fixture bytes and independently replays those bytes, then
@@ -27,6 +37,7 @@ evidence incomplete. Each byte observation is bounded by `MaxEvidenceBytes`.
 Ordinary application rejections are observations. Adapter errors, cancellation,
 missing observations, and unsupported evidence fail with `ErrIncomplete`.
 Mismatches fail with `ErrViolation`. The runner stops at the first failed check
-and reports its phase without including fixture secrets, raw adapter errors, or
-tokens. This milestone qualifies the fixture and evidence checks. Live policy
-changes, restore, and release-binary qualification require separate scenarios.
+and reports its phase without including fixture secrets, raw adapter errors,
+cursor tokens, or artifact IDs. This milestone qualifies the fixture and evidence
+checks. Live policy changes, restore, and release-binary qualification require
+separate scenarios.

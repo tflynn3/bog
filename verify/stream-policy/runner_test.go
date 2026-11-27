@@ -403,17 +403,67 @@ func TestArtifactDeniedThroughOtherAuthorizedStream(t *testing.T) {
 	assertFailure(t, target, ErrViolation, "artifact requested in another authorized stream")
 }
 
-func assertFailure(t *testing.T, target *observedTarget, want error, phase string) {
+func TestMissingArtifactDeniedThroughAuthorizedStream(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		alter  func(*Artifact, string)
+		detail string
+	}{
+		{"status", func(a *Artifact, _ string) { a.Status = http.StatusNotFound }, "want 403"},
+		{"body", func(a *Artifact, _ string) { a.Body = []byte("artifact missing\n") }, "different response evidence"},
+		{"header", func(a *Artifact, _ string) {
+			a.Headers = map[string][]string{"Bog-Result": {"artifact missing"}}
+		}, "different response evidence"},
+		{"artifact ID", func(a *Artifact, id string) { a.Body = []byte(id) }, "unexpected fixture marker"},
+		{"fixture secret", func(a *Artifact, _ string) { a.Body = []byte(plain) }, "unexpected fixture marker"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			target := &observedTarget{syntheticTarget: newSynthetic()}
+			allowed := Target{bob, target.fixture.Streams[1].Selector}
+			target.fetch = func(request Target, id string, artifact *Artifact) {
+				if _, exists := target.artifacts[id]; !exists && request == allowed && artifact.Status == http.StatusForbidden {
+					tc.alter(artifact, id)
+				}
+			}
+			err := assertFailure(t, target, ErrViolation, "artifact requested in another authorized stream")
+			if !strings.Contains(err.Error(), tc.detail) {
+				t.Fatalf("diagnostic does not report %q", tc.detail)
+			}
+		})
+	}
+}
+
+func TestExportRequiresAnAbsentArtifactProbe(t *testing.T) {
+	t.Parallel()
+	target := &observedTarget{syntheticTarget: newSynthetic()}
+	target.create = func(_ Target, start *ExportStart) {
+		const reserved = "fixture-missing-artifact"
+		if start.ArtifactID != "" {
+			target.artifacts[reserved] = target.artifacts[start.ArtifactID]
+			delete(target.artifacts, start.ArtifactID)
+			start.ArtifactID = reserved
+		}
+	}
+	assertFailure(t, target, ErrIncomplete, "missing-artifact probe does not name an absent artifact")
+}
+
+func assertFailure(t *testing.T, target *observedTarget, want error, phase string) error {
 	t.Helper()
 	err := runFixture(t, Adapters{target, target, target, target})
-	if !errors.Is(err, want) || !strings.Contains(err.Error(), phase) {
-		t.Fatalf("Run() = %v, want %v in %q", err, want, phase)
+	if err == nil {
+		t.Fatalf("Run() passed, want %v in %q", want, phase)
 	}
-	for _, sensitive := range []string{plain, escaped, failed, key, "synthetic-cursor-"} {
+	for _, sensitive := range []string{"fixture-", "retained-alice-", "retained-bob-", "synthetic-cursor-", "synthetic-artifact-"} {
 		if strings.Contains(err.Error(), sensitive) {
 			t.Fatal("diagnostic disclosed a fixture value")
 		}
 	}
+	if !errors.Is(err, want) || !strings.Contains(err.Error(), phase) {
+		t.Fatalf("Run() = %v, want %v in %q", err, want, phase)
+	}
+	return err
 }
 
 func TestAbsentAndCanceledObservers(t *testing.T) {

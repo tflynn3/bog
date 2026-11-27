@@ -3,7 +3,6 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	stdjson "encoding/json"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
@@ -259,14 +258,7 @@ func validateFile(path string, expected identity, required []string, opts valida
 }
 
 func writeReport(path string, results report) error {
-	data, err := stdjson.MarshalIndent(results, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode release report: %w", err)
-	}
-	if err := os.WriteFile(path, append(data, '\n'), 0600); err != nil {
-		return fmt.Errorf("write release report %q: %w", path, err)
-	}
-	return nil
+	return localReportPublisher().writeReport(path, results)
 }
 
 func openRegular(path string) (*os.File, error) {

@@ -9,7 +9,8 @@ import (
 )
 
 func owns(pid, port int) (bool, error) {
-	var sockets []string
+	var sockets []listenerSocket
+	wildcards := make(map[uint64]bool)
 	for _, table := range []struct {
 		path string
 		ipv6 bool
@@ -29,6 +30,24 @@ func owns(pid, port int) (bool, error) {
 			return false, fmt.Errorf("read listener table %s: %w", table.path, err)
 		}
 		sockets = append(sockets, matching...)
+		for _, socket := range matching {
+			if socket.ipv6Wildcard {
+				wildcards[socket.inode] = true
+			}
+		}
+	}
+	if len(wildcards) != 0 {
+		dualStack, err := ipv6WildcardModes(port, wildcards)
+		if err != nil {
+			return false, fmt.Errorf("inspect IPv6 wildcard listeners on port %d: %w", port, err)
+		}
+		eligible := sockets[:0]
+		for _, socket := range sockets {
+			if !socket.ipv6Wildcard || dualStack[socket.inode] {
+				eligible = append(eligible, socket)
+			}
+		}
+		sockets = eligible
 	}
 	if len(sockets) == 0 {
 		return false, nil
@@ -50,9 +69,9 @@ func owns(pid, port int) (bool, error) {
 		}
 		owned[target] = true
 	}
-	for _, inode := range sockets {
-		if !owned["socket:["+inode+"]"] {
-			return false, fmt.Errorf("foreign listener on IPv4 loopback port %d (socket inode %s belongs outside candidate PID %d)", port, inode, pid)
+	for _, socket := range sockets {
+		if !owned["socket:["+strconv.FormatUint(socket.inode, 10)+"]"] {
+			return false, fmt.Errorf("foreign listener on IPv4 loopback port %d (socket inode %d belongs outside candidate PID %d)", port, socket.inode, pid)
 		}
 	}
 	return true, nil

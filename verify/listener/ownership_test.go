@@ -11,18 +11,19 @@ func TestListenerSocketTable(t *testing.T) {
 	t.Parallel()
 	const port = 8080
 	for _, tc := range []struct {
-		name, local, state, want string
-		ipv6, malformed          bool
+		name, local, state string
+		ipv6, malformed    bool
+		want               []listenerSocket
 	}{
-		{"IPv4 loopback", "0100007F:1F90", "0A", "123", false, false},
-		{"IPv4 wildcard", "00000000:1F90", "0A", "123", false, false},
-		{"IPv6 wildcard", "00000000000000000000000000000000:1F90", "0A", "123", true, false},
-		{"mapped loopback", "0000000000000000FFFF00000100007F:1F90", "0A", "123", true, false},
-		{"mapped wildcard", "0000000000000000FFFF000000000000:1F90", "0A", "123", true, false},
-		{"IPv6 loopback cannot accept IPv4 probes", "00000000000000000000000001000000:1F90", "0A", "", true, false},
-		{"other port", "0100007F:1F91", "0A", "", false, false},
-		{"established only", "0100007F:1F90", "01", "", false, false},
-		{"truncated listener", "0100007F:1F90", "0A", "", false, true},
+		{"IPv4 loopback", "0100007F:1F90", "0A", false, false, []listenerSocket{{inode: 123}}},
+		{"IPv4 wildcard", "00000000:1F90", "0A", false, false, []listenerSocket{{inode: 123}}},
+		{"IPv6 wildcard", "00000000000000000000000000000000:1F90", "0A", true, false, []listenerSocket{{inode: 123, ipv6Wildcard: true}}},
+		{"mapped loopback", "0000000000000000FFFF00000100007F:1F90", "0A", true, false, []listenerSocket{{inode: 123}}},
+		{"mapped wildcard", "0000000000000000FFFF000000000000:1F90", "0A", true, false, []listenerSocket{{inode: 123}}},
+		{"IPv6 loopback cannot accept IPv4 probes", "00000000000000000000000001000000:1F90", "0A", true, false, nil},
+		{"other port", "0100007F:1F91", "0A", false, false, nil},
+		{"established only", "0100007F:1F90", "01", false, false, nil},
+		{"truncated listener", "0100007F:1F90", "0A", false, true, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			line := fmt.Sprintf("0: %s remote %s", tc.local, tc.state)
@@ -30,7 +31,7 @@ func TestListenerSocketTable(t *testing.T) {
 				line += " tx timer retr uid timeout 123"
 			}
 			inodes, err := listenerSockets(line, port, tc.ipv6)
-			if (err != nil) != tc.malformed || strings.Join(inodes, ",") != tc.want {
+			if (err != nil) != tc.malformed || !slices.Equal(inodes, tc.want) {
 				t.Fatalf("inodes %v, error %v", inodes, err)
 			}
 		})
@@ -45,7 +46,7 @@ func TestListenerSocketTableRecordsEveryMatchingInode(t *testing.T) {
   2: 00000000:1F90 00000000:0000 0A 0 0 0 1000 0 131
   3: 0100007F:1F91 00000000:0000 0A 0 0 0 1000 0 132`
 	got, err := listenerSockets(lines, 8080, false)
-	if err != nil || !slices.Equal(got, []string{"129", "131"}) {
+	if err != nil || !slices.Equal(got, []listenerSocket{{inode: 129}, {inode: 131}}) {
 		t.Fatalf("inodes %v, error %v", got, err)
 	}
 }

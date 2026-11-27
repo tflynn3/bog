@@ -19,10 +19,17 @@ func Owns(pid, port int) (bool, error) {
 	return owns(pid, port)
 }
 
-// The release targets are little-endian Linux amd64 and arm64. Include
-// wildcard and mapped IPv6 listeners which may accept IPv4 loopback.
-func listenerSockets(table string, port int, ipv6 bool) ([]string, error) {
-	var sockets []string
+type listenerSocket struct {
+	inode        uint64
+	ipv6Wildcard bool
+}
+
+// The release targets are little-endian Linux amd64 and arm64. The TCP
+// tables show potential matches, including IPv6 wildcards whose IPV6_V6ONLY
+// option must be checked separately.
+func listenerSockets(table string, port int, ipv6 bool) ([]listenerSocket, error) {
+	const wildcard6 = "00000000000000000000000000000000"
+	var sockets []listenerSocket
 	wantPort := fmt.Sprintf("%04X", port)
 	for line := range strings.SplitSeq(table, "\n") {
 		fields := strings.Fields(line)
@@ -38,7 +45,7 @@ func listenerSockets(table string, port int, ipv6 bool) ([]string, error) {
 			if ipv6 {
 				continue
 			}
-		case "0000000000000000FFFF00000100007F", "0000000000000000FFFF000000000000", "00000000000000000000000000000000":
+		case "0000000000000000FFFF00000100007F", "0000000000000000FFFF000000000000", wildcard6:
 			if !ipv6 {
 				continue
 			}
@@ -52,7 +59,7 @@ func listenerSockets(table string, port int, ipv6 bool) ([]string, error) {
 		if err != nil || inode == 0 {
 			return nil, fmt.Errorf("invalid listening socket inode %q", fields[9])
 		}
-		sockets = append(sockets, fields[9])
+		sockets = append(sockets, listenerSocket{inode: inode, ipv6Wildcard: addr == wildcard6})
 	}
 	return sockets, nil
 }

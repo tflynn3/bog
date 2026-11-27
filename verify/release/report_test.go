@@ -376,9 +376,9 @@ func TestAdmissionReportRetainsFixtureAndProbeFailures(t *testing.T) {
 		!strings.Contains(err.Error(), "cleanup problem") || !strings.Contains(err.Error(), skip) {
 		t.Fatalf("incorrect validation diagnostic: %v", err)
 	}
-	if err := writeReport(path+"/admission.json", report{id, cases}); err == nil || !strings.Contains(err.Error(), "write release report") {
-		t.Fatalf("report write failure was lost: %v", err)
-	}
+	badPath := filepath.Join(path, "admission.json")
+	err = writeReport(badPath, report{id, cases})
+	assertPublicationError(t, err, badPath, reportUnpublished, "open report directory", nil)
 }
 
 func writeFixture(t *testing.T, path string, data []byte) {

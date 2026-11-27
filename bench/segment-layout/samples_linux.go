@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unsafe"
 
 	"bog/internal/checkpoint"
 	"golang.org/x/sys/unix"
@@ -22,6 +21,7 @@ type workerRequest struct {
 	Path, Literal string
 	Start, End    time.Time
 	Component     *componentRequest
+	Decode        *decodeRequest
 }
 
 type querySample struct {
@@ -46,6 +46,9 @@ func worker(ctx context.Context, arg string, out io.Writer) error {
 			return err
 		}
 		return json.NewEncoder(out).Encode(m)
+	}
+	if req.Decode != nil {
+		return decodeWorker(ctx, *req.Decode, out)
 	}
 	return queryWorker(req, out)
 }
@@ -192,7 +195,7 @@ func queryFile(r io.ReaderAt, size int64, q query) (matches []checkpoint.BlockRo
 		if err != nil {
 			return err
 		}
-		working := buffers + len(rows)*int(unsafe.Sizeof(checkpoint.BlockRow{}))
+		working := buffers + len(rows)*decodedRowBytes
 		for _, row := range rows {
 			working += len(row.Row.Line)
 			if !row.Row.TS.Before(q.start) && row.Row.TS.Before(q.end) && strings.Contains(row.Row.Line, q.literal) {

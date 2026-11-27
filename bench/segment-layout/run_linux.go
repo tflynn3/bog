@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"time"
 
 	"bog/internal/checkpoint"
@@ -63,36 +62,6 @@ type report struct {
 	Environment   map[string]any   `json:"environment"`
 	Layouts       []layoutReport   `json:"layouts"`
 	Compaction    compactionReport `json:"compaction"`
-}
-
-func writeGeneration(path string, blocks [][]checkpoint.BlockRow, l layout) (_ int64, err error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { err = errors.Join(err, f.Close()) }()
-	if err := writeLayout(f, l, len(blocks), func(i int) ([]byte, summary, error) {
-		rows := slices.Clone(blocks[i])
-		slices.SortFunc(rows, ordered)
-		var filter summary
-		if l.prune {
-			for _, row := range rows {
-				filter.add(row.Row.Line)
-			}
-		}
-		raw, err := checkpoint.EncodeBlock(rows)
-		return raw, filter, err
-	}); err != nil {
-		return 0, err
-	}
-	if err := f.Sync(); err != nil {
-		return 0, err
-	}
-	info, err := f.Stat()
-	if err != nil {
-		return 0, err
-	}
-	return info.Size(), nil
 }
 
 // Each phase shares its append-order packing, queries, and oracle rows across
@@ -152,12 +121,8 @@ func collect(ctx context.Context, cfg config) (_ report, err error) {
 		return report{}, err
 	}
 	defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
-	var fs unix.Statfs_t
-	if err := unix.Statfs(dir, &fs); err != nil {
-		return report{}, err
-	}
-	var kernel unix.Utsname
-	if err := unix.Uname(&kernel); err != nil {
+	environment, err := benchmarkEnvironment(dir, cfg)
+	if err != nil {
 		return report{}, err
 	}
 	input := fixture(cfg.batches, cfg.profile == "entropy", cfg.fixtureSeed)
@@ -211,18 +176,38 @@ func collect(ctx context.Context, cfg config) (_ report, err error) {
 			Rows: len(input.rows), RewrittenRows: results[0].Backfills[0].Rows, TargetBlockSize: blockTarget,
 			SamplesPerQuery: cfg.runs, MaxLineBytes: largeLineSize,
 		},
-		Environment: map[string]any{
-			"os": runtime.GOOS, "arch": runtime.GOARCH, "go": runtime.Version(), "cpus": runtime.NumCPU(),
-			"gomaxprocs": runtime.GOMAXPROCS(0), "kernel": unix.ByteSliceToString(kernel.Release[:]),
-			"filesystem_magic": fmt.Sprintf("%#x", fs.Type), "filesystem_block_bytes": fs.Bsize,
-			"cache_policy": "FADV_RANDOM on open, FADV_DONTNEED before each timed query", "work_directory": filepath.Dir(dir),
-			"operation_timeout_ns": cfg.timeout.Nanoseconds(),
-			"godebug":              os.Getenv("GODEBUG"), "gogc": os.Getenv("GOGC"), "gomemlimit": os.Getenv("GOMEMLIMIT"), "zstd_level": zstd.SpeedDefault.String(), "zstd_window_bytes": zstdWindow,
-		},
+		Environment: environment,
 	}, nil
 }
 
+func benchmarkEnvironment(dir string, cfg config) (map[string]any, error) {
+	var fs unix.Statfs_t
+	if err := unix.Statfs(dir, &fs); err != nil {
+		return nil, err
+	}
+	var kernel unix.Utsname
+	if err := unix.Uname(&kernel); err != nil {
+		return nil, err
+	}
+	env := map[string]any{
+		"os": runtime.GOOS, "arch": runtime.GOARCH, "go": runtime.Version(), "cpus": runtime.NumCPU(),
+		"gomaxprocs": runtime.GOMAXPROCS(0), "kernel": unix.ByteSliceToString(kernel.Release[:]),
+		"filesystem_magic": fmt.Sprintf("%#x", fs.Type), "filesystem_block_bytes": fs.Bsize,
+		"cache_policy": "FADV_RANDOM on open, FADV_DONTNEED before each timed query", "work_directory": filepath.Dir(dir),
+		"operation_timeout_ns": cfg.timeout.Nanoseconds(),
+		"godebug":              os.Getenv("GODEBUG"), "gogc": os.Getenv("GOGC"), "gomemlimit": os.Getenv("GOMEMLIMIT"), "zstd_level": zstd.SpeedDefault.String(), "zstd_window_bytes": zstdWindow,
+	}
+	return env, nil
+}
+
 func run(ctx context.Context, cfg config, out io.Writer) error {
+	if cfg.incremental {
+		result, err := collectIncremental(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(out).Encode(result)
+	}
 	result, err := collect(ctx, cfg)
 	if err != nil {
 		return err

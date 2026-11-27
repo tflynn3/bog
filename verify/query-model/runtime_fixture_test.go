@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"bog/internal/client"
 	"bog/internal/httpapi"
@@ -73,6 +74,7 @@ type runtimeQueryFixture struct {
 	retained    bool
 	budget      int
 	concurrency int
+	demand      *queryDemandMeter
 	journal     [][]byte
 	checkpoint  []store.Row // decoded prefix for the tail-only replacement fixture
 	covered     int
@@ -112,52 +114,83 @@ func (f *runtimeQueryFixture) Page(ctx context.Context, req httpapi.PageRequest,
 	if err := ctx.Err(); err != nil {
 		return httpapi.PageResult{}, err
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	rows, more, id, err := f.scanPage(req, work)
+	if err != nil {
+		return httpapi.PageResult{}, err
+	}
+	if f.demand != nil && cap(rows) != 0 {
+		size := int64(cap(rows)) * int64(unsafe.Sizeof(store.PositionedRow{}))
+		f.demand.enter(model.ScanBufferReady, size)
+		defer f.demand.leave(model.ScanBufferReady, size)
+	}
+	if gate, ok := ctx.Value(scanGateKey{}).(*resumeGate); ok && req.Capture == "" {
+		gate.wait(ctx)
+		// Return ownership of a successful acquisition even on cancellation.
+		// The HTTP issuer observes cancellation and releases it.
+	}
+	result := httpapi.PageResult{Capture: id, Rows: make([]httpapi.PageRow, 0, len(rows)), More: more}
+	for _, row := range rows {
+		pos := row.Position.Time.UTC().Format(time.RFC3339Nano) + "/" + strconv.FormatUint(row.Position.Ordinal, 10)
+		result.Rows = append(result.Rows, httpapi.PageRow{Row: row.Row, Position: httpapi.PagePosition(pos)})
+	}
+	return result, nil
+}
 
+func (f *runtimeQueryFixture) scanPage(req httpapi.PageRequest, work *store.QueryWork) ([]store.PositionedRow, bool, string, error) {
 	id := req.Capture
-	var capture fixtureCapture
+	capture, err := f.captureView(id)
+	if err != nil {
+		return nil, false, "", err
+	}
 	var after *store.TailPosition
-	if id == "" {
-		capture = fixtureCapture{f.active.serial, f.active.store.CapturePositionedSnapshot()}
-	} else {
-		var ok bool
-		capture, ok = f.captures[id]
-		if !ok {
-			return httpapi.PageResult{}, httpapi.ErrCaptureExpired
-		}
+	if id != "" {
 		stamp, ordinal, found := strings.Cut(string(req.After), "/")
 		t, timeErr := time.Parse(time.RFC3339Nano, stamp)
 		i, ordinalErr := strconv.ParseUint(ordinal, 10, 64)
 		if !found || timeErr != nil || ordinalErr != nil {
-			return httpapi.PageResult{}, fmt.Errorf("invalid fixture position: %w", errors.Join(timeErr, ordinalErr))
+			return nil, false, "", fmt.Errorf("invalid fixture position: %w", errors.Join(timeErr, ordinalErr))
 		}
 		after = &store.TailPosition{Time: t, Ordinal: i}
 	}
 	rows, more, err := capture.view.Page(req.Filter.Start, req.Filter.End, req.Filter.Contains, req.Limit, 0, after, work)
 	if err != nil {
-		return httpapi.PageResult{}, err
+		return nil, false, "", err
 	}
 	if err := work.Charge(uint64(len(rows))); err != nil {
-		return httpapi.PageResult{}, err
-	}
-	result := httpapi.PageResult{Rows: make([]httpapi.PageRow, 0, len(rows)), More: more}
-	for _, row := range rows {
-		pos := row.Position.Time.UTC().Format(time.RFC3339Nano) + "/" + strconv.FormatUint(row.Position.Ordinal, 10)
-		result.Rows = append(result.Rows, httpapi.PageRow{Row: row.Row, Position: httpapi.PagePosition(pos)})
+		return nil, false, "", err
 	}
 	if id == "" {
+		f.mu.Lock()
+		defer f.mu.Unlock()
 		f.nextCapture++
 		id = strconv.Itoa(f.nextCapture)
 		f.captures[id] = capture
+		if f.demand != nil {
+			f.demand.acquire(id)
+		}
 	}
-	result.Capture = id
-	return result, nil
+	return rows, more, id, nil
+}
+
+func (f *runtimeQueryFixture) captureView(id string) (fixtureCapture, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id == "" {
+		return fixtureCapture{f.active.serial, f.active.store.CapturePositionedSnapshot()}, nil
+	}
+	capture, ok := f.captures[id]
+	if !ok {
+		return fixtureCapture{}, httpapi.ErrCaptureExpired
+	}
+	return capture, nil
 }
 
 func (f *runtimeQueryFixture) Release(id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.demand != nil {
+		f.demand.release(id)
+	}
 	delete(f.captures, id)
 	return nil
 }

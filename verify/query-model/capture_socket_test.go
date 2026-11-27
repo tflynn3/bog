@@ -88,9 +88,12 @@ type socketFault struct {
 }
 
 type resumeGate struct {
-	entered chan struct{}
-	release chan struct{}
-	done    chan struct{}
+	point     model.QueryHoldPoint
+	cancelled bool
+	err       error
+	entered   chan struct{}
+	release   chan struct{}
+	done      chan struct{}
 }
 
 type querySocketFixture struct {
@@ -99,10 +102,11 @@ type querySocketFixture struct {
 	client  *client.Client
 	fetch   model.FetchWirePage
 	next    atomic.Uint64
-	actions sync.Map // string -> *socketFault or *resumeGate
+	actions sync.Map // string -> *socketFault, *resumeGate, or handler completion channel
 }
 
 type gateKey struct{}
+type scanGateKey struct{}
 
 type gatedQueryTransport struct{ http.RoundTripper }
 
@@ -116,11 +120,16 @@ func (t gatedQueryTransport) RoundTrip(req *http.Request) (*http.Response, error
 
 func newQuerySocketFixture(t *testing.T, handler http.Handler) *querySocketFixture {
 	t.Helper()
+	return newMeasuredQuerySocketFixture(t, handler, nil)
+}
+
+func newMeasuredQuerySocketFixture(t *testing.T, handler http.Handler, meter *queryDemandMeter) *querySocketFixture {
+	t.Helper()
 	s := new(querySocketFixture)
 	s.server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		action, ok := s.actions.LoadAndDelete(r.Header.Get(faultHeader))
 		if !ok {
-			handler.ServeHTTP(w, r)
+			serveMeasuredQuery(handler, w, r, meter, nil)
 			return
 		}
 		switch a := action.(type) {
@@ -128,9 +137,16 @@ func newQuerySocketFixture(t *testing.T, handler http.Handler) *querySocketFixtu
 			fault := &queryFaultWriter{ResponseWriter: w, mode: a.mode}
 			handler.ServeHTTP(fault, r)
 			a.done <- fault.observed
+		case chan struct{}:
+			defer close(a)
+			serveMeasuredQuery(handler, w, r, meter, nil)
 		case *resumeGate:
 			defer close(a.done)
-			handler.ServeHTTP(&heldResumeWriter{ResponseWriter: w, ctx: r.Context(), gate: a}, r)
+			if a.point == model.ScanBufferReady {
+				serveMeasuredQuery(handler, w, r.WithContext(context.WithValue(r.Context(), scanGateKey{}, a)), meter, nil)
+			} else {
+				serveMeasuredQuery(handler, w, r, meter, a)
+			}
 		}
 	}))
 	s.server.Config.ReadHeaderTimeout = socketDeadline
@@ -151,6 +167,19 @@ func newQuerySocketFixture(t *testing.T, handler http.Handler) *querySocketFixtu
 		t.Fatal(err)
 	}
 	s.client, s.fetch = c, fetch
+	if meter != nil {
+		s.fetch = func(ctx context.Context, q model.WireRequest) (model.WirePage, error) {
+			if _, held := ctx.Value(gateKey{}).(string); held {
+				return fetch(ctx, q)
+			}
+			done := make(chan struct{})
+			id := s.register(done)
+			page, err := fetch(context.WithValue(ctx, gateKey{}, id), q)
+			join, cancel := context.WithTimeout(context.WithoutCancel(ctx), socketDeadline)
+			defer cancel()
+			return page, errors.Join(err, s.joinHandler(join, id, done))
+		}
+	}
 	return s
 }
 
@@ -319,11 +348,28 @@ func (w *queryFaultWriter) failWrite(pending []byte) error {
 	return w.observed
 }
 
+func serveMeasuredQuery(handler http.Handler, w http.ResponseWriter, r *http.Request, meter *queryDemandMeter, gate *resumeGate) {
+	if gate == nil && (meter == nil || r.URL.Path != "/query") {
+		handler.ServeHTTP(w, r)
+		return
+	}
+	writer := &heldResumeWriter{ResponseWriter: w, ctx: r.Context(), gate: gate, meter: meter}
+	defer func() {
+		if writer.entered && meter != nil {
+			meter.leave(model.PreparedDelivery, writer.bytes)
+		}
+	}()
+	handler.ServeHTTP(writer, r)
+}
+
 type heldResumeWriter struct {
 	http.ResponseWriter
-	ctx     context.Context
-	gate    *resumeGate
-	entered bool
+	ctx         context.Context
+	gate        *resumeGate
+	meter       *queryDemandMeter
+	entered     bool
+	bodyStarted bool
+	bytes       int64
 }
 
 func (w *heldResumeWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -331,13 +377,48 @@ func (w *heldResumeWriter) Unwrap() http.ResponseWriter { return w.ResponseWrite
 func (w *heldResumeWriter) WriteHeader(status int) {
 	if status == http.StatusOK && !w.entered {
 		w.entered = true
-		close(w.gate.entered)
-		select {
-		case <-w.gate.release:
-		case <-w.ctx.Done():
+		if w.meter != nil {
+			n, err := strconv.ParseInt(w.Header().Get("Content-Length"), 10, 64)
+			if err != nil || n < 0 {
+				w.meter.fail(errors.New("prepared response requires a valid Content-Length"))
+			} else {
+				w.bytes = n
+			}
+			w.meter.enter(model.PreparedDelivery, w.bytes)
+		}
+		if w.gate != nil && w.meter == nil {
+			w.gate.wait(w.ctx)
 		}
 	}
-	w.ResponseWriter.WriteHeader(status)
+	if w.ctx.Err() == nil {
+		w.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (w *heldResumeWriter) Write(p []byte) (int, error) {
+	if w.entered && w.gate != nil && w.meter != nil && !w.bodyStarted {
+		w.bodyStarted = true
+		// Model a stalled body delivery after committing the response headers.
+		// The kernel's socket buffer size cannot release this barrier.
+		if err := http.NewResponseController(w.ResponseWriter).Flush(); err != nil {
+			w.gate.err = fmt.Errorf("flush held response headers: %w", err)
+			return 0, w.gate.err
+		}
+		w.gate.wait(w.ctx)
+	}
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (g *resumeGate) wait(ctx context.Context) {
+	close(g.entered)
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+		g.cancelled = errors.Is(ctx.Err(), context.Canceled)
+	}
 }
 
 type resumeResult struct {
@@ -346,7 +427,14 @@ type resumeResult struct {
 }
 
 func (s *querySocketFixture) holdResume(ctx context.Context, q model.WireRequest, whileHeld func() error) (model.WirePage, error) {
-	gate := &resumeGate{entered: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
+	return s.holdQuery(ctx, q, model.PreparedDelivery, func() (bool, error) { return false, whileHeld() })
+}
+
+func (s *querySocketFixture) holdQuery(ctx context.Context, q model.WireRequest, point model.QueryHoldPoint, whileHeld func() (bool, error)) (model.WirePage, error) {
+	gate := &resumeGate{
+		point:   point,
+		entered: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{}),
+	}
 	id := s.register(gate)
 	defer s.actions.Delete(id)
 	ctx, cancel := context.WithTimeout(ctx, socketDeadline)
@@ -358,18 +446,24 @@ func (s *querySocketFixture) holdResume(ctx context.Context, q model.WireRequest
 	}()
 
 	var heldErr error
+	var cancelHeld bool
 	var completed resumeResult
 	var received bool
 	select {
 	case <-gate.entered:
-		heldErr = whileHeld()
+		cancelHeld, heldErr = whileHeld()
 	case completed = <-result:
 		heldErr = errors.New("resume completed before reaching the delivery gate")
 		received = true
 	case <-ctx.Done():
 		heldErr = ctx.Err()
 	}
-	close(gate.release)
+	if cancelHeld && heldErr == nil {
+		defer close(gate.release) // Unblock the server even if cancellation propagation fails.
+		cancel()
+	} else {
+		close(gate.release)
+	}
 	// The client can read a complete body before the final capture release.
 	// Join both sides before allowing a capacity probe to run.
 	join, stop := context.WithTimeout(context.WithoutCancel(ctx), socketDeadline)
@@ -381,12 +475,33 @@ func (s *querySocketFixture) holdResume(ctx context.Context, q model.WireRequest
 			return model.WirePage{}, errors.Join(heldErr, fmt.Errorf("join resume client: %w", join.Err()))
 		}
 	}
-	if _, unclaimed := s.actions.LoadAndDelete(id); !unclaimed {
-		select {
-		case <-gate.done:
-		case <-join.Done():
-			return model.WirePage{}, errors.Join(heldErr, completed.err, fmt.Errorf("join resume handler: %w", join.Err()))
+	if err := s.joinHandler(join, id, gate.done); err != nil {
+		return model.WirePage{}, errors.Join(heldErr, completed.err, err)
+	}
+	if gate.err != nil {
+		return model.WirePage{}, errors.Join(heldErr, completed.err, gate.err)
+	}
+	if cancelHeld && heldErr == nil {
+		if !gate.cancelled || !errors.Is(completed.err, context.Canceled) ||
+			completed.page.EncodedBody != nil || completed.page.NextCursor != "" ||
+			completed.page.BodyBytes != 0 || len(completed.page.Rows) != 0 {
+			return model.WirePage{}, fmt.Errorf("expected server-observed cancellation without an accepted page: %w", completed.err)
 		}
+		return model.WirePage{}, nil
 	}
 	return completed.page, errors.Join(heldErr, completed.err)
+}
+
+// joinHandler distinguishes a request that never reached the server from
+// one that claimed its action and is still finishing cleanup.
+func (s *querySocketFixture) joinHandler(ctx context.Context, id string, done <-chan struct{}) error {
+	if _, unclaimed := s.actions.LoadAndDelete(id); unclaimed {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("join query handler: %w", ctx.Err())
+	}
 }

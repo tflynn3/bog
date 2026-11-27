@@ -76,11 +76,27 @@ func TestPinnedQueryGenerationReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pinned tail-only replay result=%+v: %v", result, err)
 	}
-	if !result.TerminalReplay || !result.CaptureReleased {
+	if !result.TerminalReplay || !result.CaptureReleased || result.AcrossReplacementReplay != [2]bool{true, true} {
 		t.Fatalf("incomplete pinned replacement replay: %+v", result)
 	}
-	t.Logf("pinned tail-only replay at work budget %d initial=%+v replacements=%+v held=%+v fresh=%+v release=%t",
-		result.WorkBudget, result.Initial, result.Replacements, result.Held, result.Fresh, result.CaptureReleased)
+	logQueryReport(t, "pinned_query_replacement", struct {
+		Result             model.GenerationReplacementResult `json:"result"`
+		PinObservation     string                            `json:"pin_observation"`
+		ReleaseObservation string                            `json:"release_observation"`
+		Unavailable        map[string]string                 `json:"unavailable"`
+	}{
+		Result:             result,
+		PinObservation:     "retired_generation_pins from capacity status after each completed cutoff",
+		ReleaseObservation: "elapsed nanoseconds from before the retirement request to the first zero retired_generation_pins sample",
+		Unavailable: map[string]string{
+			"peak_prepared_bytes":         "candidate HTTP interface has no server-side preparation barrier",
+			"peak_scan_buffer_bytes":      "capacity status does not expose per-query scan buffers",
+			"peak_live_captures":          "capacity status provides aggregate retired pins at sampled points",
+			"capture_lifetimes":           "capacity status provides aggregate retired pins without source acquisition and release timestamps",
+			"release_after_held_delivery": "the candidate case uses idle retirement",
+			"release_after_cancel":        "candidate HTTP interface has no deterministic server-side cancellation barrier",
+		},
+	})
 }
 
 type replacementControl struct{ pinnedCompaction }

@@ -55,12 +55,12 @@ func TestPinnedQueryGenerationReplacement(t *testing.T) {
 				return err
 			}
 			control := replacementControl{pinnedCompaction{raw: raw, base: base}}
-			initial, err := control.generation(ctx, http.MethodGet, "status", 0)
+			initial, err := control.read(ctx, http.MethodGet, "status", 0)
 			if err != nil {
 				return err
 			}
 			err = run(model.GenerationReplacementAdapter{
-				Initial: initial,
+				Initial: replacementGeneration(initial.CompactionObservation),
 				Acknowledge: func(ctx context.Context, rows []model.Row) error {
 					return acknowledgeFixtureBatch(ctx, c, rows)
 				},
@@ -101,85 +101,32 @@ func TestPinnedQueryGenerationReplacement(t *testing.T) {
 
 type replacementControl struct{ pinnedCompaction }
 
-func (c replacementControl) generation(ctx context.Context, method, action string, cutoff int) (model.ReplacementGeneration, error) {
-	status, g, err := c.read(ctx, method, action, cutoff)
-	if err != nil {
-		return model.ReplacementGeneration{}, fmt.Errorf("compaction %s: %w", action, err)
-	}
-	if status != http.StatusOK {
-		return model.ReplacementGeneration{}, fmt.Errorf("compaction %s returned HTTP %d", action, status)
-	}
+func replacementGeneration(g capacityevidence.CompactionObservation) model.ReplacementGeneration {
 	return model.ReplacementGeneration{
-		Generation: *g.Generation, CoveredRows: *g.Covered, CommittedRows: *g.Committed, Complete: *g.State == "complete",
-	}, nil
+		Generation: g.Generation, CoveredRows: g.CoveredRows, CommittedRows: g.CommittedRows, Complete: g.State == "complete",
+	}
 }
 
 func (c replacementControl) activate(ctx context.Context, cutoff int) (model.ReplacementGeneration, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, pinnedCompactionTimeout)
 	defer cancel()
-	previous, err := c.generation(ctx, http.MethodGet, "status", cutoff)
+	previous, err := c.read(ctx, http.MethodGet, "status", cutoff)
 	if err != nil {
-		return previous, err
+		return model.ReplacementGeneration{}, err
 	}
-	if !previous.Complete || cutoff <= previous.CoveredRows || cutoff >= previous.CommittedRows {
-		return previous, fmt.Errorf("invalid predecessor at cutoff %d: %+v", cutoff, previous)
+	if cutoff >= previous.CommittedRows {
+		return model.ReplacementGeneration{}, fmt.Errorf("compaction cutoff %d leaves no committed suffix at %d", cutoff, previous.CommittedRows)
 	}
-
-	validate := func(current model.ReplacementGeneration) error {
-		if current.CommittedRows == previous.CommittedRows &&
-			(current.Complete && current.Generation > previous.Generation && current.CoveredRows == cutoff ||
-				!current.Complete && current.Generation == previous.Generation && current.CoveredRows == previous.CoveredRows) {
-			return nil
-		}
-		return fmt.Errorf("unexpected compaction state at cutoff %d: %+v (predecessor %+v)", cutoff, current, previous)
-	}
-	started, err := c.generation(ctx, http.MethodPost, "start", cutoff)
-	if err != nil {
-		return started, err
-	}
-	if err := validate(started); err != nil {
-		return started, err
-	}
-
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		current, err := c.generation(ctx, http.MethodGet, "status", cutoff)
-		if err != nil {
-			return current, err
-		}
-		if err := validate(current); err != nil {
-			return current, err
-		}
-		if started.Complete && current != started {
-			return current, errors.New("completed compaction changed before status observation")
-		}
-		if current.Complete {
-			return current, ctx.Err()
-		}
-		select {
-		case <-ctx.Done():
-			return current, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	current, err := c.publish(ctx, previous.CompactionObservation, cutoff, previous.CommittedRows)
+	return replacementGeneration(current), err
 }
 
 func (c replacementControl) retiredPins(ctx context.Context) (uint64, error) {
-	status, body, err := pinnedRequest(ctx, c.raw, http.MethodGet, c.base+capacityControl+"?action=status&cutoff=0")
+	reply, err := c.read(ctx, http.MethodGet, "status", 0)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("pin observation: %w", err)
 	}
-	if status != http.StatusOK {
-		return 0, fmt.Errorf("pin observation returned HTTP %d", status)
-	}
-	var response struct {
-		Metrics json.RawMessage `json:"metrics"`
-	}
-	if err := json.Unmarshal(body, &response); err != nil {
-		return 0, err
-	}
-	metrics, issues, err := capacityevidence.DecodeRuntimeMetrics(response.Metrics)
+	metrics, issues, err := capacityevidence.DecodeRuntimeMetrics(reply.metrics)
 	if err != nil {
 		return 0, fmt.Errorf("decode retire pin metrics: %w", err)
 	}

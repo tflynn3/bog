@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"debug/buildinfo"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,8 +18,6 @@ import (
 
 	model "bog/verify/query-model"
 )
-
-const capacityControl = "/_capacity/compaction"
 
 var errNoCompaction = errors.New("candidate has no retained compaction control")
 
@@ -173,120 +170,29 @@ func withConfiguredPinnedQueryEndpoint(t *testing.T, ctx context.Context, binary
 		}
 		if retained {
 			control := pinnedCompaction{raw: raw, base: base}
-			status, initial, err := control.read(ctx, http.MethodGet, "status", 0)
+			initial, err := control.read(ctx, http.MethodGet, "status", 0)
 			if err != nil {
+				var statusErr *pinnedCompactionHTTPError
+				if errors.As(err, &statusErr) && statusErr.status == http.StatusNotFound {
+					return errNoCompaction
+				}
 				return err
 			}
-			if status == http.StatusNotFound {
-				return errNoCompaction
-			}
-			if status != http.StatusOK {
-				return fmt.Errorf("compaction capability returned HTTP %d", status)
-			}
-			if *initial.State != "complete" || *initial.Covered != 0 || *initial.Committed != 0 {
+			if initial.State != "complete" || initial.CoveredRows != 0 || initial.CommittedRows != 0 {
 				return errors.New("compaction trial did not start at an empty published point")
 			}
-			control.last = initial
-			fixture.Publish = control.publish
+			previous := initial.CompactionObservation
+			fixture.Publish = func(ctx context.Context, cutoff int) error {
+				ctx, cancel := context.WithTimeout(ctx, pinnedCompactionTimeout)
+				defer cancel()
+				current, err := control.publish(ctx, previous, cutoff, cutoff)
+				if err != nil {
+					return err
+				}
+				previous = current
+				return nil
+			}
 		}
 		return run(fixture)
 	})
-}
-
-func pinnedRequest(ctx context.Context, raw *http.Client, method, path string) (status int, body []byte, err error) {
-	req, err := http.NewRequestWithContext(ctx, method, path, nil)
-	if err != nil {
-		return 0, nil, err
-	}
-	req.Header.Set("Accept-Encoding", "identity")
-	res, err := raw.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer func() { err = errors.Join(err, res.Body.Close()) }()
-	const maxBody = 8192
-	body, err = io.ReadAll(io.LimitReader(res.Body, maxBody+1))
-	if err == nil && (len(body) > maxBody || res.ContentLength >= 0 && res.ContentLength != int64(len(body))) {
-		err = errors.New("invalid control response body length")
-	}
-	return res.StatusCode, body, err
-}
-
-type pinnedGeneration struct {
-	State      *string `json:"state"`
-	Generation *uint64 `json:"generation"`
-	Covered    *int    `json:"covered_rows"`
-	Committed  *int    `json:"committed_rows"`
-}
-
-type pinnedCompaction struct {
-	raw  *http.Client
-	base string
-	last pinnedGeneration
-}
-
-func (c *pinnedCompaction) read(ctx context.Context, method, action string, cutoff int) (int, pinnedGeneration, error) {
-	path := c.base + capacityControl + "?action=" + action + "&cutoff=" + strconv.Itoa(cutoff)
-	status, body, err := pinnedRequest(ctx, c.raw, method, path)
-	if err != nil || status != http.StatusOK {
-		return status, pinnedGeneration{}, err
-	}
-	var g pinnedGeneration
-	if err := json.Unmarshal(body, &g); err != nil {
-		return status, g, err
-	}
-	if g.State == nil || g.Generation == nil || g.Covered == nil || g.Committed == nil ||
-		(*g.State != "complete" && *g.State != "running") || *g.Covered < 0 || *g.Committed < *g.Covered {
-		return status, g, errors.New("incomplete candidate compaction observation")
-	}
-	return status, g, nil
-}
-
-func (c *pinnedCompaction) publish(ctx context.Context, cutoff int) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	generation, covered := uint64(0), 0
-	if c.last.Generation != nil {
-		generation, covered = *c.last.Generation, *c.last.Covered
-	}
-	observe := func(method, action string) (pinnedGeneration, error) {
-		status, current, err := c.read(ctx, method, action, cutoff)
-		if err != nil {
-			return current, err
-		}
-		if status != http.StatusOK {
-			return current, fmt.Errorf("compaction %s at cutoff %d returned HTTP %d", action, cutoff, status)
-		}
-		if *current.Committed != cutoff ||
-			(*current.State == "running" && (*current.Generation != generation || *current.Covered != covered)) ||
-			(*current.State == "complete" && (*current.Generation <= generation || *current.Covered != cutoff)) {
-			return current, fmt.Errorf("compaction %s cutoff=%d returned state=%s generation=%d covered=%d committed=%d",
-				action, cutoff, *current.State, *current.Generation, *current.Covered, *current.Committed)
-		}
-		return current, nil
-	}
-	started, err := observe(http.MethodPost, "start")
-	if err != nil {
-		return err
-	}
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		current, err := observe(http.MethodGet, "status")
-		if err != nil {
-			return err
-		}
-		if *started.State == "complete" && (*current.State != "complete" || *current.Generation != *started.Generation) {
-			return errors.New("completed compaction changed before status observation")
-		}
-		if *current.State == "complete" {
-			c.last = current
-			return ctx.Err()
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
 }

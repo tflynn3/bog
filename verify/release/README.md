@@ -289,12 +289,19 @@ with a nonempty checkpoint and tail. In each cycle, the pinned candidate
 holds an HTTP cursor, acknowledges two batches with timestamp ties and
 backfill, then compacts through the first batch. The held and fresh walks
 must match the independent append-log oracle. After the candidate exits,
-the test uses the installed v2 manifest and exact rebased tail to export
-through `backup.ExportRecoveryView`. It verifies and restores each export,
-moves the source bundle aside before startup, and compares terminal walks
-from the original restarted directory and the separate restore. A probe
-append on the restarted directory must extend the observed physical tail
-with the exact frame at the recovered next ordinal.
+the test reads the durable writable selector and follows its generation
+and tail references relative to the pinned data directory. It checks the
+selected manifest's identity and predecessor, the tail's device and inode,
+the logical base and committed byte and ordinal bounds, and the exact
+rebased suffix bytes and digest against the fixture.
+
+The test exports the verified selection through `backup.ExportRecoveryView`,
+verifies and restores the export, then moves the source bundle aside. It
+compares terminal walks from the original restarted directory and the
+separate restore. After the restart probe receives 204 and the candidate
+exits, the test reads the selector again. It requires the same physical
+tail, the exact appended frame, and the corresponding durable byte,
+ordinal, and digest updates.
 
 Cycle two starts from cycle one's verified export, at its advanced logical
 base with a nonempty carried suffix. The report records both input and
@@ -304,6 +311,19 @@ restarted, and separately restored row counts. Strict validation checks
 the exact fixture bounds and digests and requires the second input to
 match the first export. The producer verifies both archived exports
 again after the second cycle.
+
+The proposed #108 Storage handoff uses a regular file named
+`bog.authority` with a JSON envelope containing `payload` and `sha256`.
+The checksum is lowercase hexadecimal SHA-256 over the exact encoded
+payload bytes. The payload carries `version` (2), `generation` (the
+manifest digest used in `bog-checkpoint-<digest>`), `covered_offset`,
+`next_ordinal`, `committed_end`, `committed_ordinal`, `suffix_sha256`,
+`tail` (a `bog.wal.tail-*` basename), `tail_base`, `tail_device`, and
+`tail_inode`. The device and inode are unsigned integers from the
+selected file descriptor. This release fixture requires the physical tail
+to start at the checkpoint's covered offset and end exactly at the
+selected committed end. Storage must confirm this encoding with Release
+Verification before native qualification of the composed revision.
 
 Historical validation without `-require-cutover` accepts an omitted parity
 report or a schema-v1 report with a passing `restored_parity` outcome.

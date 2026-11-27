@@ -65,11 +65,6 @@ func manifestPayload(t testing.TB, m checkpoint.Manifest) []byte {
 	return payload
 }
 
-func signMetadata(b []byte) {
-	sum := sha256.Sum256(b[:96])
-	copy(b[96:128], sum[:])
-}
-
 func putManifest(image files, payload []byte) {
 	// Preserve the candidate payload bytes so whitespace, invalid JSON and
 	// duplicate fields can reach the public parsers.
@@ -141,18 +136,6 @@ func flip(b []byte, i int) []byte {
 	return changed(b, func(b []byte) { b[i] ^= 1 })
 }
 
-func fixFrameHeader(b []byte) {
-	le.PutUint32(b[12:16], crc32.Checksum(b[:12], crcTable))
-}
-
-func frameLength(b []byte, n uint32) []byte {
-	return changed(b, func(b []byte) {
-		le.PutUint32(b[:4], n)
-		le.PutUint32(b[4:8], ^n)
-		fixFrameHeader(b)
-	})
-}
-
 func blockEdit(b []byte, edit func([]byte)) []byte {
 	return changed(b, func(b []byte) {
 		edit(b)
@@ -187,6 +170,9 @@ func backupMutations(f fixture) []mutation {
 		{"tail/partial_second_payload", boundTail, tail[:len(tail)-1]},
 		{"tail/zero_frame_length", boundTail, frameLength(tail, 0)},
 		{"tail/huge_frame_length", boundTail, frameLength(tail, math.MaxUint32)},
+		{"tail/huge_second_frame_length", boundTail, changed(tail, func(b []byte) {
+			copy(b[secondFrame:], frameLength(b[secondFrame:], math.MaxUint32))
+		})},
 		{"tail/frame_length_past_end", boundTail, frameLength(tail, uint32(len(tail)))},
 		{"tail/frame_length_complement", boundTail, changed(tail, func(b []byte) {
 			b[4] ^= 1
@@ -232,6 +218,9 @@ func historyMutations(t testing.TB, f fixture) []mutation {
 		{"manifest/inconsistent_ordinal_count", boundManifestPayload, editManifest(func(m *checkpoint.Manifest) { m.NextOrdinal++ })},
 		{"manifest/negative_segment_size", boundManifestPayload, editManifest(func(m *checkpoint.Manifest) { m.Segments[0].Size = -1 })},
 		{"manifest/huge_segment_size", boundManifestPayload, editManifest(func(m *checkpoint.Manifest) { m.Segments[0].Size = math.MaxInt64 })},
+		{"manifest/missing_referenced_segment", boundManifestPayload, editManifest(func(m *checkpoint.Manifest) {
+			m.Segments[0].Name = "bog-segment-00000000000000000000000000000000"
+		})},
 		{"manifest/duplicate_segment", boundManifestPayload, editManifest(func(m *checkpoint.Manifest) {
 			m.Segments = append(m.Segments, m.Segments[0])
 		})},

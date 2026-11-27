@@ -141,3 +141,5 @@ func setHardLimit(t *testing.T, resource int, maximum uint64) {
 		t.Fatal(fmt.Errorf("set resource limit %d: %w", resource, err))
 	}
 }
+
+func setRetainedWorkerLimits(t *testing.T) { setWorkerLimits(t) }

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -176,11 +175,4 @@ func checkBackupReplayRejections(t *testing.T, image files, staleMetadata []byte
 			assertFiles(t, path, damaged)
 		})
 	}
-}
-
-func runBoundedReplayWorker(cmd *exec.Cmd) ([]byte, error) {
-	output := new(replayWorkerLog)
-	cmd.Stdout, cmd.Stderr = output, output
-	err := cmd.Run()
-	return output.buffer.Bytes(), errors.Join(err, output.limitError())
 }

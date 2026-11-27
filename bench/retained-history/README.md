@@ -173,6 +173,16 @@ completion is a client-observed upper bound on publication lag. The send
 time of the last validated running request gives a conservative lower
 bound. These bounds include observation delay.
 
+Each timeline requires at least two `cgroup_memory_current` reads,
+including one at the overlap with acknowledged backfill. A running status
+reply must precede each read, and the following request must still observe
+the same running compaction. Both replies must precede the publication
+observation. The `live_memory_current` summary reports the sample count,
+the elapsed nanoseconds from the first read's start to the last read's
+end, and the minimum and maximum bytes read. All readings must be
+positive and at most the final `memory.peak` collected from the same
+fixture cgroup, which stays in place across candidate restart.
+
 The existing loopback control may add a `metrics` object to either reply.
 Each value is a nonnegative JSON integer. Missing, null or malformed
 fields carry individual unavailable reasons. A supplied zero is valid.

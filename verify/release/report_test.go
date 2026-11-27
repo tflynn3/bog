@@ -197,9 +197,30 @@ func TestValidateCommand(t *testing.T) {
 	if err := run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "cutover diagnostics") {
 		t.Fatalf("cutover environment accepted archived capacity report: %v", err)
 	}
-	writeFixture(t, filepath.Join(dir, "capacity.json"), cutoverCapacityReport(id))
+	produced := string(producerCutoverReport(t))
+	produced = strings.NewReplacer(strings.Repeat("a", 40), id.Revision, strings.Repeat("b", 64), id.BinarySHA256).Replace(produced)
+	writeFixture(t, filepath.Join(dir, "capacity.json"), []byte(produced))
 	if err := run(t.Context(), args); err != nil {
 		t.Fatalf("cutover rejected producer evidence: %v", err)
+	}
+	parityPath := filepath.Join(dir, "parity.json")
+	parityArgs := append(append([]string(nil), args...), "-parity", parityPath)
+	parity := report{id, map[string]outcome{"restored_parity": {Status: "pass"}}}
+	if err := writeReport(parityPath, parity); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(t.Context(), append(parityArgs, "-require-cutover=false")); err != nil {
+		t.Fatalf("historical restored parity rejected: %v", err)
+	}
+	if err := run(t.Context(), parityArgs); err == nil || !strings.Contains(err.Error(), ordinaryWALCase) {
+		t.Fatalf("cutover accepted parity without ordinary WAL replay: %v", err)
+	}
+	parity.Cases[ordinaryWALCase] = outcome{Status: "pass"}
+	if err := writeReport(parityPath, parity); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(t.Context(), parityArgs); err != nil {
+		t.Fatalf("cutover rejected recovery parity: %v", err)
 	}
 	missing := filepath.Join(dir, "capacity.json")
 	if err := os.Remove(missing); err != nil {

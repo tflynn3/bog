@@ -126,7 +126,7 @@ func TestTimelineSamplesMemoryBeforeRunningStatus(t *testing.T) {
 			}
 			p := backfillProbe{backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
 				service: s, control: "/compact", dir: t.TempDir(), origin: time.Now()}
-			c, sent, received, err := p.request(t.Context(), "start")
+			c, sent, received, err := p.request(t.Context(), "start", false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -174,7 +174,7 @@ func TestTimelineMemoryReadStopsWithContext(t *testing.T) {
 	p := backfillProbe{backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
 		service: s, control: "/compact", dir: t.TempDir(), origin: time.Now(), startSent: time.Now()}
 	for range 2 {
-		if _, _, _, err := p.request(ctx, "status"); !errors.Is(err, context.Canceled) {
+		if _, _, _, err := p.request(ctx, "status", false); !errors.Is(err, context.Canceled) {
 			t.Fatalf("status error = %v, want cancellation", err)
 		}
 	}
@@ -201,7 +201,7 @@ func TestTimelineMemoryReadCadenceAndLimit(t *testing.T) {
 		service: s, control: "/compact", dir: t.TempDir(), origin: time.Now()}
 	checkStatus := func(wantSample bool) {
 		t.Helper()
-		c, _, _, err := p.request(t.Context(), "status")
+		c, _, _, err := p.request(t.Context(), "status", false)
 		if err != nil || (c.memory != nil) != wantSample {
 			t.Fatalf("status memory = %+v, error = %v, want sample = %t", c.memory, err, wantSample)
 		}

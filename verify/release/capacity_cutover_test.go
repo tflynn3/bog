@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	jsonv1 "encoding/json"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -40,71 +45,145 @@ func cutoverTimeline(pattern string, held, requested, final int, predecessor, ge
 		`{"event":"fresh_visible","elapsed_ns":100000110,"status":null}`,
 	)
 	return fmt.Sprintf(`{"pattern":%q,"status":"pass","held_cutoff":%d,"requested_cutoff":%d,"expected_committed_rows":%d,
-		"held_rows_checked":3,"held_cursor_exhausted":true,"terminal_page_retried":true,"capture_retired":true,"fresh_backfill_visible":true,
+		"held_rows_checked":3,"held_cursor_exhausted":true,"terminal_page_retried":true,"capture_retired":true,"fresh_backfill_visible":true,"fresh_walk_exact":true,"fresh_rows_checked":%d,
 		"acknowledged_backfill":{"rows":%d,"batches":%d,"first_ack_ns":18,"last_ack_ns":%d,
 			"earliest_row_ts":"2020-01-01T00:00:00Z","latest_row_ts":"2020-01-01T00:00:01Z"},
 		"publication":{"generation":%d,"observed_lag_lower_bound_ns":%d,"observed_lag_upper_bound_ns":35},
 		"pin_drain":{"status":"observed","retired_pins_while_held":2,"retired_pins_after_exhaustion":0},
 		"samples":[%s]}`,
-		pattern, held, requested, final, final-held, (final-held)/capacityBatch, lastAck, generation, lagLower, strings.Join(samples, ","))
+		pattern, held, requested, final, final, final-held, (final-held)/capacityBatch, lastAck, generation, lagLower, strings.Join(samples, ","))
 }
 
-func cutoverCapacityReport(id identity) []byte {
-	report := string(capacityReport(id))
-	for _, seed := range []int{196608, 393216} {
-		base := capacityRecord(seed)
-		clustered := cutoverTimeline("clustered", seed-128, seed-64, seed, 38, 40)
-		scattered := cutoverTimeline("scattered", seed, seed+64, seed+2048, 41, 42)
-		record := strings.TrimSuffix(base, "}") + `,"diagnostics":{"backfill_timelines":[` + clustered + "," + scattered + "]}}"
-		report = strings.Replace(report, base, record, 1)
+func producerCutoverReport(t *testing.T) []byte {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "capacity.json")
+	generate := exec.CommandContext(t.Context(), "go", "test", "-count=1", "-run", "^TestWriteCutoverFixture$", "../../bench/retained-history")
+	generate.Env = append(os.Environ(), "BOG_CAPACITY_TEST_REPORT="+path)
+	if output, err := generate.CombinedOutput(); err != nil {
+		t.Fatalf("write producer capacity fixture: %v\n%s", err, output)
 	}
-	return []byte(report)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestValidateCutoverCapacityProof(t *testing.T) {
-	t.Parallel()
-	id := identity{1, testRevision, strings.Repeat("a", 64), capacityFixtureID}
+	id := identity{1, strings.Repeat("a", 40), strings.Repeat("b", 64), capacityFixtureID}
 	cutover := validationOptions{requireCutover: true}
-	archived, modern := capacityReport(id), cutoverCapacityReport(id)
+	archived := capacityReport(id)
 	if err := validateReport(archived, id, capacityCases); err != nil {
 		t.Fatalf("archived report rejected: %v", err)
 	}
-	if err := validateReportWithOptions(archived, id, capacityCases, cutover); err == nil || !strings.Contains(err.Error(), "cutover diagnostics") {
-		t.Fatalf("archived report accepted as cutover: %v", err)
+	if err := validateReportWithOptions(archived, id, capacityCases, cutover); err == nil {
+		t.Fatal("archived report accepted as cutover")
 	}
+
+	producer := filepath.Join(t.TempDir(), "retained-history")
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", producer, "../../bench/retained-history")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build capacity validator: %v\n%s", err, output)
+	}
+	data := producerCutoverReport(t)
+	type object = map[string]any
+	at := func(o object, key string) object { return o[key].(map[string]any) }
+	index := func(o object, key string, i int) object { return o[key].([]any)[i].(map[string]any) }
+	sample := func(b object, event string) object {
+		for _, raw := range b["samples"].([]any) {
+			s := raw.(map[string]any)
+			if s["event"] == event {
+				return s
+			}
+		}
+		t.Fatalf("capacity fixture missing %s sample", event)
+		return nil
+	}
+	memory := func(b object, event string) object { return at(sample(b, event), "cgroup_memory_current") }
 	for _, tc := range []struct {
-		name, from, to, problem string
+		name   string
+		edit   func(record, timeline object)
+		reject bool
 	}{
-		{"valid", "", "", ""},
-		{"optional producer extension", `"held_rows_checked":3`, `"held_rows_checked":3,"extension":{"another_field":0}`, ""},
-		{"null proof", `"publication":{"generation":40,"observed_lag_lower_bound_ns":10,"observed_lag_upper_bound_ns":35}`, `"publication":null`, "publication generation"},
-		{"case-sensitive key", `"backfill_timelines"`, `"Backfill_Timelines"`, "backfill_timelines"},
-		{"duplicate pattern", `"pattern":"scattered"`, `"pattern":"clustered"`, "duplicate cutover backfill pattern"},
-		{"wrong requested boundary", `"requested_cutoff":196544`, `"requested_cutoff":196545`, "incorrect cutoffs"},
-		{"incomplete continuation", `"held_cursor_exhausted":true`, `"held_cursor_exhausted":false`, "held cursor exhaustion"},
-		{"missing fresh backfill", `"fresh_backfill_visible":true`, `"fresh_backfill_visible":false`, "fresh backfill visibility"},
-		{"misreported acknowledgements", `"batches":2`, `"batches":1`, "acknowledged backfill"},
-		{"backwards publication bounds", `"observed_lag_upper_bound_ns":35`, `"observed_lag_upper_bound_ns":9`, "publication generation or observation bounds"},
-		{"publication lag mismatch", `"observed_lag_upper_bound_ns":35`, `"observed_lag_upper_bound_ns":39`, "lag bounds disagree"},
-		{"wrong publication sample cutoff", `"covered_rows":196544,"committed_rows":196608`, `"covered_rows":196543,"committed_rows":196608`, "publication at the requested cutoff"},
-		{"wrong compaction generation", `"compaction":{"state":"complete","generation":42`, `"compaction":{"state":"complete","generation":51`, "matching completed compaction"},
-		{"drain unavailable", `"status":"observed"`, `"status":"unavailable","reason":"runtime metric is absent"`, "runtime metric is absent"},
-		{"held pins missing", `"retired_pins_while_held":2`, `"retired_pins_while_held":null`, "positive held count"},
-		{"pins still held", `"retired_pins_after_exhaustion":0`, `"retired_pins_after_exhaustion":1`, "zero after retirement"},
-		{"missing replay summary", `"terminal_page_retried":true`, `"terminal_page_retried":false`, "terminal page replay"},
-		{"missing retirement summary", `"capture_retired":true`, `"capture_retired":false`, "explicit capture retirement"},
-		{"unsupported drained summary", `"retired_generation_pins":0`, `"retired_generation_pins":null`, "fresh visibility sample must follow observed pin drain"},
-		{"drain request precedes retirement", `"request_sent_ns":81`, `"request_sent_ns":79`, "did not follow explicit capture retirement"},
+		{name: "immediate and delayed drain"},
+		{"forward-compatible fields", func(_, b object) { b["extension"] = object{"value": true} }, false},
+		{"samples equal peak", func(r, b object) {
+			peak := r["cgroup_peak_memory_bytes"]
+			memory(b, "status_poll")["bytes"], memory(b, "overlap")["bytes"] = peak, peak
+			summary := at(b, "live_memory_current")
+			summary["min_bytes"], summary["max_bytes"] = peak, peak
+		}, false},
+		{"current exceeds final peak but is below cap", func(r, b object) {
+			abovePeak := r["cgroup_peak_memory_bytes"].(float64) + 1
+			memory(b, "overlap")["bytes"] = abovePeak
+			at(b, "live_memory_current")["max_bytes"] = abovePeak
+		}, true},
+		{"one overlap read", func(_, b object) { delete(sample(b, "status_poll"), "cgroup_memory_current") }, true},
+		{"missing overlap read", func(_, b object) { delete(sample(b, "overlap"), "cgroup_memory_current") }, true},
+		{"start reply carries memory", func(_, b object) {
+			sample(b, "compaction_start")["cgroup_memory_current"] = memory(b, "status_poll")
+		}, true},
+		{"publication reply carries memory", func(_, b object) {
+			sample(b, "publication")["cgroup_memory_current"] = memory(b, "overlap")
+		}, true},
+		{"missing bytes", func(_, b object) { delete(memory(b, "overlap"), "bytes") }, true},
+		{"zero bytes", func(_, b object) { memory(b, "overlap")["bytes"] = 0 }, true},
+		{"read error with contradictory bytes", func(_, b object) { memory(b, "overlap")["error"] = "read failed" }, true},
+		{"read precedes preceding running response", func(_, b object) {
+			memory(b, "overlap")["read_start_ns"] = 3400000
+		}, true},
+		{"read ends after request begins", func(_, b object) { memory(b, "overlap")["read_end_ns"] = 5500000 }, true},
+		{"zero-duration read", func(_, b object) { memory(b, "overlap")["read_end_ns"] = 3700000 }, true},
+		{"missing request time", func(_, b object) { delete(sample(b, "status_poll"), "request_sent_ns") }, true},
+		{"different operation generation", func(_, b object) { at(sample(b, "status_poll"), "status")["generation"] = 99 }, true},
+		{"different operation cutoff", func(_, b object) { at(sample(b, "status_poll"), "status")["covered_rows"] = 1 }, true},
+		{"complete status does not bracket", func(_, b object) { at(sample(b, "status_poll"), "status")["state"] = "complete" }, true},
+		{"reported span disagrees", func(_, b object) { at(b, "live_memory_current")["observation_span_ns"] = 1 }, true},
+		{"reported range disagrees", func(_, b object) { at(b, "live_memory_current")["min_bytes"] = 1 }, true},
+		{"reported count disagrees", func(_, b object) { at(b, "live_memory_current")["sample_count"] = 3 }, true},
+		{"missing summary", func(_, b object) { delete(b, "live_memory_current") }, true},
+		{"reported drain without zero sample", func(_, b object) {
+			at(sample(b, "drain_poll"), "candidate_status_metrics")["retired_generation_pins"] = nil
+		}, true},
+		{"pin drain counter contradicts unavailable status", func(_, b object) {
+			at(sample(b, "drain_poll"), "candidate_status_metrics")["unavailable"] = object{"retired_generation_pins": "missing"}
+		}, true},
+		{"drain request precedes retirement", func(_, b object) {
+			sample(b, "after_retirement")["request_sent_ns"] = 10000000
+		}, true},
+		{"inexact fresh walk", func(_, b object) { b["fresh_rows_checked"] = 1 }, true},
+		{"inexact restart walk", func(r, _ object) { r["recovered_rows"] = 1 }, true},
+		{"batch count disagrees", func(_, b object) { at(b, "acknowledged_backfill")["batches"] = 1 }, true},
+		{"missing store cleanup", func(r, _ object) { delete(at(r, "cleanup"), "store_removed") }, true},
+		{"reported OOM", func(r, _ object) { at(at(r, "diagnostics"), "cgroup_memory_events")["oom_kill"] = 1 }, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if tc.from != "" && !strings.Contains(string(modern), tc.from) {
-				t.Fatalf("missing test mutation %q", tc.from)
+			in := data
+			if tc.edit != nil {
+				var wire object
+				if err := jsonv1.Unmarshal(data, &wire); err != nil {
+					t.Fatal(err)
+				}
+				r := index(at(at(wire, "cases"), capacityCase), "evidence", 1)
+				tc.edit(r, index(at(r, "diagnostics"), "backfill_timelines", 1))
+				var err error
+				in, err = jsonv1.Marshal(wire)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
-			data := []byte(strings.Replace(string(modern), tc.from, tc.to, 1))
-			err := validateReportWithOptions(data, id, capacityCases, cutover)
-			if tc.problem == "" && err != nil || tc.problem != "" && (err == nil || !strings.Contains(err.Error(), tc.problem)) {
-				t.Fatalf("wanted %q, got %v", tc.problem, err)
+			reportPath := filepath.Join(t.TempDir(), "capacity.json")
+			if err := os.WriteFile(reportPath, in, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateReportWithOptions(in, id, capacityCases, cutover); (err != nil) != tc.reject {
+				t.Errorf("release validator error = %v, want rejection %t", err, tc.reject)
+			}
+			cmd := exec.CommandContext(t.Context(), producer, "-validate-cutover", reportPath)
+			output, err := cmd.CombinedOutput()
+			var exit *exec.ExitError
+			if err != nil && (!errors.As(err, &exit) || exit.ExitCode() != 1) || (err != nil) != tc.reject {
+				t.Errorf("capacity validator error = %v, want rejection %t\n%s", err, tc.reject, output)
 			}
 		})
 	}

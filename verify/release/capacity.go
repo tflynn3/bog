@@ -46,6 +46,7 @@ type capacityEvidence struct {
 		CandidateReaped bool   `json:"candidate_reaped"`
 		SubtreeEmpty    bool   `json:"subtree_empty"`
 		SubtreeRemoved  bool   `json:"subtree_removed"`
+		StoreRemoved    bool   `json:"store_removed"`
 		Detail          string `json:"detail"`
 	} `json:"cleanup"`
 	StartReady    int64                         `json:"start_to_ready_ns"`
@@ -54,6 +55,9 @@ type capacityEvidence struct {
 	QueryP99      int64                         `json:"backfill_query_p99_ns"`
 	IngestSamples int                           `json:"ingest_samples"`
 	QuerySamples  int                           `json:"backfill_query_samples"`
+	CgroupLimit   *uint64                       `json:"cgroup_memory_limit_bytes"`
+	CgroupSwap    *uint64                       `json:"cgroup_swap_max_bytes"`
+	CgroupOOM     *uint64                       `json:"cgroup_oom_kill_count"`
 	CgroupPeak    uint64                        `json:"cgroup_peak_memory_bytes"`
 	PeakRSS       uint64                        `json:"peak_rss_bytes"`
 	PeakFDs       uint64                        `json:"peak_descriptors"`

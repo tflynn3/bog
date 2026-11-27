@@ -127,6 +127,31 @@ type memoryCurrentSample struct {
 	Error     string        `json:"error,omitempty"`
 }
 
+type memoryObservation struct {
+	Samples int           `json:"sample_count"`
+	Span    time.Duration `json:"observation_span_ns"`
+	Min     uint64        `json:"min_bytes"`
+	Max     uint64        `json:"max_bytes"`
+}
+
+func (t *backfillTimeline) summarizeMemory() (summary memoryObservation) {
+	var first time.Duration
+	for _, sample := range t.Samples {
+		m := sample.Memory
+		if m == nil || m.Error != "" || m.Bytes == nil {
+			continue
+		}
+		if summary.Samples == 0 {
+			first, summary.Min, summary.Max = m.ReadStart, *m.Bytes, *m.Bytes
+		}
+		summary.Samples++
+		summary.Span = m.ReadEnd - first
+		summary.Min = min(summary.Min, *m.Bytes)
+		summary.Max = max(summary.Max, *m.Bytes)
+	}
+	return summary
+}
+
 type publicationProof struct {
 	Generation uint64        `json:"generation"`
 	LowerBound time.Duration `json:"observed_lag_lower_bound_ns"`
@@ -164,6 +189,7 @@ type backfillTimeline struct {
 	FreshRows       int                       `json:"fresh_rows_checked"`
 	Publication     *publicationProof         `json:"publication"`
 	PinDrain        pinDrainProof             `json:"pin_drain"`
+	Memory          *memoryObservation        `json:"live_memory_current,omitempty"`
 	Samples         []phaseSample             `json:"samples"`
 	Dropped         int                       `json:"dropped_samples"`
 	Status          string                    `json:"status"`
@@ -269,14 +295,14 @@ func (p *backfillProbe) boundary(event string) {
 	p.record(event, time.Time{}, time.Now(), compactionReply{}, nil)
 }
 
-func (p *backfillProbe) request(ctx context.Context, action string) (compactionReply, time.Time, time.Time, error) {
+func (p *backfillProbe) request(ctx context.Context, action string, forceSample bool) (compactionReply, time.Time, time.Time, error) {
 	if err := ctx.Err(); err != nil {
 		now := time.Now()
 		return compactionReply{}, now, now, err
 	}
 	var memory *memoryCurrentSample
 	if p.readMemoryCurrent != nil && action == "status" && !p.startSent.IsZero() && p.Publication == nil &&
-		p.memoryReads < liveMemorySampleLimit && time.Since(p.lastPoll) >= timelineSampleInterval {
+		p.memoryReads < liveMemorySampleLimit && (forceSample || time.Since(p.lastPoll) >= timelineSampleInterval) {
 		// A running start reply has already been processed. Read before the
 		// next status request so a running reply brackets the whole read.
 		p.memoryReads++
@@ -296,7 +322,7 @@ func (p *backfillProbe) request(ctx context.Context, action string) (compactionR
 }
 
 func (p *backfillProbe) pollPublication(ctx context.Context, previous uint64, afterWrites bool) (compaction, error) {
-	c, sent, received, err := p.request(ctx, "status")
+	c, sent, received, err := p.request(ctx, "status", false)
 	event := "status_poll"
 	if err == nil {
 		switch {
@@ -327,7 +353,7 @@ func (p *backfillProbe) pollPublication(ctx context.Context, previous uint64, af
 	if err == nil && c.State == "running" {
 		p.lastRunning = sent
 	}
-	if event != "status_poll" || err != nil || received.Sub(p.lastPoll) >= timelineSampleInterval {
+	if event != "status_poll" || err != nil || c.memory != nil || received.Sub(p.lastPoll) >= timelineSampleInterval {
 		metrics := p.record(event, sent, received, c, err)
 		p.lastPoll = received
 		if event == "publication" && err == nil {
@@ -365,7 +391,7 @@ func (t *backfillTimeline) validateRunning(c compaction, previous uint64, commit
 }
 
 func (p *backfillProbe) observePublishedPins(ctx context.Context, event string) (*uint64, error) {
-	c, sent, received, err := p.request(ctx, "status")
+	c, sent, received, err := p.request(ctx, "status", false)
 	if err == nil && (c.State != "complete" || c.Generation != p.Publication.Generation ||
 		c.CoveredRows != p.RequestedCutoff || c.CommittedRows != p.FinalCutoff) {
 		err = fmt.Errorf("published state changed during pin observation: %+v", c.compaction)

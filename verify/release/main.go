@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const ordinaryWALCase = "ordinary_wal_reopen"
+
 func run(ctx context.Context, args []string) error {
 	validate := len(args) > 0 && args[0] == "validate"
 	if validate {
@@ -25,7 +27,7 @@ func run(ctx context.Context, args []string) error {
 	var opts validationOptions
 	if validate {
 		opts.requireRetarget = os.Getenv("BOG_RELEASE_REQUIRE_RETARGET") == "1"
-		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require publication and retired pin drain evidence from live capacity")
+		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require live capacity publication, memory, and retired pin drain evidence")
 		flags.StringVar(&admission, "admission", "", "admission report")
 		flags.StringVar(&durability, "durability", "", "durability report")
 		flags.StringVar(&capacity, "capacity", "", "capacity report")
@@ -60,7 +62,11 @@ func run(ctx context.Context, args []string) error {
 			}
 		}
 		if parity != "" {
-			if checkErr := validateFile(parity, id, []string{"restored_parity"}, opts); checkErr != nil {
+			cases := []string{"restored_parity"}
+			if opts.requireCutover {
+				cases = append(cases, ordinaryWALCase)
+			}
+			if checkErr := validateFile(parity, id, cases, opts); checkErr != nil {
 				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
 			}
 		}

@@ -32,7 +32,7 @@ additional evidence. The following cases must pass.
 | Admission | `one_slot_saturation`, `ingest_during_saturation`, `cursor_resume`, `work_budget` |
 | Durability | `sigkill`, `recovery`, `enospc` |
 | Capacity | `retained_history_capacity` |
-| Restored image | `restored_parity` |
+| Recovery parity | `restored_parity`, `ordinary_wal_reopen` in cutover mode |
 
 Admission also records the full saturation fixture verdict as
 `saturation_fixture`. Validation accepts archived admission reports with
@@ -100,10 +100,13 @@ records must carry passing clustered and scattered backfill timelines under
 `diagnostics.backfill_timelines`. The validator checks acknowledged
 backfill, held-cursor exhaustion, fresh visibility, publication at the
 expected cutoff, and publication lag bounds against the sampled events.
-It requires a positive retired pin count while the cursor is held and a
-zero count after exhaustion in the producer's drain samples. Standard
-validation reads archived schema-v1 capacity reports without those
-timelines.
+Both strict validators require at least two timed `memory.current` reads
+bracketed by running status for that compaction before publication. They
+recompute the reported observation span and byte range and check each read
+against the final `memory.peak` for the fixture cgroup. They also require
+a positive retired pin count while the cursor is held and an observed zero
+after explicit retirement. Standard validation reads archived schema-v1
+capacity reports without those timelines.
 
 Set `BOG_TEST_CGROUP_PARENT` to a delegated cgroup v2 parent with memory
 and I/O enabled for its children to run the kernel regression tests.
@@ -180,6 +183,12 @@ a framed HTTP 400 with the exact `invalid cursor\n` body and no continuation
 header or trailer.
 The `restored_parity` evidence records their row counts in `post_append_rows`
 and `restart_rows`. The report is bound to the same candidate identity.
+
+The same native test seeds a separate ordinary WAL before launching the
+candidate. It checks the reopened rows, requires HTTP 204 for a backfill
+batch, and compares the exact augmented ledger before shutdown and after
+restart. The `ordinary_wal_reopen` case records the row counts and append
+status.
 
 The workflow passes `-parity parity.json` when validating the collected reports
 and runs the verifier tests with the race detector on Linux.

@@ -109,7 +109,11 @@ func testMixedLoad(t *testing.T, failure string) {
 						covered--
 					}
 				default:
-					close(op.overlapped)
+					select {
+					case <-op.appendDone:
+						close(op.overlapped)
+					default:
+					}
 					state = "running"
 				}
 			case cutoff > covered:
@@ -265,6 +269,7 @@ func testMixedLoad(t *testing.T, failure string) {
 	s := newService(srv.URL)
 	defer s.client.CloseIdleConnections()
 	s.client.Timeout = 2 * time.Second
+	s.readMemoryCurrent = func(context.Context) (uint64, error) { return f.MemoryBytes / 2, nil }
 	r := result{Diagnostics: &capacityDiagnostics{Queries: make(map[string]*queryPhase)}}
 	s.queryPhases = r.Diagnostics.Queries
 	err := f.load(ctx, s, options{mode: "live", control: "/compact"}, &r, t.TempDir())
@@ -300,8 +305,12 @@ func testMixedLoad(t *testing.T, failure string) {
 		t.Fatalf("incomplete scattered evidence: %+v", scattered)
 	}
 	for i, want := range newBackfillTimelines(f) {
-		if err := r.Diagnostics.Backfills[i].validateCutover(want, f); err != nil {
+		timeline := r.Diagnostics.Backfills[i]
+		if err := timeline.validateCutover(want, f); err != nil {
 			t.Fatalf("%s timeline fails cutover validation: %v", want.Pattern, err)
+		}
+		if err := timeline.validateLiveMemory(f.MemoryBytes); err != nil {
+			t.Fatalf("%s timeline fails memory validation: %v", want.Pattern, err)
 		}
 	}
 	mu.Lock()

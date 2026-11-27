@@ -125,8 +125,39 @@ jobs:
             sha256sum "$BINARY" | tee "$EVIDENCE/binary.sha256"
           } 2>&1 | tee "$EVIDENCE/build.log"
 
-      - name: Run release evidence producers
+      - name: Preflight release command flags
+        id: preflight
         if: steps.build.outcome == 'success'
+        timeout-minutes: 3
+        run: |
+          require_flags() {
+            local command=$1 usage=$2
+            shift 2
+            printf '%s\n%s\n' "$command" "$usage"
+            for flag in "$@"; do
+              if ! grep -Eq "^[[:space:]]+-${flag}([[:space:]]|$)" <<< "$usage"; then
+                printf '%s does not advertise -%s\n' "$command" "$flag" >&2
+                return 1
+              fi
+            done
+          }
+          {
+            release_help=$(cd gate && timeout --kill-after=5s 1m go run ./verify/release validate -help 2>&1) ||
+              { printf 'gate report validator help failed\n%s\n' "$release_help" >&2; exit 1; }
+            require_flags "gate report validator" "$release_help" binary revision fixture admission durability capacity parity require-cutover
+            cutover_help=$(cd gate && timeout --kill-after=5s 1m go run ./bench/retained-history -help 2>&1) ||
+              { printf 'gate capacity validator help failed\n%s\n' "$cutover_help" >&2; exit 1; }
+            require_flags "gate capacity validator" "$cutover_help" validate-cutover
+            producer_help=$(cd candidate && timeout --kill-after=5s 1m go run ./bench/retained-history -help 2>&1) ||
+              { printf 'candidate capacity producer help failed\n%s\n' "$producer_help" >&2; exit 1; }
+            require_flags "candidate capacity producer" "$producer_help" binary revision fixture mode cgroup-parent work-dir report
+            candidate_help=$(timeout --kill-after=5s 10s "$BINARY" -help 2>&1) ||
+              { printf 'candidate server help failed\n%s\n' "$candidate_help" >&2; exit 1; }
+            require_flags "candidate server" "$candidate_help" addr data-dir query-concurrency query-max-response-bytes query-work-budget
+          } 2>&1 | tee "$EVIDENCE/preflight.log"
+
+      - name: Run release evidence producers
+        if: steps.preflight.outcome == 'success'
         timeout-minutes: 52
         run: |
           record() {
@@ -229,12 +260,11 @@ jobs:
         timeout-minutes: 3
         env:
           BOG_RELEASE_REQUIRE_RETARGET: '1'
-          BOG_RELEASE_REQUIRE_CUTOVER: '1'
         run: |
           {
             failed=0
             sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
-            go run ./verify/release validate -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
+            go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
             go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1

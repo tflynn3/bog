@@ -13,6 +13,9 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	p.boundary("phase_start")
 	defer func() {
 		p.HeldRows = held.offset
+		if summary := p.summarizeMemory(); summary.Samples > 0 {
+			p.Memory = &summary
+		}
 		if err != nil {
 			p.Status, p.Failure = "fail", diagnosticError(err)
 			p.boundary("phase_failure")
@@ -46,7 +49,7 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	}
 	p.boundary("cutoff_acknowledged")
 	setPhase("mixed_compaction")
-	c, sent, received, err := p.request(ctx, "start")
+	c, sent, received, err := p.request(ctx, "start", false)
 	p.startSent = sent
 	if scattered && err == nil {
 		r.Diagnostics.OpeningCompaction = &c.compaction
@@ -60,6 +63,20 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	p.record("compaction_start", sent, received, c, err)
 	if err != nil {
 		return compaction{}, err
+	}
+
+	// Take the first bracket immediately. The overlap status takes a second
+	// sample even if the continuation and first batch finish within one poll interval.
+	if p.readMemoryCurrent != nil {
+		c, sent, received, err = p.request(ctx, "status", true)
+		if err == nil {
+			err = p.validateRunning(c.compaction, previous, p.RequestedCutoff)
+		}
+		p.record("status_poll", sent, received, c, err)
+		if err != nil {
+			return compaction{}, fmt.Errorf("observe opening compaction: %w", err)
+		}
+		p.lastRunning, p.lastPoll = sent, received
 	}
 
 	setPhase("mixed_continuation")
@@ -173,7 +190,7 @@ func (f fixture) overlapBackfill(ctx context.Context, p *backfillProbe, held *wa
 			return mixed.Err()
 		case <-firstWrite:
 		}
-		c, sent, received, err := p.request(mixed, "status")
+		c, sent, received, err := p.request(mixed, "status", true)
 		if p.Pattern == "scattered" && err == nil {
 			r.Diagnostics.OverlapCompaction = &c.compaction
 		}

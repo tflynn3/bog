@@ -53,7 +53,14 @@ func TestReleaseRestoredParity(t *testing.T) {
 		return err
 	})
 	probeErr = record(results.Cases, restoredParityCase, proof, probeErr)
-	if err := errors.Join(probeErr, writeReport(path, results)); err != nil {
+	var ordinary ordinaryWALProof
+	ordinaryErr := withFixtureRoot(func(root string) error {
+		var err error
+		ordinary, err = ordinaryWALParity(ctx, binary, root)
+		return err
+	})
+	ordinaryErr = record(results.Cases, ordinaryWALCase, ordinary, ordinaryErr)
+	if err := errors.Join(probeErr, ordinaryErr, writeReport(path, results)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -67,6 +74,64 @@ type parityProof struct {
 	PostRestore204 bool         `json:"post_restore_204"`
 	PostAppendRows int          `json:"post_append_rows"`
 	RestartRows    int          `json:"restart_rows"`
+}
+
+type ordinaryWALProof struct {
+	ReopenedRows int `json:"reopened_rows"`
+	AppendStatus int `json:"append_status"`
+	RestartRows  int `json:"restart_rows"`
+}
+
+func ordinaryWALParity(ctx context.Context, binary, dir string) (proof ordinaryWALProof, err error) {
+	rows := parityRows()
+	// Write a committed legacy WAL before launching the candidate.
+	if err := appendParityBatch(dir, rows[:3]); err != nil {
+		return proof, fmt.Errorf("prepare ordinary WAL: %w", err)
+	}
+	client := &http.Client{
+		Timeout:       5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	defer client.CloseIdleConnections()
+	flags := []string{fmt.Sprintf("-query-max-response-bytes=%d", restoredPageCap)}
+	var log querymodel.Log
+	log.Append(rows[:3])
+	if err := serveDirectory(ctx, binary, dir, client, flags, func(ctx context.Context, base string) error {
+		pager, err := newReleasePager(base, client, restoredPageCap)
+		if err != nil {
+			return err
+		}
+		if err := checkParityWalks(ctx, pager, &log); err != nil {
+			return err
+		}
+		proof.ReopenedRows = log.HighWater()
+		batch := make([]row, 0, len(rows[3:]))
+		for _, item := range rows[3:] {
+			batch = append(batch, parityWireRow(item))
+		}
+		proof.AppendStatus, err = ingest(ctx, client, base, batch)
+		if err != nil {
+			return err
+		}
+		log.Append(rows[3:])
+		return checkParityWalks(ctx, pager, &log)
+	}); err != nil {
+		return proof, fmt.Errorf("reopen and write ordinary WAL: %w", err)
+	}
+	if err := serveDirectory(ctx, binary, dir, client, flags, func(ctx context.Context, base string) error {
+		pager, err := newReleasePager(base, client, restoredPageCap)
+		if err != nil {
+			return err
+		}
+		if err := checkParityWalks(ctx, pager, &log); err != nil {
+			return err
+		}
+		proof.RestartRows = log.HighWater()
+		return nil
+	}); err != nil {
+		return proof, fmt.Errorf("restart ordinary WAL after acknowledged write: %w", err)
+	}
+	return proof, nil
 }
 
 func parityRows() []querymodel.Row {
@@ -110,7 +175,7 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 		if err != nil {
 			return err
 		}
-		if err := checkRestoredWalks(ctx, pager, &log); err != nil {
+		if err := checkParityWalks(ctx, pager, &log); err != nil {
 			return err
 		}
 		proof.CapturedRows = log.HighWater()
@@ -136,7 +201,7 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 		}
 		proof.HeldPages, proof.HeldRows, proof.ByteTrimmed = held.Pages, held.Rows, held.ByteTrimmedPages
 
-		if err := checkRestoredWalks(ctx, pager, &log); err != nil {
+		if err := checkParityWalks(ctx, pager, &log); err != nil {
 			return fmt.Errorf("walk after acknowledged post-restore write: %w", err)
 		}
 		proof.PostAppendRows = log.HighWater()
@@ -153,7 +218,7 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 		if err != nil {
 			return err
 		}
-		if err := checkRestoredWalks(ctx, pager, &log); err != nil {
+		if err := checkParityWalks(ctx, pager, &log); err != nil {
 			return err
 		}
 		proof.RestartRows = log.HighWater()
@@ -175,13 +240,13 @@ func restoredWalk(pager *releasePager, filter string, limits []int) querymodel.W
 	}
 }
 
-func checkRestoredWalks(ctx context.Context, pager *releasePager, log *querymodel.Log) error {
+func checkParityWalks(ctx context.Context, pager *releasePager, log *querymodel.Log) error {
 	fetch := parityFetch(pager)
 	for _, filter := range []string{"", "[match]", "absent"} {
 		for _, limits := range [][]int{{1}, {3}, {10, 1, 3}} {
 			walk := restoredWalk(pager, filter, limits)
 			if _, err := querymodel.VerifyWireWalk(ctx, log, walk, fetch, nil); err != nil {
-				return fmt.Errorf("restored parity with row limits %v: %w", limits, err)
+				return fmt.Errorf("parity with filter %q and row limits %v: %w", filter, limits, err)
 			}
 		}
 	}

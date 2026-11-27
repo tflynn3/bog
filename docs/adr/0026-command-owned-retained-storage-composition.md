@@ -1,6 +1,6 @@
 # ADR 0026 — Command-owned retained storage composition
 
-**Status** — Proposed for Cycle 114 review.
+**Status** — Proposed for Cycle 115 review.
 
 ## Decision
 
@@ -17,10 +17,19 @@ inject the retained page source through `httpapi.NewWithPageSource`.
 import path to `internal/checkpoint`, `internal/history`, or
 `internal/backup`, including through registered intermediaries. Each of
 those libraries and `internal/idempotency` must also have no production
-import path back to WAL. The fitness rule follows registered production
-imports, which the architecture suite compares with the Linux amd64 and
-arm64 inventories. The WAL rule applies independently of whether HTTP and
-readiness import WAL. Their own retained storage exclusions still apply.
+import path back to WAL.
+
+`cmd/bog` is the only production package whose import graph may reach both
+`internal/wal` and any of checkpoint, history, or backup. The fitness rule
+reports the package combining those dependencies and the retained packages
+it reaches, even when either path runs through a registered relay. It follows
+registered root-module production imports, which the architecture suite
+compares with the Linux amd64 and arm64 inventories.
+
+Readiness can observe the WAL outcome independently. HTTP uses the injected
+page source. Their retained storage exclusions still apply. The read-only
+operator graph may reach backup without WAL, and its own command exclusions
+still apply.
 [Storage authority fitness test](../../internal/archtest/storage_authority_test.go),
 [Keyed-ingest storage authority](0022-keyed-ingest-storage-authority.md)
 

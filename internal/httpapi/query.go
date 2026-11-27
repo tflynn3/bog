@@ -16,6 +16,12 @@ func writeQueryError(w http.ResponseWriter, err error) {
 		http.Error(w, "request cancelled", http.StatusRequestTimeout)
 	case errors.Is(err, ErrCaptureExpired):
 		http.Error(w, "query capture expired", http.StatusGone)
+	case errors.Is(err, ErrQueryResponseCapacityExhausted):
+		http.Error(w, ErrQueryResponseCapacityExhausted.Error(), http.StatusServiceUnavailable)
+	case errors.Is(err, ErrQueryScanCapacityExhausted):
+		http.Error(w, ErrQueryScanCapacityExhausted.Error(), http.StatusServiceUnavailable)
+	case errors.Is(err, ErrQueryCaptureCapacityExhausted):
+		http.Error(w, ErrQueryCaptureCapacityExhausted.Error(), http.StatusServiceUnavailable)
 	case errors.Is(err, ErrQueryCapacityExhausted):
 		http.Error(w, "query capacity exhausted", http.StatusServiceUnavailable)
 	case errors.Is(err, store.ErrInvalidQueryCursor):
@@ -41,6 +47,14 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if a.captures.startQuery() {
+		defer a.captures.finishQuery()
+	} else if params.cursor == "" {
+		writeQueryError(w, ErrQueryCapacityExhausted)
+		return
+	}
+	// A resume after Close still authenticates its cursor. The registry
+	// rejects its capture before it can reach the source.
 	ctx := r.Context()
 	if params.cursor != "" {
 		if a.legacy != nil {
@@ -54,21 +68,22 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		a.openQuery(w, ctx, params, work)
 		return
 	}
-	result, err := a.captures.source.Page(ctx, PageRequest{Filter: params.filter, Limit: params.limit}, work)
-	if err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	if len(result.Rows) > params.limit {
-		writeQueryError(w, errPageSourceContract)
-		return
-	}
-	response := queryResponse{maxBytes: a.maxResponseBytes}
-	if _, err := response.appendRows(result.Rows, work); err != nil {
+	response := a.newQueryResponse()
+	defer response.release()
+	req := PageRequest{Filter: params.filter, Limit: params.limit}
+	if err := a.withPage(ctx, req, work, func(result PageResult) error {
+		if len(result.Rows) > params.limit {
+			return errPageSourceContract
+		}
+		_, err := response.appendRows(result.Rows, work)
+		return err
+	}); err != nil {
+		response.release()
 		writeQueryError(w, err)
 		return
 	}
 	if err := response.reserveDelivery(work); err != nil {
+		response.release()
 		writeQueryError(w, err)
 		return
 	}
@@ -84,12 +99,13 @@ func (a *API) openQuery(w http.ResponseWriter, ctx context.Context, params query
 	cursorMayHaveReached := false
 	defer func() { a.captures.done(capture, !cursorMayHaveReached) }()
 
-	var response queryResponse
+	response := a.newQueryResponse()
+	defer response.release()
 	var token string
 	if a.legacy != nil {
-		response, token, err = a.prepareLegacyOpening(capture, params, work)
+		token, err = a.prepareLegacyOpening(capture, params, &response, work)
 	} else {
-		response, token, err = a.prepareRetainedOpening(ctx, capture, params, work)
+		token, err = a.prepareRetainedOpening(ctx, capture, params, &response, work)
 	}
 	if err == nil && token != "" {
 		// Register the plan before the client can see the token. The opening
@@ -100,6 +116,7 @@ func (a *API) openQuery(w http.ResponseWriter, ctx context.Context, params query
 		err = work.Charge()
 	}
 	if err != nil {
+		response.release()
 		writeQueryError(w, err)
 		return
 	}

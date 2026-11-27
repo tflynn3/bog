@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,7 +30,8 @@ func (s signalRestart) WaitForRestart(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(s.out, "restart the restored server now. When it is ready, run kill -USR1 %d\n", os.Getpid()); err != nil {
+	prompt := fmt.Sprintf("restart the restored server now. When it is ready, run kill -USR1 %d\n", os.Getpid())
+	if err := writeText(s.out, prompt); err != nil {
 		return fmt.Errorf("write restart prompt: %w", err)
 	}
 	select {
@@ -40,30 +42,68 @@ func (s signalRestart) WaitForRestart(ctx context.Context) error {
 }
 
 func drillBackup(ctx context.Context, opts options, server *client.Client, restart restartBoundary, out io.Writer) (int, error) {
-	before, point, status, err := compareRestore(ctx, opts, server, &opts.retry, nil)
-	if err != nil {
-		return status, fmt.Errorf("before restart: %w", err)
+	var beforeRestart func(drillCounts, recoveryPoint) error
+	if !opts.json {
+		beforeRestart = func(counts drillCounts, point recoveryPoint) error {
+			_, err := report(out, fmt.Sprintf("before restart matched: %s %s\n", counts, point))
+			return err
+		}
 	}
-	server.CloseIdleConnections()
-	if err := ctx.Err(); err != nil {
-		return exitIncomplete, fmt.Errorf("restart boundary: %w", err)
+	result, err := drillRestore(ctx, opts, server, restart, beforeRestart)
+	if opts.json {
+		if writeErr := writeDrillResult(out, result); writeErr != nil {
+			return exitIncomplete, errors.Join(err, writeErr)
+		}
 	}
-	if _, err := fmt.Fprintf(out, "before restart matched: %s %s\n", comparisonCounts(before), formatPoint(point)); err != nil {
-		return exitIncomplete, fmt.Errorf("before restart: write result: %w", err)
-	}
-	if err := restart.WaitForRestart(ctx); err != nil {
-		return exitIncomplete, fmt.Errorf("restart boundary: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return exitIncomplete, fmt.Errorf("restart boundary: %w", err)
-	}
-	after, _, status, err := compareRestore(ctx, opts, server, &opts.retry, &point)
-	if err != nil {
-		return status, fmt.Errorf("after restart: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return exitIncomplete, fmt.Errorf("after restart: %w", err)
+	if err != nil || opts.json {
+		return result.ExitStatus, err
 	}
 	return report(out, fmt.Sprintf("restore drill matched after restart: %s %s\n",
-		comparisonCounts(after), formatPoint(point)))
+		result.AfterRestart.Counts, result.RecoveryPoint))
+}
+
+func drillRestore(ctx context.Context, opts options, server *client.Client, restart restartBoundary, beforeRestart func(drillCounts, recoveryPoint) error) (drillResult, error) {
+	result := drillResult{
+		SchemaVersion: drillSchemaVersion,
+		BeforeRestart: drillPhaseResult{Status: phaseNotRun},
+		AfterRestart:  drillPhaseResult{Status: phaseNotRun},
+	}
+	before, point, status, err := compareRestore(ctx, opts, server, &opts.retry, nil)
+	if point != nil {
+		result.RecoveryPoint = resultPoint(*point)
+	}
+	result.BeforeRestart.recordCounts(before)
+	if err != nil {
+		result.BeforeRestart.Status = phaseFailed
+		return result.fail(phaseBeforeRestart, status, fmt.Errorf("before restart: %w", err))
+	}
+	result.BeforeRestart.Status = phaseMatched
+
+	server.CloseIdleConnections()
+	if err := ctx.Err(); err != nil {
+		return result.fail(phaseRestartBoundary, exitIncomplete, fmt.Errorf("restart boundary: %w", err))
+	}
+	if beforeRestart != nil {
+		if err := beforeRestart(*result.BeforeRestart.Counts, *result.RecoveryPoint); err != nil {
+			return result.fail(phaseBeforeRestart, exitIncomplete, fmt.Errorf("before restart: %w", err))
+		}
+	}
+	if err := restart.WaitForRestart(ctx); err != nil {
+		return result.fail(phaseRestartBoundary, exitIncomplete, fmt.Errorf("restart boundary: %w", err))
+	}
+	if err := ctx.Err(); err != nil {
+		return result.fail(phaseRestartBoundary, exitIncomplete, fmt.Errorf("restart boundary: %w", err))
+	}
+	after, _, status, err := compareRestore(ctx, opts, server, &opts.retry, point)
+	result.AfterRestart.recordCounts(after)
+	if ctxErr := ctx.Err(); err == nil && ctxErr != nil {
+		status, err = exitIncomplete, ctxErr
+	}
+	if err != nil {
+		result.AfterRestart.Status = phaseFailed
+		return result.fail(phaseAfterRestart, status, fmt.Errorf("after restart: %w", err))
+	}
+	result.AfterRestart.Status = phaseMatched
+	result.Parity = true
+	return result, nil
 }

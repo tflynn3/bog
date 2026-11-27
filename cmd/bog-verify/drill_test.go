@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -260,7 +261,7 @@ type promptWriter func([]byte) (int, error)
 func (w promptWriter) Write(p []byte) (int, error) { return w(p) }
 
 func TestDrillCLIWaitsForOperatorSignal(t *testing.T) {
-	dir, _, _ := makeBundle(t)
+	dir, _, point := makeBundle(t)
 	for _, action := range []string{"signal", "cancel at boundary", "cancel after restart", "output error"} {
 		t.Run(action, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
@@ -310,13 +311,20 @@ func TestDrillCLIWaitsForOperatorSignal(t *testing.T) {
 			})
 			args := append(compareArgs(dir, server.URL), "-contains", "no matches")
 			args[0] = "drill"
-			status, err := execute(ctx, args, out)
+			status, err := execute(ctx, args, out, io.Discard)
 			mu.Lock()
 			defer mu.Unlock()
 			switch action {
 			case "signal":
 				if status != exitOK || err != nil || requests != 2 {
 					t.Fatalf("status %d, error %v, requests %d, output %q", status, err, requests, &output)
+				}
+				want := fmt.Sprintf("before restart matched: rows=0 reference_pages=1 server_pages=1 %s\n"+
+					"restart the restored server now. When it is ready, run kill -USR1 %d\n"+
+					"restore drill matched after restart: rows=0 reference_pages=1 server_pages=1 %s\n",
+					formatPoint(point), os.Getpid(), formatPoint(point))
+				if output.String() != want {
+					t.Fatalf("default stdout %q, want %q", &output, want)
 				}
 			case "cancel at boundary":
 				if status != exitIncomplete || !errors.Is(err, context.Canceled) || requests != 1 {

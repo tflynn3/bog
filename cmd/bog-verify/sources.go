@@ -15,11 +15,11 @@ func compareBackup(ctx context.Context, opts options, server *client.Client, out
 	if err != nil {
 		return status, err
 	}
-	return report(out, fmt.Sprintf("query matched: %s %s\n", comparisonCounts(result), formatPoint(point)))
+	return report(out, fmt.Sprintf("query matched: %s %s\n", comparisonCounts(*result), formatPoint(*point)))
 }
 
 func compareRestore(ctx context.Context, opts options, server *client.Client, retry *client.PageRetry, expected *backup.Point) (
-	result comparison, point backup.Point, status int, err error,
+	result *comparison, point *backup.Point, status int, err error,
 ) {
 	walk, err := server.NewBoundedWalk(opts.query, opts.maxPages)
 	if err != nil {
@@ -44,10 +44,11 @@ func compareRestore(ctx context.Context, opts options, server *client.Client, re
 			}
 		}
 	}()
-	point = reference.Point()
-	if expected != nil && point != *expected {
+	verified := reference.Point()
+	point = &verified
+	if expected != nil && verified != *expected {
 		return result, point, exitVerification, verificationError(opts.bundle,
-			fmt.Errorf("reference recovery point changed: expected %s, found %s", formatPoint(*expected), formatPoint(point)))
+			fmt.Errorf("reference recovery point changed: expected %s, found %s", formatPoint(*expected), formatPoint(verified)))
 	}
 	fetch := walk.NextPage
 	if retry != nil {
@@ -65,8 +66,8 @@ func compareRestore(ctx context.Context, opts options, server *client.Client, re
 		}
 		return queryPage{rows: p.Rows, terminal: p.NextCursor == ""}, nil
 	}
-	result, status, err = compare(ctx, referenceStream(reference, opts.maxPages), live)
-	return result, point, status, err
+	counts, status, err := compare(ctx, referenceStream(reference, opts.maxPages), live)
+	return &counts, point, status, err
 }
 
 func comparisonCounts(result comparison) string {

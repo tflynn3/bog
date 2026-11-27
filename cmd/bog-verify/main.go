@@ -26,7 +26,7 @@ const usage = `Usage:
   bog-verify drill -backup DIR -url URL -start TIME -end TIME
                    [-contains TEXT] [-limit 100] [-max-pages 100000]
                    [-max-page-bytes 33554432] [-max-retries 3]
-                   [-retry-delay 100ms] [-timeout 5m]
+                   [-retry-delay 100ms] [-timeout 5m] [-json]
 
 The reference backup must remain immutable throughout the command. Use a
 separate copy as the restored server's data directory. Query times are
@@ -50,6 +50,7 @@ type options struct {
 	maxPageBytes int64
 	query        client.Query
 	retry        client.PageRetry
+	json         bool
 }
 
 func parseOptions(mode string, args []string) (options, error) {
@@ -69,6 +70,7 @@ func parseOptions(mode string, args []string) (options, error) {
 		flags.Int64Var(&opts.maxPageBytes, "max-page-bytes", client.DefaultMaxPage, "maximum encoded bytes per live HTTP page")
 	}
 	if mode == "drill" {
+		flags.BoolVar(&opts.json, "json", false, "emit one JSON drill result on stdout")
 		flags.IntVar(&opts.retry.MaxRetries, "max-retries", 3, "maximum retries per live page")
 		flags.DurationVar(&opts.retry.Delay, "retry-delay", 100*time.Millisecond, "wait between live page attempts")
 	}
@@ -122,16 +124,16 @@ func parseOptions(mode string, args []string) (options, error) {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	status, err := execute(ctx, args, stdout)
+	status, err := execute(ctx, args, stdout, stderr)
 	if err != nil {
-		if _, writeErr := fmt.Fprintf(stderr, "bog-verify: %v\n", err); writeErr != nil {
+		if writeErr := writeText(stderr, fmt.Sprintf("bog-verify: %v\n", err)); writeErr != nil {
 			return exitIncomplete
 		}
 	}
 	return status
 }
 
-func execute(ctx context.Context, args []string, out io.Writer) (int, error) {
+func execute(ctx context.Context, args []string, out, diagnosticOut io.Writer) (int, error) {
 	if len(args) == 0 {
 		if _, err := io.WriteString(out, usage); err != nil {
 			return exitUsage, fmt.Errorf("write usage: %w", err)
@@ -173,7 +175,11 @@ func execute(ctx context.Context, args []string, out io.Writer) (int, error) {
 	defer server.CloseIdleConnections()
 	server.MaxPageBytes = opts.maxPageBytes
 	if mode == "drill" {
-		return drillBackup(ctx, opts, server, signalRestart{out: out}, out)
+		promptOut := out
+		if opts.json {
+			promptOut = diagnosticOut
+		}
+		return drillBackup(ctx, opts, server, signalRestart{out: promptOut}, out)
 	}
 	return compareBackup(ctx, opts, server, out)
 }
@@ -186,10 +192,18 @@ func showHelp(out io.Writer) (int, error) {
 }
 
 func report(out io.Writer, message string) (int, error) {
-	if _, err := io.WriteString(out, message); err != nil {
+	if err := writeText(out, message); err != nil {
 		return exitIncomplete, fmt.Errorf("write result: %w", err)
 	}
 	return exitOK, nil
+}
+
+func writeText(out io.Writer, message string) error {
+	n, err := io.WriteString(out, message)
+	if err == nil && n != len(message) {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 func verificationError(bundle string, err error) error {
@@ -197,8 +211,7 @@ func verificationError(bundle string, err error) error {
 }
 
 func formatPoint(p backup.Point) string {
-	return fmt.Sprintf("generation=%x covered_offset=%d next_ordinal=%d committed_end=%d",
-		p.Generation, p.CoveredOffset, p.NextOrdinal, p.CommittedEnd)
+	return resultPoint(p).String()
 }
 
 func main() {

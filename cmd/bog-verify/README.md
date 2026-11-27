@@ -52,17 +52,65 @@ accepted. Capture expiry (HTTP 410), invalid cursors (HTTP 400), and retry
 exhaustion produce distinct incomplete diagnostics. The overall
 `-timeout` covers both comparisons, retry waits, and the restart boundary.
 
-On native Linux, run the fixture-backed integration test with a built #53
+### JSON result
+
+Add `-json` to `drill` to write one newline-terminated JSON object to
+stdout when the drill ends, including on operational failure. Watch stderr
+for the restart prompt and the readable failure diagnostic. Exit statuses
+are the same as for text output. Help and invalid command-line options
+keep their usual behavior. An output write failure returns status 4.
+
+| Field | Schema version 1 |
+| --- | --- |
+| `schema_version` | Integer `1`. |
+| `parity` | Boolean. True only after both walks match through their terminal pages and the drill completes. |
+| `exit_status` | Integer drill exit status from the table below. |
+| `recovery_point` | Object with the verified reference's `generation` (64 lowercase hexadecimal characters), `covered_offset` and `committed_end` (logical WAL byte offsets), and `next_ordinal` (first uncovered append ordinal). Null if the drill could not obtain the point. |
+| `before_restart`, `after_restart` | Phase objects, each with `status` (`matched`, `failed`, or `not_run`) and `counts`. |
+| `diagnostic` | Null on success. On failure, an object containing `phase`, `code`, and `message`. |
+
+A phase's `counts` is null until its comparison starts. Once started it
+contains integer `rows` (matched row pairs), `reference_pages`, and
+`server_pages` (accepted pages, including empty and terminal pages). A
+failed walk can have partial counts or even the full row count if a
+terminal page was still pending. The recovery point always identifies the
+reference opened before restart. If the reference changes, the second
+phase fails verification and the diagnostic includes the expected and
+observed recovery points.
+
+Diagnostic phases are `before_restart`, `restart_boundary`, and
+`after_restart`. A failure while waiting for the restart leaves
+`after_restart.status` at `not_run`. Consumers can branch on these codes.
+
+| Code | Meaning |
+| --- | --- |
+| `backup_verification_failed` | The reference backup failed verification or its recovery point changed. |
+| `mismatch` | The compared rows differed in ordering, timestamp, content, or length. |
+| `cursor_expired` | The server reported that the continued capture expired. |
+| `invalid_cursor` | The server rejected a continuation cursor as invalid. |
+| `retries_exhausted` | The live page did not complete within its retry budget. |
+| `page_budget_exhausted` | A stream needed another page after reaching its page budget. |
+| `page_too_large` | The live page exceeded the configured byte limit. |
+| `canceled`, `deadline_exceeded` | The drill was canceled or exceeded its deadline. |
+| `incomplete` | Another error prevented the phase from completing. |
+
+The diagnostic `message` is for people and may change. For mismatches it can
+include excerpts from the compared log lines, as in the default text output.
+
+### Native Linux fixture
+
+On native Linux, run the fixture-backed integration test with the pinned
 candidate for the runner's architecture. The test restores a disposable
-copy and runs the read-only drill, checking exact parity with the immutable
-bundle before and after restart. Once the drill completes, the test harness
+copy and checks the JSON drill result against the immutable bundle before
+and after restart. Once the drill completes, the test harness
 posts a batch of backfilled rows with tied timestamps and requires HTTP 204.
 It restarts the same binary on the same data directory and listener address,
 compares the full ordered history with the original fixture and appended rows
 through the terminal page, and reverifies the reference bundle.
 
 ```sh
-BOG_RESTORE_DRILL_BINARY=/absolute/path/to/bog \
+sha256sum --check "$EVIDENCE/binary.sha256" &&
+BOG_RESTORE_DRILL_BINARY="$BINARY" \
   go test -count=1 ./cmd/bog-verify -run '^TestRestoreDrillShippedServer$' -v
 ```
 

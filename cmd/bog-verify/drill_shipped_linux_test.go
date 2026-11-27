@@ -47,7 +47,8 @@ func TestRestoreDrillShippedServer(t *testing.T) {
 	check(t, err)
 	addr := reserved.Addr().(*net.TCPAddr)
 	check(t, reserved.Close())
-	opts, err := parseOptions("drill", compareArgs(bundle, "http://"+addr.String())[1:])
+	args := append(compareArgs(bundle, "http://"+addr.String())[1:], "-json")
+	opts, err := parseOptions("drill", args)
 	check(t, err)
 	current, err := startDrillCandidate(t, ctx, binary, restored, addr)
 	check(t, err)
@@ -75,8 +76,18 @@ func TestRestoreDrillShippedServer(t *testing.T) {
 	if err != nil || status != exitOK {
 		t.Fatalf("restore drill exit %d: %v\n%s", status, err, &out)
 	}
-	if strings.Count(out.String(), "rows=4") != 2 || strings.Count(out.String(), formatPoint(point)) != 2 {
+	result := decodeDrillResult(t, out.Bytes())
+	if result.SchemaVersion != 1 || !result.Parity || result.ExitStatus != exitOK || result.Diagnostic != nil ||
+		result.RecoveryPoint == nil || *result.RecoveryPoint != *resultPoint(point) {
 		t.Fatalf("unexpected drill result:\n%s", &out)
+	}
+	for name, phase := range map[string]drillPhaseResult{
+		"before_restart": result.BeforeRestart, "after_restart": result.AfterRestart,
+	} {
+		if phase.Status != "matched" || phase.Counts == nil ||
+			phase.Counts.Rows != 4 || phase.Counts.ReferencePages != 2 || phase.Counts.ServerPages < 2 {
+			t.Fatalf("%s has unexpected parity counts in %s", name, &out)
+		}
 	}
 
 	// Backfill across the checkpoint and committed tail ties. Reverse lexical

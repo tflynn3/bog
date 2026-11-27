@@ -166,7 +166,7 @@ func TestCaptureExpiryRequiresCanonicalContinuationResponse(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var closeCount int
-			page, err := acceptQueryResponse(t.Context(), retryResponse(tc.status, tc.body, tc.length, tc.closeErr, &closeCount), 0, 0, tc.cursor)
+			page, err := acceptQueryResponse(t.Context(), retryResponse(tc.status, tc.body, tc.length, tc.closeErr, &closeCount), 0, 0, tc.cursor, nil)
 			if errors.Is(err, ErrCaptureExpired) != tc.want || errors.Is(err, ErrInvalidCursor) ||
 				err == nil || page.Rows != nil || page.NextCursor != "" || closeCount != 1 {
 				t.Fatalf("page %+v, error %v, bodies closed %d, want expiry=%t", page, err, closeCount, tc.want)

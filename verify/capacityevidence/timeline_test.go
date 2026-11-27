@@ -147,7 +147,7 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 			mutate: func(b *backfillEvidence) {
 				s := sample(b, "overlap")
 				s.Filesystem = &filesystemObservation{ObservedNS: new(int64(36)), StagingBytes: new(int64(8192))}
-				s.Metrics.StagingUsed = new(uint64(0))
+				s.Metrics.Used = new(uint64(0))
 				sample(b, "publication").Filesystem = &filesystemObservation{ObservedNS: new(int64(57)), StagingBytes: new(int64(0))}
 			},
 		},
@@ -422,10 +422,14 @@ func TestValidateCapacityObservations(t *testing.T) {
 	small, large := observationRecord(t, SmallScale), observationRecord(t, LargeScale)
 	for _, tc := range []struct {
 		name, event, metrics, statusError, problem string
-		omitStatus                                 bool
+		omitStatus, omitMetrics                    bool
 	}{
 		{name: "omitted running poll status", event: "status_poll", omitStatus: true, problem: "compaction state for status_poll sample"},
-		{name: "historical omission", event: "compaction_start"},
+		{name: "historical omission of metrics fields", event: "compaction_start", metrics: `{}`},
+		{name: "historical omission of metrics object", event: "compaction_start", omitMetrics: true},
+		{name: "historical null metrics object", event: "compaction_start", metrics: `null`},
+		{name: "unknown key with different case", event: "capture_retired",
+			metrics: `{"Pending_Compactions":0,"Oldest_Pinned_Generation":"future format"}`},
 		{name: "numeric zero and empty live pin set", event: "compaction_start",
 			metrics: `{"pending_compactions":0,"oldest_pinned_generation":null}`},
 		{name: "uint64 count and live pin", event: "overlap",
@@ -499,7 +503,9 @@ func TestValidateCapacityObservations(t *testing.T) {
 				t.Fatalf("missing %s sample", tc.event)
 			}
 			s := samples[i].(object)
-			if tc.metrics != "" {
+			if tc.omitMetrics {
+				delete(s, "candidate_status_metrics")
+			} else if tc.metrics != "" {
 				s["candidate_status_metrics"] = jsontext.Value(tc.metrics)
 			}
 			if tc.omitStatus {

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"bog/verify/capacityevidence"
 )
 
 func TestRuntimeSamplesDistinguishZeroAndUnavailable(t *testing.T) {
@@ -100,6 +102,70 @@ func TestOptionalRuntimeMetrics(t *testing.T) {
 			}
 			if pending, oldest := string(wire[pendingCompactionsMetric]), string(wire[oldestPinnedGenerationMetric]); pending != tc.pending || oldest != tc.oldest {
 				t.Fatalf("encoded pending = %q, oldest pin = %q, want %q and %q", pending, oldest, tc.pending, tc.oldest)
+			}
+		})
+	}
+}
+
+func TestLiveRuntimeMetricsRoundTrip(t *testing.T) {
+	t.Parallel()
+	const pin = `"` + testPinnedGeneration + `"`
+	for _, tc := range []struct {
+		name, start, held, drained, problem string
+	}{
+		{
+			name:    "zero pending and a live pin after predecessor drain",
+			start:   `{"pending_compactions":0,"oldest_pinned_generation":null,"future_metric":42}`,
+			held:    `{"retired_generation_pins":1,"oldest_pinned_generation":` + pin + `}`,
+			drained: `{"retired_generation_pins":0,"oldest_pinned_generation":` + pin + `}`,
+		},
+		{
+			name:    "malformed diagnostics beside valid pin counts",
+			start:   `[]`,
+			held:    `{"retired_generation_pins":1,"oldest_pinned_generation":false}`,
+			drained: `{"retired_generation_pins":0,"pending_compactions":"0"}`,
+		},
+		{
+			name:    "omitted and malformed diagnostics cannot substitute for retired pin zero",
+			held:    `{"retired_generation_pins":1}`,
+			drained: `{"retired_generation_pins":-1,"pending_compactions":0,"oldest_pinned_generation":null}`,
+			problem: "fresh visibility sample must follow observed pin drain",
+		},
+		{
+			name:    "live generation cannot substitute for positive retired pin count",
+			held:    `{"retired_generation_pins":null,"oldest_pinned_generation":` + pin + `}`,
+			drained: `{"retired_generation_pins":0}`,
+			problem: "before_retirement must observe the positive held pin count",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := passingCutoverReport()
+			record := &r.Cases[capacityCase].Evidence[0]
+			samples := record.Diagnostics.Backfills[0].Samples
+			for i := range samples {
+				var raw string
+				switch samples[i].Event {
+				case "compaction_start":
+					raw = tc.start
+				case "before_retirement":
+					raw = tc.held
+				case "after_retirement":
+					raw = tc.drained
+				default:
+					continue
+				}
+				samples[i].Candidate = readRuntimeMetrics(json.RawMessage(raw), nil)
+			}
+			data, err := json.Marshal(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, err := range []error{record.validateCutover(), capacityevidence.ValidateReport(data)} {
+				if tc.problem == "" && err != nil ||
+					tc.problem != "" && (err == nil || !strings.Contains(err.Error(), tc.problem)) {
+					t.Errorf("strict validation error = %v, want %q", err, tc.problem)
+				}
 			}
 		})
 	}

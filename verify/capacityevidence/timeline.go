@@ -2,12 +2,8 @@ package capacityevidence
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/json/jsontext"
-	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -83,64 +79,6 @@ type backfillSample struct {
 	Compaction  *compactionEvidence    `json:"status"`
 	StatusError string                 `json:"status_error"`
 	Metrics     runtimeObservations    `json:"candidate_status_metrics"`
-}
-
-type runtimeObservations struct {
-	PublicationLag     *uint64 `json:"publication_lag_ns,omitempty"`
-	StagingReserved    *uint64 `json:"staging_reserved_bytes,omitempty"`
-	StagingUsed        *uint64 `json:"staging_used_bytes,omitempty"`
-	OldestPinAge       *uint64 `json:"oldest_pin_age_ns,omitempty"`
-	Reclaimable        *uint64 `json:"reclaimable_bytes,omitempty"`
-	RetiredPins        *uint64 `json:"retired_generation_pins,omitempty"`
-	PendingCompactions *uint64 `json:"pending_compactions,omitempty"`
-	// A raw value preserves an explicit null separately from an omitted member.
-	OldestPinnedGeneration jsontext.Value    `json:"oldest_pinned_generation,omitzero"`
-	Unavailable            map[string]string `json:"unavailable,omitempty"`
-}
-
-func (m runtimeObservations) validate(hasStatus bool) error {
-	for _, field := range [...]struct {
-		name  string
-		value *uint64
-	}{
-		{"publication_lag_ns", m.PublicationLag},
-		{"staging_reserved_bytes", m.StagingReserved},
-		{"staging_used_bytes", m.StagingUsed},
-		{"oldest_pin_age_ns", m.OldestPinAge},
-		{"reclaimable_bytes", m.Reclaimable},
-		{"retired_generation_pins", m.RetiredPins},
-		{"pending_compactions", m.PendingCompactions},
-	} {
-		if field.value == nil {
-			continue
-		}
-		if m.Unavailable[field.name] != "" {
-			return fmt.Errorf("%s contradicts unavailable status", field.name)
-		}
-		if !hasStatus {
-			return fmt.Errorf("%s requires a successful candidate status snapshot", field.name)
-		}
-	}
-
-	const oldest = "oldest_pinned_generation"
-	raw := m.OldestPinnedGeneration
-	if len(raw) == 0 || raw.Kind() == jsontext.KindNull {
-		// Omission carries no observation. An explicit null observes an
-		// empty set only on a successful snapshot without a reason. Older
-		// reports also used null placeholders for skipped snapshots.
-		return nil
-	}
-	var id string
-	if err := json.Unmarshal(raw, &id); err != nil || len(id) != 2*sha256.Size || strings.Trim(id, "0123456789abcdef") != "" {
-		return fmt.Errorf("%s must be a lowercase hexadecimal SHA-256 digest or null", oldest)
-	}
-	if m.Unavailable[oldest] != "" {
-		return fmt.Errorf("%s contradicts unavailable status", oldest)
-	}
-	if !hasStatus {
-		return fmt.Errorf("%s requires a successful candidate status snapshot", oldest)
-	}
-	return nil
 }
 
 type backfillCutoffs struct {

@@ -31,12 +31,30 @@ An explicit zero for pending work remains a numeric zero in the report.
 
 ## Compatibility and proof
 
+Release Verification owns the shared runtime metric fields and their value
+semantics in `verify/capacityevidence`. The retained-history benchmark uses
+that contract when decoding live snapshots and supplies the diagnostic
+reasons for missing or malformed fields and failed probes. The strict
+report validator uses the same contract and decides whether an observation
+is consistent with its timeline sample.
+
+All runtime counters accept unsigned 64-bit JSON integers, including zero.
+A missing or null counter supplies no measurement. A malformed live field
+is recorded as unavailable while valid siblings are retained. A malformed
+known field in a strict report fails validation. Both readers ignore
+unknown metrics.
+
 The fields are optional schema-v1 diagnostics. Legacy candidates and
 historical reports remain compatible, at the cost of less information
-when investigating an old run. Sample order, polling, deadlines, and
-memory read bracketing follow the existing capacity proof. The positive
-`retired_generation_pins` count while the held capture is live and the
-zero count after explicit retirement still establish predecessor drain.
+when investigating an old run. A numeric observation or a generation digest
+requires a successful status snapshot and cannot carry a matching
+unavailable reason. The report reader distinguishes an omitted oldest
+generation from an explicit null. A null with a matching reason or on a
+skipped or failed snapshot supplies no pin-set observation. Sample order,
+polling, deadlines, and memory read bracketing follow the existing capacity
+proof. A positive `retired_generation_pins` count while the held capture is
+live followed by zero after explicit retirement still establishes
+predecessor drain.
 The oldest live generation can still be present after the predecessor
 drains. Filesystem staging bytes, pin record counts, and pin record
 modification ages describe the fixture directory. Runtime pin evidence

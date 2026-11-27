@@ -53,13 +53,14 @@ func TestStoreDependencyDirection(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			rules := map[string]rule{
-				server:               {serverCommand, []string{store}},
-				store:                {role: runtimeLibrary},
-				operatorCommand:      {role: verifier},
-				releaseVerifier:      {role: verifier},
-				linuxVerifier:        {role: verifier},
-				retainedBench:        {role: verifier},
-				streamPolicyVerifier: {role: verifierModel},
+				server:                {serverCommand, []string{store}},
+				store:                 {role: runtimeLibrary},
+				operatorCommand:       {verifier, []string{"bog/internal/backup"}},
+				"bog/internal/backup": {role: staged},
+				releaseVerifier:       {role: verifier},
+				linuxVerifier:         {role: verifier},
+				retainedBench:         {role: verifier},
+				streamPolicyVerifier:  {role: verifierModel},
 			}
 			for path, imports := range tt.localImports {
 				rules[path] = rule{runtimeLibrary, imports}

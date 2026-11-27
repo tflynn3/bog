@@ -194,6 +194,14 @@ func TestComposedCutoverRules(t *testing.T) {
 	}{
 		{name: "command composes retained storage and readiness independently"},
 		{
+			name: "promoted checkpoint cannot import history and form a cycle",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[checkpoint] = productionPackage("checkpoint", store, history)
+				rules[checkpoint] = rule{runtimeLibrary, []string{store, history}}
+			},
+			want: []string{"production import cycle: " + history + " -> " + checkpoint + " -> " + history},
+		},
+		{
 			name: "wiring without role promotions",
 			change: func(_ map[string]listedPackage, rules map[string]rule) {
 				for _, path := range []string{backup, checkpoint, history} {

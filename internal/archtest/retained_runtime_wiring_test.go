@@ -22,23 +22,27 @@ import (
 	"time"
 )
 
-func TestRetainedRuntimeWiring(t *testing.T) {
-	t.Parallel()
-	for _, arch := range []string{"amd64", "arm64"} {
-		t.Run("linux_"+arch, func(t *testing.T) {
-			t.Parallel()
-			for _, problem := range retainedRuntimeWiringProblems(t, "../..", arch, registry) {
-				t.Error(problem)
-			}
-		})
+type retainedConstructors struct {
+	directoryReadiness bool
+	retainedPaging     bool
+}
+
+// Apply the guard even if the command wiring and role changes disagree.
+// The inventory check separately reports the missing or premature promotion.
+func retainedRuntimeConstructors(rules map[string]rule, reachable map[string]bool) retainedConstructors {
+	wired := func(path string) bool {
+		return rules[path].role == runtimeLibrary || reachable[path]
+	}
+	historyWired := wired("bog/internal/history")
+	return retainedConstructors{
+		directoryReadiness: historyWired || wired("bog/internal/checkpoint") || wired("bog/internal/backup"),
+		retainedPaging:     historyWired,
 	}
 }
 
-func retainedRuntimeWiringProblems(t *testing.T, root, arch string, rules map[string]rule) []string {
+func retainedRuntimeWiringProblems(t *testing.T, root, arch string, required retainedConstructors) []string {
 	t.Helper()
-	historyWired := rules["bog/internal/history"].role == runtimeLibrary
-	if !historyWired && rules["bog/internal/checkpoint"].role != runtimeLibrary &&
-		rules["bog/internal/backup"].role != runtimeLibrary {
+	if !required.directoryReadiness {
 		return nil
 	}
 	root, err := filepath.Abs(root)
@@ -50,13 +54,8 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, rules map[st
 	// resolve the real import bindings without running or linking a Linux binary.
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "list", "-deps", "-export",
+	cmd := linuxProductionList(ctx, root, arch, "-export",
 		"-json=ImportPath,Dir,GoFiles,Export", "./cmd/bog")
-	cmd.Dir = root
-	cmd.Env = append(cmd.Environ(),
-		"GOOS=linux", "GOARCH="+arch, "GOAMD64=v1", "GOARM64=v8.0", "CGO_ENABLED=0",
-		"GOENV=off", "GOFLAGS=", "GO111MODULE=on", "GOWORK=off")
-	cmd.WaitDelay = 2 * time.Second
 	data, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -120,7 +119,7 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, rules map[st
 	missing := map[string]struct{}{
 		"bog/internal/readiness.NewHandlerForDirectory": {},
 	}
-	if historyWired {
+	if required.retainedPaging {
 		missing["bog/internal/httpapi.NewWithPageSource"] = struct{}{}
 	}
 	var problems []string
@@ -132,7 +131,7 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, rules map[st
 			continue
 		}
 		path, name := constructor.Pkg().Path(), constructor.Name()
-		if path == "bog/internal/httpapi" && !historyWired {
+		if path == "bog/internal/httpapi" && !required.retainedPaging {
 			continue
 		}
 		delete(missing, path+"."+name)
@@ -215,16 +214,27 @@ var _ = httpapi.NewWithQueryLimits
 		"paging_tagged.go":         "//go:build retained_wiring_fixture\n\n" + pageSource,
 	}
 	for _, tt := range []struct {
-		name    string
-		arch    string
-		wired   []string
-		sources map[string]string
-		want    []string
+		name      string
+		arch      string
+		wired     []string
+		reachable []string
+		sources   map[string]string
+		want      []string
 	}{
 		{
 			name:    "staged baseline permits legacy constructors",
 			arch:    "amd64",
 			sources: legacyWiring,
+		},
+		{
+			name:      "observed backup wiring requires directory readiness only",
+			arch:      "amd64",
+			reachable: []string{backup},
+			sources:   legacyWiring,
+			want: []string{
+				legacyReadiness,
+				"cmd/bog (linux/amd64): retained runtime must reference readiness.NewHandlerForDirectory",
+			},
 		},
 		{
 			name:    "checkpoint only rejects path readiness",
@@ -270,6 +280,18 @@ var _ = httpapi.NewWithQueryLimits
 			arch:    "arm64",
 			wired:   []string{history, checkpoint},
 			sources: legacyWiring,
+			want: []string{
+				legacyPaging,
+				legacyReadiness,
+				"cmd/bog (linux/arm64): retained runtime must reference httpapi.NewWithPageSource",
+				"cmd/bog (linux/arm64): retained runtime must reference readiness.NewHandlerForDirectory",
+			},
+		},
+		{
+			name:      "observed history wiring activates both guards with stale staged roles",
+			arch:      "arm64",
+			reachable: []string{history, checkpoint},
+			sources:   legacyWiring,
 			want: []string{
 				legacyPaging,
 				legacyReadiness,
@@ -410,7 +432,12 @@ func NewWithPageSource() {}
 			for _, path := range tt.wired {
 				rules[path] = rule{role: runtimeLibrary}
 			}
-			if got := retainedRuntimeWiringProblems(t, root, tt.arch, rules); !slices.Equal(got, tt.want) {
+			reachable := make(map[string]bool, len(tt.reachable))
+			for _, path := range tt.reachable {
+				reachable[path] = true
+			}
+			required := retainedRuntimeConstructors(rules, reachable)
+			if got := retainedRuntimeWiringProblems(t, root, tt.arch, required); !slices.Equal(got, tt.want) {
 				t.Errorf("constructor diagnostics = %q, want %q", got, tt.want)
 			}
 		})

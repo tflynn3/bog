@@ -13,7 +13,7 @@ type stagingDeclaration struct {
 	activation string
 }
 
-// Both Linux inventories at ddc0496f00812 still leave the retained libraries
+// Both Linux inventories at 26535d86d556b still leave the retained libraries
 // outside cmd/bog. Remove each declaration with its role change once the
 // reviewed Storage handoff meets these criteria.
 var stagedPackages = map[string]stagingDeclaration{
@@ -156,6 +156,7 @@ func TestRetainedCutoverStaging(t *testing.T) {
 	tests := []struct {
 		name                  string
 		operatorOnly          bool
+		promoteOperatorBackup bool
 		keepDeclarations      []string
 		dropIdempotency       bool
 		wireIdempotency       bool
@@ -173,6 +174,12 @@ func TestRetainedCutoverStaging(t *testing.T) {
 			name:         "operator-only backup still needs its declaration",
 			operatorOnly: true,
 			want:         []string{"staged package " + backup + " has no staging declaration"},
+		},
+		{
+			name:                  "operator-only backup cannot be promoted",
+			operatorOnly:          true,
+			promoteOperatorBackup: true,
+			wantArchitecture:      []string{backup + " is registered as runtime library but reachability from " + server + " is false"},
 		},
 		{
 			name:             "promoted packages retain stale declarations",
@@ -222,7 +229,9 @@ func TestRetainedCutoverStaging(t *testing.T) {
 			}
 			if tt.operatorOnly {
 				rules[server] = rule{serverCommand, []string{history, wal}}
-				rules[backup] = rule{staged, nil}
+				if !tt.promoteOperatorBackup {
+					rules[backup] = rule{staged, nil}
+				}
 			}
 			if tt.leaveCheckpointStaged {
 				rules[checkpoint] = rule{staged, nil}

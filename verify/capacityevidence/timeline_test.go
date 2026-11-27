@@ -2,6 +2,7 @@ package capacityevidence
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"fmt"
 	"slices"
@@ -107,7 +108,11 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 		},
 		{
 			name: "final cutoff request failed", pattern: "scattered",
-			mutate:  func(b *backfillEvidence) { sample(b, "final_cutoff").StatusError = "connection reset" },
+			mutate: func(b *backfillEvidence) {
+				s := sample(b, "final_cutoff")
+				s.Compaction, s.Metrics.RetiredPins = nil, nil
+				s.StatusError = "connection reset"
+			},
 			problem: "final_cutoff sample failed",
 		},
 		{
@@ -174,12 +179,20 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 		},
 		{
 			name: "deadline cannot attest zero", pattern: "scattered",
-			mutate:  func(b *backfillEvidence) { sample(b, "drain_poll").StatusError = context.DeadlineExceeded.Error() },
+			mutate: func(b *backfillEvidence) {
+				s := sample(b, "drain_poll")
+				s.Compaction, s.Metrics.RetiredPins = nil, nil
+				s.StatusError = context.DeadlineExceeded.Error()
+			},
 			problem: "fresh visibility sample must follow observed pin drain",
 		},
 		{
 			name: "drain cannot retry arbitrary error", pattern: "scattered",
-			mutate:  func(b *backfillEvidence) { sample(b, "after_retirement").StatusError = "connection reset" },
+			mutate: func(b *backfillEvidence) {
+				s := sample(b, "after_retirement")
+				s.Compaction, s.Metrics.RetiredPins = nil, nil
+				s.StatusError = "connection reset"
+			},
 			problem: "after_retirement sample failed",
 		},
 		{
@@ -213,4 +226,191 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRuntimeObservationPresence(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		wire       string
+		oldestKind jsontext.Kind
+		pending    *uint64
+		reason     string
+	}{
+		{wire: `{}`},
+		{wire: `{"pending_compactions":0,"oldest_pinned_generation": null }`, oldestKind: jsontext.KindNull, pending: new(uint64(0))},
+		{wire: `{"pending_compactions":null,"oldest_pinned_generation":null,"unavailable":{"oldest_pinned_generation":"withheld"}}`,
+			oldestKind: jsontext.KindNull, reason: "withheld"},
+	} {
+		var m runtimeObservations
+		if err := json.Unmarshal([]byte(tc.wire), &m); err != nil {
+			t.Fatal(err)
+		}
+		if got := m.OldestPinnedGeneration.Kind(); got != tc.oldestKind {
+			t.Errorf("%s: oldest generation kind = %v, want %v", tc.wire, got, tc.oldestKind)
+		}
+		if m.PendingCompactions == nil && tc.pending != nil ||
+			m.PendingCompactions != nil && (tc.pending == nil || *m.PendingCompactions != *tc.pending) {
+			t.Errorf("%s: unexpected pending compactions %v", tc.wire, m.PendingCompactions)
+		}
+		if got := m.Unavailable["oldest_pinned_generation"]; got != tc.reason {
+			t.Errorf("%s: oldest generation reason = %q, want %q", tc.wire, got, tc.reason)
+		}
+	}
+}
+
+func TestValidateCapacityObservations(t *testing.T) {
+	t.Parallel()
+	id := fmt.Sprintf("%q", strings.Repeat("0123456789abcdef", 4))
+	small, large := observationRecord(t, SmallScale), observationRecord(t, LargeScale)
+	for _, tc := range []struct {
+		name, event, metrics, statusError, problem string
+	}{
+		{name: "historical omission", event: "compaction_start"},
+		{name: "numeric zero and empty live pin set", event: "compaction_start",
+			metrics: `{"pending_compactions":0,"oldest_pinned_generation":null}`},
+		{name: "uint64 count and live pin", event: "overlap",
+			metrics: `{"pending_compactions":18446744073709551615,"oldest_pinned_generation":` + id + `}`},
+		{name: "oldest live pin may survive predecessor drain", event: "drain_poll",
+			metrics: `{"retired_generation_pins":0,"oldest_pinned_generation":` + id + `}`},
+		{name: "both diagnostics unavailable", event: "status_poll",
+			metrics: `{"pending_compactions":null,"oldest_pinned_generation":null,"unavailable":{"pending_compactions":"missing","oldest_pinned_generation":"missing"}}`},
+		{name: "missing value with a reason", event: "status_poll",
+			metrics: `{"unavailable":{"oldest_pinned_generation":"missing"}}`},
+		{name: "unrelated reason and future diagnostic", event: "publication",
+			metrics: `{"pending_compactions":0,"future_metric":{"value":true},"unavailable":{"oldest_pinned_generation":"missing"}}`},
+		{name: "historical skipped status placeholder", event: "capture_retired",
+			metrics: `{"oldest_pinned_generation":null}`},
+		{name: "retry unavailable snapshot", event: "after_retirement", statusError: context.DeadlineExceeded.Error(),
+			metrics: `{"oldest_pinned_generation":null,"unavailable":{"oldest_pinned_generation":"timeout","retired_generation_pins":"timeout"}}`},
+		{name: "pending zero contradicts reason", event: "compaction_start",
+			metrics: `{"pending_compactions":0,"unavailable":{"pending_compactions":"missing"}}`,
+			problem: "compaction_start sample: pending_compactions contradicts unavailable status"},
+		{name: "staging zero contradicts reason", event: "overlap",
+			metrics: `{"staging_used_bytes":0,"unavailable":{"staging_used_bytes":"missing"}}`,
+			problem: "overlap sample: staging_used_bytes contradicts unavailable status"},
+		{name: "retired zero contradicts reason during running poll", event: "status_poll",
+			metrics: `{"retired_generation_pins":0,"unavailable":{"retired_generation_pins":"missing"}}`,
+			problem: "status_poll sample: retired_generation_pins contradicts unavailable status"},
+		{name: "retired zero contradicts reason during drain", event: "drain_poll",
+			metrics: `{"retired_generation_pins":0,"unavailable":{"retired_generation_pins":"missing"}}`,
+			problem: "drain_poll sample: retired_generation_pins contradicts unavailable status"},
+		{name: "generation contradicts reason", event: "publication",
+			metrics: `{"oldest_pinned_generation":` + id + `,"unavailable":{"oldest_pinned_generation":"missing"}}`,
+			problem: "publication sample: oldest_pinned_generation contradicts unavailable status"},
+		{name: "zero on failed request", event: "after_retirement", statusError: context.DeadlineExceeded.Error(),
+			metrics: `{"retired_generation_pins":0}`, problem: "retired_generation_pins requires a successful candidate status snapshot"},
+		{name: "generation on skipped request", event: "capture_retired",
+			metrics: `{"oldest_pinned_generation":` + id + `}`, problem: "oldest_pinned_generation requires a successful candidate status snapshot"},
+		{name: "negative pending count", event: "status_poll",
+			metrics: `{"pending_compactions":-1}`, problem: "pending_compactions"},
+		{name: "overflowing pending count", event: "status_poll",
+			metrics: `{"pending_compactions":18446744073709551616}`, problem: "pending_compactions"},
+		{name: "fractional pending count", event: "status_poll",
+			metrics: `{"pending_compactions":0.5}`, problem: "pending_compactions"},
+		{name: "quoted pending count", event: "status_poll",
+			metrics: `{"pending_compactions":"0"}`, problem: "pending_compactions"},
+		{name: "numeric generation", event: "publication",
+			metrics: `{"oldest_pinned_generation":0}`, problem: "oldest_pinned_generation must be a lowercase hexadecimal SHA-256 digest or null"},
+		{name: "short generation", event: "publication",
+			metrics: `{"oldest_pinned_generation":"abcd"}`, problem: "oldest_pinned_generation must be a lowercase hexadecimal SHA-256 digest or null"},
+		{name: "uppercase generation", event: "publication",
+			metrics: `{"oldest_pinned_generation":` + strings.ToUpper(id) + `}`, problem: "oldest_pinned_generation must be a lowercase hexadecimal SHA-256 digest or null"},
+		{name: "nonhex generation", event: "publication",
+			metrics: fmt.Sprintf(`{"oldest_pinned_generation":%q}`, strings.Repeat("g", 64)),
+			problem: "oldest_pinned_generation must be a lowercase hexadecimal SHA-256 digest or null"},
+		{name: "empty live pin set cannot prove retired zero", event: "drain_poll",
+			metrics: `{"oldest_pinned_generation":null}`, problem: "fresh visibility sample must follow observed pin drain"},
+		{name: "pending zero cannot prove retired zero", event: "drain_poll",
+			metrics: `{"pending_compactions":0,"retired_generation_pins":null}`, problem: "fresh visibility sample must follow observed pin drain"},
+		{name: "live pin ID cannot prove positive held count", event: "before_retirement",
+			metrics: `{"oldest_pinned_generation":` + id + `}`, problem: "before_retirement must observe the positive held pin count"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			type object = map[string]any
+			var wire object
+			if err := json.Unmarshal(small, &wire); err != nil {
+				t.Fatal(err)
+			}
+			timeline := wire["diagnostics"].(object)["backfill_timelines"].([]any)[0].(object)
+			samples := timeline["samples"].([]any)
+			i := slices.IndexFunc(samples, func(raw any) bool { return raw.(object)["event"] == tc.event })
+			if i == -1 {
+				t.Fatalf("missing %s sample", tc.event)
+			}
+			s := samples[i].(object)
+			if tc.metrics != "" {
+				s["candidate_status_metrics"] = jsontext.Value(tc.metrics)
+			}
+			if tc.statusError != "" {
+				s["status_error"], s["status"] = tc.statusError, nil
+			}
+
+			data, err := json.Marshal(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			envelope := fmt.Appendf(nil, `{"schema_version":1,"fixture":%q,"mode":"live","cases":{%q:{"status":"pass","evidence":[%s,%s]}}}`,
+				FixtureID, Case, data, large)
+			for _, result := range []struct {
+				entry string
+				err   error
+			}{
+				{"ValidateRecord", ValidateRecord(data)},
+				{"ValidateReport", ValidateReport(envelope)},
+			} {
+				if tc.problem == "" && result.err != nil ||
+					tc.problem != "" && (result.err == nil || !strings.Contains(result.err.Error(), tc.problem)) {
+					t.Errorf("%s error = %v, want %q", result.entry, result.err, tc.problem)
+				}
+			}
+		})
+	}
+}
+
+func observationRecord(t *testing.T, seed int) []byte {
+	t.Helper()
+	d := &diagnostics{
+		MemoryEvents: map[string]*uint64{"oom_kill": new(uint64(0))},
+		Candidates: []lifecycleEvidence{
+			{Lifetime: "startup", Ready: 1, Reaped: true, ExitCode: new(int(0))},
+			{Lifetime: "restart", Ready: 1, Reaped: true, ExitCode: new(int(0))},
+		},
+	}
+	for i, pattern := range [...]string{"clustered", "scattered"} {
+		held, requested, final := seed-2*BatchRows, seed-BatchRows, seed
+		if pattern == "scattered" {
+			held, requested, final = seed, seed+BatchRows, seed+TailRows
+		}
+		var b backfillEvidence
+		if err := json.Unmarshal([]byte(cutoverTimeline(pattern, held, requested, final, i, i+1)), &b); err != nil {
+			t.Fatal(err)
+		}
+		start, overlap := b.Samples[0], &b.Samples[1]
+		firstRead, lastRead := int64(25), int64(39)
+		overlap.Memory = &memoryCurrentSample{ReadStart: 26, ReadEnd: 29, Bytes: new(uint64(1024))}
+		if pattern == "clustered" {
+			start.Event, start.SentNS, start.ElapsedNS = "status_poll", new(int64(27)), 28
+			start.Memory = &memoryCurrentSample{ReadStart: firstRead, ReadEnd: 26, Bytes: new(uint64(1024))}
+			overlap.Memory.ReadStart, lastRead = 28, 29
+			b.Samples = slices.Insert(b.Samples, 1, start)
+		} else {
+			firstRead = overlap.Memory.ReadStart
+			b.Samples[2].Memory = &memoryCurrentSample{ReadStart: 36, ReadEnd: lastRead, Bytes: new(uint64(1024))}
+		}
+		b.Memory = &memoryObservation{Samples: 2, Span: lastRead - firstRead, Min: 1024, Max: 1024}
+		d.Timelines = append(d.Timelines, b)
+	}
+	data, err := json.Marshal(record{
+		Fixture: fixture{seed, TailRows, LineBytes, BatchRows, MemoryLimit},
+		Status:  "pass", Workload: "pass", Phase: "complete", TimedOut: new(false), RecoveredRows: seed + TailRows,
+		Compaction:  compactionEvidence{"complete", 2, seed + BatchRows, seed + TailRows},
+		Diagnostics: d,
+		Cleanup:     cleanupEvidence{Status: "pass", CandidateReaped: true, SubtreeEmpty: true, SubtreeRemoved: true, StoreRemoved: true},
+		CgroupLimit: new(uint64(MemoryLimit)), CgroupSwap: new(uint64(0)), CgroupOOM: new(uint64(0)), CgroupPeak: 2048,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

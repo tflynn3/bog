@@ -22,7 +22,7 @@ func TestReleaseEvidenceBoundary(t *testing.T) {
 
 // TestLinuxArchitecture checks the registry against Linux production imports
 // on both architectures. Test imports stay outside that graph, so release
-// tests can construct WAL and HTTP fixtures in process.
+// tests can construct WAL, HTTP, and retained storage fixtures in process.
 func releaseEvidenceBoundaryProblems(rules map[string]rule) []string {
 	var problems []string
 	for _, root := range []string{releaseVerifier, linuxVerifier, retainedBench} {
@@ -30,7 +30,14 @@ func releaseEvidenceBoundaryProblems(rules map[string]rule) []string {
 			problems = append(problems, fmt.Sprintf("%s must be registered as a %s", root, verifier))
 		}
 		reached := registeredReachability(rules, root)
-		for _, path := range []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/wal"} {
+		for _, path := range []string{
+			"bog/internal/backup",
+			"bog/internal/checkpoint",
+			"bog/internal/history",
+			"bog/internal/httpapi",
+			"bog/internal/readiness",
+			"bog/internal/wal",
+		} {
 			if reached[path] {
 				problems = append(problems, fmt.Sprintf("forbidden release evidence dependency: %s reaches %s", root, path))
 			}
@@ -42,14 +49,22 @@ func releaseEvidenceBoundaryProblems(rules map[string]rule) []string {
 func TestReleaseEvidenceBoundaryFixtures(t *testing.T) {
 	t.Parallel()
 	const (
-		httpapi   = "bog/internal/httpapi"
-		readiness = "bog/internal/readiness"
-		store     = "bog/internal/store"
-		wal       = "bog/internal/wal"
-		relay     = "bog/verify/evidencehelper"
+		backup     = "bog/internal/backup"
+		checkpoint = "bog/internal/checkpoint"
+		history    = "bog/internal/history"
+		httpapi    = "bog/internal/httpapi"
+		readiness  = "bog/internal/readiness"
+		store      = "bog/internal/store"
+		wal        = "bog/internal/wal"
+		relay      = "bog/verify/evidencehelper"
 	)
+	// Model the composed server after the retained libraries are promoted.
 	base := map[string]rule{
-		server:          {serverCommand, []string{httpapi, readiness, wal}},
+		server:          {serverCommand, []string{backup, history, httpapi, readiness, wal}},
+		operatorCommand: {verifier, []string{backup, goClient, store}},
+		backup:          {runtimeLibrary, []string{store}},
+		checkpoint:      {runtimeLibrary, []string{store}},
+		history:         {runtimeLibrary, []string{checkpoint, store}},
 		httpapi:         {runtimeLibrary, []string{store, wal}},
 		readiness:       {runtimeLibrary, []string{store, wal}},
 		store:           {runtimeLibrary, nil},
@@ -59,11 +74,14 @@ func TestReleaseEvidenceBoundaryFixtures(t *testing.T) {
 		linuxVerifier:   {verifier, nil},
 		retainedBench:   {verifier, nil},
 	}
-	t.Run("production client and shared rows", func(t *testing.T) {
+	t.Run("production client and shared rows alongside retained server and offline reader", func(t *testing.T) {
 		t.Parallel()
 		requireValidCommandFixture(t, base)
 		if got := releaseEvidenceBoundaryProblems(base); len(got) != 0 {
 			t.Errorf("releaseEvidenceBoundaryProblems() = %q, want no problems", got)
+		}
+		if got := operatorBoundaryProblems(base); len(got) != 0 {
+			t.Errorf("operatorBoundaryProblems() = %q, want no problems", got)
 		}
 	})
 
@@ -71,6 +89,9 @@ func TestReleaseEvidenceBoundaryFixtures(t *testing.T) {
 		destination string
 		reached     []string
 	}{
+		{backup, []string{backup}},
+		{checkpoint, []string{checkpoint}},
+		{history, []string{checkpoint, history}},
 		{httpapi, []string{httpapi, wal}},
 		{readiness, []string{readiness, wal}},
 		{wal, []string{wal}},

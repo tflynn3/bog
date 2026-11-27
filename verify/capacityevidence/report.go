@@ -89,39 +89,80 @@ type report struct {
 	Cases         map[string]jsontext.Value `json:"cases"`
 }
 
+type capacityCase[T any] struct {
+	Status   string `json:"status"`
+	Evidence []T    `json:"evidence"`
+}
+
+func decodeReport(data []byte) (report, error) {
+	var envelope report
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return report{}, fmt.Errorf("decode capacity report: %w", err)
+	}
+	return envelope, nil
+}
+
+func (r report) isLive() bool {
+	return r.SchemaVersion == 1 && r.Fixture == FixtureID && r.Mode == "live"
+}
+
+func decodeCapacityCase[T any](r report) (capacityCase[T], error) {
+	var capacity capacityCase[T]
+	raw, present := r.Cases[Case]
+	if !present {
+		return capacity, fmt.Errorf("missing required case %q", Case)
+	}
+	err := json.Unmarshal(raw, &capacity)
+	return capacity, err
+}
+
 // ValidateReport requires a complete live proof at both scales. Callers
 // validate candidate identity and any companion reports at their entry point.
 func ValidateReport(data []byte) error {
-	return validateReport(data, false)
+	_, err := validateCutoverReport(data, false)
+	return err
 }
 
 // ValidateCorrelatedReport requires the enriched proof at every scale and
 // for both backfill workloads, even if all correlation fields were omitted.
 func ValidateCorrelatedReport(data []byte) error {
-	return validateReport(data, true)
+	_, err := validateCutoverReport(data, true)
+	return err
 }
 
-func validateReport(data []byte, requireCorrelation bool) error {
-	var envelope report
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return fmt.Errorf("decode capacity report: %w", err)
+// ValidateReleaseCutoverReport requires the benchmark cutover proof and
+// the additional release measurements at both scales.
+func ValidateReleaseCutoverReport(data []byte) error {
+	raw, err := validateCutoverReport(data, false)
+	if err != nil {
+		return err
 	}
-	if envelope.SchemaVersion != 1 || envelope.Fixture != FixtureID || envelope.Mode != "live" {
-		return errors.New("cutover capacity requires a schema-v1 live linux-release-v1 report")
-	}
-	raw, present := envelope.Cases[Case]
-	if !present {
-		return fmt.Errorf("missing required case %q", Case)
-	}
-	var capacity struct {
-		Status   string   `json:"status"`
-		Evidence []record `json:"evidence"`
-	}
+	var capacity capacityCase[measurements]
 	if err := json.Unmarshal(raw, &capacity); err != nil {
-		return fmt.Errorf("decode capacity case: %w", err)
+		return fmt.Errorf("capacity measurements: %w", err)
+	}
+	for i, m := range capacity.Evidence {
+		if err := m.validate(); err != nil {
+			return fmt.Errorf("capacity record %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
+func validateCutoverReport(data []byte, requireCorrelation bool) (jsontext.Value, error) {
+	envelope, err := decodeReport(data)
+	if err != nil {
+		return nil, err
+	}
+	if !envelope.isLive() {
+		return nil, errors.New("cutover capacity requires a schema-v1 live linux-release-v1 report")
+	}
+	capacity, err := decodeCapacityCase[record](envelope)
+	if err != nil {
+		return nil, fmt.Errorf("decode capacity case: %w", err)
 	}
 	if capacity.Status != "pass" || len(capacity.Evidence) != 2 {
-		return errors.New("cutover capacity requires a passing record at each live scale")
+		return nil, errors.New("cutover capacity requires a passing record at each live scale")
 	}
 	for _, r := range capacity.Evidence {
 		requireCorrelation = requireCorrelation || r.hasCorrelation()
@@ -131,17 +172,87 @@ func validateReport(data []byte, requireCorrelation bool) error {
 		size := r.Fixture.SeedRows
 		index, err := scaleIndex(size)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if seen[index] {
-			return fmt.Errorf("duplicate capacity fixture size %d", size)
+			return nil, fmt.Errorf("duplicate capacity fixture size %d", size)
 		}
 		seen[index] = true
 		if err := r.validate(requireCorrelation); err != nil {
+			return nil, fmt.Errorf("capacity fixture %d: %w", size, err)
+		}
+	}
+	return envelope.Cases[Case], nil
+}
+
+type historicalRecord struct {
+	record
+	measurements
+	// Shadow the typed cutover diagnostics so historical extensions stay opaque.
+	Diagnostics jsontext.Value `json:"diagnostics"`
+}
+
+// ValidateHistoricalReport checks the standard release contract for a
+// schema-v1 live report, including reports that predate cutover diagnostics.
+func ValidateHistoricalReport(data []byte) error {
+	envelope, err := decodeReport(data)
+	if err != nil {
+		return err
+	}
+	if !envelope.isLive() {
+		return errors.New("capacity requires live mode and fixture linux-release-v1 in a schema-v1 report")
+	}
+	capacity, err := decodeCapacityCase[historicalRecord](envelope)
+	if err != nil {
+		return fmt.Errorf("capacity evidence: %w", err)
+	}
+	if capacity.Status != "pass" {
+		return errors.New("capacity requires a passing case")
+	}
+	if capacity.Evidence == nil {
+		return errors.New(`capacity evidence: missing or null "evidence"`)
+	}
+	if len(capacity.Evidence) != 2 {
+		return fmt.Errorf("capacity requires exactly one record each for %d and %d seed rows", SmallScale, LargeScale)
+	}
+	var seen [2]bool
+	for _, r := range capacity.Evidence {
+		size := r.Fixture.SeedRows
+		index, err := scaleIndex(size)
+		if err != nil || seen[index] {
+			return fmt.Errorf("unexpected or duplicate capacity fixture size %d", size)
+		}
+		seen[index] = true
+		if err := r.validateHistorical(); err != nil {
 			return fmt.Errorf("capacity fixture %d: %w", size, err)
 		}
 	}
 	return nil
+}
+
+func (r historicalRecord) validateHistorical() error {
+	f := r.Fixture
+	if !f.hasLiveDimensions() {
+		return errors.New("incorrect fixture dimensions or memory limit")
+	}
+	if !r.completedWorkload() || r.TimedOut == nil || *r.TimedOut {
+		return errors.New("require a completed fixture and workload without timeout")
+	}
+	total := f.SeedRows + TailRows
+	if r.RecoveredRows != total {
+		return fmt.Errorf("recovered %d rows, want %d", r.RecoveredRows, total)
+	}
+	c := r.Compaction
+	if c.State != "complete" || c.Generation == 0 || c.CoveredRows != f.SeedRows+BatchRows || c.CommittedRows != total {
+		return errors.New("missing or incorrect completed compaction evidence")
+	}
+	if !r.Cleanup.completed() {
+		return errors.New("cleanup must prove candidate reaping, subtree emptiness, and subtree removal")
+	}
+	if !r.hasBoundedPeak() {
+		return errors.New("missing or invalid resource measurements")
+	}
+	return r.measurements.validate()
 }
 
 // ValidateRecord checks the same wire proof before a producer reports a
@@ -188,9 +299,25 @@ func (r record) hasCorrelation() bool {
 	return false
 }
 
+func (f fixture) hasLiveDimensions() bool {
+	return f.TailRows == TailRows && f.BatchRows == BatchRows && f.LineBytes == LineBytes && f.MemoryBytes == MemoryLimit
+}
+
+func (r record) completedWorkload() bool {
+	return r.Phase == "complete" && r.Status == "pass" && r.Workload == "pass"
+}
+
+func (r record) hasBoundedPeak() bool {
+	return r.CgroupPeak > 0 && r.CgroupPeak <= MemoryLimit
+}
+
+func (c cleanupEvidence) completed() bool {
+	return c.Status == "pass" && c.CandidateReaped && c.SubtreeEmpty && c.SubtreeRemoved && c.Detail == ""
+}
+
 func (r record) validate(requireCorrelation bool) error {
 	f := r.Fixture
-	if f.TailRows != TailRows || f.BatchRows != BatchRows || f.LineBytes != LineBytes || f.MemoryBytes != MemoryLimit {
+	if !f.hasLiveDimensions() {
 		return errors.New("incorrect fixture dimensions or memory limit")
 	}
 	if r.TimedOut == nil {
@@ -199,8 +326,7 @@ func (r record) validate(requireCorrelation bool) error {
 	if *r.TimedOut {
 		return errors.New("require timed_out to be false")
 	}
-	if r.Phase != "complete" || r.Status != "pass" || r.Workload != "pass" ||
-		r.RecoveredRows != f.SeedRows+TailRows {
+	if !r.completedWorkload() || r.RecoveredRows != f.SeedRows+TailRows {
 		return errors.New("missing completed fixture with exact restart parity")
 	}
 	d := r.Diagnostics
@@ -208,14 +334,14 @@ func (r record) validate(requireCorrelation bool) error {
 		return errors.New("missing cutover diagnostics")
 	}
 	if r.CgroupLimit == nil || *r.CgroupLimit != MemoryLimit || r.CgroupSwap == nil || *r.CgroupSwap != 0 ||
-		r.CgroupPeak == 0 || r.CgroupPeak > MemoryLimit {
+		!r.hasBoundedPeak() {
 		return errors.New("missing cgroup limit readback, disabled swap readback, or bounded memory peak")
 	}
 	if oom := d.MemoryEvents["oom_kill"]; oom == nil || *oom != 0 || r.CgroupOOM == nil || *r.CgroupOOM != 0 {
 		return errors.New("require an observed numeric zero for raw and summary cgroup OOM-kill counts")
 	}
 	c := r.Cleanup
-	if c.Status != "pass" || !c.CandidateReaped || !c.SubtreeEmpty || !c.SubtreeRemoved || !c.StoreRemoved || c.Detail != "" {
+	if !c.completed() || !c.StoreRemoved {
 		return errors.New("missing candidate, subtree, or fixture store cleanup")
 	}
 	if len(d.Candidates) != 2 {

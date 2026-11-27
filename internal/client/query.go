@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -36,34 +37,98 @@ type Page struct {
 
 const nextCursorHeader = "Bog-Next-Cursor"
 
-var errCursorCycle = errors.New("next cursor does not advance pagination: cursor cycle")
+// ErrPageBytes means an HTTP 200 query response exceeded the configured
+// encoded page byte ceiling.
+var ErrPageBytes = errors.New("query response exceeds page byte ceiling")
 
-func readQueryBody(r *http.Response, limit int64) ([]byte, error) {
+// pageSizeError preserves the query diagnostic while exposing ErrPageBytes.
+type pageSizeError struct{}
+
+func (pageSizeError) Error() string { return "response exceeds size limit" }
+func (pageSizeError) Unwrap() error { return ErrPageBytes }
+
+// ErrMalformedPage means an HTTP 200 response violated the query page protocol.
+var ErrMalformedPage = errors.New("malformed query page")
+
+// ErrPageInterrupted means delivery of an HTTP 200 page failed while reading
+// or closing its body. Context cancellation uses the standard context errors.
+var ErrPageInterrupted = errors.New("query page delivery interrupted")
+
+var errCursorCycle = fmt.Errorf("%w: next cursor does not advance pagination: cursor cycle", ErrMalformedPage)
+
+func readQueryBody(ctx context.Context, r *http.Response, limit int64) ([]byte, error) {
+	if limit < 0 || limit == math.MaxInt64 {
+		return nil, errors.New("invalid response size limit")
+	}
 	if !framed(r) {
-		return nil, errors.New("query response has unverifiable framing")
+		return nil, fmt.Errorf("%w: query response has unverifiable framing", ErrMalformedPage)
 	}
 	encodings := r.Header.Values("Content-Encoding")
 	if r.Uncompressed || len(encodings) > 1 || (len(encodings) == 1 && !strings.EqualFold(encodings[0], "identity")) {
-		return nil, errors.New("unsupported query content encoding")
+		return nil, fmt.Errorf("%w: unsupported query content encoding", ErrMalformedPage)
 	}
-	if r.ContentLength >= 0 && r.ContentLength > limit && limit >= 0 {
-		return nil, errors.New("response exceeds size limit")
+	if r.ContentLength > limit {
+		return nil, pageSizeError{}
 	}
-	body, err := readBounded(r.Body, limit)
-	if err != nil {
-		return nil, err
+
+	// Read at most one extra byte to distinguish a complete page exactly at
+	// the limit from an oversized stream. ReadAll can return bytes and an error.
+	body, readErr := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	size := int64(len(body))
+	if size > limit {
+		if readErr != nil {
+			return nil, errors.Join(pageSizeError{}, interruptedPage(ctx, readErr))
+		}
+		return nil, pageSizeError{}
 	}
-	if r.ContentLength >= 0 && int64(len(body)) != r.ContentLength {
-		return nil, io.ErrUnexpectedEOF
+	if readErr != nil {
+		return nil, interruptedPage(ctx, readErr)
+	}
+	if r.ContentLength >= 0 && size != r.ContentLength {
+		if size < r.ContentLength {
+			return nil, fmt.Errorf("%w: received %d of %d declared bytes: %w",
+				ErrPageInterrupted, size, r.ContentLength, io.ErrUnexpectedEOF)
+		}
+		return nil, fmt.Errorf("%w: received %d bytes with Content-Length %d",
+			ErrMalformedPage, size, r.ContentLength)
 	}
 	return body, nil
+}
+
+func interruptedPage(ctx context.Context, err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Cause(ctx)) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrPageInterrupted, err)
+}
+
+// withQueryCancellation retains an independent failure and exposes the
+// context error even if the transport reported only a custom cancel cause.
+func withQueryCancellation(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		cause := context.Cause(ctx)
+		if !errors.Is(ctxErr, cause) && !errors.Is(err, cause) {
+			err = joinQueryErrors(err, cause)
+		}
+		if !errors.Is(err, ctxErr) {
+			err = joinQueryErrors(err, ctxErr)
+		}
+	}
+	return err
+}
+
+func joinQueryErrors(err, additional error) error {
+	if err == nil {
+		return additional
+	}
+	return errors.Join(err, additional)
 }
 
 // FetchPage requests a first page when cursor is empty, or a continuation
 // otherwise. It returns the zero Page if the response fails validation or the
 // context is canceled before acceptance.
 func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (Page, error) {
-	if err := ctx.Err(); err != nil {
+	if err := withQueryCancellation(ctx, nil); err != nil {
 		return Page{}, err
 	}
 	req, err := c.request(ctx, http.MethodGet, "/query", nil)
@@ -85,8 +150,12 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (Page, e
 	req.URL.RawQuery = v.Encode()
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return Page{}, err
+		return Page{}, withQueryCancellation(ctx, err)
 	}
+	return acceptQueryResponse(ctx, resp, c.MaxPageBytes, q.Limit, cursor)
+}
+
+func acceptQueryResponse(ctx context.Context, resp *http.Response, maxBytes int64, maxRows int, cursor string) (Page, error) {
 	// Acceptance happens only after the entire response has been read, validated
 	// and closed. Keep the page local until then.
 	if resp.StatusCode != http.StatusOK {
@@ -94,22 +163,19 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (Page, e
 		e.QueryRetryable = resp.StatusCode == http.StatusServiceUnavailable
 		e.CursorRejected = cursor != "" && resp.StatusCode == http.StatusBadRequest && framed(resp) && e.Cause == nil && e.Body == "invalid cursor\n"
 		if err := resp.Body.Close(); err != nil {
-			return Page{}, errors.Join(e, err)
+			return Page{}, withQueryCancellation(ctx, errors.Join(e, err))
 		}
-		return Page{}, e
+		return Page{}, withQueryCancellation(ctx, e)
 	}
-	limit := c.MaxPageBytes
-	if limit == 0 {
-		limit = DefaultMaxPage
+	if maxBytes == 0 {
+		maxBytes = DefaultMaxPage
 	}
 
-	page, err := decodeQueryPage(ctx, resp, limit, q.Limit, cursor)
+	page, err := decodeQueryPage(ctx, resp, maxBytes, maxRows, cursor)
 	if closeErr := resp.Body.Close(); closeErr != nil {
-		err = errors.Join(err, closeErr)
+		err = joinQueryErrors(err, fmt.Errorf("close query page: %w", interruptedPage(ctx, closeErr)))
 	}
-	if err == nil {
-		err = ctx.Err()
-	}
+	err = withQueryCancellation(ctx, err)
 	if err != nil {
 		return Page{}, &HTTPError{StatusCode: resp.StatusCode, Cause: err}
 	}
@@ -117,17 +183,23 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (Page, e
 }
 
 func decodeQueryPage(ctx context.Context, resp *http.Response, maxBytes int64, maxRows int, cursor string) (Page, error) {
-	body, err := readQueryBody(resp, maxBytes)
+	if err := ctx.Err(); err != nil {
+		return Page{}, err
+	}
+	body, err := readQueryBody(ctx, resp, maxBytes)
 	if err != nil {
 		return Page{}, fmt.Errorf("read query page: %w", err)
 	}
 	rows, err := decodeQueryRows(ctx, body, maxRows)
 	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("%w: %w", ErrMalformedPage, err)
+		}
 		return Page{}, err
 	}
 	next, err := readNextCursor(resp, cursor)
 	if err != nil {
-		return Page{}, err
+		return Page{}, fmt.Errorf("%w: %w", ErrMalformedPage, err)
 	}
 	return Page{Rows: rows, NextCursor: next}, nil
 }
@@ -187,7 +259,10 @@ func readNextCursor(resp *http.Response, cursor string) (string, error) {
 		return "", errors.New("invalid next cursor header")
 	}
 	decoded, err := base64.RawURLEncoding.Strict().DecodeString(next)
-	if err != nil || len(decoded) <= sha256.Size || len(decoded) > maxCursorBytes || base64.RawURLEncoding.EncodeToString(decoded) != next {
+	if err != nil {
+		return "", fmt.Errorf("invalid next cursor header: %w", err)
+	}
+	if len(decoded) <= sha256.Size || len(decoded) > maxCursorBytes || base64.RawURLEncoding.EncodeToString(decoded) != next {
 		return "", errors.New("invalid next cursor header")
 	}
 	if next == cursor {
@@ -223,7 +298,7 @@ func (c *Client) WalkFrom(ctx context.Context, q Query, cursor string, consume f
 				Cause:      errCursorCycle,
 			}
 		}
-		if err := ctx.Err(); err != nil {
+		if err := withQueryCancellation(ctx, nil); err != nil {
 			return cursor, err
 		}
 		if err = consume(p); err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -192,7 +193,8 @@ func TestInterruptedHTTP10Continuation(t *testing.T) {
 	}
 	var status *HTTPError
 	if failed.cursor != fixtureCursor || !errors.Is(failed.err, io.ErrUnexpectedEOF) ||
-		!errors.As(failed.err, &status) || status.StatusCode != http.StatusOK || status.Retryable() {
+		!errors.Is(failed.err, ErrPageInterrupted) || !errors.As(failed.err, &status) ||
+		status.StatusCode != http.StatusOK || status.Retryable() {
 		t.Fatalf("interrupted walk returned cursor %q and error %v", failed.cursor, failed.err)
 	}
 	if len(pages) != 1 {
@@ -219,6 +221,116 @@ func TestInterruptedHTTP10Continuation(t *testing.T) {
 	server.Close()
 	if seen.interrupted != seen.retry || seen.first == "" || seen.terminal == "" || calls.Load() != 4 {
 		t.Fatalf("request targets after %d requests: %+v", calls.Load(), seen)
+	}
+}
+
+func TestBoundedWalkCancellationDuringResponseBody(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	readCtx, cancelRead := context.WithCancelCause(ctx)
+	stop := errors.New("stop reading this page")
+
+	var requests atomic.Int32
+	prefix := contractRow("tie")
+	continuation := prefix + prefix + contractRow("later")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cursor := r.URL.Query().Get("cursor")
+		switch n := requests.Add(1); n {
+		case 1:
+			if cursor != "" || r.URL.Query().Get("page") != "1" {
+				t.Errorf("first request %s", r.URL)
+			}
+			writeContractPage(t, w, contractRow("first"), fixtureCursor)
+		case 2:
+			if cursor != fixtureCursor {
+				t.Errorf("canceled request %s", r.URL)
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(continuation)))
+			w.Header().Set(nextCursorHeader, fixtureNext)
+			if n, err := io.WriteString(w, prefix); err != nil || n != len(prefix) {
+				t.Errorf("write prefix: %d of %d bytes, %v", n, len(prefix), err)
+				return
+			}
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				t.Errorf("flush prefix: %v", err)
+				return
+			}
+			select {
+			case <-r.Context().Done():
+			case <-ctx.Done():
+				t.Error("canceled continuation did not close its connection")
+			}
+		case 3:
+			if cursor != fixtureCursor {
+				t.Errorf("retry skipped the failed cursor: %s", r.URL)
+			}
+			writeContractPage(t, w, continuation, fixtureNext)
+		case 4:
+			if cursor != fixtureNext {
+				t.Errorf("terminal request %s", r.URL)
+			}
+			writeContractPage(t, w, contractRow("last"), "")
+		default:
+			t.Errorf("unexpected request %d: %s", n, r.URL)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	defer cancelRead(nil)
+
+	c, err := New(server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := c.http.Transport.(*http.Transport)
+	defer transport.CloseIdleConnections()
+	// Cancel once the real transport has delivered bytes from the body.
+	c.http.Transport = queryRoundTripper(func(req *http.Request) (*http.Response, error) {
+		resp, err := transport.RoundTrip(req)
+		if err != nil || req.Context() != readCtx {
+			return resp, err
+		}
+		body := resp.Body
+		resp.Body = queryResponseBody{queryReadFunc(func(p []byte) (int, error) {
+			n, err := body.Read(p)
+			if n > 0 {
+				cancelRead(stop)
+			}
+			return n, err
+		}), body.Close}
+		return resp, nil
+	})
+	walk, err := c.NewBoundedWalk(Query{Limit: 3}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := walk.NextPage(ctx)
+	if err != nil || first.NextCursor != fixtureCursor || len(first.Rows) != 1 || first.Rows[0].Line != "first" {
+		t.Fatalf("first page %+v, error %v", first, err)
+	}
+	page, err := walk.NextPage(readCtx)
+	var status *HTTPError
+	if page.Rows != nil || page.NextCursor != "" || !errors.Is(err, context.Canceled) || !errors.Is(err, stop) ||
+		errors.Is(err, ErrPageInterrupted) || !errors.As(err, &status) || status.StatusCode != http.StatusOK {
+		t.Fatalf("canceled page %+v, error %v", page, err)
+	}
+
+	var received []string
+	for _, next := range []string{fixtureNext, ""} {
+		page, err := walk.NextPage(ctx)
+		if err != nil || page.NextCursor != next {
+			t.Fatalf("resumed page %+v, error %v, want cursor %q", page, err, next)
+		}
+		for _, row := range page.Rows {
+			received = append(received, row.Line)
+		}
+	}
+	if !slices.Equal(received, []string{"tie", "tie", "later", "last"}) {
+		t.Fatalf("resumed walk delivered %q", received)
+	}
+	if _, err := walk.NextPage(ctx); !errors.Is(err, io.EOF) || requests.Load() != 4 {
+		t.Fatalf("after terminal page got %v, requests %d", err, requests.Load())
 	}
 }
 
@@ -290,6 +402,7 @@ func TestQueryResponseValidation(t *testing.T) {
 	}{
 		{name: "empty terminal"},
 		{name: "exact size and row caps", body: row, limit: int64(len(row)), rowLimit: 1, wantRows: 1},
+		{name: "exact chunked size cap", body: row, limit: int64(len(row)), chunked: true, wantRows: 1},
 		{name: "omitted row cap", body: strings.Repeat(row, 501), wantRows: 501},
 		{name: "exact row cap with cursor", body: row, rowLimit: 1, headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, wantRows: 1, wantCursor: fixtureNext},
 		{name: "over row cap with cursor", body: row + row, rowLimit: 1, headers: http.Header{"Bog-Next-Cursor": {fixtureNext}}, wantError: "exceeds requested limit 1"},
@@ -297,6 +410,7 @@ func TestQueryResponseValidation(t *testing.T) {
 		{name: "length exceeds cap", body: row, limit: int64(len(row) - 1), wantError: "size limit"},
 		{name: "chunked exceeds cap", body: row, limit: int64(len(row) - 1), chunked: true, wantError: "size limit"},
 		{name: "invalid cap", body: row, limit: -1, wantError: "invalid response size limit"},
+		{name: "unrepresentable cap", body: row, limit: math.MaxInt64, wantError: "invalid response size limit"},
 		{name: "duplicate encoding", body: row, headers: http.Header{"Content-Encoding": {"identity", "gzip"}}, wantError: "encoding"},
 		{name: "compressed response", body: row, headers: http.Header{"Content-Encoding": {"gzip"}}, wantError: "encoding"},
 		{name: "trailing cursor", body: row, headers: http.Header{"Trailer": {"Bog-Next-Cursor"}}, chunked: true, wantError: "cursor trailer"},

@@ -6,7 +6,13 @@
 //
 // FetchPage validates every page for direct callers, Walk, WalkFrom, and
 // BoundedWalk. It exposes rows and the continuation together after checking
-// HTTP framing, the byte ceiling, NDJSON records, and the cursor header. A
+// HTTP framing, the byte ceiling, NDJSON records, and the cursor header.
+// FetchPage errors from an HTTP response retain its status in HTTPError. Use
+// errors.Is to distinguish ErrPageBytes for declared or streamed overflow,
+// ErrMalformedPage for protocol violations, ErrPageInterrupted for body
+// delivery failures, and the standard context cancellation and deadline
+// errors. A failure can retain multiple causes, such as overflow and a body
+// close error. HTTPError.Retryable identifies a query HTTP 503. A
 // positive Query.Limit caps the row count. Zero omits the limit from the
 // request and uses the server default. A fully framed empty page can carry
 // a fresh valid cursor under the client transport contract. The shipped Bog

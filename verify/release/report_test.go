@@ -24,6 +24,9 @@ const fullToHealthyJSON = `"full_to_healthy":{"readiness_status":503,"readiness_
 
 const ordinaryWALJSON = `{"reopened_rows":3,"append_status":204,"restart_rows":6}`
 const restoredParityJSON = `{"captured_rows":6,"held_capture_rows":6,"post_restore_204":true,"post_append_rows":7,"restart_rows":7}`
+const crashGenerationJSON = `[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]`
+const crashPointJSON = `{"Generation":` + crashGenerationJSON + `,"CoveredOffset":256,"NextOrdinal":3,"CommittedEnd":512}`
+const crashProofJSON = `{"verified_point":` + crashPointJSON + `,"append_status":204,"observed_signal":9,"replay_matched":true,"replay_rows":8,"crash_candidate_reaped":true,"restart_candidate_reaped":true,"fixture_removed":true}`
 
 func TestValidateReport(t *testing.T) {
 	t.Parallel()
@@ -206,6 +209,78 @@ func TestValidateRecoveryEvidence(t *testing.T) {
 	}
 }
 
+func TestValidatePostRestoreAckCrashEvidence(t *testing.T) {
+	t.Parallel()
+	id := identity{1, testRevision, strings.Repeat("a", 64), capacityFixtureID}
+	for _, tc := range []struct {
+		name, status, from, to, problem string
+	}{
+		{name: "pass", status: "pass"},
+		{"producer extensions", "pass", `"Generation":`, `"extension":true,"Generation":`, ""},
+		{"missing case", "", "", "", "missing required case"},
+		{"failed case", "fail", "", "", `expected pass, got "fail"`},
+		{"skipped case", "skip", "", "", `expected pass, got "skip"`},
+		{"status only", "pass", crashProofJSON, "", "evidence"},
+		{"null proof", "pass", crashProofJSON, `null`, "expected JSON object"},
+		{"array proof", "pass", crashProofJSON, `[]`, "malformed JSON object"},
+		{"missing point", "pass", `"verified_point":` + crashPointJSON + `,`, "", "verified_point"},
+		{"null point", "pass", crashPointJSON, `null`, "verified_point"},
+		{"empty point", "pass", crashPointJSON, `{}`, "verified_point"},
+		{"missing generation", "pass", `"Generation":` + crashGenerationJSON + `,`, "", "Generation"},
+		{"misspelled generation", "pass", `"Generation"`, `"generation"`, "Generation"},
+		{"zero generation", "pass", `[1,0,`, `[0,0,`, "nonzero Generation"},
+		{"short generation", "pass", crashGenerationJSON, `[1]`, "Generation"},
+		{"long generation", "pass", `[1,0,`, `[1,0,0,`, "Generation"},
+		{"string generation", "pass", crashGenerationJSON, `"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="`, "Generation"},
+		{"null generation byte", "pass", `[1,0,`, `[1,null,`, "null Generation byte"},
+		{"out of range generation byte", "pass", `[1,0,`, `[256,0,`, "Generation"},
+		{"zero checkpoint offset", "pass", `"CoveredOffset":256`, `"CoveredOffset":0`, "CoveredOffset"},
+		{"no tail", "pass", `"CommittedEnd":512`, `"CommittedEnd":256`, "CommittedEnd"},
+		{"reversed offsets", "pass", `"CommittedEnd":512`, `"CommittedEnd":255`, "CommittedEnd"},
+		{"wrong checkpoint row count", "pass", `"NextOrdinal":3`, `"NextOrdinal":6`, "NextOrdinal=3"},
+		{"negative ordinal", "pass", `"NextOrdinal":3`, `"NextOrdinal":-1`, "NextOrdinal"},
+		{"missing committed end", "pass", `,"CommittedEnd":512`, "", "CommittedEnd"},
+		{"unacknowledged append", "pass", `"append_status":204`, `"append_status":200`, "append_status=200"},
+		{"wrong signal", "pass", `"observed_signal":9`, `"observed_signal":15`, "observed_signal=15"},
+		{"string signal", "pass", `"observed_signal":9`, `"observed_signal":"SIGKILL"`, "observed_signal"},
+		{"duplicate signal", "pass", `"observed_signal":9`, `"observed_signal":15,"observed_signal":9`, "duplicate"},
+		{"missing replay verdict", "pass", `"replay_matched":true,`, "", "replay_matched"},
+		{"replay mismatch", "pass", `"replay_matched":true`, `"replay_matched":false`, "replay_matched=false"},
+		{"wrong replay count", "pass", `"replay_rows":8`, `"replay_rows":7`, "replay_rows=7"},
+		{"fractional replay count", "pass", `"replay_rows":8`, `"replay_rows":8.5`, "replay_rows"},
+		{"crash process left behind", "pass", `"crash_candidate_reaped":true`, `"crash_candidate_reaped":false`, "crash_candidate_reaped=false"},
+		{"restart process left behind", "pass", `"restart_candidate_reaped":true`, `"restart_candidate_reaped":false`, "restart_candidate_reaped=false"},
+		{"fixture left behind", "pass", `"fixture_removed":true`, `"fixture_removed":false`, "fixture_removed=false"},
+		{"null cleanup result", "pass", `"fixture_removed":true`, `"fixture_removed":null`, "fixture_removed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cases := map[string]outcome{
+				restoredParityCase: {Status: "pass", Evidence: jsontext.Value(restoredParityJSON)},
+				ordinaryWALCase:    {Status: "pass", Evidence: jsontext.Value(ordinaryWALJSON)},
+			}
+			if tc.status != "" {
+				proof := strings.Replace(crashProofJSON, tc.from, tc.to, 1)
+				cases[postRestoreAckCrashCase] = outcome{Status: tc.status, Evidence: jsontext.Value(proof)}
+			}
+			raw, err := json.Marshal(report{id, cases})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validateReportWithOptions(raw, id, cutoverParityCases, validationOptions{requireCutover: true})
+			if tc.problem == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), postRestoreAckCrashCase) || !strings.Contains(err.Error(), tc.problem) {
+				t.Fatalf("wanted %q with %q, got %v", postRestoreAckCrashCase, tc.problem, err)
+			}
+		})
+	}
+}
+
 func TestValidateCommand(t *testing.T) {
 	t.Setenv("BOG_RELEASE_REQUIRE_RETARGET", "")
 	t.Setenv("BOG_RELEASE_REQUIRE_CUTOVER", "")
@@ -269,9 +344,13 @@ func TestValidateCommand(t *testing.T) {
 	if err := run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "cutover diagnostics") {
 		t.Fatalf("cutover environment accepted archived capacity report: %v", err)
 	}
-	produced := string(producerCutoverReport(t))
-	produced = strings.NewReplacer(strings.Repeat("a", 40), id.Revision, strings.Repeat("b", 64), id.BinarySHA256).Replace(produced)
-	writeFixture(t, filepath.Join(dir, "capacity.json"), []byte(produced))
+	// Keep the archived capacity report as an independent strict failure.
+	// The combined command must report parity errors even when capacity fails.
+	capacityPath := filepath.Join(dir, "capacity.json")
+	capacityErr := validateFile(capacityPath, id, capacityCases, validationOptions{requireCutover: true})
+	if capacityErr == nil {
+		t.Fatal("archived capacity unexpectedly satisfied strict validation")
+	}
 	if err := run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "-parity is required") {
 		t.Fatalf("cutover accepted an omitted parity report: %v", err)
 	}
@@ -290,21 +369,23 @@ func TestValidateCommand(t *testing.T) {
 	if err := run(t.Context(), parityArgs); err == nil || !strings.Contains(err.Error(), ordinaryWALCase) {
 		t.Fatalf("cutover accepted parity without ordinary WAL replay: %v", err)
 	}
-	parity.Cases[ordinaryWALCase] = outcome{Status: "pass"}
-	if err := writeReport(parityPath, parity); err != nil {
-		t.Fatal(err)
-	}
-	if err := run(t.Context(), parityArgs); err == nil ||
-		!strings.Contains(err.Error(), ordinaryWALCase) || !strings.Contains(err.Error(), restoredParityCase) {
-		t.Fatalf("cutover accepted status-only recovery cases: %v", err)
-	}
 	parity.Cases[restoredParityCase] = outcome{Status: "pass", Evidence: jsontext.Value(restoredParityJSON)}
 	parity.Cases[ordinaryWALCase] = outcome{Status: "pass", Evidence: jsontext.Value(ordinaryWALJSON)}
 	if err := writeReport(parityPath, parity); err != nil {
 		t.Fatal(err)
 	}
-	if err := run(t.Context(), parityArgs); err != nil {
-		t.Fatalf("cutover rejected recovery parity: %v", err)
+	if err := run(t.Context(), append(parityArgs, "-require-cutover=false")); err != nil {
+		t.Fatalf("historical parity without immediate crash proof rejected: %v", err)
+	}
+	if err := run(t.Context(), parityArgs); err == nil || !strings.Contains(err.Error(), `missing required case "post_restore_ack_crash"`) {
+		t.Fatalf("cutover accepted parity without immediate crash proof: %v", err)
+	}
+	parity.Cases[postRestoreAckCrashCase] = outcome{Status: "pass", Evidence: jsontext.Value(crashProofJSON)}
+	if err := writeReport(parityPath, parity); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(t.Context(), parityArgs); err == nil || err.Error() != "capacity report: "+capacityErr.Error() {
+		t.Fatalf("complete recovery parity should leave only the expected capacity error, got %v", err)
 	}
 	complete := parity.Cases[restoredParityCase]
 	for _, tc := range []struct {
@@ -331,8 +412,7 @@ func TestValidateCommand(t *testing.T) {
 	if err := writeReport(parityPath, parity); err != nil {
 		t.Fatal(err)
 	}
-	missing := filepath.Join(dir, "capacity.json")
-	if err := os.Remove(missing); err != nil {
+	if err := os.Remove(capacityPath); err != nil {
 		t.Fatal(err)
 	}
 	if err := run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "capacity report") {

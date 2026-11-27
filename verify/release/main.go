@@ -25,7 +25,7 @@ func run(ctx context.Context, args []string) error {
 	var opts validationOptions
 	if validate {
 		opts.requireRetarget = os.Getenv("BOG_RELEASE_REQUIRE_RETARGET") == "1"
-		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require live capacity and recovery parity evidence")
+		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require live capacity, recovery parity, and immediate post-restore crash evidence")
 		flags.StringVar(&admission, "admission", "", "admission report")
 		flags.StringVar(&durability, "durability", "", "durability report")
 		flags.StringVar(&capacity, "capacity", "", "capacity report")
@@ -64,7 +64,7 @@ func run(ctx context.Context, args []string) error {
 		} else if parity != "" {
 			cases := []string{restoredParityCase}
 			if opts.requireCutover {
-				cases = append(cases, ordinaryWALCase)
+				cases = cutoverParityCases
 			}
 			if checkErr := validateFile(parity, id, cases, opts); checkErr != nil {
 				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))

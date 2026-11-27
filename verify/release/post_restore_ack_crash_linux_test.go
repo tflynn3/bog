@@ -16,28 +16,11 @@ import (
 	"testing"
 	"time"
 
-	"bog/internal/backup"
 	querymodel "bog/verify/query-model"
 )
 
-const (
-	postRestoreAckCrashCase = "post_restore_ack_crash"
-	postRestoreCrashRows    = parityFixtureRows + 2
-)
-
-type postRestoreAckCrashProof struct {
-	Point                  backup.Point   `json:"verified_point"`
-	AppendStatus           int            `json:"append_status"`
-	ObservedSignal         syscall.Signal `json:"observed_signal"`
-	ReplayMatched          bool           `json:"replay_matched"`
-	ReplayRows             int            `json:"replay_rows"`
-	CrashCandidateReaped   bool           `json:"crash_candidate_reaped"`
-	RestartCandidateReaped bool           `json:"restart_candidate_reaped"`
-	FixtureRemoved         bool           `json:"fixture_removed"`
-}
-
-// TestReleasePostRestoreAckCrash can run on either native release runner
-// before this case is wired into the combined parity producer.
+// TestReleasePostRestoreAckCrash runs the same probe as the combined parity
+// producer and can publish a standalone report for diagnostics.
 func TestReleasePostRestoreAckCrash(t *testing.T) {
 	path := os.Getenv("BOG_RELEASE_POST_RESTORE_ACK_CRASH_REPORT")
 	if path == "" {
@@ -81,7 +64,7 @@ func probePostRestoreAckCrash(ctx context.Context, binary, root string, proof *p
 	if err != nil {
 		return fmt.Errorf("prepare verified restore: %w", err)
 	}
-	proof.Point = point
+	proof.Point = verifiedRestorePoint(point)
 
 	transport := &http.Transport{DisableKeepAlives: true}
 	defer transport.CloseIdleConnections()

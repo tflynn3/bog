@@ -196,6 +196,10 @@ func validateOutcome(raw jsontext.Value, name string, mandatory bool, opts valid
 		if opts.requireCutover {
 			return validateRestoredParity(fields["evidence"])
 		}
+	case postRestoreAckCrashCase:
+		if opts.requireCutover {
+			return validatePostRestoreAckCrash(fields["evidence"])
+		}
 	}
 	return nil
 }

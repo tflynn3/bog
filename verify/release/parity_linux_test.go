@@ -44,6 +44,12 @@ func TestReleaseRestoredParity(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
+	if err := writeParityReport(ctx, binary, path, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeParityReport(ctx context.Context, binary, path string, id identity) error {
 	results := report{id, make(map[string]outcome)}
 	var proof parityProof
 	probeErr := withFixtureRoot(func(root string) error {
@@ -59,8 +65,61 @@ func TestReleaseRestoredParity(t *testing.T) {
 		return err
 	})
 	ordinaryErr = record(results.Cases, ordinaryWALCase, ordinary, ordinaryErr)
-	if err := errors.Join(probeErr, ordinaryErr, writeReport(path, results)); err != nil {
+	crashProof, crashErr := postRestoreAckCrash(ctx, binary)
+	crashErr = record(results.Cases, postRestoreAckCrashCase, crashProof, crashErr)
+	return errors.Join(probeErr, ordinaryErr, crashErr, writeReport(path, results))
+}
+
+func TestParityReportPublishesAllOutcomesOnStartFailure(t *testing.T) {
+	output, fixtures := t.TempDir(), t.TempDir()
+	t.Setenv("TMPDIR", fixtures)
+	binary := filepath.Join(output, "invalid-candidate")
+	writeFixture(t, binary, []byte("not an executable"))
+	id, err := readIdentity(binary, testRevision, capacityFixtureID)
+	if err != nil {
 		t.Fatal(err)
+	}
+	path := filepath.Join(output, "parity.json")
+	if err := writeParityReport(t.Context(), binary, path, id); err == nil {
+		t.Fatal("parity producer accepted an invalid candidate")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got report
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.identity != id || len(got.Cases) != len(cutoverParityCases) {
+		t.Fatalf("unexpected parity report: %s", raw)
+	}
+	for _, name := range cutoverParityCases {
+		result := got.Cases[name]
+		if result.Status != "fail" || result.Detail == nil || !strings.Contains(*result.Detail, "start candidate") {
+			t.Errorf("case %s did not report a startup failure: %s", name, raw)
+		}
+	}
+	// Decode the emitted point as the original standalone probe's type to
+	// check that its restored checkpoint-and-tail evidence stays compatible.
+	var evidence struct {
+		Point          backup.Point `json:"verified_point"`
+		FixtureRemoved bool         `json:"fixture_removed"`
+	}
+	if err := json.Unmarshal(got.Cases[postRestoreAckCrashCase].Evidence, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if !evidence.FixtureRemoved || evidence.Point.Generation == ([sha256.Size]byte{}) ||
+		evidence.Point.NextOrdinal != paritySeedRows || evidence.Point.CoveredOffset <= 0 ||
+		evidence.Point.CommittedEnd <= evidence.Point.CoveredOffset {
+		t.Errorf("immediate crash case lost fixture evidence on startup failure: %s", raw)
+	}
+	entries, err := os.ReadDir(fixtures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("fixture parent still contains %v", entries)
 	}
 }
 

@@ -1,7 +1,7 @@
 # ADR 0027 — Immediate post-restore crash evidence
 
-**Status** — Standalone Linux probe implemented. Strict gate activation and
-native qualification are pending.
+**Status** — Strict gate activated after the #96 companion fixture. Native
+qualification of the composed #53 revision remains pending.
 
 ## Decision
 
@@ -59,21 +59,26 @@ probe, including on failure. A passing result contains `append_status` of
 `restart_candidate_reaped`, and `fixture_removed`.
 [Standalone probe](../../verify/release/post_restore_ack_crash_linux_test.go)
 
-## Activation handoff
+## Strict release activation
 
-At the lease handoff, the existing Release Verification owner calls the
-probe from `TestReleaseRestoredParity` and writes its independent outcome
-into the candidate-bound `parity.json`. Keep the held-cursor
-`restored_parity` scenario with its own restore and lifecycle. It verifies
-cursor continuity before crash and cursor rejection after restart. Keep
-the ordinary WAL reopen case alongside it.
+Release Verification calls the #96 probe from `TestReleaseRestoredParity`
+using a fresh verified restore. The candidate-bound `parity.json` records
+`post_restore_ack_crash`, `ordinary_wal_reopen`, and `restored_parity` as
+distinct outcomes. The held-cursor scenario uses its own restore and
+checks cursor continuity before crash and cursor rejection after restart.
 
-Extend `validate -require-cutover` to require a passing
-`post_restore_ack_crash` case and check its typed evidence, including the
-verified checkpoint-and-tail point, acknowledgment, observed signal, exact
-replay verdict and row count, and cleanup. Preserve historical schema-v1
-standard validation, including its acceptance of parity reports without this
-case. Require the combined parity producer's explicit passing test event
-and matching report on both native Linux amd64 and arm64 for the same
-composed #53 revision. [Release gate](0008-release-verifier-composition.md),
+`validate -require-cutover` requires all three cases to pass. The crash
+proof retains the standalone schema-v1 `verified_point` object with
+`Generation` as 32 numeric digest bytes, `CoveredOffset`, `NextOrdinal`,
+and `CommittedEnd`. The validator checks a nonzero digest, a positive
+covered offset below the committed end, and the fixture's first uncovered
+ordinal of 3. It also requires HTTP 204, observed SIGKILL, an exact
+eight-row replay, both processes reaped, and fixture removal. Standard
+validation still accepts historical schema-v1 parity reports that omit
+the crash case.
+
+Both native jobs use the existing explicit `TestReleaseRestoredParity`
+pass event and the matching `parity.json`. Native qualification requires
+both jobs to pass against the same composed #53 revision on Linux amd64
+and arm64. [Release gate](0008-release-verifier-composition.md),
 [Native workflow](../../.github/workflows/linux-release.yml)

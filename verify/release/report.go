@@ -81,7 +81,7 @@ func readIdentity(ctx context.Context, binary, revision, fixture string) (id ide
 }
 
 // Decode contract keys by exact spelling while allowing producer extensions.
-func decodeFields(data []byte, fields map[string]any) (map[string]jsontext.Value, error) {
+func decodeFields(data []byte, fields map[string]any, nullable ...string) (map[string]jsontext.Value, error) {
 	var object map[string]jsontext.Value
 	if err := json.Unmarshal(data, &object); err != nil {
 		return nil, fmt.Errorf("%w: malformed JSON object: %w", errArtifactMalformed, err)
@@ -89,13 +89,18 @@ func decodeFields(data []byte, fields map[string]any) (map[string]jsontext.Value
 	if object == nil {
 		return nil, fmt.Errorf("%w: expected JSON object", errArtifactMalformed)
 	}
-	for key, dest := range fields {
+	for _, key := range slices.Sorted(maps.Keys(fields)) {
 		raw, exists := object[key]
 		if !exists || raw.Kind() == 'n' {
 			return nil, fmt.Errorf("%w: missing or null %q", errArtifactMalformed, key)
 		}
-		if err := json.Unmarshal(raw, dest); err != nil {
+		if err := json.Unmarshal(raw, fields[key]); err != nil {
 			return nil, fmt.Errorf("%w: %s: %w", errArtifactMalformed, key, err)
+		}
+	}
+	for _, key := range nullable {
+		if _, exists := object[key]; !exists {
+			return nil, fmt.Errorf("%w: missing %q", errArtifactMalformed, key)
 		}
 	}
 	return object, nil
@@ -104,6 +109,9 @@ func decodeFields(data []byte, fields map[string]any) (map[string]jsontext.Value
 type validationOptions struct {
 	requireRetarget bool
 	requireCutover  bool
+	// The release caller supplies the independent fixture observations.
+	// Supplying them also requires the restore drill case in this report.
+	restoreDrill *restoreDrillExpectations
 }
 
 func validateReport(data []byte, expected identity, required []string) error {
@@ -123,17 +131,15 @@ func validateReportWithOptions(data []byte, expected identity, required []string
 	if got != expected {
 		return fmt.Errorf("report identity mismatch: got %+v, want %+v", got, expected)
 	}
-	for _, name := range required {
-		if _, ok := cases[name]; !ok {
-			return fmt.Errorf("missing required case %q", name)
-		}
+	if opts.restoreDrill != nil && !slices.Contains(required, restoreDrillCase) {
+		required = append(slices.Clone(required), restoreDrillCase)
 	}
 	// Prefer failed probes and cleanup details to skipped prerequisites.
 	// Retain all malformed or failing cases in stable order for diagnosis.
 	var failures, skips []error
 	for _, name := range slices.Sorted(maps.Keys(cases)) {
 		raw := cases[name]
-		mandatory := slices.Contains(required, name) || name == saturationFixtureCase
+		mandatory := slices.Contains(required, name) || name == saturationFixtureCase || name == restoreDrillCase
 		if err := validateOutcome(raw, name, mandatory, opts); err != nil {
 			problem := fmt.Errorf("case %q: %w", name, err)
 			if errors.Is(err, errSkippedCase) {
@@ -143,7 +149,13 @@ func validateReportWithOptions(data []byte, expected identity, required []string
 			}
 		}
 	}
-	if err := errors.Join(append(failures, skips...)...); err != nil {
+	problems := append(failures, skips...)
+	for _, name := range slices.Compact(slices.Sorted(slices.Values(required))) {
+		if _, ok := cases[name]; !ok {
+			problems = append(problems, fmt.Errorf("missing required case %q", name))
+		}
+	}
+	if err := errors.Join(problems...); err != nil {
 		return err
 	}
 	if slices.Contains(required, capacityCase) {
@@ -172,21 +184,27 @@ func validateOutcome(raw jsontext.Value, name string, mandatory bool, opts valid
 			return errors.New("detail must be a string")
 		}
 	}
+	var statusErr error
 	switch status {
 	case "pass":
 	case "fail", "skip":
 		if mandatory {
-			statusErr := errSkippedCase
+			statusErr = errSkippedCase
 			if status == "fail" {
 				statusErr = errors.New("expected pass, got \"fail\"")
 			}
 			if detail != nil && *detail != "" {
-				return fmt.Errorf("%w: %s", statusErr, *detail)
+				statusErr = fmt.Errorf("%w: %s", statusErr, *detail)
 			}
-			return statusErr
 		}
 	default:
 		return fmt.Errorf("unknown status %q", status)
+	}
+	if name == restoreDrillCase {
+		return errors.Join(statusErr, validateRestoreDrillOutcome(status, fields["evidence"], opts.restoreDrill))
+	}
+	if statusErr != nil {
+		return statusErr
 	}
 	if !mandatory {
 		return nil

@@ -99,9 +99,18 @@ The policy binding applies revisions to the candidate's authoritative policy
 service and acknowledges them when they govern new requests. The probes
 exercise unauthenticated requests, independent grants, same- and cross-tenant
 cursor and artifact attempts, revocation and regrant, and original-cursor
-rejection after restart. Export creation must return its final outcome and
-retrieval must expose the original artifact body. Verify its manifest and
-payload independently using the candidate's native format.
+rejection after restart. The candidate also runs the masking scenario shared
+with `RunPolicyRevisions` through the same HTTP and policy bindings.
+
+| Masking probe | Required candidate evidence |
+| --- | --- |
+| Acknowledged masking change | An authorized cursor that resumed before the change returns the standard 400 response with no rows or next cursor. Revoking the query grant yields the standard 403, and regrant still leaves the old cursor invalid. |
+| Restored masking rules | The original cursor and a cursor issued under the changed rules both return the standard 400. The unaffected stream's held cursor resumes to the exact remaining rows across both changes. |
+| Fresh queries | Unfiltered queries and literal searches for the original text and its masked replacement return the exact independently expected rows and terminal NDJSON under both the changed and restored rules. |
+
+Export creation must return its final outcome and retrieval must expose the
+original artifact body. Verify its manifest and payload independently using the
+candidate's native format.
 
 Open the exact committed range before restart using authoritative commit
 metadata. Decode that range with an independent parser and verify its framing
@@ -109,10 +118,15 @@ and integrity. The verifier compares all decoded records in order, checks the
 actual bytes for plain and escaped forbidden values, and requires each
 retained line and replacement to appear in the observed bytes. After restart
 it checks reopened queries and exports, then reads the committed range again.
-The HTTP and file fixture includes a target that serves redacted queries
-while its committed file preserves a forbidden value.
 
 Bindings should report unsupported capabilities as errors. Missing bindings,
-incomplete observations, and HTTP 501 responses produce `ErrIncomplete`.
-This entry point covers unkeyed ingest and grant checks. The existing revision
-runner covers keyed retries and revocation at the export publication barrier.
+incomplete acknowledgments or observations, and HTTP 501 responses produce
+`ErrIncomplete`. Observable policy violations produce `ErrViolation`.
+`RunPolicyRevisions` also covers keyed retries and revocation at the export
+publication barrier.
+
+The disposable HTTP and file fixtures exercise the candidate verifier. They
+include a target that acknowledges a masking revision while continuing to serve
+the old policy and a target that serves redacted queries while its committed
+file preserves a forbidden value. These results qualify the fixture checks.
+Serving runtime qualification requires observations from the pinned candidate.

@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// The candidate exposes real HTTP responses while the verifier opens its
+// The fixture exposes real HTTP responses while the verifier opens its
 // committed file separately. The fault changes the durable write only.
 type candidateFixture struct {
 	mu       sync.Mutex
@@ -248,6 +248,87 @@ func TestRunCandidate(t *testing.T) {
 			defer fixture.mu.Unlock()
 			if fixture.restarts != 1 || len(fixture.target.frames) != 4 {
 				t.Fatalf("got %d restarts and %d commits", fixture.restarts, len(fixture.target.frames))
+			}
+		})
+	}
+}
+
+func TestCandidateMaskingPolicyEvidence(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, diagnostic string
+		version          string
+		want             error
+		apply            func(context.Context, PolicyObserver, PolicyRevision) (PolicyAck, error)
+	}{
+		{"acknowledged without applying", "old masking revision must invalidate", "fixture-masking-v2", ErrViolation,
+			func(_ context.Context, _ PolicyObserver, revision PolicyRevision) (PolicyAck, error) {
+				return PolicyAck{Complete: true, Number: revision.Number}, nil
+			}},
+		{"missing acknowledgment", "policy update lacks acknowledgment", "fixture-masking-v2", ErrIncomplete,
+			func(ctx context.Context, policy PolicyObserver, revision PolicyRevision) (PolicyAck, error) {
+				ack, err := policy.ApplyPolicy(ctx, revision)
+				ack.Complete = false
+				return ack, err
+			}},
+		{"unaffected stream revision changed", "unaffected stream must resume", "fixture-masking-v2", ErrViolation,
+			func(ctx context.Context, policy PolicyObserver, revision PolicyRevision) (PolicyAck, error) {
+				revision.Streams[1].MaskingVersion = "fixture-masking-v2"
+				return policy.ApplyPolicy(ctx, revision)
+			}},
+		{"masking version applied without rules", "fresh query must match and page over masked rows", "fixture-masking-v2", ErrViolation,
+			func(ctx context.Context, policy PolicyObserver, revision PolicyRevision) (PolicyAck, error) {
+				revision.Streams[0].Masks = nil
+				return policy.ApplyPolicy(ctx, revision)
+			}},
+		{"original revision reused", "restored masking rules must retain a new revision", "fixture-masking-v3", ErrViolation,
+			func(ctx context.Context, policy PolicyObserver, revision PolicyRevision) (PolicyAck, error) {
+				revision.Streams[0].MaskingVersion = "fixture-masking-v1"
+				return policy.ApplyPolicy(ctx, revision)
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture, candidate := newCandidateFixture(t, "")
+			candidate.Policy = policyFunc(func(ctx context.Context, revision PolicyRevision) (PolicyAck, error) {
+				if revision.Streams[0].MaskingVersion == tc.version {
+					return tc.apply(ctx, fixture, revision)
+				}
+				return fixture.ApplyPolicy(ctx, revision)
+			})
+			err := runCandidateFixture(t, candidate)
+			if !errors.Is(err, tc.want) || !strings.Contains(err.Error(), "masking revisions between pages") ||
+				!strings.Contains(err.Error(), tc.diagnostic) {
+				t.Fatalf("expected %v matching %q in masking scenario, got %v", tc.want, tc.diagnostic, err)
+			}
+		})
+	}
+}
+
+func TestCandidateMaskingFilterEvidence(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, filter string
+		want         error
+		alter        func(*CandidateRequest)
+	}{
+		{"hidden input matched", maskedInput, ErrViolation, func(r *CandidateRequest) { r.Query.Contains = "" }},
+		{"masked replacement missed", maskedLine, ErrViolation, func(r *CandidateRequest) { r.Query.Contains = maskedInput }},
+		{"filtered query unavailable", maskedLine, ErrIncomplete, func(r *CandidateRequest) { r.Operation = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, candidate := newCandidateFixture(t, "")
+			request := candidate.Request
+			candidate.Request = func(ctx context.Context, probe CandidateRequest) (*http.Request, error) {
+				if probe.Operation == CandidateQuery && probe.Query.Contains == tc.filter {
+					tc.alter(&probe)
+				}
+				return request(ctx, probe)
+			}
+			err := runCandidateFixture(t, candidate)
+			if !errors.Is(err, tc.want) || !strings.Contains(err.Error(), "fresh query must match and page over masked rows") {
+				t.Fatalf("expected %v on fresh masked query, got %v", tc.want, err)
 			}
 		})
 	}

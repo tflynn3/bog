@@ -175,12 +175,26 @@ func (s *revisionScenario) setMask(ctx context.Context, version string, rules []
 	})
 }
 
+func (s *revisionScenario) checkMaskingFilters(ctx context.Context, target Target) error {
+	for _, filter := range []string{"", maskedInput, maskedLine} {
+		request := s.queryRequest(target, 10)
+		request.Contains = filter
+		if err := s.endPage(ctx, request, s.expectedRows(request)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *revisionScenario) checkMaskingRevisions(ctx context.Context) error {
 	a := Target{alice, s.fixture.Streams[0].Selector}
 	b := Target{bob, s.fixture.Streams[1].Selector}
 	original, err := s.open(ctx, a)
 	if err != nil {
 		return err
+	}
+	if err := s.resume(ctx, a, original); err != nil {
+		return fmt.Errorf("original cursor must resume before changing masking rules: %w", err)
 	}
 	other, err := s.open(ctx, b)
 	if err != nil {
@@ -199,6 +213,9 @@ func (s *revisionScenario) checkMaskingRevisions(ctx context.Context) error {
 	if err := s.setMask(ctx, "fixture-masking-v2", []Replacement{{maskedInput, maskedLine}}); err != nil {
 		return err
 	}
+	if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{original.token}); err != nil {
+		return fmt.Errorf("old masking revision must invalidate authorized cursor: %w", err)
+	}
 	if err := s.setQuery(ctx, a, false); err != nil {
 		return err
 	}
@@ -209,21 +226,20 @@ func (s *revisionScenario) checkMaskingRevisions(ctx context.Context) error {
 		return err
 	}
 	if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{original.token}); err != nil {
-		return fmt.Errorf("old masking revision must invalidate authorized cursor: %w", err)
+		return fmt.Errorf("regranted query must still reject old masking revision: %w", err)
 	}
 	if err := s.resume(ctx, b, other); err != nil {
 		return fmt.Errorf("unaffected stream must resume: %w", err)
 	}
-	for _, filter := range []string{"", maskedInput, maskedLine} {
-		request := s.queryRequest(a, 10)
-		request.Contains = filter
-		if err := s.endPage(ctx, request, s.expectedRows(request)); err != nil {
-			return fmt.Errorf("fresh query must match and page over masked rows: %w", err)
-		}
+	if err := s.checkMaskingFilters(ctx, a); err != nil {
+		return fmt.Errorf("fresh query must match and page over masked rows: %w", err)
 	}
 	masked, err := s.open(ctx, a)
 	if err != nil {
 		return err
+	}
+	if err := s.resume(ctx, a, masked); err != nil {
+		return fmt.Errorf("masked cursor must resume before restoring rules: %w", err)
 	}
 	if err := s.setMask(ctx, "fixture-masking-v3", nil); err != nil {
 		return err
@@ -232,6 +248,11 @@ func (s *revisionScenario) checkMaskingRevisions(ctx context.Context) error {
 	if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{original.token, masked.token}); err != nil {
 		return fmt.Errorf("restored masking rules must retain a new revision: %w", err)
 	}
-	request := s.queryRequest(a, 10)
-	return s.endPage(ctx, request, s.expectedRows(request))
+	if err := s.resume(ctx, b, other); err != nil {
+		return fmt.Errorf("unaffected stream must resume after restoring rules: %w", err)
+	}
+	if err := s.checkMaskingFilters(ctx, a); err != nil {
+		return fmt.Errorf("fresh query must match and page over restored rows: %w", err)
+	}
+	return nil
 }

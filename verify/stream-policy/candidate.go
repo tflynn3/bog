@@ -72,9 +72,9 @@ type Candidate struct {
 	VerifyArtifact func(context.Context, []byte) (Manifest, []Record, error)
 }
 
-// RunCandidate exercises server-side grants, scope binding, and redaction on a
-// fresh target. A deadline bounds network, policy, and storage observations.
-// The caller owns provisioning and cleanup.
+// RunCandidate exercises server-side grants, scope binding, masking revisions,
+// and pre-append redaction on a fresh target. A deadline bounds network,
+// policy, and storage observations. The caller owns provisioning and cleanup.
 func RunCandidate(ctx context.Context, candidate Candidate) error {
 	if err := observation(ctx, nil); err != nil {
 		return err
@@ -100,6 +100,7 @@ func RunCandidate(ctx context.Context, candidate Candidate) error {
 		{"ingest grants and pre-append redaction", s.checkCandidateIngest},
 		{"authorization and cursor scope", s.checkQueries},
 		{"query grant revocation and regrant", s.checkGrantRevisions},
+		{"masking revisions between pages", s.checkMaskingRevisions},
 		{"committed bytes and restart", s.checkCandidateReplay},
 		{"scoped exports after restart", s.checkExports},
 		{"export grant revocation and regrant", s.checkCandidateExportGrant},

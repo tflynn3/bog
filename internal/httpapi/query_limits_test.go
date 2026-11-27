@@ -41,9 +41,9 @@ func TestLiveQueryScanWork(t *testing.T) {
 	}{
 		{"direct nonmatches", direct, "&contains=x", 1 + 2 + 3*5},
 		{"merged nonmatches", merged, "&contains=x", 2 + 3 + 3*5},
-		// The first 512 rows are scanned. Four blocks are pruned after
-		// the upper bound seek, so the final unit is a Bloom check.
-		{"Bloom pruning", bloom, "&page=1&limit=1&contains=needle", 1 + 11 + 11 + 512*5 + 4},
+		// The captured run starts inside the window. After 512 inspected
+		// rows and an upper-bound seek, four Bloom checks prune the rest.
+		{"Bloom pruning", bloom, "&page=1&limit=1&contains=needle", 1 + 11 + 512*5 + 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query := func(budget uint64) *httptest.ResponseRecorder {
@@ -86,12 +86,19 @@ func TestLiveQuerySmallWorkBudget(t *testing.T) {
 	if ordinary.Code != http.StatusOK || ordinary.Body.String() != jsonRow(t, rows[0])+jsonRow(t, rows[1]) {
 		t.Fatalf("ordinary query: status=%d body=%q", ordinary.Code, ordinary.Body.String())
 	}
-	first := query(queryBounds, "&page=1&limit=1")
+	// The long gap makes the unrestricted walk unaffordable before
+	// issuance. A window ending at the first miss can finish at budget 32.
+	assertQueryRejection(t, query(queryBounds, "&page=1&limit=1"), http.StatusServiceUnavailable, "query work budget exhausted")
+	shortBounds := "/query?start=2025-01-01T00:00:00Z&end=" + rows[2].TS.Format(time.RFC3339Nano)
+	first := query(shortBounds, "&page=1&limit=1")
 	token := first.Header().Get("Bog-Next-Cursor")
 	if first.Code != http.StatusOK || first.Body.String() != jsonRow(t, rows[0]) || token == "" {
 		t.Fatalf("legacy first page: status=%d headers=%v body=%q", first.Code, first.Header(), first.Body.String())
 	}
-	assertQueryRejection(t, query(queryBounds, "&cursor="+token), http.StatusServiceUnavailable, "query work budget exhausted")
+	second := query(shortBounds, "&cursor="+token)
+	if second.Code != http.StatusOK || second.Body.String() != jsonRow(t, rows[1]) || second.Header().Get("Bog-Next-Cursor") != "" {
+		t.Fatalf("legacy terminal page: status=%d headers=%v body=%q", second.Code, second.Header(), second.Body.String())
+	}
 	assertQueryRejection(t, query(queryBounds, "&limit=3"), http.StatusServiceUnavailable, "query work budget exhausted")
 	assertQueryRejection(t, query(queryBounds, "&page=1&limit=2"), http.StatusServiceUnavailable, "query work budget exhausted")
 

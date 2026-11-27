@@ -12,6 +12,8 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 		return nil
 	}
 	rows, blocks, restored, levels := v.rows, v.blocks, v.restored, v.levels
+	captureMatches := matches.ordinals != nil
+	inspectLine := !captureMatches || contains != ""
 	// Publication replaces the run levels, so the captured slice is immutable.
 	runs := make([]indexRun, 0, len(levels)+1)
 	if restored.length > 0 {
@@ -37,10 +39,15 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 		if run.ordinals == nil {
 			run.length = min(run.length, count-run.base)
 		}
-		if err := work.seek(run.length); err != nil {
-			return err
+		lo := 0
+		// A full capture can avoid a binary seek when the run's first
+		// row already qualifies. Its run setup unit covers this probe.
+		if !captureMatches || rows[run.ordinal(0)].TS.Before(start) {
+			if err := work.seek(run.length); err != nil {
+				return err
+			}
+			lo = sort.Search(run.length, func(j int) bool { return !rows[run.ordinal(j)].TS.Before(start) })
 		}
-		lo := sort.Search(run.length, func(j int) bool { return !rows[run.ordinal(j)].TS.Before(start) })
 		lower = append(lower, lo)
 		if after != nil {
 			if err := work.seek(run.length - lo); err != nil {
@@ -89,7 +96,7 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 				return false, nil
 			}
 			examined++
-			if err := work.row(row.Line, true); err != nil {
+			if err := work.row(row.Line, inspectLine); err != nil {
 				return false, err
 			}
 			if strings.Contains(row.Line, contains) && matches.add(row, ordinal, count) {
@@ -149,6 +156,10 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 			scanThreshold = max(512, 2*limit)
 		} else {
 			scanThreshold = int(^uint(0) >> 1)
+		}
+		if captureMatches {
+			// The plan's capacity is a metadata bound, not a density hint.
+			scanThreshold = 512
 		}
 		// The multi-run policy uses the full-window estimate before attempting
 		// the merge. A single run can answer dense pages without that estimate.
@@ -305,7 +316,7 @@ func (v queryView) scan(start, end time.Time, contains string, count int, after 
 			if !row.TS.Before(end) {
 				return nil
 			}
-			if err := work.row(row.Line, true); err != nil {
+			if err := work.row(row.Line, inspectLine); err != nil {
 				return err
 			}
 			if strings.Contains(row.Line, contains) {

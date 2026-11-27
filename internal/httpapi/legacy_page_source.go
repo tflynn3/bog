@@ -15,7 +15,30 @@ type legacyPageSource struct {
 	store *store.Store
 	mu    sync.Mutex
 	next  uint64
-	views map[string]*store.PositionedSnapshot
+	views map[string]legacyView
+}
+
+type legacyView struct {
+	snapshot *store.PositionedSnapshot
+	plan     *legacyQueryPlan
+}
+
+func (s *legacyPageSource) retain(view legacyView) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	id := strconv.FormatUint(s.next, 10)
+	if s.views == nil {
+		s.views = make(map[string]legacyView)
+	}
+	s.views[id] = view
+	return id
+}
+
+func (s *legacyPageSource) lookup(id string) legacyView {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.views[id]
 }
 
 func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.QueryWork) (PageResult, error) {
@@ -40,9 +63,7 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 		}
 		view = s.store.CapturePositionedSnapshot()
 	} else {
-		s.mu.Lock()
-		view = s.views[id]
-		s.mu.Unlock()
+		view = s.lookup(id).snapshot
 		if view == nil {
 			return PageResult{}, ErrCaptureExpired
 		}
@@ -68,14 +89,7 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 		result.Rows[i] = PageRow{Row: row.Row, Position: legacyPosition(row.Position)}
 	}
 	if id == "" {
-		s.mu.Lock()
-		s.next++
-		id = strconv.FormatUint(s.next, 10)
-		if s.views == nil {
-			s.views = make(map[string]*store.PositionedSnapshot)
-		}
-		s.views[id] = view
-		s.mu.Unlock()
+		id = s.retain(legacyView{snapshot: view})
 	}
 	result.Capture = id
 	return result, nil

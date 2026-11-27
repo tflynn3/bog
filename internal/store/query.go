@@ -96,17 +96,19 @@ type queryMatches struct {
 	firstOrdinal uint64
 	rows         []Row
 	positioned   []PositionedRow // non-nil when collecting positioned results
+	ordinals     []int           // non-nil when collecting an immutable match list
 	last         Position
 	more         bool
 }
 
 func (p *queryMatches) full() bool {
-	return len(p.rows)+len(p.positioned) == p.limit
+	return len(p.rows)+len(p.positioned)+len(p.ordinals) == p.limit
 }
 
 func (p *queryMatches) reset() {
 	p.rows = p.rows[:0]
 	p.positioned = p.positioned[:0]
+	p.ordinals = p.ordinals[:0]
 }
 
 func (p *queryMatches) add(row Row, ordinal, capacity int) (done bool) {
@@ -114,7 +116,9 @@ func (p *queryMatches) add(row Row, ordinal, capacity int) (done bool) {
 		p.more = true
 		return true
 	}
-	if p.positioned != nil {
+	if p.ordinals != nil {
+		p.ordinals = append(p.ordinals, ordinal)
+	} else if p.positioned != nil {
 		if cap(p.positioned) == 0 {
 			p.positioned = make([]PositionedRow, 0, min(p.limit, capacity))
 		}

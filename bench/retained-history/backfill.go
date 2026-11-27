@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"bog/verify/capacityevidence"
 )
 
 func (f fixture) runBackfill(ctx context.Context, s service, o options, r *result, dir string, timeline *backfillTimeline, held *walk, previous uint64) (_ compaction, err error) {
 	p := backfillProbe{backfillTimeline: timeline, service: s, control: o.control, dir: dir, origin: time.Now()}
 	p.Status = "running"
+	if o.requireCorrelation {
+		p.Correlation = &capacityevidence.CycleCorrelation{PredecessorGeneration: &previous}
+	}
 	p.boundary("phase_start")
 	defer func() {
 		p.HeldRows = held.offset
@@ -148,7 +153,7 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	}
 	p.FreshExact = true
 	p.boundary("fresh_walk_complete")
-	return published, nil
+	return published, p.observePeak(ctx)
 }
 
 func (f fixture) overlapBackfill(ctx context.Context, p *backfillProbe, held *walk, r *result, previous uint64, writes *[]ingestSample, reads *[]time.Duration) error {

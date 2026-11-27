@@ -12,30 +12,50 @@ import (
 )
 
 const (
-	PendingCompactionsMetric     = "pending_compactions"
-	OldestPinnedGenerationMetric = "oldest_pinned_generation"
+	PendingCompactionsMetric       = "pending_compactions"
+	OldestPinnedGenerationMetric   = "oldest_pinned_generation"
+	ReplayTailBytesMetric          = "replay_tail_bytes"
+	PredecessorPinAgeMetric        = "oldest_predecessor_pin_age_ns"
+	PredecessorPinGenerationMetric = "predecessor_pin_generation"
+	ReclaimedBytesMetric           = "reclaimed_bytes"
+	ReclaimedPredecessorMetric     = "reclaimed_predecessor_generation"
+	ReclaimedReplacementMetric     = "reclaimed_replacement_generation"
 )
 
 // RuntimeMetrics is the schema-v1 candidate_status_metrics object emitted by
 // the benchmark. A nil counter records no measurement. A nil generation with
 // a successful snapshot and no matching unavailable reason records no live pins.
+//
+// The correlation fields describe the same snapshot as the compaction status.
+// ReplayTailBytes measures committed suffix bytes eligible for replay from the
+// status generation and covered boundary. PredecessorPinAge measures the oldest
+// live reference to PredecessorPinGeneration. These generation numbers use the
+// control route's compaction sequence. A completed reclamation reports the bytes
+// actually credited to capacity and both generations in the requested replacement.
+// The runtime omits the reclamation tuple until the credit is complete.
 type RuntimeMetrics struct {
-	PublicationLag         *uint64           `json:"publication_lag_ns"`
-	Reserved               *uint64           `json:"staging_reserved_bytes"`
-	Used                   *uint64           `json:"staging_used_bytes"`
-	OldestPin              *uint64           `json:"oldest_pin_age_ns"`
-	Reclaimable            *uint64           `json:"reclaimable_bytes"`
-	RetiredPins            *uint64           `json:"retired_generation_pins"`
-	PendingCompactions     *uint64           `json:"pending_compactions"`
-	OldestPinnedGeneration *string           `json:"oldest_pinned_generation"`
-	Unavailable            map[string]string `json:"unavailable,omitempty"`
+	PublicationLag           *uint64           `json:"publication_lag_ns"`
+	Reserved                 *uint64           `json:"staging_reserved_bytes"`
+	Used                     *uint64           `json:"staging_used_bytes"`
+	OldestPin                *uint64           `json:"oldest_pin_age_ns"`
+	Reclaimable              *uint64           `json:"reclaimable_bytes"`
+	RetiredPins              *uint64           `json:"retired_generation_pins"`
+	PendingCompactions       *uint64           `json:"pending_compactions"`
+	OldestPinnedGeneration   *string           `json:"oldest_pinned_generation"`
+	ReplayTailBytes          *uint64           `json:"replay_tail_bytes,omitempty"`
+	PredecessorPinAge        *uint64           `json:"oldest_predecessor_pin_age_ns,omitempty"`
+	PredecessorPinGeneration *uint64           `json:"predecessor_pin_generation,omitempty"`
+	ReclaimedBytes           *uint64           `json:"reclaimed_bytes,omitempty"`
+	ReclaimedPredecessor     *uint64           `json:"reclaimed_predecessor_generation,omitempty"`
+	ReclaimedReplacement     *uint64           `json:"reclaimed_replacement_generation,omitempty"`
+	Unavailable              map[string]string `json:"unavailable,omitempty"`
 }
 
-func (m *RuntimeMetrics) counters() [7]struct {
+func (m *RuntimeMetrics) counters() [13]struct {
 	name string
 	dest **uint64
 } {
-	return [7]struct {
+	return [13]struct {
 		name string
 		dest **uint64
 	}{
@@ -46,6 +66,12 @@ func (m *RuntimeMetrics) counters() [7]struct {
 		{"reclaimable_bytes", &m.Reclaimable},
 		{"retired_generation_pins", &m.RetiredPins},
 		{PendingCompactionsMetric, &m.PendingCompactions},
+		{ReplayTailBytesMetric, &m.ReplayTailBytes},
+		{PredecessorPinAgeMetric, &m.PredecessorPinAge},
+		{PredecessorPinGenerationMetric, &m.PredecessorPinGeneration},
+		{ReclaimedBytesMetric, &m.ReclaimedBytes},
+		{ReclaimedPredecessorMetric, &m.ReclaimedPredecessor},
+		{ReclaimedReplacementMetric, &m.ReclaimedReplacement},
 	}
 }
 

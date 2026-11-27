@@ -105,6 +105,7 @@ type report struct {
 type options struct {
 	binary, revision, fixture, report, mode, workDir, cgroupParent, control string
 	timeout                                                                 time.Duration
+	requireCorrelation                                                      bool
 }
 
 func pinBinary(source, dest, revision string) (digest string, err error) {
@@ -164,8 +165,10 @@ func createFixtureRoot(parent string) (string, error) {
 
 func run(ctx context.Context, args []string, publish func(string, report) error) (err error) {
 	var o options
-	var cutoverReport string
+	var cutoverReport, correlatedReport string
 	f := flag.NewFlagSet("retained-history", flag.ContinueOnError)
+	f.StringVar(&correlatedReport, "validate-capacity-correlation", "", "require correlated capacity proof in an existing report")
+	f.BoolVar(&o.requireCorrelation, "require-capacity-correlation", false, "require replay, pin age, capacity credit, and cgroup peak for each live replacement")
 	f.StringVar(&cutoverReport, "validate-cutover", "", "validate the cutover proof in an existing capacity report")
 	f.StringVar(&o.binary, "binary", "", "absolute path to pinned Linux Bog binary")
 	f.StringVar(&o.revision, "revision", "", "full lowercase commit SHA")
@@ -179,6 +182,12 @@ func run(ctx context.Context, args []string, publish func(string, report) error)
 	if err := f.Parse(args); err != nil {
 		return err
 	}
+	if correlatedReport != "" {
+		if f.NArg() != 0 || f.NFlag() != 1 {
+			return errors.New("-validate-capacity-correlation takes a report path and runs independently of fixture flags")
+		}
+		return validateCapacityFile(correlatedReport, capacityevidence.ValidateCorrelatedReport)
+	}
 	if cutoverReport != "" {
 		if f.NArg() != 0 || f.NFlag() != 1 {
 			return errors.New("-validate-cutover takes a report path and runs independently of fixture flags")
@@ -188,6 +197,9 @@ func run(ctx context.Context, args []string, publish func(string, report) error)
 	if f.NArg() != 0 || !filepath.IsAbs(o.binary) || !regexp.MustCompile("^[0-9a-f]{40}$").MatchString(o.revision) ||
 		o.fixture != capacityevidence.FixtureID || o.report == "" || o.timeout <= 0 || (o.mode != "live" && o.mode != "legacy") {
 		return errors.New("require absolute -binary, full lowercase -revision, -fixture linux-release-v1, and -report; see -help")
+	}
+	if o.requireCorrelation && o.mode != "live" {
+		return errors.New("-require-capacity-correlation requires live mode")
 	}
 	source, sourceErr := os.Stat(o.binary)
 	if dest, destErr := os.Stat(o.report); sourceErr == nil && destErr == nil && os.SameFile(source, dest) {

@@ -92,6 +92,16 @@ type report struct {
 // ValidateReport requires a complete live proof at both scales. Callers
 // validate candidate identity and any companion reports at their entry point.
 func ValidateReport(data []byte) error {
+	return validateReport(data, false)
+}
+
+// ValidateCorrelatedReport requires the enriched proof at every scale and
+// for both backfill workloads, even if all correlation fields were omitted.
+func ValidateCorrelatedReport(data []byte) error {
+	return validateReport(data, true)
+}
+
+func validateReport(data []byte, requireCorrelation bool) error {
 	var envelope report
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return fmt.Errorf("decode capacity report: %w", err)
@@ -113,6 +123,9 @@ func ValidateReport(data []byte) error {
 	if capacity.Status != "pass" || len(capacity.Evidence) != 2 {
 		return errors.New("cutover capacity requires a passing record at each live scale")
 	}
+	for _, r := range capacity.Evidence {
+		requireCorrelation = requireCorrelation || r.hasCorrelation()
+	}
 	var seen [2]bool
 	for _, r := range capacity.Evidence {
 		size := r.Fixture.SeedRows
@@ -124,7 +137,7 @@ func ValidateReport(data []byte) error {
 			return fmt.Errorf("duplicate capacity fixture size %d", size)
 		}
 		seen[index] = true
-		if err := r.validate(); err != nil {
+		if err := r.validate(requireCorrelation); err != nil {
 			return fmt.Errorf("capacity fixture %d: %w", size, err)
 		}
 	}
@@ -134,6 +147,15 @@ func ValidateReport(data []byte) error {
 // ValidateRecord checks the same wire proof before a producer reports a
 // passing live scale. Presence-sensitive fields must reach this API as JSON.
 func ValidateRecord(data []byte) error {
+	return validateRecord(data, false)
+}
+
+// ValidateCorrelatedRecord requires a complete enriched proof for a scale.
+func ValidateCorrelatedRecord(data []byte) error {
+	return validateRecord(data, true)
+}
+
+func validateRecord(data []byte, requireCorrelation bool) error {
 	var r record
 	if err := json.Unmarshal(data, &r); err != nil {
 		return fmt.Errorf("decode capacity record: %w", err)
@@ -141,7 +163,7 @@ func ValidateRecord(data []byte) error {
 	if _, err := scaleIndex(r.Fixture.SeedRows); err != nil {
 		return err
 	}
-	return r.validate()
+	return r.validate(requireCorrelation || r.hasCorrelation())
 }
 
 func scaleIndex(size int) (int, error) {
@@ -155,7 +177,18 @@ func scaleIndex(size int) (int, error) {
 	}
 }
 
-func (r record) validate() error {
+func (r record) hasCorrelation() bool {
+	if r.Diagnostics != nil {
+		for _, t := range r.Diagnostics.Timelines {
+			if len(t.Correlation) != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (r record) validate(requireCorrelation bool) error {
 	f := r.Fixture
 	if f.TailRows != TailRows || f.BatchRows != BatchRows || f.LineBytes != LineBytes || f.MemoryBytes != MemoryLimit {
 		return errors.New("incorrect fixture dimensions or memory limit")
@@ -196,13 +229,13 @@ func (r record) validate() error {
 			return fmt.Errorf("missing clean %s lifecycle", lifetime)
 		}
 	}
-	if err := r.validateTimelines(); err != nil {
+	if err := r.validateTimelines(requireCorrelation); err != nil {
 		return err
 	}
 	return d.Restart.validate(r.Compaction)
 }
 
-func (r record) validateTimelines() error {
+func (r record) validateTimelines(requireCorrelation bool) error {
 	timelines := r.Diagnostics.Timelines
 	if len(timelines) != 2 || timelines[0].Pattern != "clustered" || timelines[1].Pattern != "scattered" {
 		return errors.New("require clustered followed by scattered backfill timelines")
@@ -212,10 +245,20 @@ func (r record) validateTimelines() error {
 		{seed - 2*BatchRows, seed - BatchRows, seed},
 		{seed, seed + BatchRows, seed + TailRows},
 	}
-	var published uint64
+	var published, previousPeak uint64
 	for i, t := range timelines {
 		if err := t.validate(cutoffs[i], published, r.CgroupPeak); err != nil {
 			return fmt.Errorf("%s backfill: %w", t.Pattern, err)
+		}
+		if requireCorrelation {
+			if len(t.Correlation) == 0 {
+				return fmt.Errorf("%s backfill: missing capacity correlation", t.Pattern)
+			}
+			var err error
+			previousPeak, err = t.validateCorrelation(r.CgroupPeak, previousPeak)
+			if err != nil {
+				return fmt.Errorf("%s backfill: %w", t.Pattern, err)
+			}
 		}
 		published = t.Publication.Generation
 	}

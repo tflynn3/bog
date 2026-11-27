@@ -2,6 +2,7 @@ package capacityevidence
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"time"
@@ -46,8 +47,9 @@ type backfillEvidence struct {
 		Held   *uint64 `json:"retired_pins_while_held"`
 		After  *uint64 `json:"retired_pins_after_exhaustion"`
 	} `json:"pin_drain"`
-	Memory  *memoryObservation `json:"live_memory_current"`
-	Samples []backfillSample   `json:"samples"`
+	Correlation jsontext.Value     `json:"capacity_correlation,omitzero"`
+	Memory      *memoryObservation `json:"live_memory_current"`
+	Samples     []backfillSample   `json:"samples"`
 }
 
 type memoryObservation struct {
@@ -186,7 +188,7 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs, previousPublicat
 			}
 			fresh = true
 			continue
-		case "compaction_start", "overlap", "status_poll", "publication", "final_cutoff", "before_retirement", "after_retirement", "drain_poll":
+		case "compaction_start", "overlap", "status_poll", "publication", "final_cutoff", "before_retirement", "after_retirement", "drain_poll", "reclamation_poll":
 		default:
 			continue
 		}
@@ -310,6 +312,10 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs, previousPublicat
 				return errors.New("before_retirement must observe the positive held pin count at the final cutoff after terminal page replay")
 			}
 			held = true
+		case "reclamation_poll":
+			if len(b.Correlation) == 0 || !drained || fresh || c.CommittedRows != want.final {
+				return errors.New("reclamation poll must observe the final cutoff after pin drain and before fresh visibility")
+			}
 		case "after_retirement", "drain_poll":
 			if c.CommittedRows != want.final {
 				return errors.New("pin drain sample did not observe the final cutoff")

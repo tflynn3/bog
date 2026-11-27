@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -78,13 +77,13 @@ func verifyRetainedShutdown(ctx context.Context, binary, dir string, client *htt
 	flags := []string{"-query-concurrency=1", "-query-max-response-bytes=" + strconv.Itoa(shutdownPageCap)}
 	var ledger querymodel.Log
 	err := superviseDirectory(ctx, binary, dir, client, flags, "", (*candidateProcess).gracefulStop,
-		func(ctx context.Context, base string, p *candidateProcess, port int, owns listenerOwner) error {
+		func(probes context.Context, base string, p *candidateProcess, port int, owns listenerOwner) error {
 			for offset := 0; offset < len(seed); offset += batchRows {
-				if _, err := appendTailParityRows(ctx, client, base, &ledger, seed[offset:offset+batchRows]); err != nil {
+				if _, err := appendTailParityRows(probes, client, base, &ledger, seed[offset:offset+batchRows]); err != nil {
 					return fmt.Errorf("seed batch at %d: %w", offset, err)
 				}
 			}
-			predecessor, err := publishReleaseGeneration(ctx, client, base, batchRows, ledger.HighWater(), nil)
+			predecessor, err := publishReleaseGeneration(probes, client, base, batchRows, ledger.HighWater(), nil)
 			if err != nil {
 				return fmt.Errorf("publish predecessor with committed suffix: %w", err)
 			}
@@ -93,7 +92,7 @@ func verifyRetainedShutdown(ctx context.Context, binary, dir string, client *htt
 				return err
 			}
 			filter := querymodel.Filter{Start: pager.query.Start, End: pager.query.End}
-			first, _, err := fetchOraclePage(ctx, pager, querymodel.WireRequest{Filter: filter, Limit: 1, MaxPageBytes: shutdownPageCap})
+			first, _, err := fetchOraclePage(probes, pager, querymodel.WireRequest{Filter: filter, Limit: 1, MaxPageBytes: shutdownPageCap})
 			if err != nil {
 				return fmt.Errorf("capture predecessor: %w", err)
 			}
@@ -108,6 +107,8 @@ func verifyRetainedShutdown(ctx context.Context, binary, dir string, client *htt
 			for i, item := range held[1:] {
 				want[i] = row{item.Time.Format(time.RFC3339Nano), item.Line}
 			}
+			// Process exit cancels probes. The client can still have buffered
+			// response bytes to read after a successful server exit.
 			return drainShutdownContinuation(ctx, base, first.NextCursor, want, func(ctx context.Context, peer int) error {
 				if err := requireShutdownQuerySlot(ctx, client, base); err != nil {
 					return err
@@ -177,78 +178,44 @@ func verifyRetainedShutdown(ctx context.Context, binary, dir string, client *htt
 
 // Read only the response headers until the shutdown probe finishes. Then
 // drain the same connection and check the complete predecessor response.
-func drainShutdownContinuation(ctx context.Context, base, cursor string, want []row, check func(context.Context, int) error) (err error) {
+func drainShutdownContinuation(ctx context.Context, base, cursor string, want []row, check func(context.Context, int) error) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	dialer := net.Dialer{Control: func(_, _ string, socket syscall.RawConn) error {
-		var optionErr error
-		controlErr := socket.Control(func(fd uintptr) {
-			optionErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, receiveWindow)
-		})
-		return errors.Join(controlErr, optionErr)
-	}}
-	conn, err := dialer.DialContext(ctx, "tcp4", strings.TrimPrefix(base, "http://"))
-	if err != nil {
-		return err
-	}
-	var res *http.Response
-	defer func() {
-		// Close the socket first so error cleanup cannot block draining the body.
-		err = errors.Join(err, conn.Close())
-		if res != nil {
-			if closeErr := res.Body.Close(); !errors.Is(closeErr, net.ErrClosed) {
-				err = errors.Join(err, closeErr)
-			}
-		}
-	}()
 	deadline, _ := ctx.Deadline()
-	if err := conn.SetDeadline(deadline); err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+queryPath(cursor, 1000, ""), nil)
-	if err != nil {
-		return err
-	}
-	req.Close = true
-	if err := req.Write(conn); err != nil {
-		return err
-	}
-	res, err = http.ReadResponse(bufio.NewReader(conn), req)
-	if err != nil {
-		return err
-	}
-	if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "application/x-ndjson" ||
-		res.Header.Get("Content-Length") == "" || res.ContentLength <= 0 || res.ContentLength > shutdownPageCap ||
-		len(res.Header.Values(nextCursor)) != 0 || hasCursorTrailer(res) {
-		return fmt.Errorf("invalid held response headers: HTTP %d, Content-Length %d", res.StatusCode, res.ContentLength)
-	}
-	server, peer := conn.RemoteAddr().(*net.TCPAddr).Port, conn.LocalAddr().(*net.TCPAddr).Port
-	if err := awaitShutdownObservation(ctx, "held response to reach TCP backpressure", func(context.Context) (bool, error) {
-		return zeroWindow(server, peer)
-	}); err != nil {
-		return err
-	}
-	if err := check(ctx, peer); err != nil {
-		return err
-	}
-	if err := conn.(*net.TCPConn).SetReadBuffer(1 << 20); err != nil {
-		return fmt.Errorf("expand receive buffer to drain retained response: %w", err)
-	}
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return fmt.Errorf("read retained response after SIGTERM: %w", err)
-	}
-	if int64(len(body)) != res.ContentLength || len(body) == 0 || body[len(body)-1] != '\n' || hasCursorTrailer(res) {
-		return errors.New("retained response did not finish with exact NDJSON framing")
-	}
-	n, err := checkRows(response{status: res.StatusCode, contentType: res.Header.Get("Content-Type"), body: body}, want)
-	if err != nil {
-		return err
-	}
-	if n != len(want) {
-		return fmt.Errorf("retained response delivered %d rows, want %d", n, len(want))
-	}
-	return nil
+	return withBackpressuredContinuation(ctx, deadline, base+queryPath(cursor, 1000, ""), func(conn *net.TCPConn, res *http.Response) error {
+		if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "application/x-ndjson" ||
+			res.Header.Get("Content-Length") == "" || res.ContentLength <= 0 || res.ContentLength > shutdownPageCap ||
+			len(res.Header.Values(nextCursor)) != 0 || hasCursorTrailer(res) {
+			return fmt.Errorf("invalid held response headers: HTTP %d, Content-Length %d", res.StatusCode, res.ContentLength)
+		}
+		server, peer := conn.RemoteAddr().(*net.TCPAddr).Port, conn.LocalAddr().(*net.TCPAddr).Port
+		if err := awaitShutdownObservation(ctx, "held response to reach TCP backpressure", func(context.Context) (bool, error) {
+			return zeroWindow(server, peer)
+		}); err != nil {
+			return err
+		}
+		if err := check(ctx, peer); err != nil {
+			return err
+		}
+		if err := conn.SetReadBuffer(1 << 20); err != nil {
+			return fmt.Errorf("expand receive buffer to drain retained response: %w", err)
+		}
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			return fmt.Errorf("read retained response after SIGTERM: %w", err)
+		}
+		if int64(len(body)) != res.ContentLength || len(body) == 0 || body[len(body)-1] != '\n' || hasCursorTrailer(res) {
+			return errors.New("retained response did not finish with exact NDJSON framing")
+		}
+		n, err := checkRows(response{status: res.StatusCode, contentType: res.Header.Get("Content-Type"), body: body}, want)
+		if err != nil {
+			return err
+		}
+		if n != len(want) {
+			return fmt.Errorf("retained response delivered %d rows, want %d", n, len(want))
+		}
+		return nil
+	})
 }
 
 func requireShutdownQuerySlot(ctx context.Context, client *http.Client, base string) error {

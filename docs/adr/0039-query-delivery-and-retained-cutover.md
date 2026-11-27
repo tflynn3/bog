@@ -174,21 +174,20 @@ pin-drain checks. Require both native verdicts and verified cleanup.
 
 ### Native retained shutdown
 
-On each native runner, run the opt-in scenario from the verifier checkout
-against that runner's pinned #108 binary. Set `BINARY` to its absolute
-path, `REVISION` to the full composed commit, and `DIGEST` to the
-SHA-256 recorded by the runner's build. Retain the events and require the
-named test to pass on both runners at the same revision.
-
-```sh
-BOG_RELEASE_RETAINED_SHUTDOWN=1 BOG_RELEASE_BINARY="$BINARY" \
-  BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_BINARY_SHA256="$DIGEST" \
-  BOG_RELEASE_FIXTURE=linux-release-v1 \
-  go test -race -json -count=1 -timeout=90s -run '^TestReleaseRetainedShutdown$' \
-    ./verify/release > retained-shutdown-events.jsonl &&
-  python3 verify/release/check_gate_evidence.py test-events \
-    retained-shutdown-events.jsonl bog/verify/release TestReleaseRetainedShutdown
-```
+The native release matrix requires the `retained_shutdown` producer from
+the checkout pinned to the workflow SHA. Each runner enables
+`BOG_RELEASE_RETAINED_SHUTDOWN=1` and supplies the candidate binary path,
+the recorded SHA-256, the full composed revision, and the
+`linux-release-v1` fixture. It runs `TestReleaseRetainedShutdown` with the
+race detector and a 90-second Go test timeout inside a three-minute
+command timeout. The event checker requires exactly one passing event for
+the package and named test. A skip, missing pass, or failure blocks the
+producer. The manifest checker requires a successful producer record
+bound to the gate checkout, candidate revision, and native architecture.
+Each architecture's release evidence artifact includes
+`retained-shutdown-events.jsonl` and the `producers.txt` manifest.
+[Linux release workflow](../../.github/workflows/linux-release.yml),
+[Gate evidence checks](0048-release-gate-evidence-checks.md)
 
 The test checks the digest before launch, before restart, and after the
 scenario. It publishes a predecessor with a committed suffix, captures

@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,8 +47,12 @@ func TestFixedBudgetCasesOverHTTP(t *testing.T) {
 				c.FirstRows != expected.firstRows || c.ResumeLimit != 1 || c.ResponseByteCap != 96 {
 				t.Fatalf("case parameters: %+v", c)
 			}
-			p := &fixturePeer{captures: make(map[string]scriptedCapture), trimCap: int(c.ResponseByteCap)}
-			server := httptest.NewServer(p)
+			seedPeer := &fixturePeer{captures: make(map[string]scriptedCapture), trimCap: int(c.ResponseByteCap)}
+			var active atomic.Pointer[fixturePeer]
+			active.Store(seedPeer)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				active.Load().ServeHTTP(w, r)
+			}))
 			t.Cleanup(server.Close)
 			clientConn, fetch := useWireClient(t, server.URL, c.ResponseByteCap)
 			acknowledge := func(ctx context.Context, rows []model.Row) error {
@@ -67,9 +73,11 @@ func TestFixedBudgetCasesOverHTTP(t *testing.T) {
 				return nil
 			}
 			var matches []string
+			var requests []model.WireRequest
 			hookCalls := 0
 			var openingCursor string
 			result, err := model.RunFixedBudgetCase(t.Context(), c, acknowledge, func(ctx context.Context, req model.WireRequest) (model.WirePage, error) {
+				requests = append(requests, req)
 				start := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 				if !req.Filter.Start.Equal(start) || !req.Filter.End.Equal(start.Add(10*time.Minute)) || req.Filter.Contains != expected.literal {
 					t.Errorf("unexpected query filter %+v", req.Filter)
@@ -87,12 +95,18 @@ func TestFixedBudgetCasesOverHTTP(t *testing.T) {
 				if _, ok := ctx.Deadline(); !ok || cursor == "" || cursor != openingCursor {
 					return errors.New("post-capture hook lacks a deadline or the issuing token")
 				}
-				p.mu.Lock()
-				defer p.mu.Unlock()
-				if len(p.requests) != 3 || len(p.rows) != expected.seedCount+1 ||
-					p.rows[expected.seedCount].Line != expected.backfill {
+				seedPeer.mu.Lock()
+				defer seedPeer.mu.Unlock()
+				if len(seedPeer.requests) != 3 || len(seedPeer.rows) != expected.seedCount+1 ||
+					seedPeer.rows[expected.seedCount].Line != expected.backfill {
 					return errors.New("first backfill was not acknowledged before publication")
 				}
+				// Install a replacement with an independent live row slice.
+				// Existing tokens retain their original capture and position.
+				active.Store(&fixturePeer{
+					rows: slices.Clone(seedPeer.rows), captures: maps.Clone(seedPeer.captures),
+					serial: seedPeer.serial, trimCap: seedPeer.trimCap,
+				})
 				return nil
 			})
 			trimmed := 0
@@ -100,16 +114,28 @@ func TestFixedBudgetCasesOverHTTP(t *testing.T) {
 				trimmed = 1
 			}
 			wantStats := model.WireStats{Pages: 3, Rows: len(expected.matches), BodyBytes: expected.bodyBytes, ByteTrimmedPages: trimmed}
+			wantRows := append(slices.Clone(expected.matches), expected.matches[len(expected.matches)-1])
 			if err != nil || hookCalls != 1 || result.Outcome != model.FixedBudgetExhausted || result.WireStats != wantStats ||
-				result.Page != 3 || result.Limit != 1 || result.HTTPStatus != http.StatusOK || !slices.Equal(matches, expected.matches) {
+				result.Phase != "terminal_replay" || result.Page != 3 || result.Limit != 1 ||
+				result.HTTPStatus != http.StatusOK || !slices.Equal(matches, wantRows) {
 				t.Fatalf("result=%+v matches=%q error=%v", result, matches, err)
 			}
+			if len(requests) != 4 || requests[2].Cursor == "" || requests[2] != requests[3] {
+				t.Fatalf("terminal replay changed the request: %+v", requests)
+			}
+			seedPeer.mu.Lock()
+			seedRequests := slices.Clone(seedPeer.requests)
+			seedRows := len(seedPeer.rows)
+			seedPeer.mu.Unlock()
+			p := active.Load()
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			resume := fmt.Sprintf("resume:%s:1", expected.literal)
-			sequence := []string{"ingest", fmt.Sprintf("first:%s:%d", expected.literal, c.FirstLimit), "ingest", resume, "ingest", resume}
-			if !slices.Equal(p.requests, sequence) {
-				t.Errorf("requests %v, want %v", p.requests, sequence)
+			before := []string{"ingest", fmt.Sprintf("first:%s:%d", expected.literal, c.FirstLimit), "ingest"}
+			after := []string{resume, "ingest", resume, resume}
+			if !slices.Equal(seedRequests, before) || !slices.Equal(p.requests, after) || seedRows != expected.seedCount+1 {
+				t.Errorf("requests before replacement %v, want %v; after %v, want %v; original rows %d",
+					seedRequests, before, p.requests, after, seedRows)
 			}
 			finalTie := time.Duration(0)
 			if c.Fixture == "sparse" {
@@ -198,7 +224,8 @@ func TestFixedBudgetCaseFailures(t *testing.T) {
 			if tc.clean {
 				wantOutcome = model.FixedBudgetCleanRejection
 			}
-			if result.Outcome != wantOutcome || result.HTTPStatus != tc.status || result.Page != tc.page || result.Limit != 1 ||
+			phase := []string{"opening", "continuation", "terminal_resume"}[tc.page-1]
+			if result.Outcome != wantOutcome || result.Phase != phase || result.HTTPStatus != tc.status || result.Page != tc.page || result.Limit != 1 ||
 				result.Pages != tc.page-1 || result.Rows != tc.page-1 || acks != tc.page || requests != tc.page {
 				t.Fatalf("result=%+v append calls=%d fetch calls=%d error=%v", result, acks, requests, err)
 			}
@@ -211,7 +238,7 @@ func TestFixedBudgetCaseFailures(t *testing.T) {
 			if err == nil || tc.fetchErr != nil && !errors.Is(err, tc.fetchErr) {
 				t.Fatalf("unexpected error %v; expected %q and cause %v", err, tc.diagnostic, tc.fetchErr)
 			}
-			for _, fragment := range []string{tc.diagnostic, `fixture="tied"`, "reference_work_budget=11", "response_byte_cap=96", "first_limit=1", "resume_limit=1", fmt.Sprintf("page %d limit=1", tc.page)} {
+			for _, fragment := range []string{tc.diagnostic, `fixture="tied"`, "reference_work_budget=11", "response_byte_cap=96", "first_limit=1", "resume_limit=1", "phase=" + phase, fmt.Sprintf("page %d limit=1", tc.page)} {
 				if !strings.Contains(err.Error(), fragment) {
 					t.Errorf("error lacks %q: %v", fragment, err)
 				}
@@ -249,8 +276,9 @@ func TestFixedBudgetCaseStopsOnIngestFailure(t *testing.T) {
 				return model.WirePage{Rows: seed[queries-1 : queries], BodyBytes: 41, NextCursor: fmt.Sprint("cursor-", queries)}, nil
 			})
 			stage := []string{"seed", "backfill before resume 1", "backfill before resume 2"}[failureAt-1]
+			phase := []string{"seed", "first_backfill", "second_backfill"}[failureAt-1]
 			if !errors.Is(err, want) || !strings.Contains(err.Error(), "acknowledge "+stage) || acks != failureAt || queries != failureAt-1 ||
-				result.Pages != queries || result.Page != queries {
+				result.Pages != queries || result.Page != queries || result.Phase != phase {
 				t.Fatalf("result=%+v acks=%d queries=%d error=%v", result, acks, queries, err)
 			}
 		})
@@ -310,7 +338,7 @@ func TestFixedBudgetCaseStopsOnPostCaptureFailure(t *testing.T) {
 				return want
 			})
 			if !errors.Is(err, want) || strings.Contains(err.Error(), token) ||
-				result.Outcome != model.FixedBudgetIssuedCursor || result.Page != 1 || result.Pages != 1 ||
+				result.Outcome != model.FixedBudgetIssuedCursor || result.Phase != "post_capture" || result.Page != 1 || result.Pages != 1 ||
 				acks != 2 || fetches != 1 || hooks != 1 {
 				t.Fatalf("result=%+v acks=%d fetches=%d hooks=%d error=%v", result, acks, fetches, hooks, err)
 			}

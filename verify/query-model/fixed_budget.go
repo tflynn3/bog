@@ -34,9 +34,10 @@ func FixedBudgetCases() []FixedBudgetCase {
 	}
 }
 
-// FixedBudgetOutcome describes how far the probe got. Only exhaustion proves
-// progress at an issuing budget. A clean opening rejection is evidence that
-// the endpoint refused this trial before publishing a cursor.
+// FixedBudgetOutcome describes how far the probe got. Exhaustion requires
+// both a complete walk and a verified terminal replay at the issuing budget.
+// A clean opening rejection is evidence that the endpoint refused this trial
+// before publishing a cursor.
 type FixedBudgetOutcome string
 
 const (
@@ -46,13 +47,16 @@ const (
 	FixedBudgetExhausted      FixedBudgetOutcome = "exhausted"
 )
 
-// FixedBudgetResult counts verified pages and records the last attempted
-// query page, its limit, and the observed HTTP status. Page is zero before
-// the first request. HTTPStatus is zero when the adapter observed no status
-// or supplied no status metadata. Successful fetches represent HTTP 200.
+// FixedBudgetResult counts verified walk pages, excluding the replay. Phase
+// describes the latest lifecycle step, including terminal_replay. Page, Limit
+// and HTTPStatus describe the latest query attempt, including replay under
+// the original page number. Page is zero before the first request.
+// HTTPStatus is zero when no status metadata is available. Successful
+// fetches represent HTTP 200.
 type FixedBudgetResult struct {
 	WireStats
 	Outcome    FixedBudgetOutcome
+	Phase      string
 	Page       int
 	Limit      int
 	HTTPStatus int
@@ -111,15 +115,15 @@ func (c FixedBudgetCase) fixture() (seed []Row, backfill [2]Row, filter Filter, 
 
 // RunFixedBudgetCase seeds an empty endpoint, verifies the issuing page,
 // acknowledges a matching backfill before each resume, and checks every
-// continuation against the original acknowledged prefix. The optional hook
-// runs once after the first backfill is acknowledged and before the first
-// resume, within the walk deadline. It can observe publication while the
-// cursor is held and must honor ctx. The case never retries or starts a
-// fresh capture. A clean opening rejection returns a distinct outcome and
+// continuation against the original acknowledged prefix. It replays the
+// terminal page with the same request and deadline using the same fetch
+// adapter. The optional hook runs once after the first backfill and before
+// the first resume. It can observe publication while the cursor is held and
+// must honor ctx. A clean opening rejection returns a distinct outcome and
 // nil error. Failures after a verified issuing page retain its progress
-// evidence, including when a continuation returns a clean 503.
+// evidence, including when a continuation or replay returns a clean 503.
 func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge AcknowledgeBatch, fetch FetchWirePage, afterCapture ...AfterCapture) (FixedBudgetResult, error) {
-	result := FixedBudgetResult{Outcome: FixedBudgetIndeterminate}
+	result := FixedBudgetResult{Outcome: FixedBudgetIndeterminate, Phase: "setup"}
 	fail := func(err error) (FixedBudgetResult, error) {
 		stage := "before opening page"
 		if result.Page > 0 {
@@ -128,8 +132,8 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 				stage += fmt.Sprintf(" HTTP %d", result.HTTPStatus)
 			}
 		}
-		return result, fmt.Errorf("fixed-budget fixture=%q reference_work_budget=%d response_byte_cap=%d first_limit=%d first_rows=%d resume_limit=%d: %s: %w",
-			c.Fixture, c.ReferenceWorkBudget, c.ResponseByteCap, c.FirstLimit, c.FirstRows, c.ResumeLimit, stage, err)
+		return result, fmt.Errorf("fixed-budget fixture=%q reference_work_budget=%d response_byte_cap=%d first_limit=%d first_rows=%d resume_limit=%d: phase=%s %s: %w",
+			c.Fixture, c.ReferenceWorkBudget, c.ResponseByteCap, c.FirstLimit, c.FirstRows, c.ResumeLimit, result.Phase, stage, err)
 	}
 	if acknowledge == nil || fetch == nil {
 		return fail(errors.New("append acknowledgement and fetch adapters are required"))
@@ -161,12 +165,14 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 		return fail(err)
 	}
 	var log Log
+	result.Phase = "seed"
 	if err := acknowledge(ctx, seed); err != nil {
 		return fail(fmt.Errorf("acknowledge seed: %w", err))
 	}
 	log.Append(seed)
+	highWater := log.HighWater()
 
-	var openingRejection *FixedBudgetHTTPError
+	result.Phase = "opening"
 	appendBackfill := func(ctx context.Context, resume int) error {
 		batch := backfill[resume-1 : resume]
 		if err := acknowledge(ctx, batch); err != nil {
@@ -175,17 +181,8 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 		log.Append(batch)
 		return nil
 	}
-	result.WireStats, err = VerifyWireWalk(ctx, &log, walk, func(ctx context.Context, req WireRequest) (WirePage, error) {
-		// The verifier accepted the first resume before requesting page three.
-		if result.Page == 2 {
-			if err := appendBackfill(ctx, 2); err != nil {
-				return WirePage{}, err
-			}
-			if err := ctx.Err(); err != nil {
-				return WirePage{}, err
-			}
-		}
-		result.Page++
+	var openingRejection *FixedBudgetHTTPError
+	fetchObserved := func(ctx context.Context, req WireRequest) (WirePage, error) {
 		result.Limit = req.Limit
 		result.HTTPStatus = 0
 		page, err := fetch(ctx, req)
@@ -195,7 +192,7 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 			var observed *FixedBudgetHTTPError
 			if errors.As(err, &observed) && observed != nil {
 				result.HTTPStatus = observed.StatusCode
-				if result.Page == 1 && err == observed && observed.CleanBudgetRejection &&
+				if result.Phase == "opening" && err == observed && observed.CleanBudgetRejection &&
 					observed.StatusCode == http.StatusServiceUnavailable &&
 					len(page.Rows) == 0 && page.NextCursor == "" && page.BodyBytes == 0 {
 					openingRejection = observed
@@ -203,11 +200,37 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 			}
 		}
 		return page, err
+	}
+	var terminalRequest WireRequest
+	var terminalRows int
+	var terminalBytes int64
+	result.WireStats, err = VerifyWireWalk(ctx, &log, walk, func(ctx context.Context, req WireRequest) (WirePage, error) {
+		switch result.Page {
+		case 1:
+			result.Phase = "continuation"
+		case 2:
+			result.Phase = "second_backfill"
+			if err := appendBackfill(ctx, 2); err != nil {
+				return WirePage{}, err
+			}
+			if err := ctx.Err(); err != nil {
+				return WirePage{}, err
+			}
+			result.Phase = "terminal_resume"
+		}
+		result.Page++
+		page, err := fetchObserved(ctx, req)
+		if result.Page == walk.Limits.MaxPages {
+			terminalRequest, terminalRows, terminalBytes = req, len(page.Rows), page.BodyBytes
+		}
+		return page, err
 	}, func(ctx context.Context, cursor string) error {
+		result.Phase = "first_backfill"
 		if err := appendBackfill(ctx, 1); err != nil {
 			return err
 		}
 		if len(afterCapture) == 1 && afterCapture[0] != nil {
+			result.Phase = "post_capture"
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -215,18 +238,48 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 		}
 		return nil
 	})
-	switch {
-	case err == nil && result.Pages == walk.Limits.MaxPages:
-		result.Outcome = FixedBudgetExhausted
-		return result, nil
-	case err == nil:
-		err = fmt.Errorf("expected to exhaust on page %d, exhausted on page %d", walk.Limits.MaxPages, result.Pages)
-		result.Outcome = FixedBudgetIssuedCursor
-	case openingRejection != nil && errors.Is(err, openingRejection) && ctx.Err() == nil:
-		result.Outcome = FixedBudgetCleanRejection
-		return result, nil
-	case result.Pages > 0:
+	if result.Pages > 0 {
 		result.Outcome = FixedBudgetIssuedCursor
 	}
-	return fail(err)
+	if openingRejection != nil && errors.Is(err, openingRejection) && ctx.Err() == nil {
+		result.Outcome = FixedBudgetCleanRejection
+		return result, nil
+	}
+	if err != nil {
+		return fail(err)
+	}
+	if result.Pages != walk.Limits.MaxPages {
+		return fail(fmt.Errorf("expected to exhaust on page %d, exhausted on page %d", walk.Limits.MaxPages, result.Pages))
+	}
+
+	// Reuse the request that reached exhaustion, including its input cursor.
+	// Match the original ledger prefix again so the replay cannot accept a
+	// backfilled row or drift when the adapter reuses response storage.
+	result.Phase = "terminal_replay"
+	matches, err := log.Match(highWater, filter)
+	if err != nil {
+		return fail(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	page, err := fetchObserved(ctx, terminalRequest)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fail(ctxErr)
+	}
+	if err != nil {
+		return fail(redactWireFailure(fmt.Errorf("fetch page: %w", err), terminalRequest.Cursor, page.NextCursor))
+	}
+	offset := result.Rows - terminalRows
+	if err := checkWirePage(terminalRequest, page, matches[offset:], offset, nil); err != nil {
+		return fail(err)
+	}
+	if page.BodyBytes != terminalBytes {
+		return fail(fmt.Errorf("replayed terminal body has %d bytes, want %d", page.BodyBytes, terminalBytes))
+	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	result.Outcome = FixedBudgetExhausted
+	return result, nil
 }

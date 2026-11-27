@@ -129,3 +129,27 @@ Its only direct root-module production import is `bog/internal/client`.
 The client owns HTTP query framing, cursors, export sessions, and
 checkpoint persistence. It uses `bog/internal/store` for shared row
 types. The server has no production path to this command.
+
+## Interrupted export and restored recovery qualification
+
+Run the restore qualification on native Linux with the clean retained-history
+candidate supplied by the release verifier. Run the same revision on amd64
+and arm64 using each runner's own binary.
+
+```sh
+BOG_RELEASE_BINARY=/absolute/path/to/bog \
+BOG_RELEASE_REVISION="$candidate_revision" \
+go test -race -count=1 -v ./cmd/bog-export \
+  -run '^TestCheckpointRestoredIssuerQualification$'
+```
+
+The test creates two separately verified restores with a checkpoint and
+committed tail. On the first, it cuts a continuation, checks atomic file
+replacement, and interrupts and resumes a CLI checkpoint on the issuing
+process while backfill is acknowledged. On the second, it sends SIGKILL
+on HTTP 204 before touching the response body, then checks a fresh walk
+through the restarted directory. The append-log oracle checks exact order
+and multiplicity in both cases. Verbose output records the revision, native
+binary SHA-256, verified restore points, crash signal, replay count, and
+cleanup. `TestInterruptedExportRestoreFixture` exercises the same driver
+with controlled subprocesses on macOS and Linux.

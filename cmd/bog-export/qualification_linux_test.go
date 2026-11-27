@@ -1,17 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +17,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"bog/internal/client"
 	"bog/internal/httpapi"
@@ -46,7 +43,7 @@ func TestCheckpointNativeIssuerQualification(t *testing.T) {
 						seedExportIssuer(t, ctx, issuer.base, exportBackfill)
 					}
 				}
-				qualifyExportInterruption(t, tc, issuer.proxy(t), afterInterrupt)
+				qualifyExportInterruption(t, ctx, tc, issuer.proxy(t), afterInterrupt)
 			})
 		}
 		fresh := newExportQualification(t, issuer.base)
@@ -189,143 +186,34 @@ func qualificationAddress(t *testing.T) *net.TCPAddr {
 	return addr
 }
 
-type qualificationIssuer struct {
-	base    string
-	cmd     *exec.Cmd
-	done    chan struct{}
-	waitErr error // Published by closing done.
-	reaped  bool
-	log     bytes.Buffer
-}
-
 func startQualificationIssuer(t *testing.T, ctx context.Context, binary, dir string, addr *net.TCPAddr) *qualificationIssuer {
 	t.Helper()
-	p := &qualificationIssuer{base: "http://" + addr.String(), done: make(chan struct{})}
-	// Lifetime is owned by cleanup. A canceled workload must still have
-	// time to signal the issuer, drain it, and collect its exit status.
-	p.cmd = exec.Command(binary, "-addr", addr.String(), "-data-dir", dir)
-	p.cmd.Stdout, p.cmd.Stderr = &p.log, &p.log
-	p.cmd.WaitDelay = time.Second
-	if err := p.cmd.Start(); err != nil {
-		t.Fatalf("start issuer: %v", err)
-	}
-	go func() {
-		p.waitErr = p.cmd.Wait()
-		close(p.done)
-	}()
-	t.Cleanup(func() {
-		if err := p.stop(syscall.SIGTERM); err != nil {
-			t.Error(err)
-		}
-		if p.reaped && p.log.Len() != 0 {
-			t.Logf("issuer stderr/stdout:\n%s", &p.log)
-		}
-	})
-
-	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := p.waitForHealth(probeCtx, addr.Port); err != nil {
-		t.Fatalf("issuer startup: %v", err)
-	}
-	return p
+	cmd := exec.Command(binary, "-addr", addr.String(), "-data-dir", dir)
+	cmd.Env = append(cmd.Environ(), "BOG_CAPACITY_CONTROL=")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return startQualificationProcess(t, ctx, cmd, addr, func(pid, port int) (bool, error) {
+		return listener.OwnsBind(pid, port, listener.BindLoopback)
+	}, nil, reapIssuerGroup)
 }
 
-func (p *qualificationIssuer) waitForHealth(ctx context.Context, port int) error {
-	transport := &http.Transport{}
-	defer transport.CloseIdleConnections()
-	probe := &http.Client{Transport: transport, Timeout: time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
+// Observe exit without reaping the leader so its process group ID stays
+// reserved until descendants have been signaled. Cmd.Wait reaps the leader.
+func reapIssuerGroup(pid int) error {
+	const pidType = 1 // Linux P_PID
 	for {
-		select {
-		case <-p.done:
-			return fmt.Errorf("issuer exited before listening (wait: %v)", p.waitErr)
-		default:
+		var info [16]uint64 // Linux siginfo_t, 128 bytes and naturally aligned.
+		_, _, errno := syscall.Syscall6(syscall.SYS_WAITID, pidType, uintptr(pid),
+			uintptr(unsafe.Pointer(&info)), syscall.WEXITED|syscall.WNOWAIT, 0, 0)
+		if errno == syscall.EINTR {
+			continue
 		}
-		owned, err := listener.OwnsBind(p.cmd.Process.Pid, port, listener.BindLoopback)
-		if err != nil {
-			return fmt.Errorf("check issuer listener: %w", err)
+		if errno != 0 {
+			return fmt.Errorf("observe issuer exit: %w", errno)
 		}
-		if owned {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.base+"/healthz", nil)
-			if err != nil {
-				return err
-			}
-			resp, err := probe.Do(req)
-			if err != nil {
-				return err
-			}
-			_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-			if err := errors.Join(readErr, resp.Body.Close()); err != nil {
-				return err
-			}
-			if resp.StatusCode != http.StatusOK {
-				return fmt.Errorf("health probe returned HTTP %d", resp.StatusCode)
-			}
-			owned, err := listener.OwnsBind(p.cmd.Process.Pid, port, listener.BindLoopback)
-			if err != nil {
-				return err
-			}
-			if !owned {
-				return errors.New("issuer lost its listener during health probe")
-			}
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-p.done:
-			return fmt.Errorf("issuer exited before health probe (wait: %v)", p.waitErr)
-		case <-ticker.C:
-		}
+		break
 	}
-}
-
-func (p *qualificationIssuer) stop(sig syscall.Signal) error {
-	if p.reaped {
-		return nil
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("clean up issuer process group: %w", err)
 	}
-	signalErr := p.cmd.Process.Signal(sig)
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-p.done:
-		p.reaped = true
-		if sig == syscall.SIGKILL {
-			var exit *exec.ExitError
-			if errors.As(p.waitErr, &exit) && exit.Sys().(syscall.WaitStatus).Signal() == sig {
-				return signalErr
-			}
-			return errors.Join(signalErr, fmt.Errorf("issuer did not exit on SIGKILL (wait: %v)", p.waitErr))
-		}
-		return errors.Join(signalErr, p.waitErr)
-	case <-timer.C:
-		killErr := p.cmd.Process.Kill()
-		if errors.Is(killErr, os.ErrProcessDone) {
-			killErr = nil
-		}
-		err := errors.Join(errors.New("issuer shutdown timed out"), signalErr, killErr)
-		timer.Reset(3 * time.Second)
-		select {
-		case <-p.done:
-			p.reaped = true
-			return err
-		case <-timer.C:
-			return errors.Join(err, errors.New("timed out reaping issuer"))
-		}
-	}
-}
-
-func (p *qualificationIssuer) proxy(t *testing.T) http.Handler {
-	t.Helper()
-	target, err := url.Parse(p.base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	transport := &http.Transport{}
-	proxy.Transport = transport
-	t.Cleanup(transport.CloseIdleConnections)
-	return proxy
+	return nil
 }

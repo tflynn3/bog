@@ -73,7 +73,13 @@ func (a *publicationAttempt) install() error {
 	a.installing = true
 	for _, file := range a.files {
 		path := stageDir + "/" + file.Name
+		if err := stagingFault(a.ctx, linkFinal); err != nil {
+			return err
+		}
 		if err := p.root.Link(path, file.Name); err != nil {
+			return err
+		}
+		if err := stagingFault(a.ctx, unlinkStageLink); err != nil {
 			return err
 		}
 		if err := p.root.Remove(path); err != nil {
@@ -176,16 +182,8 @@ func (p *publication) recoverStaging(info os.FileInfo, m *Manifest) error {
 	if info.Mode().Perm() != 0700 {
 		return p.removeEmptyStaging()
 	}
-	stage, err := openStaging(p.dir)
+	names, intent, err := p.inspectStaging()
 	if err != nil {
-		return err
-	}
-	names, err := p.stagingNames(stage)
-	var intent publicationIntent
-	if err == nil {
-		intent, err = readIntent(stage)
-	}
-	if err = errors.Join(err, stage.Close()); err != nil {
 		return err
 	}
 	if m == nil && intent.HadManifest {
@@ -263,17 +261,22 @@ func readIntent(stage *os.File) (publicationIntent, error) {
 }
 
 func (p *publication) removeOwned(files []ownedSegment, reachable map[string]bool) error {
-	var err error
+	var abandoned []string
 	for _, file := range files {
 		if reachable[file.Name] {
 			continue
 		}
 		owned, checkErr := p.matchesOwnedSegment(file)
 		if checkErr != nil {
-			err = errors.Join(err, checkErr)
-		} else if owned {
-			err = errors.Join(err, p.root.Remove(file.Name))
+			return checkErr
 		}
+		if owned {
+			abandoned = append(abandoned, file.Name)
+		}
+	}
+	var err error
+	for _, name := range abandoned {
+		err = errors.Join(err, p.root.Remove(name))
 	}
 	if len(files) > 0 {
 		err = errors.Join(err, p.dir.Sync())
@@ -295,6 +298,20 @@ func (p *publication) matchesOwnedSegment(file ownedSegment) (_ bool, err error)
 	if !info.Mode().IsRegular() || st.Ino != file.Inode || st.Uid != uint32(os.Geteuid()) ||
 		info.Size() != file.Size || info.Mode().Perm()&0022 != 0 {
 		return false, nil
+	}
+	if st.Nlink != 1 {
+		// A two-link inode is attempt-owned only while the other link
+		// is its original staged entry.
+		if st.Nlink != 2 {
+			return false, fmt.Errorf("%w: unexpected links to installed segment %q", ErrIntegrity, file.Name)
+		}
+		staged, err := p.root.Lstat(stageDir + "/" + file.Name)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+		if staged == nil || !os.SameFile(info, staged) {
+			return false, fmt.Errorf("%w: unowned link to installed segment %q", ErrIntegrity, file.Name)
+		}
 	}
 	fd, err := openat(int(p.dir.Fd()), file.Name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {

@@ -79,7 +79,7 @@ func TestRecoverRejectsUnsafeStaging(t *testing.T) {
 	for _, name := range []string{
 		"symlink", "regular file", "foreign mode zero directory", "foreign private directory",
 		"nonempty mode zero directory", "unrecognized private entry", "staged symlink",
-		"ambiguous stage with durable intent",
+		"ambiguous stage with durable intent", "unrecorded segment with durable intent", "unowned staging hard link",
 	} {
 		t.Run(name, func(t *testing.T) {
 			foreign := name == "foreign mode zero directory" || name == "foreign private directory"
@@ -110,6 +110,15 @@ func TestRecoverRejectsUnsafeStaging(t *testing.T) {
 				case "unrecognized private entry", "ambiguous stage with durable intent":
 					evidence = filepath.Join(stage, "unexpected")
 					requirePublicationOK(t, os.WriteFile(evidence, []byte("ambiguous"), 0600))
+				case "unrecorded segment with durable intent":
+					evidence = filepath.Join(stage, segmentPrefix+"77777777777777777777777777777777")
+					requirePublicationOK(t, os.WriteFile(evidence, originalSegment, 0600))
+				case "unowned staging hard link":
+					const foreignName = segmentPrefix + "88888888888888888888888888888888"
+					final := filepath.Join(dir, foreignName)
+					evidence = filepath.Join(stage, foreignName)
+					requirePublicationOK(t, os.WriteFile(final, originalSegment, 0600))
+					requirePublicationOK(t, os.Link(final, evidence))
 				case "staged symlink":
 					requirePublicationOK(t, os.Symlink(filepath.Join(dir, segment), evidence))
 				}
@@ -117,7 +126,7 @@ func TestRecoverRejectsUnsafeStaging(t *testing.T) {
 					requirePublicationOK(t, os.Chmod(stage, 0000))
 					t.Cleanup(func() { requirePublicationOK(t, os.Chmod(stage, 0700)) })
 				}
-				if name == "ambiguous stage with durable intent" {
+				if name == "ambiguous stage with durable intent" || name == "unrecorded segment with durable intent" {
 					requirePublicationOK(t, withTestPublication(l, func(p *publication) error {
 						a := publicationAttempt{pub: p, ctx: t.Context()}
 						installed = segmentPrefix + "55555555555555555555555555555555"
@@ -146,7 +155,8 @@ func TestRecoverRejectsUnsafeStaging(t *testing.T) {
 				requirePublicationOK(t, os.Chmod(stage, 0700))
 			}
 			switch name {
-			case "nonempty mode zero directory", "unrecognized private entry", "staged symlink", "ambiguous stage with durable intent":
+			case "nonempty mode zero directory", "unrecognized private entry", "staged symlink",
+				"ambiguous stage with durable intent", "unrecorded segment with durable intent", "unowned staging hard link":
 				_, err := os.Lstat(evidence)
 				requirePublicationOK(t, err)
 			}
@@ -163,13 +173,4 @@ func TestRecoverRejectsUnsafeStaging(t *testing.T) {
 			}
 		})
 	}
-}
-
-func withTestPublication(l *Legacy, run func(*publication) error) (err error) {
-	lock, err := LockPublication(l.dir, true)
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, lock.Close()) }()
-	return run(l.publication())
 }

@@ -13,8 +13,8 @@ import (
 // byte charges, and the final set of files recorded in the publication intent.
 type stagedBlock struct {
 	ownedSegment
-	charge    *Reservation
-	rewritten bool
+	chargeIndex int // Index in the attempt's ledger, or -1 without a budget.
+	rewritten   bool
 }
 
 func (s stagedBlock) segment() Segment {
@@ -51,7 +51,7 @@ func (a *publicationAttempt) stageBlock(rows []BlockRow) error {
 	if len(a.files) >= MaxSegments {
 		return fmt.Errorf("%w: too many staged segments", ErrIntegrity)
 	}
-	file, err := a.writeBlock(rows)
+	file, err := a.writeBlock(rows, false)
 	if err != nil {
 		return err
 	}
@@ -60,31 +60,41 @@ func (a *publicationAttempt) stageBlock(rows []BlockRow) error {
 }
 
 func (a *publicationAttempt) replaceBlock(slot int, rows []BlockRow) error {
+	if slot < 0 || slot >= len(a.files) {
+		return fmt.Errorf("%w: invalid staged segment slot %d", ErrIntegrity, slot)
+	}
 	old := a.files[slot]
 	if old.reusableRoom() == 0 {
 		return fmt.Errorf("%w: staged segment cannot be reused", ErrIntegrity)
 	}
-	// Write and sync the replacement under a fresh name, with both files
-	// charged. On any failure the attempt must stop and run staging cleanup.
-	file, err := a.writeBlock(rows)
+	// Until retirement is durable, both reservations belong to the attempt.
+	// An error aborts the build before intent; cleanup can discard either
+	// name without consulting a slot table or replaying the replacement.
+	file, err := a.writeBlock(rows, true)
 	if err != nil {
 		return err
 	}
-	if err := a.pub.root.Remove(stageDir + "/" + old.Name); err != nil {
+	if err := a.retireStagedBlock(old); err != nil {
 		return err
-	}
-	if err := a.pub.syncStaging(); err != nil {
-		return err
-	}
-	if old.charge != nil {
-		old.charge.Release()
 	}
 	file.rewritten = true
+	if old.chargeIndex >= 0 {
+		// The successor was the most recent reservation. Move it into
+		// the retired slot in the cleanup ledger before releasing the old
+		// reservation, so settlement visits only outstanding charges.
+		charges := a.pub.stage.charges
+		retired := charges[old.chargeIndex]
+		charges[old.chargeIndex] = charges[file.chargeIndex]
+		charges[file.chargeIndex] = nil
+		a.pub.stage.charges = charges[:file.chargeIndex]
+		file.chargeIndex = old.chargeIndex
+		retired.Release()
+	}
 	a.files[slot] = file
 	return nil
 }
 
-func (a *publicationAttempt) writeBlock(rows []BlockRow) (stagedBlock, error) {
+func (a *publicationAttempt) writeBlock(rows []BlockRow, replacing bool) (stagedBlock, error) {
 	if len(rows) == 0 || len(rows) > blockPayload/blockRowSize {
 		return stagedBlock{}, errBlock
 	}
@@ -110,21 +120,21 @@ func (a *publicationAttempt) writeBlock(rows []BlockRow) (stagedBlock, error) {
 	if err != nil {
 		return stagedBlock{}, err
 	}
-	return a.writeSegment(name, data, digest(data), charge)
+	return a.writeSegment(name, data, digest(data), charge, replacing)
 }
 
-func (a *publicationAttempt) reserveBlock(size int) (*Reservation, error) {
+func (a *publicationAttempt) reserveBlock(size int) (int, error) {
 	account := a.pub.stage
 	if account == nil {
-		return nil, a.ctx.Err()
+		return -1, a.ctx.Err()
 	}
 	charge, err := account.budget.Reserve(a.ctx, StagingBytes, uint64(size))
 	if err != nil {
-		return nil, err
+		return -1, err
 	}
 	// The account also covers partial writes and failed replacements.
 	account.charges = append(account.charges, charge)
-	return charge, nil
+	return len(account.charges) - 1, nil
 }
 
 func (a *publicationAttempt) stageSegment(name string, b []byte, sum string) error {
@@ -135,26 +145,12 @@ func (a *publicationAttempt) stageSegment(name string, b []byte, sum string) err
 	if err != nil {
 		return err
 	}
-	file, err := a.writeSegment(name, b, sum, charge)
+	file, err := a.writeSegment(name, b, sum, charge, false)
 	if err != nil {
 		return err
 	}
 	a.files = append(a.files, file)
 	return nil
-}
-
-func (a *publicationAttempt) writeSegment(name string, b []byte, sum string, charge *Reservation) (stagedBlock, error) {
-	p := a.pub
-	path := stageDir + "/" + name
-	if err := p.writeNew(path, b); err != nil {
-		return stagedBlock{}, err
-	}
-	info, err := p.root.Lstat(path)
-	if err != nil {
-		return stagedBlock{}, err
-	}
-	st := info.Sys().(*syscall.Stat_t)
-	return stagedBlock{ownedSegment: ownedSegment{Name: name, Inode: st.Ino, Size: info.Size(), SHA256: sum}, charge: charge}, nil
 }
 
 func (a *publicationAttempt) readOriginal(s Segment, ordinalLimit uint64) ([]BlockRow, error) {

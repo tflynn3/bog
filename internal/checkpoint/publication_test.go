@@ -12,6 +12,9 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
+
+	"bog/internal/store"
 )
 
 func checkpointNames(t *testing.T, dir string) []string {
@@ -187,6 +190,77 @@ func TestRecoverBeforeManifestAttempt(t *testing.T) {
 	}
 }
 
+func TestRecoverInterruptedStagedReplacement(t *testing.T) {
+	for _, tc := range []struct {
+		step  stagingStep
+		files int
+	}{
+		{writeSuccessor, 2},
+		{closeSuccessor, 2},
+		{unlinkPrior, 2},
+		{syncRetirement, 1},
+	} {
+		t.Run(string(tc.step), func(t *testing.T) {
+			path, l, wal := capturedPublicationFixture(t)
+			old, err := l.Publish()
+			requirePublicationOK(t, err)
+			const unrelated = segmentPrefix + "66666666666666666666666666666666"
+			requirePublicationOK(t, l.publication().writeNew(unrelated, []byte("unrelated")))
+			before := checkpointNames(t, path)
+			authority := readFixture(t, path, manifestName)
+			original := readFixture(t, path, old.Segments[0].Name)
+
+			ctx := context.WithValue(t.Context(), stagingFaultKey{}, func(step stagingStep) error {
+				if step == tc.step {
+					return syscall.EIO
+				}
+				return nil
+			})
+			rows := []BlockRow{{Row: store.Row{TS: time.Unix(20, 0).UTC(), Line: "tie"}}}
+			successor := append(slices.Clone(rows), BlockRow{Row: rows[0].Row, Ordinal: 1})
+			// Leave the stage exactly as the interrupted operation left it.
+			err = withTestPublication(l, func(p *publication) error {
+				if err := p.root.Mkdir(stageDir, 0700); err != nil {
+					return err
+				}
+				a := publicationAttempt{pub: p, ctx: ctx}
+				if err := a.stageBlock(rows); err != nil {
+					return err
+				}
+				return a.replaceBlock(0, successor)
+			})
+			if !errors.Is(err, syscall.EIO) {
+				t.Fatalf("expected interruption at %s: %v", tc.step, err)
+			}
+			if got := checkpointNames(t, filepath.Join(path, stageDir)); len(got) != tc.files {
+				t.Fatalf("staged entries = %v, want %d", got, tc.files)
+			}
+			requirePublicationOK(t, l.Close())
+			l, err = OpenLegacy(path)
+			requirePublicationOK(t, err)
+			closeOnCleanup(t, l)
+			publisher := NewPublisher(l.root, l.dir, NewBudget(Limits{StagingBytes: MaxBlockSize}))
+			for range 2 {
+				requirePublicationOK(t, publisher.RecoverCaptured(func() (*Manifest, error) {
+					return old, l.publication().checkPrevious(t.Context(), old)
+				}))
+				if !slices.Equal(before, checkpointNames(t, path)) ||
+					!bytes.Equal(authority, readFixture(t, path, manifestName)) ||
+					!bytes.Equal(original, readFixture(t, path, old.Segments[0].Name)) ||
+					string(readFixture(t, path, unrelated)) != "unrelated" {
+					t.Fatal("recovery changed a file outside its abandoned stage")
+				}
+			}
+			requirePublicationOK(t, CheckPublication(l.dir))
+			m, err := publisher.PublishCaptured(t.Context(), bytes.NewReader(wal), int64(len(wal)), old, old.NextOrdinal, digest(wal))
+			requirePublicationOK(t, err)
+			if m == nil || !slices.Equal(m.Segments, old.Segments) {
+				t.Fatal("retry did not preserve the previous checkpoint")
+			}
+		})
+	}
+}
+
 func capturedPublicationFixture(t *testing.T) (string, *Legacy, []byte) {
 	t.Helper()
 	dir, wal, _ := fixture(t)
@@ -205,6 +279,15 @@ func recoverCaptured(l *Legacy) error {
 		m := p.Manifest()
 		return &m, nil
 	})
+}
+
+func withTestPublication(l *Legacy, run func(*publication) error) (err error) {
+	lock, err := LockPublication(l.dir, true)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	return run(l.publication())
 }
 
 type capturedSuffix struct {

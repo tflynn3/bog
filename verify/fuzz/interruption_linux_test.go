@@ -41,8 +41,8 @@ func TestInterruptionWorker(t *testing.T) {
 	}
 	source, dest := os.Getenv(sourceEnv), os.Getenv(destEnv)
 	switch mode {
-	case "checkpoint":
-		interruptCheckpoint(t, source, park)
+	case "checkpoint", "checkpoint-staged":
+		interruptCheckpoint(t, mode, source, park)
 	case "export", "restore", "export-umask":
 		interruptBackup(t, mode, source, dest, park)
 	default:

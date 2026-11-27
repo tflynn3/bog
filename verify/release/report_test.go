@@ -354,8 +354,9 @@ func TestValidateCommand(t *testing.T) {
 		t.Fatalf("cutover flag accepted archived capacity report: %v", err)
 	}
 	t.Setenv("BOG_RELEASE_REQUIRE_CUTOVER", "1")
-	if err := run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "cutover diagnostics") {
-		t.Fatalf("cutover environment accepted archived capacity report: %v", err)
+	if err := run(t.Context(), args); !errors.Is(err, os.ErrNotExist) ||
+		!strings.Contains(err.Error(), "cutover diagnostics") || !strings.Contains(err.Error(), "missing -query-model-events, -query-handler-events") {
+		t.Fatalf("cutover environment did not require live capacity and query artifacts: %v", err)
 	}
 	// Keep the archived capacity report as an independent strict failure.
 	// The combined command must report parity errors even when capacity fails.
@@ -407,8 +408,10 @@ func TestValidateCommand(t *testing.T) {
 	if err := writeReport(parityPath, parity); err != nil {
 		t.Fatal(err)
 	}
+	writeFixture(t, modelPath, []byte(passingCutoverQueryEvents(t, id)))
+	parityArgs = append(parityArgs, "-query-model-events", modelPath, "-query-handler-events", handlerPath)
 	if err := run(t.Context(), parityArgs); err == nil || err.Error() != "capacity report: "+capacityErr.Error() {
-		t.Fatalf("complete recovery parity should leave only the expected capacity error, got %v", err)
+		t.Fatalf("complete recovery parity and query evidence should leave only the expected capacity error, got %v", err)
 	}
 	complete := parity.Cases[restoredParityCase]
 	for _, tc := range []struct {

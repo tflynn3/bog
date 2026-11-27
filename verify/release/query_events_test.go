@@ -51,7 +51,7 @@ func TestValidateQueryQualification(t *testing.T) {
 			model, handlers := filepath.Join(dir, "model.jsonl"), filepath.Join(dir, "handlers.jsonl")
 			writeFixture(t, model, []byte(tc.model))
 			writeFixture(t, handlers, []byte(tc.handlers))
-			err := validateQueryQualification(t.Context(), model, handlers, id)
+			err := validateQueryQualification(t.Context(), model, handlers, id, false)
 			if tc.want == "" {
 				if err != nil {
 					t.Fatal(err)
@@ -62,18 +62,92 @@ func TestValidateQueryQualification(t *testing.T) {
 		})
 	}
 	t.Run("both evidence paths required", func(t *testing.T) {
-		if err := validateQueryQualification(t.Context(), "model.jsonl", "", id); err == nil || !strings.Contains(err.Error(), "requires both") {
+		if err := validateQueryQualification(t.Context(), "model.jsonl", "", id, false); err == nil || !strings.Contains(err.Error(), "requires both") {
 			t.Fatalf("missing handler path: %v", err)
 		}
 	})
 	t.Run("both files missing", func(t *testing.T) {
 		dir := t.TempDir()
 		model, handlers := filepath.Join(dir, "model.jsonl"), filepath.Join(dir, "handlers.jsonl")
-		err := validateQueryQualification(t.Context(), model, handlers, id)
+		err := validateQueryQualification(t.Context(), model, handlers, id, false)
 		if !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), model) || !strings.Contains(err.Error(), handlers) {
 			t.Fatalf("missing events: %v", err)
 		}
 	})
+}
+
+func TestValidateQueryReplacementQualification(t *testing.T) {
+	t.Parallel()
+	id := identity{1, testRevision, strings.Repeat("a", 64), capacityFixtureID}
+	historicalModel := passingQueryEvents(t, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id)
+	handlerEvents := passingQueryEvents(t, queryHandlerTests, nil, id)
+	packagePass := queryEventLine(t, "pass", "", "")
+	modelPrefix := strings.TrimSuffix(historicalModel, packagePass)
+	log := queryIdentityEvent(t, pinnedQueryReplacement, id)
+	pass := queryEventLine(t, "pass", pinnedQueryReplacement, "")
+	skip := queryEventLine(t, "skip", pinnedQueryReplacement, "")
+	fail := queryEventLine(t, "fail", pinnedQueryReplacement, "")
+	identityMismatch := pinnedQueryReplacement + " candidate identity does not match the pinned build"
+	orderError := pinnedQueryReplacement + " requires candidate identity before its pass and its pass before the package pass"
+	for _, tc := range []struct {
+		name    string
+		suffix  string
+		handler string
+		want    string
+	}{
+		{"matched candidate", log + pass + packagePass, handlerEvents, ""},
+		{"archived stream", packagePass, handlerEvents, pinnedQueryReplacement + " reported 0 passes, expected 1\n" + pinnedQueryReplacement + " reported 0 candidate identities, expected 1"},
+		{"skip despite pass", log + skip + pass + packagePass, handlerEvents, pinnedQueryReplacement + " reported skip"},
+		{"fail despite pass", log + fail + pass + packagePass, handlerEvents, pinnedQueryReplacement + " reported failure"},
+		{"missing pass", log + packagePass, handlerEvents, pinnedQueryReplacement + " reported 0 passes, expected 1"},
+		{"duplicate pass", log + pass + pass + packagePass, handlerEvents, pinnedQueryReplacement + " reported 2 passes, expected 1"},
+		{"missing identity", pass + packagePass, handlerEvents, pinnedQueryReplacement + " reported 0 candidate identities, expected 1"},
+		{"duplicate identity", log + log + pass + packagePass, handlerEvents, pinnedQueryReplacement + " reported 2 candidate identities, expected 1"},
+		{"different revision", strings.Replace(log, id.Revision, strings.Repeat("b", 40), 1) + pass + packagePass, handlerEvents, identityMismatch},
+		{"different digest", log + strings.Replace(log, id.BinarySHA256, strings.Repeat("b", 64), 1) + pass + packagePass, handlerEvents, identityMismatch},
+		{"pass from another package", log + strings.Replace(pass, queryEventPackage, "bog/other", 1) + packagePass, handlerEvents, pinnedQueryReplacement + " reported 0 passes, expected 1"},
+		{"identity from another package", strings.Replace(log, queryEventPackage, "bog/other", 1) + pass + packagePass, handlerEvents, pinnedQueryReplacement + " reported 0 candidate identities, expected 1"},
+		{"identity from a subtest", strings.Replace(log, pinnedQueryReplacement, pinnedQueryReplacement+"/other", 1) + pass + packagePass, handlerEvents, pinnedQueryReplacement + " reported 0 candidate identities, expected 1"},
+		{"identity in handler stream", pass + packagePass, log + handlerEvents, pinnedQueryReplacement + " reported 0 candidate identities, expected 1"},
+		{"identity after pass", pass + log + packagePass, handlerEvents, orderError},
+		{"test pass after package pass", log + packagePass + pass, handlerEvents, orderError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			model, handlers := filepath.Join(dir, "model.jsonl"), filepath.Join(dir, "handlers.jsonl")
+			writeFixture(t, model, []byte(modelPrefix+tc.suffix))
+			writeFixture(t, handlers, []byte(tc.handler))
+			err := validateQueryQualification(t.Context(), model, handlers, id, true)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if want := fmt.Sprintf("query model events: validate %q: %s", model, tc.want); err == nil || err.Error() != want {
+				t.Fatalf("validation = %v, want %q", err, want)
+			}
+		})
+	}
+	t.Run("historical rules for optional replacement events", func(t *testing.T) {
+		dir := t.TempDir()
+		model, handlers := filepath.Join(dir, "model.jsonl"), filepath.Join(dir, "handlers.jsonl")
+		writeFixture(t, model, []byte(modelPrefix+skip+packagePass))
+		writeFixture(t, handlers, []byte(handlerEvents))
+		if err := validateQueryQualification(t.Context(), model, handlers, id, false); err != nil {
+			t.Fatalf("historical validation rejected optional skip: %v", err)
+		}
+		writeFixture(t, model, []byte(modelPrefix+fail+packagePass))
+		want := fmt.Sprintf("query model events: validate %q: %s reported failure", model, pinnedQueryReplacement)
+		if err := validateQueryQualification(t.Context(), model, handlers, id, false); err == nil || err.Error() != want {
+			t.Fatalf("historical validation = %v, want %q", err, want)
+		}
+	})
+}
+
+func passingCutoverQueryEvents(t *testing.T, id identity) string {
+	t.Helper()
+	leaves := append([]string{pinnedQueryReplacement}, pinnedQueryTests...)
+	return passingQueryEvents(t, leaves, []string{pinnedQueryReplay, pinnedQuery104, pinnedQueryReplacement}, id)
 }
 
 func passingQueryEvents(t *testing.T, leaves, pinned []string, id identity) string {
@@ -238,7 +312,7 @@ func TestBothQueryEventFilesCheckInputs(t *testing.T) {
 
 					ctx, cancel := context.WithCancel(t.Context())
 					defer cancel()
-					check := func() error { return validateQueryQualification(ctx, model, handler, id) }
+					check := func() error { return validateQueryQualification(ctx, model, handler, id, false) }
 					var err error
 					switch tc.name {
 					case "FIFO":
@@ -272,7 +346,7 @@ func TestQueryQualificationSharesBudgetAcrossFiles(t *testing.T) {
 	t.Parallel()
 
 	id := identity{Revision: testRevision, BinarySHA256: strings.Repeat("a", 64)}
-	model := passingQueryEvents(t, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id)
+	model := passingCutoverQueryEvents(t, id)
 	model += "{\"Action\":\"build-output\",\"ImportPath\":\"bog/other\",\"Output\":\"ignored\"}\r\n"
 	handlers := passingQueryEvents(t, queryHandlerTests, nil, id)
 	handlers += `{"Action":"output","Package":"bog/other","Output":"ignored"}` // No final newline.
@@ -298,7 +372,7 @@ func TestQueryQualificationSharesBudgetAcrossFiles(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			budget := newQueryEventBudget(tc.bytes, tc.events)
-			err := validateQueryQualificationWithBudget(t.Context(), modelPath, handlerPath, id, budget)
+			err := validateQueryQualificationWithBudget(t.Context(), modelPath, handlerPath, id, true, budget)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("validation = %v, want %v", err, tc.want)
 			}

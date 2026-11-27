@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -46,8 +47,9 @@ func (b *queryEventBudget) byteError() error {
 }
 
 const (
-	pinnedQueryReplay = "TestPinnedQueryModelReplay"
-	pinnedQuery104    = "TestPinnedQueryModel104"
+	pinnedQueryReplay      = "TestPinnedQueryModelReplay"
+	pinnedQuery104         = "TestPinnedQueryModel104"
+	pinnedQueryReplacement = "TestPinnedQueryGenerationReplacement"
 )
 
 var pinnedQueryTests = []string{
@@ -74,11 +76,11 @@ var queryHandlerTests = []string{
 	"TestRetainedCaptureRetirementDrainsAtCapacity",
 }
 
-func validateQueryQualification(ctx context.Context, model, handlers string, id identity) error {
-	return validateQueryQualificationWithBudget(ctx, model, handlers, id, newQueryEventBudget(maxQueryEventBytes, maxQueryEventCount))
+func validateQueryQualification(ctx context.Context, model, handlers string, id identity, requireCutover bool) error {
+	return validateQueryQualificationWithBudget(ctx, model, handlers, id, requireCutover, newQueryEventBudget(maxQueryEventBytes, maxQueryEventCount))
 }
 
-func validateQueryQualificationWithBudget(ctx context.Context, model, handlers string, id identity, budget *queryEventBudget) error {
+func validateQueryQualificationWithBudget(ctx context.Context, model, handlers string, id identity, requireCutover bool, budget *queryEventBudget) error {
 	if model == "" || handlers == "" {
 		var missing []string
 		if model == "" {
@@ -90,7 +92,12 @@ func validateQueryQualificationWithBudget(ctx context.Context, model, handlers s
 		return fmt.Errorf("query qualification requires both -query-model-events and -query-handler-events: missing %s: %w",
 			strings.Join(missing, ", "), os.ErrNotExist)
 	}
-	modelErr := validateQueryEventFile(ctx, "query model events", model, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id, budget)
+	modelTests, pinned := pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}
+	if requireCutover {
+		modelTests = slices.Concat(modelTests, []string{pinnedQueryReplacement})
+		pinned = append(pinned, pinnedQueryReplacement)
+	}
+	modelErr := validateQueryEventFile(ctx, "query model events", model, modelTests, pinned, id, budget)
 	if budget.byteOverflow || errors.Is(modelErr, errQueryEventCount) {
 		return modelErr
 	}
@@ -158,6 +165,7 @@ func validateQueryEventsWithBudget(ctx context.Context, r io.Reader, budget *que
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(nil, maxQueryEventLineBytes+1)
 	scanner.Split(scanQueryEventLine)
+	var replacementIdentityLine, replacementPassLine, packagePassLine int
 	var observed error
 	for line := 1; ; line++ {
 		scanned := scanner.Scan()
@@ -201,6 +209,12 @@ func validateQueryEventsWithBudget(ctx context.Context, r io.Reader, budget *que
 			if _, required := passes[event.Test]; required {
 				passes[event.Test]++
 			}
+			switch event.Test {
+			case pinnedQueryReplacement:
+				replacementPassLine = line
+			case "":
+				packagePassLine = line
+			}
 		case "output":
 			if _, pinned := identities[event.Test]; !pinned {
 				continue
@@ -211,6 +225,9 @@ func validateQueryEventsWithBudget(ctx context.Context, r io.Reader, budget *que
 					continue
 				}
 				identities[event.Test]++
+				if event.Test == pinnedQueryReplacement {
+					replacementIdentityLine = line
+				}
 			}
 		}
 	}
@@ -227,6 +244,10 @@ func validateQueryEventsWithBudget(ctx context.Context, r io.Reader, budget *que
 		if identities[test] != 1 {
 			missing = append(missing, fmt.Errorf("%s reported %d candidate identities, expected 1", test, identities[test]))
 		}
+	}
+	if len(missing) == 0 && roots[pinnedQueryReplacement] &&
+		(replacementIdentityLine == 0 || replacementIdentityLine >= replacementPassLine || replacementPassLine >= packagePassLine) {
+		return fmt.Errorf("%s requires candidate identity before its pass and its pass before the package pass", pinnedQueryReplacement)
 	}
 	return errors.Join(missing...)
 }

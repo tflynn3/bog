@@ -17,18 +17,24 @@ type scenario struct {
 	denialMarkers []string
 	forbidden     []string
 	outcomes      []Response
+	afterRestart  func(context.Context) error
 }
 
 // Run executes the reference scenario on a freshly provisioned target. A nil
 // error means that all positive controls and negative probes were observed.
 func Run(ctx context.Context, adapters Adapters) error {
+	_, err := runReference(ctx, adapters, nil)
+	return err
+}
+
+func runReference(ctx context.Context, adapters Adapters, afterRestart func(context.Context) error) (*scenario, error) {
 	if adapters.Query == nil || adapters.Retry == nil || adapters.Replay == nil || adapters.Export == nil {
-		return fmt.Errorf("%w: all four adapters are required", ErrIncomplete)
+		return nil, fmt.Errorf("%w: all four adapters are required", ErrIncomplete)
 	}
 	fixture := ReferenceFixture()
 	s := scenario{
 		Adapters: adapters, fixture: fixture, appends: fixtureAppends(fixture), targets: fixture.targets(),
-		forbidden: []string{plain, escaped, failed, uncommitted},
+		forbidden: []string{plain, escaped, failed, uncommitted}, afterRestart: afterRestart,
 	}
 	for _, entry := range s.appends {
 		for _, row := range entry.rows {
@@ -48,13 +54,13 @@ func Run(ctx context.Context, adapters Adapters) error {
 		{"final committed bytes and replay", s.checkReplay},
 	} {
 		if err := observation(ctx, nil); err != nil {
-			return fmt.Errorf("%s: %w", step.name, err)
+			return nil, fmt.Errorf("%s: %w", step.name, err)
 		}
 		if err := step.run(ctx); err != nil {
-			return fmt.Errorf("%s: %w", step.name, err)
+			return nil, fmt.Errorf("%s: %w", step.name, err)
 		}
 	}
-	return observation(ctx, nil)
+	return &s, observation(ctx, nil)
 }
 
 func observation(ctx context.Context, err error) error {
@@ -130,6 +136,11 @@ func (s *scenario) checkReplay(ctx context.Context) error {
 	evidence, err := s.Replay.RestartAndReplay(ctx)
 	if err := observation(ctx, err); err != nil {
 		return err
+	}
+	if s.afterRestart != nil {
+		if err := s.afterRestart(ctx); err != nil {
+			return err
+		}
 	}
 	if !evidence.Complete || evidence.Records == nil {
 		return ErrIncomplete

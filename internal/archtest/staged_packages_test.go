@@ -13,7 +13,7 @@ type stagingDeclaration struct {
 	activation string
 }
 
-// Both Linux inventories at 62d13b7fa374 leave the retained libraries outside
+// Both Linux inventories at 74e56a7d2f46 leave the retained libraries outside
 // cmd/bog. Remove each #108 declaration with its role change when the reviewed
 // Storage revision shows reachability and satisfies ADR 0049.
 var stagedPackages = map[string]stagingDeclaration{
@@ -32,6 +32,10 @@ var stagedPackages = map[string]stagingDeclaration{
 	"bog/internal/idempotency": {
 		owner:      "bog-storage",
 		activation: "The production WAL atomically commits and recovers retry records with their batches. HTTP ingest verifies concurrent same-key submissions, conflicting bodies, and retry after an ambiguous response and restart.",
+	},
+	streamPolicyEngine: {
+		owner:      "Core Engineering",
+		activation: "ADR 0050 requires measured cmd/bog reachability on Linux amd64 and arm64 and independent serving evidence on both native targets for admission and paging, durable redaction and replay, keyed retries where enabled, and scoped export and writable restore.",
 	},
 }
 
@@ -159,12 +163,13 @@ func TestRetainedCutoverStaging(t *testing.T) {
 		promoteOperatorBackup bool
 		keepDeclarations      []string
 		dropIdempotency       bool
+		dropStreamPolicy      bool
 		wireIdempotency       bool
 		leaveCheckpointStaged bool
 		wantArchitecture      []string
 		want                  []string
 	}{
-		{name: "retained libraries promoted and keyed ingest stays staged"},
+		{name: "retained libraries promoted while keyed ingest and stream policy stay staged"},
 		{
 			name:             "operator-only backup stays staged when history and checkpoint are wired",
 			operatorOnly:     true,
@@ -214,6 +219,11 @@ func TestRetainedCutoverStaging(t *testing.T) {
 			want:            []string{"staged package " + idempotency + " has no staging declaration"},
 		},
 		{
+			name:             "stream policy declaration removed with the retained declarations",
+			dropStreamPolicy: true,
+			want:             []string{"staged package " + streamPolicyEngine + " has no staging declaration"},
+		},
+		{
 			name:             "keyed ingest is wired while still staged",
 			wireIdempotency:  true,
 			wantArchitecture: []string{idempotency + " is registered as staged but reachability from " + server + " is true"},
@@ -225,13 +235,14 @@ func TestRetainedCutoverStaging(t *testing.T) {
 			// Illustrate promotion by reachability without prescribing the
 			// exact set of direct imports in the Storage draft.
 			rules := map[string]rule{
-				server:          {serverCommand, []string{backup, history, wal}},
-				operatorCommand: {verifier, []string{backup}},
-				backup:          {runtimeLibrary, nil},
-				checkpoint:      {runtimeLibrary, nil},
-				history:         {runtimeLibrary, []string{checkpoint}},
-				idempotency:     {staged, nil},
-				wal:             {runtimeLibrary, nil},
+				server:             {serverCommand, []string{backup, history, wal}},
+				operatorCommand:    {verifier, []string{backup}},
+				backup:             {runtimeLibrary, nil},
+				checkpoint:         {runtimeLibrary, nil},
+				history:            {runtimeLibrary, []string{checkpoint}},
+				idempotency:        {staged, nil},
+				streamPolicyEngine: {staged, nil},
+				wal:                {runtimeLibrary, nil},
 			}
 			if tt.operatorOnly {
 				rules[server] = rule{serverCommand, []string{history, wal}}
@@ -263,6 +274,9 @@ func TestRetainedCutoverStaging(t *testing.T) {
 				declarations[idempotency] = stagingDeclaration{
 					owner: "bog-storage", activation: "Commit and recover retry records atomically with their batches.",
 				}
+			}
+			if !tt.dropStreamPolicy {
+				declarations[streamPolicyEngine] = stagedPackages[streamPolicyEngine]
 			}
 			for _, path := range tt.keepDeclarations {
 				declarations[path] = stagingDeclaration{

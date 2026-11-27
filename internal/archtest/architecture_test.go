@@ -40,7 +40,7 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// At 62d13b7fa374, cmd/bog reaches HTTP, readiness, store, and WAL on both
+// At 74e56a7d2f46, cmd/bog reaches HTTP, readiness, store, and WAL on both
 // Linux targets. Promote retained libraries with measured #108 wiring and
 // activation evidence. The operator's direct backup import is independent
 // of server reachability.
@@ -56,6 +56,7 @@ var registry = map[string]rule{
 	"bog/internal/history":       {staged, []string{"bog/internal/checkpoint", "bog/internal/store"}},
 	"bog/internal/backup":        {staged, []string{"bog/internal/store"}},
 	"bog/internal/idempotency":   {staged, nil},
+	streamPolicyEngine:           {staged, nil},
 	goClient:                     {standalone, []string{"bog/internal/store"}},
 	"bog/internal/ingest":        {testOnly, nil},
 	"bog/internal/archtest":      {testOnly, nil},

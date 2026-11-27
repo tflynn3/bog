@@ -1,7 +1,7 @@
 # ADR 0050 — Staged stream-policy decision boundary
 
-**Status** — Proposed for Cycle 194. Engine registration and production
-activation are separate changes.
+**Status** — Accepted for staged registration in Cycle 199. Production
+activation awaits serving integration and evidence.
 
 ## Context
 
@@ -89,18 +89,20 @@ masking versions, and all-or-nothing batch redaction. Security
 Verification owns independent stream-policy conformance. Core
 Architecture owns the package registry and SYSTEM.md.
 
-After the retained promotion lands, coordinate a fresh lease with Core
-Architecture and #137. Land the engine and its registration together.
-Register `internal/streampolicy` as staged with its exact direct
-root-module production imports in `internal/archtest/architecture_test.go`.
-Add its owner and activation criteria in
-`internal/archtest/staged_packages_test.go`, and update the SYSTEM.md
-production graph, Staged subgraph, and package role table together.
-Verify the exact graph and server reachability on Linux amd64 and arm64.
-Run the architecture suite against the combined revision so an absent
-package, missing role, stale edge, or mismatched diagram fails the same
-review. Record the measured revision with the inventory. The #108
-promotion owner retains its existing lease through that handoff.
+The #137 engine landed before its registry entry. At
+`74e56a7d2f46abd010eb0a86414b179fff06ecae`, the Linux amd64 and arm64
+inventories show zero direct root-module production imports from
+`internal/streampolicy` and no path to it from `cmd/bog`. Register the
+engine as staged and record its ownership and activation criteria in the
+staging declaration. Update the measured inventory, Staged subgraph,
+and package role table in SYSTEM.md with the registry repair.
+
+Core Architecture serializes the shared registry and SYSTEM.md edits
+with #108 promotion. Recheck write leases at dispatch and confirm the
+file handoff. If promotion holds the files, land the repair through its
+ordered queue. Give the landed repair SHA to the retained promotion
+owner for rebase and run the architecture suite on the composed revision
+to verify both Linux graphs, staging declarations, and diagram parity.
 [Package role parity](0019-package-role-governance.md),
 [Fitness and registry ownership](../architecture/SYSTEM.md#fitness-and-registry-ownership)
 

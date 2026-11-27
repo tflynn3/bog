@@ -34,10 +34,13 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 	id := req.Capture
 	var view *store.PositionedSnapshot
 	var after *store.TailPosition
+	// One adapter unit covers capture or lookup and the fixed-size
+	// positions for the first block of rows.
+	const positionsPerUnit = 32
+	if err := work.Charge(1); err != nil {
+		return PageResult{}, err
+	}
 	if id == "" {
-		if err := work.Charge(1); err != nil {
-			return PageResult{}, err
-		}
 		view = s.store.CapturePositionedSnapshot()
 	} else {
 		s.mu.Lock()
@@ -46,6 +49,8 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 		if view == nil {
 			return PageResult{}, ErrCaptureExpired
 		}
+	}
+	if req.After != "" {
 		if err := work.Charge(1); err != nil {
 			return PageResult{}, err
 		}
@@ -60,7 +65,7 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 	if err != nil {
 		return PageResult{}, err
 	}
-	if err := work.Charge(uint64(len(rows))); err != nil {
+	if err := work.Charge(uint64(max(0, len(rows)-1) / positionsPerUnit)); err != nil {
 		return PageResult{}, err
 	}
 	result := PageResult{Rows: make([]PageRow, len(rows)), More: more}

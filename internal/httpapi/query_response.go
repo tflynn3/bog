@@ -31,24 +31,31 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	if err := work.Charge(); err != nil {
 		return false, 0, err
 	}
-	stamp, size, complete, err := b.measureRow(row, b.maxBytes-b.size, b.size != 0, work)
+	stamp, size, complete, err := b.measureRow(row, b.maxBytes-b.size, b.size != 0, work, false)
 	if err != nil || !complete || size > b.maxBytes-b.size {
 		return false, size, err
 	}
 
+	if err := b.appendMeasured(row.Line, stamp, size, work); err != nil {
+		return false, 0, err
+	}
+	return true, 0, nil
+}
+
+func (b *queryResponse) appendMeasured(line string, stamp []byte, size int, work *store.QueryWork) error {
 	record := make([]byte, 0, size)
 	record = append(record, queryRecordPrefix...)
 	record = append(record, stamp...)
 	record = append(record, queryRecordField...)
-	for line := row.Line; len(line) > 0; {
+	for len(line) > 0 {
 		// The measurement pass reserved the work for these bytes.
 		if err := work.Charge(); err != nil {
-			return false, 0, err
+			return err
 		}
 		n := queryChunkEnd(line)
 		payload, err := b.escapeChunk(line[:n])
 		if err != nil {
-			return false, 0, err
+			return err
 		}
 		record = append(record, payload...)
 		line = line[n:]
@@ -56,7 +63,7 @@ func (b *queryResponse) appendRow(row store.Row, work *store.QueryWork) (bool, i
 	record = append(record, queryRecordSuffix...)
 	b.rows = append(b.rows, record)
 	b.size += len(record)
-	return true, 0, nil
+	return nil
 }
 
 const (
@@ -67,7 +74,7 @@ const (
 
 // measureRow uses the same encoding as delivery. Certification measures
 // complete records independently of how the client will split the pages.
-func (b *queryResponse) measureRow(row store.Row, remaining int, allowEarlyExit bool, work *store.QueryWork) ([]byte, int, bool, error) {
+func (b *queryResponse) measureRow(row store.Row, remaining int, allowEarlyExit bool, work *store.QueryWork, prepaid bool) ([]byte, int, bool, error) {
 	stamp, err := row.TS.MarshalJSON()
 	if err != nil {
 		return nil, 0, false, err
@@ -83,7 +90,11 @@ func (b *queryResponse) measureRow(row store.Row, remaining int, allowEarlyExit 
 			break
 		}
 		n := queryChunkEnd(line)
-		if err := work.Charge(uint64(n)); err != nil {
+		units := uint64(n)
+		if prepaid {
+			units = 0
+		}
+		if err := work.Charge(units); err != nil {
 			return nil, 0, false, err
 		}
 		payload, err := b.escapeChunk(line[:n])

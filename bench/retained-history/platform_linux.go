@@ -129,19 +129,23 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 }
 
 func readCandidateMemoryCurrent(ctx context.Context, p *child, group string) (uint64, error) {
+	return readCandidateMemory(ctx, p, group, "memory.current")
+}
+
+func readCandidateMemory(ctx context.Context, p *child, group, name string) (uint64, error) {
 	check := func() error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if p.exited() {
-			return errors.New("candidate exited during memory.current sampling")
+			return fmt.Errorf("candidate exited during %s sampling", name)
 		}
 		return nil
 	}
 	if err := check(); err != nil {
 		return 0, err
 	}
-	value, err := readMemoryCurrent(group)
+	value, err := readCgroupUint(group, name)
 	if err := errors.Join(err, check()); err != nil {
 		return 0, err
 	}
@@ -451,6 +455,9 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 	if o.mode == "live" {
 		probe.readMemoryCurrent = func(ctx context.Context) (uint64, error) {
 			return readCandidateMemoryCurrent(ctx, p, group)
+		}
+		probe.readMemoryPeak = func(ctx context.Context) (uint64, error) {
+			return readCandidateMemory(ctx, p, group, "memory.peak")
 		}
 	}
 	return p, f.load(work, probe, o, r, dir)

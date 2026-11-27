@@ -71,6 +71,19 @@ type phaseSample struct {
 	Memory      *memoryCurrentSample `json:"cgroup_memory_current,omitempty"`
 }
 
+func (s phaseSample) replaceable() bool {
+	switch s.Event {
+	case "status_poll":
+		return s.Memory == nil
+	case "drain_poll":
+		return s.Candidate.RetiredPins == nil || *s.Candidate.RetiredPins > 0
+	case "reclamation_poll":
+		return s.Candidate.ReclaimedBytes == nil
+	default:
+		return false
+	}
+}
+
 type memoryCurrentSample struct {
 	ReadStart time.Duration `json:"read_start_ns"`
 	ReadEnd   time.Duration `json:"read_end_ns"`
@@ -126,26 +139,27 @@ type backfillAcknowledgements struct {
 }
 
 type backfillTimeline struct {
-	Acknowledged       *backfillAcknowledgements `json:"acknowledged_backfill"`
-	Pattern            string                    `json:"pattern"`
-	HeldCutoff         int                       `json:"held_cutoff"`
-	RequestedCutoff    int                       `json:"requested_cutoff"`
-	FinalCutoff        int                       `json:"expected_committed_rows"`
-	HeldRows           int                       `json:"held_rows_checked"`
-	HeldExhausted      bool                      `json:"held_cursor_exhausted"`
-	TerminalRetried    bool                      `json:"terminal_page_retried"`
-	TerminalBytesEqual bool                      `json:"terminal_page_bytes_equal"`
-	CaptureRetired     bool                      `json:"capture_retired"`
-	FreshVisible       bool                      `json:"fresh_backfill_visible"`
-	FreshExact         bool                      `json:"fresh_walk_exact"`
-	FreshRows          int                       `json:"fresh_rows_checked"`
-	Publication        *publicationProof         `json:"publication"`
-	PinDrain           pinDrainProof             `json:"pin_drain"`
-	Memory             *memoryObservation        `json:"live_memory_current,omitempty"`
-	Samples            []phaseSample             `json:"samples"`
-	Dropped            int                       `json:"dropped_samples"`
-	Status             string                    `json:"status"`
-	Failure            string                    `json:"failure,omitempty"`
+	Acknowledged       *backfillAcknowledgements          `json:"acknowledged_backfill"`
+	Pattern            string                             `json:"pattern"`
+	HeldCutoff         int                                `json:"held_cutoff"`
+	RequestedCutoff    int                                `json:"requested_cutoff"`
+	FinalCutoff        int                                `json:"expected_committed_rows"`
+	HeldRows           int                                `json:"held_rows_checked"`
+	HeldExhausted      bool                               `json:"held_cursor_exhausted"`
+	TerminalRetried    bool                               `json:"terminal_page_retried"`
+	TerminalBytesEqual bool                               `json:"terminal_page_bytes_equal"`
+	CaptureRetired     bool                               `json:"capture_retired"`
+	FreshVisible       bool                               `json:"fresh_backfill_visible"`
+	FreshExact         bool                               `json:"fresh_walk_exact"`
+	FreshRows          int                                `json:"fresh_rows_checked"`
+	Publication        *publicationProof                  `json:"publication"`
+	PinDrain           pinDrainProof                      `json:"pin_drain"`
+	Correlation        *capacityevidence.CycleCorrelation `json:"capacity_correlation,omitempty"`
+	Memory             *memoryObservation                 `json:"live_memory_current,omitempty"`
+	Samples            []phaseSample                      `json:"samples"`
+	Dropped            int                                `json:"dropped_samples"`
+	Status             string                             `json:"status"`
+	Failure            string                             `json:"failure,omitempty"`
 }
 
 func newBackfillTimelines(f fixture) []*backfillTimeline {
@@ -168,7 +182,7 @@ func (t *backfillTimeline) add(sample phaseSample) {
 		// Keep named boundaries, memory evidence, and the initial half of
 		// the timeline. Rotate the other poll samples.
 		for i := timelineSampleLimit / 2; i < len(t.Samples); i++ {
-			if t.Samples[i].Memory == nil && (t.Samples[i].Event == "status_poll" || t.Samples[i].Event == "drain_poll") {
+			if t.Samples[i].replaceable() {
 				copy(t.Samples[i:], t.Samples[i+1:])
 				t.Samples = t.Samples[:len(t.Samples)-1]
 				break
@@ -344,21 +358,19 @@ func (t *backfillTimeline) validateRunning(c compaction, previous uint64, commit
 	return nil
 }
 
-func (p *backfillProbe) observePublishedPins(ctx context.Context, event string) (*uint64, time.Time, error) {
+func (p *backfillProbe) observePublishedPins(ctx context.Context, event string) (runtimeSample, time.Time, error) {
 	c, sent, received, err := p.request(ctx, "status", false)
 	if err == nil && (c.State != "complete" || c.Generation != p.Publication.Generation ||
 		c.CoveredRows != p.RequestedCutoff || c.CommittedRows != p.FinalCutoff) {
 		err = fmt.Errorf("published state changed during pin observation: %+v", c.compaction)
 	}
 	metrics := p.record(event, sent, received, c, err)
-	if err != nil {
-		return nil, received, err
-	}
-	return metrics.RetiredPins, received, nil
+	return metrics, received, err
 }
 
 func (p *backfillProbe) observeHeldPin(ctx context.Context) error {
-	count, _, err := p.observePublishedPins(ctx, "before_retirement")
+	metrics, received, err := p.observePublishedPins(ctx, "before_retirement")
+	count := metrics.RetiredPins
 	p.PinDrain.Held = count
 	switch {
 	case err != nil:
@@ -369,7 +381,7 @@ func (p *backfillProbe) observeHeldPin(ctx context.Context) error {
 		return errors.New(p.PinDrain.Reason)
 	default:
 		p.PinDrain.Status, p.PinDrain.Reason = "pending", "capture retirement and drain have yet to be observed"
-		return nil
+		return p.observeHeldCapacity(metrics, received)
 	}
 }
 
@@ -387,8 +399,9 @@ func (p *backfillProbe) observeDrain(ctx context.Context, retiredAt time.Time, l
 poll:
 	for event := "after_retirement"; budget.Err() == nil; event = "drain_poll" {
 		request, stop := context.WithTimeout(budget, diagnosticRequestLimit)
-		count, received, err := p.observePublishedPins(request, event)
+		metrics, received, err := p.observePublishedPins(request, event)
 		stop()
+		count := metrics.RetiredPins
 		switch {
 		case ctx.Err() != nil:
 			return ctx.Err()
@@ -406,7 +419,7 @@ poll:
 		case *count == 0:
 			p.PinDrain.After = count
 			p.PinDrain.Status, p.PinDrain.Reason = "observed", ""
-			return nil
+			return p.observeReclamation(ctx, metrics, received)
 		default:
 			p.PinDrain.After = count
 			p.PinDrain.Reason = "predecessor pins still present at the last drain sample"

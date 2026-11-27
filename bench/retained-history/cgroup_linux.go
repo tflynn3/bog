@@ -79,10 +79,6 @@ func placeInGroup(group string, pid int) error {
 	return writeCgroupFile(group, "cgroup.procs", strconv.Itoa(pid))
 }
 
-func readMemoryCurrent(group string) (uint64, error) {
-	return readCgroupUint(group, "memory.current")
-}
-
 func writeCgroupFile(group, name, value string) error {
 	file, err := os.OpenFile(filepath.Join(group, name), os.O_WRONLY, 0)
 	if err != nil {

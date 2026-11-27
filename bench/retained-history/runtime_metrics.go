@@ -32,6 +32,11 @@ func readRuntimeMetrics(raw json.RawMessage, statusErr error) runtimeSample {
 	}
 	m.Unavailable = make(map[string]string, len(issues))
 	for field, issue := range issues {
+		// Missing enrichment fields are normal on historical candidates
+		// and while a reclaim operation is pending.
+		if issue == capacityevidence.RuntimeMetricMissing && isCorrelationMetric(field) {
+			continue
+		}
 		reason := absent
 		if reason == "" {
 			reason = runtimeMetricReason(field, issue)
@@ -56,5 +61,16 @@ func runtimeMetricReason(field string, issue capacityevidence.RuntimeMetricIssue
 		return "candidate generation ID must be a lowercase hex SHA-256 digest or null"
 	default:
 		return "candidate did not supply a nonnegative integer"
+	}
+}
+
+func isCorrelationMetric(field string) bool {
+	switch field {
+	case capacityevidence.ReplayTailBytesMetric, capacityevidence.PredecessorPinAgeMetric,
+		capacityevidence.PredecessorPinGenerationMetric, capacityevidence.ReclaimedBytesMetric,
+		capacityevidence.ReclaimedPredecessorMetric, capacityevidence.ReclaimedReplacementMetric:
+		return true
+	default:
+		return false
 	}
 }

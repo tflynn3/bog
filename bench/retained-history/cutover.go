@@ -12,7 +12,11 @@ import (
 
 // The native gate runs this check from its own checkout. A report from an
 // older candidate can pass the historical validator without cutover proof.
-func validateCutoverFile(path string) (err error) {
+func validateCutoverFile(path string) error {
+	return validateCapacityFile(path, capacityevidence.ValidateReport)
+}
+
+func validateCapacityFile(path string, validate func([]byte) error) (err error) {
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return err
@@ -33,7 +37,7 @@ func validateCutoverFile(path string) (err error) {
 	if len(data) > maxReport {
 		return errors.New("capacity report exceeds 16 MiB")
 	}
-	return capacityevidence.ValidateReport(data)
+	return validate(data)
 }
 
 func (r result) validateCutover() error {

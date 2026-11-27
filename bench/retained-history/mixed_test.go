@@ -20,6 +20,7 @@ type scriptedReplacement struct {
 	cutoff                             int
 	query, appendDone, overlapped      chan struct{}
 	running, resumed, retried, retired bool
+	postRetirementReplies              int
 	terminalCursor, terminalQuery      string
 }
 
@@ -29,11 +30,17 @@ func TestMixedLoadKeepsOriginalCutoffs(t *testing.T) {
 		if name == "" {
 			name = "success"
 		}
-		t.Run(name, func(t *testing.T) { testMixedLoad(t, failure) })
+		t.Run(name, func(t *testing.T) { testMixedLoad(t, failure, nil) })
 	}
 }
 
-func testMixedLoad(t *testing.T, failure string) {
+func TestMixedLoadCorrelatesBothWorkloads(t *testing.T) {
+	testMixedLoad(t, "", func(context.Context) (uint64, error) { return 768, nil })
+}
+
+func testMixedLoad(t *testing.T, failure string, readPeak func(context.Context) (uint64, error)) {
+	t.Helper()
+	correlated := readPeak != nil
 	f := fixture{2048, 32, 64, 8, 1024, true}
 	cluster := &scriptedReplacement{cutoff: f.SeedRows - f.BatchRows}
 	scatter := &scriptedReplacement{cutoff: f.SeedRows + f.BatchRows}
@@ -128,6 +135,21 @@ func testMixedLoad(t *testing.T, failure string) {
 				reply.Metrics["retired_generation_pins"] = 1
 				if op.retired {
 					reply.Metrics["retired_generation_pins"] = 0
+					op.postRetirementReplies++
+				}
+				if correlated {
+					reply.Metrics["replay_tail_bytes"] = uint64((len(appended) - covered) * f.LineBytes)
+					if !op.retired {
+						reply.Metrics["predecessor_pin_generation"] = generation - 1
+						reply.Metrics["oldest_predecessor_pin_age_ns"] = 0
+					} else if op == cluster || op.postRetirementReplies > 1 {
+						reply.Metrics["reclaimed_predecessor_generation"] = generation - 1
+						reply.Metrics["reclaimed_replacement_generation"] = generation
+						reply.Metrics["reclaimed_bytes"] = 0
+						if op == scatter {
+							reply.Metrics["reclaimed_bytes"] = 2048
+						}
+					}
 				}
 				if op == scatter {
 					switch {
@@ -283,10 +305,11 @@ func testMixedLoad(t *testing.T, failure string) {
 	trial := testRestartTrial(t)
 	s.acknowledged = &trial.ledger
 	s.client.Timeout = 2 * time.Second
+	s.readMemoryPeak = readPeak
 	s.readMemoryCurrent = func(context.Context) (uint64, error) { return f.MemoryBytes / 2, nil }
 	r := result{Diagnostics: &capacityDiagnostics{Queries: make(map[string]*queryPhase)}}
 	s.queryPhases = r.Diagnostics.Queries
-	err := f.load(ctx, s, options{mode: "live", control: "/compact"}, &r, trial.dir)
+	err := f.load(ctx, s, options{mode: "live", control: "/compact", requireCorrelation: correlated}, &r, trial.dir)
 	clustered, scattered := r.Diagnostics.Backfills[0], r.Diagnostics.Backfills[1]
 	if clustered.Status != "pass" || clustered.PinDrain.Status != "observed" || !clustered.FreshVisible || !clustered.HeldExhausted || !clustered.TerminalBytesEqual {
 		t.Fatalf("incomplete clustered evidence: %+v (load error %v)", clustered, err)
@@ -329,6 +352,23 @@ func testMixedLoad(t *testing.T, failure string) {
 		if timeline.Memory == nil || timeline.Memory.Samples < 2 || timeline.Memory.Min == 0 ||
 			timeline.Memory.Max > f.MemoryBytes || *timeline.Memory != timeline.summarizeMemory() {
 			t.Fatalf("%s timeline lacks consistent live memory observations: %+v", timeline.Pattern, timeline.Memory)
+		}
+	}
+	if correlated {
+		for i, timeline := range r.Diagnostics.Backfills {
+			proof := timeline.Correlation
+			var wantCredit uint64
+			if i == 1 {
+				wantCredit = 2048
+			}
+			if proof == nil || proof.CgroupPeak == nil || proof.CgroupPeak.Bytes == nil ||
+				*proof.CgroupPeak.Bytes != 768 || proof.PredecessorPinAge == nil || *proof.PredecessorPinAge != 0 ||
+				proof.ReplayTailBytes == nil || *proof.ReplayTailBytes != uint64((timeline.FinalCutoff-timeline.RequestedCutoff)*f.LineBytes) ||
+				proof.ReclaimedBytes == nil || *proof.ReclaimedBytes != wantCredit ||
+				proof.FinalPinReleaseNS == nil || proof.ReclaimedObservedNS == nil ||
+				(*proof.ReclaimedObservedNS > *proof.FinalPinReleaseNS) != (i == 1) {
+				t.Fatalf("%s capacity correlation = %+v", timeline.Pattern, proof)
+			}
 		}
 	}
 	mu.Lock()

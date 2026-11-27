@@ -354,3 +354,14 @@ func testReap(t *testing.T, p *child) {
 		t.Error("child was not reaped")
 	}
 }
+
+func TestCorrelatedCapacityLinuxFixture(t *testing.T) {
+	group := t.TempDir()
+	if err := os.WriteFile(filepath.Join(group, "memory.peak"), []byte("768\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	candidate := &child{done: make(chan struct{})}
+	testMixedLoad(t, "", func(ctx context.Context) (uint64, error) {
+		return readCandidateMemory(ctx, candidate, group, "memory.peak")
+	})
+}

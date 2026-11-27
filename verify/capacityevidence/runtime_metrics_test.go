@@ -10,7 +10,7 @@ import (
 
 func TestRuntimeMetricsWireContract(t *testing.T) {
 	t.Parallel()
-	const known = `"publication_lag_ns":0,"staging_reserved_bytes":1,"staging_used_bytes":2,"oldest_pin_age_ns":3,"reclaimable_bytes":4,"retired_generation_pins":5,"pending_compactions":18446744073709551615,"oldest_pinned_generation":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"`
+	const known = `"publication_lag_ns":0,"staging_reserved_bytes":1,"staging_used_bytes":2,"oldest_pin_age_ns":3,"reclaimable_bytes":4,"retired_generation_pins":5,"pending_compactions":18446744073709551615,"oldest_pinned_generation":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","replay_tail_bytes":0,"oldest_predecessor_pin_age_ns":6,"predecessor_pin_generation":7,"reclaimed_bytes":0,"reclaimed_predecessor_generation":7,"reclaimed_replacement_generation":8`
 	m, issues, err := DecodeRuntimeMetrics([]byte(`{` + known + `,"future_metric":{"value":true,"value":false},
 		"future_metric":[{"retired_generation_pins":0}],"unavailable":{"pending_compactions":"ignored by live decoder"}}`))
 	if err != nil {
@@ -50,6 +50,8 @@ func TestRuntimeCounterInterpretation(t *testing.T) {
 	for _, key := range []string{
 		"publication_lag_ns", "staging_reserved_bytes", "staging_used_bytes", "oldest_pin_age_ns",
 		"reclaimable_bytes", "retired_generation_pins", "pending_compactions",
+		ReplayTailBytesMetric, PredecessorPinAgeMetric, PredecessorPinGenerationMetric,
+		ReclaimedBytesMetric, ReclaimedPredecessorMetric, ReclaimedReplacementMetric,
 	} {
 		t.Run(key, func(t *testing.T) {
 			t.Parallel()
@@ -101,7 +103,9 @@ func TestRepeatedRuntimeMetricMembers(t *testing.T) {
 	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	for _, key := range []string{
 		"publication_lag_ns", "staging_reserved_bytes", "staging_used_bytes", "oldest_pin_age_ns",
-		"reclaimable_bytes", "retired_generation_pins", "pending_compactions", "oldest_pinned_generation",
+		"reclaimable_bytes", "retired_generation_pins", "pending_compactions",
+		ReplayTailBytesMetric, PredecessorPinAgeMetric, PredecessorPinGenerationMetric,
+		ReclaimedBytesMetric, ReclaimedPredecessorMetric, ReclaimedReplacementMetric, "oldest_pinned_generation",
 	} {
 		t.Run(key, func(t *testing.T) {
 			t.Parallel()

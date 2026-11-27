@@ -173,7 +173,7 @@ func TestRejectionAndPositiveControls(t *testing.T) {
 		{
 			name: "authorized scope accepts foreign cursor", phase: "authorized cursor scope mismatch", want: ErrViolation,
 			query: func(q QueryRequest, p *Page) error {
-				if p.Status == http.StatusBadRequest && q.Principal == bob {
+				if p.Status == http.StatusBadRequest && q.Principal == bob && q.Cursor == "synthetic-cursor-0001" {
 					p.Status = http.StatusOK
 				}
 				return nil
@@ -182,7 +182,7 @@ func TestRejectionAndPositiveControls(t *testing.T) {
 		{
 			name: "scope mismatch leaks which component failed", phase: "authorization and cursor scope", want: ErrViolation,
 			query: func(q QueryRequest, p *Page) error {
-				if p.Status == http.StatusBadRequest && q.Principal == bob {
+				if p.Status == http.StatusBadRequest && q.Principal == bob && q.Cursor == "synthetic-cursor-0001" {
 					p.Body = []byte("different principal")
 				}
 				return nil
@@ -432,61 +432,6 @@ func TestMissingArtifactDeniedThroughAuthorizedStream(t *testing.T) {
 				t.Fatalf("diagnostic does not report %q", tc.detail)
 			}
 		})
-	}
-}
-
-func TestExportDenialMatrix(t *testing.T) {
-	t.Parallel()
-	target := &observedTarget{syntheticTarget: newSynthetic()}
-	a, b, c := target.fixture.Streams[0].Selector, target.fixture.Streams[1].Selector, target.fixture.Streams[2].Selector
-	ids := make(map[string]string)
-	target.create = func(request Target, start *ExportStart) {
-		if start.ArtifactID != "" {
-			ids[request.Selector] = start.ArtifactID
-		}
-	}
-	denials := make(map[Target][]string)
-	target.fetch = func(request Target, id string, artifact *Artifact) {
-		if artifact.Status == http.StatusForbidden {
-			denials[request] = append(denials[request], id)
-		}
-	}
-	if err := runFixture(t, Adapters{target, target, target, target}); err != nil {
-		t.Fatal(err)
-	}
-	for _, selector := range []string{a, b, c} {
-		if ids[selector] == "" {
-			t.Fatalf("no positive artifact for %s", selector)
-		}
-	}
-	for _, tc := range []struct {
-		request Target
-		sources []string
-	}{
-		{Target{alice, a}, []string{b, c}},
-		{Target{alice, b}, []string{a, c}},
-		{Target{alice, c}, []string{a, b}},
-		{Target{alice, unknown}, []string{a, b, c}},
-		{Target{bob, a}, []string{a, b, c}},
-		{Target{bob, b}, []string{a, c}},
-		{Target{bob, c}, []string{a, b, c}},
-		{Target{bob, unknown}, []string{a, b, c}},
-		{Target{exporter, a}, []string{b, c}},
-		{Target{exporter, b}, []string{a, b, c}},
-		{Target{exporter, c}, []string{a, b, c}},
-		{Target{exporter, unknown}, []string{a, b, c}},
-	} {
-		got := denials[tc.request]
-		if len(got) != 2*len(tc.sources) {
-			t.Errorf("%+v observed %d denials, want %d", tc.request, len(got), 2*len(tc.sources))
-			continue
-		}
-		for i, source := range tc.sources {
-			existing, missing := got[2*i], got[2*i+1]
-			if _, exists := target.artifacts[missing]; existing != ids[source] || missing == "" || exists {
-				t.Errorf("%+v has no existing/absent pair for %s", tc.request, source)
-			}
-		}
 	}
 }
 

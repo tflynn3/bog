@@ -70,7 +70,7 @@ func ReferenceFixture() Fixture {
 
 type appendCase struct {
 	request IngestRequest
-	record  Record
+	rows    []Row
 }
 
 func fixtureAppends(f Fixture) []appendCase {
@@ -80,15 +80,24 @@ func fixtureAppends(f Fixture) []appendCase {
 		ts3 = "2026-01-01T00:00:03Z"
 		ts4 = "2026-01-01T00:00:04Z"
 	)
+	type fixtureRow struct{ timestamp, retained, secret string }
+	batch := func(principal string, stream Stream, input ...fixtureRow) appendCase {
+		entry := appendCase{request: IngestRequest{Target: Target{principal, stream.Selector}, Key: key}}
+		for _, row := range input {
+			entry.request.Body += ndjson(row.timestamp, row.retained+" "+row.secret)
+			entry.rows = append(entry.rows, Row{row.timestamp, row.retained + " " + replacement})
+		}
+		return entry
+	}
 	return []appendCase{
-		{IngestRequest{Target{alice, f.Streams[0].Selector}, key, ndjson(ts1, "retained-alice-a "+plain)},
-			Record{f.Streams[0].Scope, Row{ts1, "retained-alice-a [redacted]"}}},
-		{IngestRequest{Target{alice, f.Streams[1].Selector}, key, ndjson(ts2, "retained-alice-b "+escaped)},
-			Record{f.Streams[1].Scope, Row{ts2, "retained-alice-b [redacted]"}}},
-		{IngestRequest{Target{alice, f.Streams[2].Selector}, key, ndjson(ts3, "retained-alice-c "+plain)},
-			Record{f.Streams[2].Scope, Row{ts3, "retained-alice-c [redacted]"}}},
-		{IngestRequest{Target{bob, f.Streams[0].Selector}, key, ndjson(ts4, "retained-bob-a "+escaped)},
-			Record{f.Streams[0].Scope, Row{ts4, "retained-bob-a [redacted]"}}},
+		batch(alice, f.Streams[0], fixtureRow{ts1, "retained-alice-a", plain}),
+		batch(alice, f.Streams[1],
+			fixtureRow{ts2, "retained-alice-b", escaped},
+			fixtureRow{ts3, "retained-second-b", plain}),
+		batch(alice, f.Streams[2],
+			fixtureRow{ts3, "retained-alice-c", plain},
+			fixtureRow{ts4, "retained-second-c", escaped}),
+		batch(bob, f.Streams[0], fixtureRow{ts4, "retained-bob-a", escaped}),
 	}
 }
 

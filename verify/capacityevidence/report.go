@@ -205,20 +205,15 @@ func (r record) validateTimelines() error {
 		{seed - 2*BatchRows, seed - BatchRows, seed},
 		{seed, seed + BatchRows, seed + TailRows},
 	}
+	var published uint64
 	for i, t := range timelines {
-		if err := t.validate(cutoffs[i]); err != nil {
+		if err := t.validate(cutoffs[i], published, r.CgroupPeak); err != nil {
 			return fmt.Errorf("%s backfill: %w", t.Pattern, err)
 		}
-		if err := t.validateLiveMemory(r.CgroupPeak); err != nil {
-			return fmt.Errorf("%s backfill: %w", t.Pattern, err)
-		}
-	}
-	clustered, scattered := timelines[0].Publication.Generation, timelines[1].Publication.Generation
-	if clustered >= scattered {
-		return errors.New("clustered and scattered publications must have advancing generations")
+		published = t.Publication.Generation
 	}
 	c := r.Compaction
-	if c.State != "complete" || c.Generation != scattered ||
+	if c.State != "complete" || c.Generation != published ||
 		c.CoveredRows != cutoffs[1].publish || c.CommittedRows != cutoffs[1].final {
 		return errors.New("scattered publication disagrees with the completed fixture compaction")
 	}

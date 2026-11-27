@@ -61,6 +61,7 @@ type cleanupEvidence struct {
 
 type diagnostics struct {
 	Timelines []backfillEvidence `json:"backfill_timelines"`
+	Restart   *restartEvidence   `json:"restart"`
 	// A pointer preserves an explicitly observed zero through JSON decoding.
 	MemoryEvents map[string]*uint64  `json:"cgroup_memory_events"`
 	Candidates   []lifecycleEvidence `json:"candidates"`
@@ -192,7 +193,10 @@ func (r record) validate() error {
 			return fmt.Errorf("missing clean %s lifecycle", lifetime)
 		}
 	}
-	return r.validateTimelines()
+	if err := r.validateTimelines(); err != nil {
+		return err
+	}
+	return d.Restart.validate(r.Compaction)
 }
 
 func (r record) validateTimelines() error {

@@ -101,22 +101,16 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	p.HeldExhausted = true
 	p.boundary("held_exhausted")
 	setPhase("terminal_retry")
-	cursor := terminal.cursor
-	terminal.phase = r.Phase
-	terminal.seen = map[string]bool{cursor: true}
-	if _, err := terminal.page(ctx, s, f); err != nil {
+	if err := terminal.replay(ctx, s, f, r.Phase, held.offset); err != nil {
 		return published, fmt.Errorf("retry terminal page: %w", err)
 	}
-	if terminal.cursor != "" || terminal.offset != held.offset {
-		return published, errors.New("retry of terminal page returned a different page boundary")
-	}
-	p.TerminalRetried = true
+	p.TerminalRetried, p.TerminalBytesEqual = true, true
 	p.boundary("terminal_retried")
 	setPhase("capture_retirement")
 	if err := p.observeHeldPin(ctx); err != nil {
 		return published, err
 	}
-	if err := s.retireCapture(ctx, o.control, cursor); err != nil {
+	if err := s.retireCapture(ctx, o.control, terminal.request.cursor); err != nil {
 		return published, fmt.Errorf("explicitly retire held capture: %w", err)
 	}
 	p.CaptureRetired = true

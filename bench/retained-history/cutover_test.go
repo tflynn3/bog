@@ -16,7 +16,7 @@ func passingCutoverReport() report {
 		for i, b := range backfills {
 			b.Status = "pass"
 			b.HeldRows, b.FreshRows = b.HeldCutoff/2, b.FinalCutoff
-			b.HeldExhausted, b.TerminalRetried, b.CaptureRetired = true, true, true
+			b.HeldExhausted, b.TerminalRetried, b.TerminalBytesEqual, b.CaptureRetired = true, true, true, true
 			b.FreshVisible, b.FreshExact = true, true
 			// The seed checkpoint advances the predecessor between phases.
 			predecessor := uint64(2*i + 1)
@@ -55,17 +55,27 @@ func passingCutoverReport() report {
 			b.Memory = new(b.summarizeMemory())
 		}
 		scattered := backfills[1]
+		published := compaction{scattered.Publication.Generation, scattered.RequestedCutoff, scattered.FinalCutoff, "complete"}
+		dir := directoryIdentity{Device: 0, Inode: uint64(f.SeedRows)}
+		total, suffix := scattered.FinalCutoff, scattered.FinalCutoff-scattered.RequestedCutoff
 		records = append(records, result{
 			StartReady: new(time.Millisecond), RestartReady: new(time.Millisecond),
 			IngestP99: new(time.Millisecond), QueryP99: new(time.Millisecond),
 			IngestSamples: f.TailRows / f.BatchRows, QuerySamples: 2,
 			Fixture: f, Status: "pass", Workload: "pass", Phase: "complete", RecoveredRows: f.SeedRows + f.TailRows,
-			Compaction: &compaction{scattered.Publication.Generation, scattered.RequestedCutoff, scattered.FinalCutoff, "complete"},
+			Compaction: new(published),
 			Cleanup:    cleanupProof{Status: "pass", CandidateReaped: true, SubtreeEmpty: true, SubtreeRemoved: true, StoreRemoved: true},
 			Diagnostics: &capacityDiagnostics{
 				Candidates: []*candidateEvidence{
 					{Lifetime: "startup", Ready: new(time.Millisecond), Reaped: true, ExitCode: new(int)},
 					{Lifetime: "restart", Ready: new(time.Millisecond), Reaped: true, ExitCode: new(int)},
+				},
+				Restart: &restartEvidence{
+					Status: "pass", Phase: "complete", Original: new(dir), BeforeRestart: new(dir),
+					Restarted: new(dir), AfterWalk: new(dir), FirstReaped: true, SubtreeDrained: true,
+					Publication: new(published), Recovered: new(published),
+					Ledger: restartLedgerProof{Status: "pass", Acknowledged: total, Batches: total / f.BatchRows,
+						SuffixRows: suffix, Matched: total, MatchedSuffix: suffix, Pages: (total + 999) / 1000, Exhausted: true},
 				},
 				Backfills: backfills, MemoryEvents: map[string]uint64{"oom_kill": 0},
 			},
@@ -98,6 +108,9 @@ func TestStrictCutoverReportProof(t *testing.T) {
 		{"store leftover", "cleanup", func(r *result, _ *backfillTimeline) { r.Cleanup.StoreRemoved = false }},
 		{"unexpected exit", "startup lifecycle", func(r *result, _ *backfillTimeline) { r.Diagnostics.Candidates[0].ExitedBeforeCleanup = true }},
 		{"wrong restart row count", "restart parity", func(r *result, _ *backfillTimeline) { r.RecoveredRows-- }},
+		{"missing restart proof", "completed restart proof", func(r *result, _ *backfillTimeline) { r.Diagnostics.Restart = nil }},
+		{"wrong recovered generation", "recovered checkpoint disagrees", func(r *result, _ *backfillTimeline) { r.Diagnostics.Restart.Recovered.Generation++ }},
+		{"no replay byte comparison", "byte equality on terminal page replay", func(_ *result, b *backfillTimeline) { b.TerminalBytesEqual = false }},
 		{"wrong cutoff", "incorrect cutoffs", func(_ *result, b *backfillTimeline) { b.RequestedCutoff++ }},
 		{"no replay", "terminal page replay", func(_ *result, b *backfillTimeline) { b.TerminalRetried = false }},
 		{"no retirement", "capture retirement", func(_ *result, b *backfillTimeline) { b.CaptureRetired = false }},

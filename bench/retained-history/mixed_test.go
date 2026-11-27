@@ -20,11 +20,11 @@ type scriptedReplacement struct {
 	cutoff                             int
 	query, appendDone, overlapped      chan struct{}
 	running, resumed, retried, retired bool
-	terminalCursor                     string
+	terminalCursor, terminalQuery      string
 }
 
 func TestMixedLoadKeepsOriginalCutoffs(t *testing.T) {
-	for _, failure := range []string{"", "bad_publication", "timeout", "missing_held", "zero_held", "missing_drain", "bad_retry", "retire_failed", "bad_fresh"} {
+	for _, failure := range []string{"", "bad_publication", "timeout", "missing_held", "zero_held", "missing_drain", "bad_retry", "different_retry_bytes", "retire_failed", "bad_fresh"} {
 		name := failure
 		if name == "" {
 			name = "success"
@@ -233,13 +233,18 @@ func testMixedLoad(t *testing.T, failure string) {
 			}
 			stop := min(offset+limit, len(snapshot))
 			page := slices.Clone(snapshot[offset:stop])
+			var differentBytes bool
 			if offset > 0 && active != nil && !active.running && covered == active.cutoff && !active.retired {
 				active.resumed = true
 				if stop == len(snapshot) {
 					if active.terminalCursor == "" {
-						active.terminalCursor = cursor
+						active.terminalCursor, active.terminalQuery = cursor, req.URL.RawQuery
 					} else if active.terminalCursor == cursor {
+						if active.terminalQuery != req.URL.RawQuery {
+							t.Errorf("terminal retry query = %q, want %q", req.URL.RawQuery, active.terminalQuery)
+						}
 						active.retried = true
+						differentBytes = active == scatter && failure == "different_retry_bytes"
 						if active == scatter && failure == "bad_retry" {
 							page[0].Line = "wrong row"
 						}
@@ -254,6 +259,13 @@ func testMixedLoad(t *testing.T, failure string) {
 			}
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/x-ndjson")
+			if differentBytes {
+				// Whitespace changes the wire body while preserving the exact rows.
+				if _, err := io.WriteString(w, " "); err != nil {
+					t.Error(err)
+					return
+				}
+			}
 			enc := json.NewEncoder(w)
 			for _, r := range page {
 				if err := enc.Encode(r); err != nil && req.Context().Err() == nil {
@@ -276,7 +288,7 @@ func testMixedLoad(t *testing.T, failure string) {
 	s.queryPhases = r.Diagnostics.Queries
 	err := f.load(ctx, s, options{mode: "live", control: "/compact"}, &r, trial.dir)
 	clustered, scattered := r.Diagnostics.Backfills[0], r.Diagnostics.Backfills[1]
-	if clustered.Status != "pass" || clustered.PinDrain.Status != "observed" || !clustered.FreshVisible || !clustered.HeldExhausted {
+	if clustered.Status != "pass" || clustered.PinDrain.Status != "observed" || !clustered.FreshVisible || !clustered.HeldExhausted || !clustered.TerminalBytesEqual {
 		t.Fatalf("incomplete clustered evidence: %+v (load error %v)", clustered, err)
 	}
 	if failure != "" {
@@ -286,12 +298,19 @@ func testMixedLoad(t *testing.T, failure string) {
 			!slices.ContainsFunc(scattered.Samples, func(s phaseSample) bool { return s.Event == "overlap" }) {
 			t.Fatalf("expected partial failed evidence: %+v, err %v", scattered, err)
 		}
+		if failure == "different_retry_bytes" {
+			if !strings.Contains(err.Error(), "different NDJSON bytes") || scattered.TerminalRetried ||
+				scattered.TerminalBytesEqual || scattered.CaptureRetired ||
+				slices.ContainsFunc(scattered.Samples, func(s phaseSample) bool { return s.Event == "terminal_retried" }) {
+				t.Fatalf("wire mismatch produced successful retry or retirement evidence: %+v, error %v", scattered, err)
+			}
+		}
 		if failure == "timeout" && !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
 			t.Fatal("script did not cancel the operation")
 		}
 		wantPhase := map[string]string{
 			"missing_held": "capture_retirement", "zero_held": "capture_retirement", "missing_drain": "pin_drain",
-			"bad_retry": "terminal_retry", "retire_failed": "capture_retirement", "bad_fresh": "fresh_walk",
+			"bad_retry": "terminal_retry", "different_retry_bytes": "terminal_retry", "retire_failed": "capture_retirement", "bad_fresh": "fresh_walk",
 		}[failure]
 		if wantPhase != "" && r.Phase != wantPhase {
 			t.Fatalf("failure phase = %q, want %q, error %v", r.Phase, wantPhase, err)
@@ -302,7 +321,7 @@ func testMixedLoad(t *testing.T, failure string) {
 		t.Fatal(err)
 	}
 	if scattered.Status != "pass" || scattered.PinDrain.Status != "observed" || !scattered.FreshVisible ||
-		!scattered.HeldExhausted || !scattered.TerminalRetried || !scattered.CaptureRetired ||
+		!scattered.HeldExhausted || !scattered.TerminalRetried || !scattered.TerminalBytesEqual || !scattered.CaptureRetired ||
 		!scattered.FreshExact || scattered.FreshRows != f.SeedRows+f.TailRows {
 		t.Fatalf("incomplete scattered evidence: %+v", scattered)
 	}

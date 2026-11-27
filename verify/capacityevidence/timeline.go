@@ -17,20 +17,21 @@ const (
 )
 
 type backfillEvidence struct {
-	Pattern      string `json:"pattern"`
-	Status       string `json:"status"`
-	Failure      string `json:"failure"`
-	HeldCutoff   int    `json:"held_cutoff"`
-	Cutoff       int    `json:"requested_cutoff"`
-	FinalCutoff  int    `json:"expected_committed_rows"`
-	HeldRows     int    `json:"held_rows_checked"`
-	Exhausted    bool   `json:"held_cursor_exhausted"`
-	Retried      bool   `json:"terminal_page_retried"`
-	Retired      bool   `json:"capture_retired"`
-	FreshExact   bool   `json:"fresh_walk_exact"`
-	FreshRows    int    `json:"fresh_rows_checked"`
-	FreshVisible bool   `json:"fresh_backfill_visible"`
-	Acknowledged struct {
+	Pattern            string `json:"pattern"`
+	Status             string `json:"status"`
+	Failure            string `json:"failure"`
+	HeldCutoff         int    `json:"held_cutoff"`
+	Cutoff             int    `json:"requested_cutoff"`
+	FinalCutoff        int    `json:"expected_committed_rows"`
+	HeldRows           int    `json:"held_rows_checked"`
+	Exhausted          bool   `json:"held_cursor_exhausted"`
+	Retried            bool   `json:"terminal_page_retried"`
+	TerminalBytesEqual bool   `json:"terminal_page_bytes_equal"`
+	Retired            bool   `json:"capture_retired"`
+	FreshExact         bool   `json:"fresh_walk_exact"`
+	FreshRows          int    `json:"fresh_rows_checked"`
+	FreshVisible       bool   `json:"fresh_backfill_visible"`
+	Acknowledged       struct {
 		Rows     int       `json:"rows"`
 		Batches  int       `json:"batches"`
 		First    int64     `json:"first_ack_ns"`
@@ -163,6 +164,9 @@ func (b backfillEvidence) validate(want backfillCutoffs, previousPublication, pe
 	if !b.Retried || !b.Retired {
 		return errors.New("require terminal page replay and explicit capture retirement")
 	}
+	if !b.TerminalBytesEqual {
+		return errors.New("require byte equality on terminal page replay")
+	}
 	ack := b.Acknowledged
 	if ack.Rows != want.final-want.held || ack.Batches != ack.Rows/BatchRows ||
 		ack.First <= 0 || ack.Last < ack.First || ack.Earliest.IsZero() || ack.Latest.Before(ack.Earliest) {
@@ -221,6 +225,9 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs, previousPublicat
 			exhaustedAt = elapsed
 			continue
 		case "terminal_retried":
+			if sample.StatusError != "" {
+				return fmt.Errorf("terminal page replay observation failed: %s", sample.StatusError)
+			}
 			if exhaustedAt == 0 || retriedAt != 0 {
 				return errors.New("terminal page replay must follow held cursor exhaustion")
 			}

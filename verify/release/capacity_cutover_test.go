@@ -114,6 +114,28 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
 		}
 		delete(sample(b, remove), "cgroup_memory_current")
 	}
+	t.Run("historical live proof in standard mode", func(t *testing.T) {
+		var wire object
+		if err := jsonv1.Unmarshal(data, &wire); err != nil {
+			t.Fatal(err)
+		}
+		capacity := at(at(wire, "cases"), capacityCase)
+		for scale := range capacity["evidence"].([]any) {
+			d := at(index(capacity, "evidence", scale), "diagnostics")
+			delete(d, "restart")
+			for pattern := range d["backfill_timelines"].([]any) {
+				delete(index(d, "backfill_timelines", pattern), "terminal_page_bytes_equal")
+			}
+		}
+		historical, err := jsonv1.Marshal(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateReport(historical, id, capacityCases); err != nil {
+			t.Fatalf("standard validation rejected historical live evidence: %v", err)
+		}
+	})
+	restart := func(r object) object { return at(at(r, "diagnostics"), "restart") }
 	for _, tc := range []struct {
 		name string
 		edit func(record, timeline object)
@@ -212,6 +234,27 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
 		}, "last backfill acknowledgment must occur by the fresh visibility observation"},
 		{"inexact fresh walk", func(_, b object) { b["fresh_rows_checked"] = 1 }, "missing exact fresh walk parity"},
 		{"inexact restart walk", func(r, _ object) { r["recovered_rows"] = 1 }, "missing completed fixture with exact restart parity"},
+		{"missing restart proof", func(r, _ object) {
+			delete(at(r, "diagnostics"), "restart")
+		}, "completed restart proof"},
+		{"restart directory changed", func(r, _ object) {
+			at(restart(r), "after_walk_directory")["device"] = 9
+		}, "restart directory device or inode changed"},
+		{"recovered checkpoint has different generation", func(r, _ object) {
+			at(restart(r), "recovered_checkpoint")["generation"] = 99
+		}, "recovered checkpoint disagrees"},
+		{"unmatched WAL suffix", func(r, _ object) {
+			at(restart(r), "ledger")["matched_wal_suffix_rows"] = 0
+		}, "expect and match the nonempty WAL suffix"},
+		{"missing clustered terminal byte verdict", func(r, _ object) {
+			delete(index(at(r, "diagnostics"), "backfill_timelines", 0), "terminal_page_bytes_equal")
+		}, "clustered backfill: require byte equality on terminal page replay"},
+		{"null scattered terminal byte verdict", func(_, b object) {
+			b["terminal_page_bytes_equal"] = nil
+		}, "scattered backfill: require byte equality on terminal page replay"},
+		{"negative scattered terminal byte verdict", func(_, b object) {
+			b["terminal_page_bytes_equal"] = false
+		}, "scattered backfill: require byte equality on terminal page replay"},
 		{"batch count disagrees", func(_, b object) { at(b, "acknowledged_backfill")["batches"] = 1 }, "invalid acknowledged backfill evidence"},
 		{"missing store cleanup", func(r, _ object) { delete(at(r, "cleanup"), "store_removed") }, "missing candidate, subtree, or fixture store cleanup"},
 		{"missing raw OOM", func(r, _ object) { delete(at(at(r, "diagnostics"), "cgroup_memory_events"), "oom_kill") }, "raw and summary cgroup OOM-kill counts"},

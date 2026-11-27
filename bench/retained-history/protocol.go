@@ -177,7 +177,12 @@ type walk struct {
 	phase            string
 }
 
-func (w *walk) page(ctx context.Context, s service, f fixture) (_ time.Duration, err error) {
+func (w *walk) page(ctx context.Context, s service, f fixture) (time.Duration, error) {
+	elapsed, _, err := w.readPage(ctx, s, f)
+	return elapsed, err
+}
+
+func (w *walk) readPage(ctx context.Context, s service, f fixture) (_ time.Duration, terminalBody []byte, err error) {
 	var attempt queryAttempt
 	defer func() { recordQuery(s.queryPhases, w.phase, attempt, err) }()
 	limit := [...]int{1, 193, 509}[w.pages%3]
@@ -198,64 +203,91 @@ func (w *walk) page(ctx context.Context, s service, f fixture) (_ time.Duration,
 	res, data, err := s.requestObserved(ctx, http.MethodGet, "/query?"+q.Encode(), nil, &attempt)
 	elapsed := time.Since(start)
 	if err != nil {
-		return elapsed, err
+		return elapsed, nil, err
 	}
 	attempt.Phase = "validation"
 	if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "application/x-ndjson" {
-		return elapsed, fmt.Errorf("query HTTP %d (%s)", res.StatusCode, attempt.Admission)
+		return elapsed, nil, fmt.Errorf("query HTTP %d (%s)", res.StatusCode, attempt.Admission)
 	}
 	if len(data) != 0 && data[len(data)-1] != '\n' {
-		return elapsed, errors.New("query ended with an unterminated NDJSON row")
+		return elapsed, nil, errors.New("query ended with an unterminated NDJSON row")
 	}
 	cursors := res.Header.Values("Bog-Next-Cursor")
 	if len(cursors) > 1 || len(res.Trailer.Values("Bog-Next-Cursor")) != 0 ||
 		(len(cursors) == 1 && (cursors[0] == "" || w.seen[cursors[0]])) {
-		return elapsed, errors.New("query returned an invalid or repeated cursor")
+		return elapsed, nil, errors.New("query returned an invalid or repeated cursor")
 	}
 	scan := bufio.NewScanner(bytes.NewReader(data))
 	count := 0
 	for scan.Scan() {
 		var got row
 		if err := json.Unmarshal(scan.Bytes(), &got); err != nil {
-			return elapsed, err
+			return elapsed, nil, err
 		}
 		if w.offset >= len(w.want) || count >= limit {
-			return elapsed, fmt.Errorf("unexpected row at offset %d on page %d", w.offset, w.pages+1)
+			return elapsed, nil, fmt.Errorf("unexpected row at offset %d on page %d", w.offset, w.pages+1)
 		}
 		want := f.row(w.want[w.offset])
 		if !got.TS.Equal(want.TS) || got.Line != want.Line {
-			return elapsed, fmt.Errorf("row mismatch at offset %d (append ordinal %d)", w.offset, w.want[w.offset])
+			return elapsed, nil, fmt.Errorf("row mismatch at offset %d (append ordinal %d)", w.offset, w.want[w.offset])
 		}
 		w.offset++
 		count++
 	}
 	if err := scan.Err(); err != nil {
-		return elapsed, err
+		return elapsed, nil, err
 	}
 	if (w.offset < len(w.want)) != (len(cursors) == 1) || (len(cursors) == 1 && count == 0) {
-		return elapsed, fmt.Errorf("query did not advance or terminate correctly at offset %d of %d", w.offset, len(w.want))
+		return elapsed, nil, fmt.Errorf("query did not advance or terminate correctly at offset %d of %d", w.offset, len(w.want))
 	}
 	w.cursor = ""
 	if len(cursors) == 1 {
 		w.cursor = cursors[0]
 		w.seen[w.cursor] = true
+	} else {
+		terminalBody = data
 	}
 	w.pages++
-	return elapsed, nil
+	return elapsed, terminalBody, nil
 }
 
-// exhaust returns the request that produced the terminal page, including its
-// input cursor. Replaying this copy leaves the completed walk unchanged.
-func (w *walk) exhaust(ctx context.Context, s service, f fixture) (walk, error) {
+// terminalPage retains the request and bounded body of the terminal page.
+type terminalPage struct {
+	request walk
+	body    []byte
+}
+
+func (w *walk) exhaust(ctx context.Context, s service, f fixture) (terminalPage, error) {
 	for {
 		request := *w
-		if _, err := w.page(ctx, s, f); err != nil {
-			return walk{}, err
+		_, body, err := w.readPage(ctx, s, f)
+		if err != nil {
+			return terminalPage{}, err
 		}
 		if w.cursor == "" {
-			return request, nil
+			return terminalPage{request: request, body: body}, nil
 		}
 	}
+}
+
+func (p terminalPage) replay(ctx context.Context, s service, f fixture, phase string, endOffset int) error {
+	request := p.request
+	if request.cursor == "" {
+		return errors.New("terminal page replay requires a continuation cursor")
+	}
+	request.phase = phase
+	request.seen = map[string]bool{request.cursor: true}
+	_, body, err := request.readPage(ctx, s, f)
+	if err != nil {
+		return err
+	}
+	if request.cursor != "" || request.offset != endOffset {
+		return errors.New("retry of terminal page returned a different page boundary")
+	}
+	if !bytes.Equal(p.body, body) {
+		return errors.New("retry of terminal page returned different NDJSON bytes")
+	}
+	return nil
 }
 
 type compaction struct {

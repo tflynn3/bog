@@ -126,25 +126,26 @@ type backfillAcknowledgements struct {
 }
 
 type backfillTimeline struct {
-	Acknowledged    *backfillAcknowledgements `json:"acknowledged_backfill"`
-	Pattern         string                    `json:"pattern"`
-	HeldCutoff      int                       `json:"held_cutoff"`
-	RequestedCutoff int                       `json:"requested_cutoff"`
-	FinalCutoff     int                       `json:"expected_committed_rows"`
-	HeldRows        int                       `json:"held_rows_checked"`
-	HeldExhausted   bool                      `json:"held_cursor_exhausted"`
-	TerminalRetried bool                      `json:"terminal_page_retried"`
-	CaptureRetired  bool                      `json:"capture_retired"`
-	FreshVisible    bool                      `json:"fresh_backfill_visible"`
-	FreshExact      bool                      `json:"fresh_walk_exact"`
-	FreshRows       int                       `json:"fresh_rows_checked"`
-	Publication     *publicationProof         `json:"publication"`
-	PinDrain        pinDrainProof             `json:"pin_drain"`
-	Memory          *memoryObservation        `json:"live_memory_current,omitempty"`
-	Samples         []phaseSample             `json:"samples"`
-	Dropped         int                       `json:"dropped_samples"`
-	Status          string                    `json:"status"`
-	Failure         string                    `json:"failure,omitempty"`
+	Acknowledged       *backfillAcknowledgements `json:"acknowledged_backfill"`
+	Pattern            string                    `json:"pattern"`
+	HeldCutoff         int                       `json:"held_cutoff"`
+	RequestedCutoff    int                       `json:"requested_cutoff"`
+	FinalCutoff        int                       `json:"expected_committed_rows"`
+	HeldRows           int                       `json:"held_rows_checked"`
+	HeldExhausted      bool                      `json:"held_cursor_exhausted"`
+	TerminalRetried    bool                      `json:"terminal_page_retried"`
+	TerminalBytesEqual bool                      `json:"terminal_page_bytes_equal"`
+	CaptureRetired     bool                      `json:"capture_retired"`
+	FreshVisible       bool                      `json:"fresh_backfill_visible"`
+	FreshExact         bool                      `json:"fresh_walk_exact"`
+	FreshRows          int                       `json:"fresh_rows_checked"`
+	Publication        *publicationProof         `json:"publication"`
+	PinDrain           pinDrainProof             `json:"pin_drain"`
+	Memory             *memoryObservation        `json:"live_memory_current,omitempty"`
+	Samples            []phaseSample             `json:"samples"`
+	Dropped            int                       `json:"dropped_samples"`
+	Status             string                    `json:"status"`
+	Failure            string                    `json:"failure,omitempty"`
 }
 
 func newBackfillTimelines(f fixture) []*backfillTimeline {

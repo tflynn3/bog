@@ -41,7 +41,7 @@ func cutoverTimeline(pattern string, held, requested, final int, predecessor, ge
 		`{"event":"fresh_visible","elapsed_ns":100000110,"status":null}`,
 	)
 	return fmt.Sprintf(`{"pattern":%q,"status":"pass","held_cutoff":%d,"requested_cutoff":%d,"expected_committed_rows":%d,
-		"held_rows_checked":3,"held_cursor_exhausted":true,"terminal_page_retried":true,"capture_retired":true,"fresh_backfill_visible":true,"fresh_walk_exact":true,"fresh_rows_checked":%d,
+		"held_rows_checked":3,"held_cursor_exhausted":true,"terminal_page_retried":true,"terminal_page_bytes_equal":true,"capture_retired":true,"fresh_backfill_visible":true,"fresh_walk_exact":true,"fresh_rows_checked":%d,
 		"acknowledged_backfill":{"rows":%d,"batches":%d,"first_ack_ns":18,"last_ack_ns":%d,
 			"earliest_row_ts":"2020-01-01T00:00:00Z","latest_row_ts":"2020-01-01T00:00:01Z"},
 		"publication":{"generation":%d,"observed_lag_lower_bound_ns":%d,"observed_lag_upper_bound_ns":35},
@@ -243,6 +243,16 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 				s.StatusError = context.DeadlineExceeded.Error()
 			},
 			problem: "status_poll sample failed",
+		},
+		{
+			name: "missing terminal byte equality", pattern: "clustered",
+			mutate:  func(b *backfillEvidence) { b.TerminalBytesEqual = false },
+			problem: "require byte equality on terminal page replay",
+		},
+		{
+			name: "failed terminal replay event", pattern: "scattered",
+			mutate:  func(b *backfillEvidence) { sample(b, "terminal_retried").StatusError = "body differs" },
+			problem: "terminal page replay observation failed",
 		},
 		{
 			name: "missing terminal replay event", pattern: "clustered",
@@ -561,10 +571,21 @@ func observationRecord(t *testing.T, seed int) []byte {
 		b.Memory = &memoryObservation{Samples: 2, Span: lastRead - firstRead, Min: 1024, Max: 1024}
 		d.Timelines = append(d.Timelines, b)
 	}
+	total, cutoff := seed+TailRows, seed+BatchRows
+	published := compactionEvidence{"complete", 52, cutoff, total}
+	dir := directoryIdentity{Device: new(uint64(0)), Inode: new(uint64(23))}
+	d.Restart = &restartEvidence{
+		Status: "pass", Phase: "complete",
+		Original: new(dir), BeforeRestart: new(dir), Restarted: new(dir), AfterWalk: new(dir),
+		FirstReaped: true, SubtreeDrained: true, Publication: new(published), Recovered: new(published),
+		Ledger: restartLedgerEvidence{Status: "pass", Acknowledged: total, Batches: total / BatchRows,
+			SuffixRows: total - cutoff, Matched: total, MatchedSuffix: total - cutoff,
+			Pages: (total + 999) / 1000, Exhausted: true},
+	}
 	data, err := json.Marshal(record{
 		Fixture: fixture{seed, TailRows, LineBytes, BatchRows, MemoryLimit},
 		Status:  "pass", Workload: "pass", Phase: "complete", TimedOut: new(false), RecoveredRows: seed + TailRows,
-		Compaction:  compactionEvidence{"complete", 52, seed + BatchRows, seed + TailRows},
+		Compaction:  published,
 		Diagnostics: d,
 		Cleanup:     cleanupEvidence{Status: "pass", CandidateReaped: true, SubtreeEmpty: true, SubtreeRemoved: true, StoreRemoved: true},
 		CgroupLimit: new(uint64(MemoryLimit)), CgroupSwap: new(uint64(0)), CgroupOOM: new(uint64(0)), CgroupPeak: 2048,

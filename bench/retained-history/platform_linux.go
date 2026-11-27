@@ -441,7 +441,7 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 		if r.Cleanup.Status == "pass" {
 			r.Status = "pass"
 			if o.mode == "live" {
-				if err := r.validateCutover(f); err != nil {
+				if err := r.validateCutover(); err != nil {
 					r.Phase, r.Workload, r.Status, r.Detail = "cutover_proof", "fail", "fail", err.Error()
 				}
 			}

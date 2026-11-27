@@ -15,10 +15,12 @@ import (
 	"regexp"
 	"slices"
 	"syscall"
+
+	"bog/verify/capacityevidence"
 )
 
 const schemaVersion = 1
-const capacityCase = "retained_history_capacity"
+const capacityCase = capacityevidence.Case
 const saturationFixtureCase = "saturation_fixture"
 
 var fullRevision = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -139,7 +141,13 @@ func validateReportWithOptions(data []byte, expected identity, required []string
 		return err
 	}
 	if slices.Contains(required, capacityCase) {
-		return validateCapacity(fields["mode"], cases[capacityCase], got.Fixture, opts.requireCutover)
+		if opts.requireCutover {
+			if err := capacityevidence.ValidateReport(data); err != nil {
+				return err
+			}
+			return validateCutoverMeasurements(cases[capacityCase])
+		}
+		return validateCapacity(fields["mode"], cases[capacityCase], got.Fixture)
 	}
 	return nil
 }
@@ -258,7 +266,7 @@ func validateFile(path string, expected identity, required []string, opts valida
 }
 
 func writeReport(path string, results report) error {
-	return localReportPublisher().writeReport(path, results)
+	return (capacityevidence.ReportPublisher{}).WriteReport(path, results)
 }
 
 func openRegular(path string) (*os.File, error) {

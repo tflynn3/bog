@@ -83,7 +83,7 @@ func TestStrictCutoverReportProof(t *testing.T) {
 		edit       func(*result, *backfillTimeline)
 	}{
 		{name: "both live scales"},
-		{"duplicate scale", "missing capacity fixture", func(r *result, _ *backfillTimeline) { r.Fixture.SeedRows /= 2 }},
+		{"duplicate scale", "duplicate capacity fixture", func(r *result, _ *backfillTimeline) { r.Fixture.SeedRows /= 2 }},
 		{"missing swap", "swap readback", func(r *result, _ *backfillTimeline) { r.CgroupSwap = nil }},
 		{"swap enabled", "swap readback", func(r *result, _ *backfillTimeline) { *r.CgroupSwap = 1 }},
 		{"wrong memory limit", "limit readback", func(r *result, _ *backfillTimeline) { *r.CgroupLimit /= 2 }},
@@ -96,14 +96,14 @@ func TestStrictCutoverReportProof(t *testing.T) {
 		{"store leftover", "cleanup", func(r *result, _ *backfillTimeline) { r.Cleanup.StoreRemoved = false }},
 		{"unexpected exit", "startup lifecycle", func(r *result, _ *backfillTimeline) { r.Diagnostics.Candidates[0].ExitedBeforeCleanup = true }},
 		{"wrong restart row count", "restart parity", func(r *result, _ *backfillTimeline) { r.RecoveredRows-- }},
-		{"wrong cutoff", "exact durable publication", func(_ *result, b *backfillTimeline) { b.RequestedCutoff++ }},
-		{"no replay", "terminal retry", func(_ *result, b *backfillTimeline) { b.TerminalRetried = false }},
-		{"no retirement", "retirement", func(_ *result, b *backfillTimeline) { b.CaptureRetired = false }},
-		{"inexact fresh walk", "exact fresh parity", func(_ *result, b *backfillTimeline) { b.FreshRows-- }},
-		{"missing held pins", "positive held predecessor", func(_ *result, b *backfillTimeline) { b.PinDrain.Held = nil }},
-		{"zero held pins", "positive held predecessor", func(_ *result, b *backfillTimeline) { *b.PinDrain.Held = 0 }},
-		{"missing drained value", "observed zero", func(_ *result, b *backfillTimeline) { b.PinDrain.After = nil }},
-		{"positive drained value", "observed zero", func(_ *result, b *backfillTimeline) { *b.PinDrain.After = 1 }},
+		{"wrong cutoff", "incorrect cutoffs", func(_ *result, b *backfillTimeline) { b.RequestedCutoff++ }},
+		{"no replay", "terminal page replay", func(_ *result, b *backfillTimeline) { b.TerminalRetried = false }},
+		{"no retirement", "capture retirement", func(_ *result, b *backfillTimeline) { b.CaptureRetired = false }},
+		{"inexact fresh walk", "exact fresh walk parity", func(_ *result, b *backfillTimeline) { b.FreshRows-- }},
+		{"missing held pins", "positive held count", func(_ *result, b *backfillTimeline) { b.PinDrain.Held = nil }},
+		{"zero held pins", "positive held count", func(_ *result, b *backfillTimeline) { *b.PinDrain.Held = 0 }},
+		{"missing drained value", "to zero after retirement", func(_ *result, b *backfillTimeline) { b.PinDrain.After = nil }},
+		{"positive drained value", "to zero after retirement", func(_ *result, b *backfillTimeline) { *b.PinDrain.After = 1 }},
 		{"lost status samples", "missing runtime samples", func(_ *result, b *backfillTimeline) { b.Samples = nil }},
 		{"different generation sampled", "publication at the requested cutoff", func(_ *result, b *backfillTimeline) { b.Samples[3].Status.Generation++ }},
 		{"above final peak", "above-final-memory.peak", func(r *result, b *backfillTimeline) { *b.Samples[1].Memory.Bytes = *r.CgroupPeak + 1 }},
@@ -122,7 +122,7 @@ func TestStrictCutoverReportProof(t *testing.T) {
 			if err := writeReport(path, r); err != nil {
 				t.Fatal(err)
 			}
-			err := run(t.Context(), []string{"-validate-cutover", path})
+			err := run(t.Context(), []string{"-validate-cutover", path}, writeReport)
 			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
 				t.Fatalf("validation error = %v, want %q", err, tc.want)
 			}
@@ -136,7 +136,7 @@ func TestCutoverRequiresOverlapMemoryForEveryTimeline(t *testing.T) {
 			t.Run(fmt.Sprintf("%d/%s", f.SeedRows, b.Pattern), func(t *testing.T) {
 				r := passingCutoverReport()
 				r.Cases[capacityCase].Evidence[scale].Diagnostics.Backfills[pattern].Samples[2].Memory = nil
-				if err := r.validateCutover(); err == nil || !strings.Contains(err.Error(), b.Pattern+" backfill: require a bracketed memory.current overlap sample") {
+				if err := r.Cases[capacityCase].Evidence[scale].validateCutover(); err == nil || !strings.Contains(err.Error(), b.Pattern+" backfill: require a bracketed memory.current overlap sample") {
 					t.Fatalf("validation error = %v, want missing overlap rejection for %s", err, b.Pattern)
 				}
 			})
@@ -174,7 +174,7 @@ func TestStrictCutoverTimeoutVerdict(t *testing.T) {
 			if err := os.WriteFile(path, []byte(before+tc.field+after), 0600); err != nil {
 				t.Fatal(err)
 			}
-			err := run(t.Context(), []string{"-validate-cutover", path})
+			err := run(t.Context(), []string{"-validate-cutover", path}, writeReport)
 			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
 				t.Fatalf("validation error = %v, want %q", err, tc.want)
 			}

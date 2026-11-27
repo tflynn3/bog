@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -360,6 +362,11 @@ func TestPinDrainStatusTransitions(t *testing.T) {
 			var calls atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				i := int(calls.Add(1)) - 1
+				if len(tc.counts) == 0 {
+					t.Error("unexpected pin status request without positive held pin evidence")
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
 				count := tc.counts[min(i, len(tc.counts)-1)]
 				// The oldest live pin can be on another generation after the
 				// predecessor drains. Only its own count establishes drain.
@@ -383,7 +390,8 @@ func TestPinDrainStatusTransitions(t *testing.T) {
 			if tc.wantError {
 				limit = 75 * time.Millisecond
 			}
-			err := p.observeDrain(t.Context(), limit)
+			retiredAt := time.Now()
+			err := p.observeDrain(t.Context(), retiredAt, limit)
 			if (err != nil) != tc.wantError || p.PinDrain.Status != tc.want ||
 				len(p.Samples) < len(tc.counts) ||
 				(len(p.Samples) > 0 && p.Samples[0].Event != "after_retirement") {
@@ -391,4 +399,68 @@ func TestPinDrainStatusTransitions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPinDrainBudgetStartsAtCaptureRetirement(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	s := newService(srv.URL)
+	defer s.client.CloseIdleConnections()
+	p := backfillProbe{backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
+		service: s, control: "/compact", dir: t.TempDir(), origin: time.Now().Add(-2 * drainBudget)}
+	p.Publication = &publicationProof{Generation: 4}
+	p.PinDrain = pinDrainProof{Status: "pending", Held: new(uint64(1))}
+	// Model time spent recording diagnostics between retirement and polling.
+	retiredAt := time.Now().Add(-drainBudget)
+	p.record("capture_retired", time.Time{}, retiredAt, compactionReply{}, nil)
+	err := p.observeDrain(t.Context(), retiredAt, drainBudget)
+	if err == nil || !strings.Contains(err.Error(), "predecessor pin drain unconfirmed") {
+		t.Fatalf("observeDrain error = %v, want expired drain budget", err)
+	}
+	if calls.Load() != 0 || len(p.Samples) != 1 || p.PinDrain.Status != "pending" || p.PinDrain.After != nil {
+		t.Fatalf("expired drain issued %d requests, recorded %d samples, proof = %+v", calls.Load(), len(p.Samples), p.PinDrain)
+	}
+}
+
+type drainTransport func(*http.Request) (*http.Response, error)
+
+func (f drainTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestPinDrainRejectsLateZeroReply(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Leave less time than the per-request timeout so the retirement
+		// deadline must be propagated to the request.
+		retiredAt := time.Now().Add(-drainBudget + diagnosticRequestLimit/2)
+		deadline := retiredAt.Add(drainBudget)
+		s := newService("http://candidate.test")
+		s.client.Transport = drainTransport(func(req *http.Request) (*http.Response, error) {
+			if got, ok := req.Context().Deadline(); !ok || !got.Equal(deadline) {
+				t.Errorf("request deadline = %v, want %v", got, deadline)
+			}
+			time.Sleep(time.Until(deadline) + time.Nanosecond)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					`{"state":"complete","generation":4,"covered_rows":128,"committed_rows":192,"metrics":{"retired_generation_pins":0}}`)),
+			}, nil
+		})
+		p := backfillProbe{backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
+			service: s, control: "/compact", origin: retiredAt.Add(-time.Second)}
+		p.Publication = &publicationProof{Generation: 4}
+		p.PinDrain.Held = new(uint64(1))
+		err := p.observeDrain(t.Context(), retiredAt, drainBudget)
+		if err == nil || !strings.Contains(err.Error(), "pin observation exceeded the drain budget") {
+			t.Fatalf("observeDrain error = %v, want late observation error", err)
+		}
+		if len(p.Samples) != 1 || p.Samples[0].Elapsed != deadline.Sub(p.origin)+time.Nanosecond ||
+			p.PinDrain.Status != "pending" || p.PinDrain.After != nil {
+			t.Fatalf("late reply recorded samples %+v with proof %+v", p.Samples, p.PinDrain)
+		}
+	})
 }

@@ -21,6 +21,10 @@ The scattered predecessor covers the full seed and must advance past
 the clustered publication because the producer publishes a seed checkpoint
 between phases. Generation IDs may have gaps.
 
+The last backfill acknowledgment must occur by the recorded
+`fresh_visible` observation. An acknowledgment at the same elapsed
+timestamp is valid. Publication can precede the last acknowledgment.
+
 At least two positive `memory.current` reads, including the overlap read,
 must fall between a running reply and the next request that still observes
 the same running generation. The validator derives the count, span, and
@@ -44,7 +48,10 @@ records and runtime metrics describe different observation sources.
 
 The strict proof still requires a positive `retired_generation_pins`
 count after terminal replay while the capture is held, followed by a
-numeric zero after explicit retirement and within the drain budget.
+numeric zero after explicit retirement and within two seconds of the
+recorded `capture_retired` timestamp, including time before the first
+poll. The producer uses that timestamp for its polling deadline. A zero
+observed at the deadline satisfies the proof.
 Successful pin observations must describe the published generation,
 the requested coverage, and the final committed row count. Within the
 budget, a deadline retry or an unavailable pin count can precede the

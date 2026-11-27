@@ -140,7 +140,7 @@ type wireFailure struct {
 func (e *wireFailure) Error() string { return e.detail }
 func (e *wireFailure) Unwrap() error { return e.cause }
 
-func (t *wireTrace) failure(cause error, sensitive ...string) error {
+func wireErrorDetail(cause error, sensitive ...string) string {
 	detail := cause.Error()
 	for _, token := range sensitive {
 		if token != "" {
@@ -150,12 +150,21 @@ func (t *wireTrace) failure(cause error, sensitive ...string) error {
 			}
 		}
 	}
+	return detail[:min(len(detail), wireDiagnosticBytes)]
+}
+
+func redactWireFailure(cause error, sensitive ...string) error {
+	return &wireFailure{detail: wireErrorDetail(cause, sensitive...), cause: cause}
+}
+
+func (t *wireTrace) failure(cause error, sensitive ...string) error {
+	detail := wireErrorDetail(cause, sensitive...)
 	w := t.walk
 	var message strings.Builder
 	fmt.Fprintf(&message, "seed=%d high_water=%d start=%s end=%s contains=%.80q max_pages=%d max_page_bytes=%d timeout=%s: %.512q",
 		w.Seed, t.highWater, w.Filter.Start.UTC().Format(time.RFC3339Nano),
 		w.Filter.End.UTC().Format(time.RFC3339Nano), w.Filter.Contains,
-		w.Limits.MaxPages, w.Limits.MaxPageBytes, w.Limits.Timeout, detail[:min(len(detail), wireDiagnosticBytes)])
+		w.Limits.MaxPages, w.Limits.MaxPageBytes, w.Limits.Timeout, detail)
 	fmt.Fprintf(&message, "\nrow limits %v", w.RowLimits[:min(len(w.RowLimits), wireTracePages)])
 	if n := len(w.RowLimits) - wireTracePages; n > 0 {
 		fmt.Fprintf(&message, " [omitted %d limits]", n)

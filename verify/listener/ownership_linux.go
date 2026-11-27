@@ -8,7 +8,7 @@ import (
 	"strconv"
 )
 
-func owns(pid, port int) (bool, error) {
+func owns(pid, port int, expected Bind) (bool, error) {
 	var sockets []listenerSocket
 	wildcards := make(map[uint64]bool)
 	for _, table := range []struct {
@@ -72,6 +72,14 @@ func owns(pid, port int) (bool, error) {
 	for _, socket := range sockets {
 		if !owned["socket:["+strconv.FormatUint(socket.inode, 10)+"]"] {
 			return false, fmt.Errorf("foreign listener on IPv4 loopback port %d (socket inode %d belongs outside candidate PID %d)", port, socket.inode, pid)
+		}
+	}
+	if expected != "" {
+		for _, socket := range sockets {
+			if socket.bind != expected {
+				return false, fmt.Errorf("candidate PID %d listener on port %d (socket inode %d) has bind %s, want %s",
+					pid, port, socket.inode, socket.bind, expected)
+			}
 		}
 	}
 	return true, nil

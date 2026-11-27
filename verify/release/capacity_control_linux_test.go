@@ -4,20 +4,25 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"bog/verify/listener"
 )
 
 const (
-	capacityOptIn     = "BOG_CAPACITY_CONTROL"
-	capacityScopeSeed = "capacity scope seed"
+	capacityOptIn       = "BOG_CAPACITY_CONTROL"
+	capacityScopeFilter = "capacity scope"
+	capacityScopeSeed   = capacityScopeFilter + " seed"
+	capacityScopeTail   = capacityScopeFilter + " continuation"
 )
 
 func TestReleaseCapacityControlScope(t *testing.T) {
@@ -33,13 +38,14 @@ func TestReleaseCapacityControlScope(t *testing.T) {
 
 	for _, tc := range []struct {
 		name    string
-		ip      net.IP
+		bind    listener.Bind
 		optIn   string
 		visible bool
 	}{
-		{name: "loopback_without_opt_in", ip: net.IPv4(127, 0, 0, 1)},
-		{name: "wildcard_with_opt_in", ip: net.IPv4zero, optIn: "1"},
-		{name: "loopback_with_opt_in", ip: net.IPv4(127, 0, 0, 1), optIn: "1", visible: true},
+		{name: "loopback_without_opt_in", bind: listener.BindLoopback},
+		{name: "loopback_with_opt_in_disabled", bind: listener.BindLoopback, optIn: "0"},
+		{name: "wildcard_with_opt_in", bind: listener.BindWildcard, optIn: "1"},
+		{name: "loopback_with_opt_in", bind: listener.BindLoopback, optIn: "1", visible: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setenv registers restoration and prevents parallel execution. The
@@ -63,12 +69,16 @@ func TestReleaseCapacityControlScope(t *testing.T) {
 			}
 			defer client.CloseIdleConnections()
 			bind := candidateBind{
-				ip: tc.ip,
+				ip: net.ParseIP(string(tc.bind)),
 				verify: func(pid, port int) error {
-					if err := requireCapacityBind(pid, port, tc.ip.IsUnspecified()); err != nil {
+					owned, err := listener.OwnsBind(pid, port, tc.bind)
+					if err != nil {
 						return err
 					}
-					t.Logf("confirmed candidate pid=%d bind=%s:%d", pid, tc.ip, port)
+					if !owned {
+						return fmt.Errorf("candidate PID %d has no IPv4 loopback listener on port %d", pid, port)
+					}
+					t.Logf("confirmed candidate pid=%d bind=%s:%d", pid, tc.bind, port)
 					return nil
 				},
 			}
@@ -87,11 +97,14 @@ func TestReleaseCapacityControlScope(t *testing.T) {
 
 func probeCapacityControl(ctx context.Context, t *testing.T, client *http.Client, base string, visible bool) error {
 	t.Helper()
-	// Commit a row so cutoff=1 is valid for all three launches.
+	// Commit a row so cutoff=1 ends a whole batch in every launch.
 	if _, err := ingest(ctx, client, base, []row{{TS: fixtureStart, Line: capacityScopeSeed}}); err != nil {
 		return fmt.Errorf("seed compaction cutoff: %w", err)
 	}
 	if !visible {
+		if _, err := ingest(ctx, client, base, []row{{TS: fixtureStart, Line: capacityScopeTail}}); err != nil {
+			return fmt.Errorf("seed continuation: %w", err)
+		}
 		return checkCapacityControlAbsent(ctx, t, client, base)
 	}
 	probeErr := checkCapacityControlPresent(ctx, t, client, base)
@@ -126,173 +139,169 @@ func checkCapacityControlAbsent(ctx context.Context, t *testing.T, client *http.
 	}{
 		{http.MethodGet, "/_capacity/compaction?action=status&cutoff=1", http.StatusNotFound},
 		{http.MethodPost, "/_capacity/compaction?action=start&cutoff=1", http.StatusNotFound},
-		{http.MethodGet, "/healthz", http.StatusOK},
 	} {
 		probeErr = errors.Join(probeErr, checkCapacityHTTPStatus(ctx, t, client, base, probe.method, probe.path, probe.want))
 	}
-	return probeErr
+	retirementErr := checkCapacityRetirementAbsent(ctx, t, client, base)
+	healthErr := checkCapacityHTTPStatus(ctx, t, client, base, http.MethodGet, "/healthz", http.StatusOK)
+	return errors.Join(probeErr, retirementErr, healthErr)
+}
+
+func checkCapacityRetirementAbsent(ctx context.Context, t *testing.T, client *http.Client, base string) error {
+	t.Helper()
+	const pageBytes = 4096
+	pager, err := newReleasePager(base, client, pageBytes)
+	if err != nil {
+		return fmt.Errorf("create retirement scope pager: %w", err)
+	}
+	first, _, err := pager.fetch(ctx, capacityScopeFilter, 1, "")
+	if err == nil {
+		err = checkBudgetPage(first, []row{{TS: fixtureStart, Line: capacityScopeSeed}}, false, nil)
+	}
+	if err != nil {
+		return fmt.Errorf("issue continuation for retirement: %w", err)
+	}
+
+	params := url.Values{"action": {"retire"}, "cursor": {first.NextCursor}}
+	retireErr := checkCapacityHTTPStatus(ctx, t, client, base, http.MethodPost,
+		"/_capacity/compaction?"+params.Encode(), http.StatusNotFound)
+	last, _, resumeErr := pager.fetch(ctx, capacityScopeFilter, 1, first.NextCursor)
+	if resumeErr == nil {
+		resumeErr = checkBudgetPage(last, []row{{TS: fixtureStart, Line: capacityScopeTail}}, true, nil)
+	}
+	if resumeErr != nil {
+		resumeErr = fmt.Errorf("resume continuation after retirement probe: %w", resumeErr)
+	} else if retireErr == nil {
+		t.Log("continuation returned the exact terminal row after HTTP 404 for retirement")
+	}
+	return errors.Join(retireErr, resumeErr)
 }
 
 func checkCapacityHTTPStatus(ctx context.Context, t *testing.T, client *http.Client, base, method, path string, want int) error {
 	t.Helper()
+	label, _, _ := strings.Cut(path, "&cursor=")
 	res, err := request(ctx, client, method, base+path, nil)
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, path, err)
+		return fmt.Errorf("%s %s: %w", method, label, err)
 	}
-	t.Logf("%s %s returned HTTP %d", method, path, res.status)
+	t.Logf("%s %s returned HTTP %d", method, label, res.status)
 	if res.status != want {
-		return fmt.Errorf("%s %s returned HTTP %d, want %d: %.200s", method, path, res.status, want, res.body)
+		return fmt.Errorf("%s %s returned HTTP %d, want %d: %.200s", method, label, res.status, want, res.body)
 	}
 	return nil
 }
 
-// listener.Owns establishes ownership for IPv4 HTTP. Match the child's
-// LISTEN inodes against procfs as well so a loopback fallback cannot pass the
-// wildcard case, even if the process also owns an IPv6-only wildcard.
-func requireCapacityBind(pid, port int, wildcard bool) error {
-	fdDir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
-	entries, err := os.ReadDir(fdDir)
-	if err != nil {
-		return fmt.Errorf("inspect candidate descriptors for bind: %w", err)
-	}
-	owned := make(map[string]bool, len(entries))
-	for _, entry := range entries {
-		target, err := os.Readlink(filepath.Join(fdDir, entry.Name()))
-		if errors.Is(err, os.ErrNotExist) {
-			continue // Unrelated descriptors may close during inspection.
-		}
-		if err != nil {
-			return fmt.Errorf("read candidate descriptor for bind: %w", err)
-		}
-		owned[target] = true
-	}
-
-	// Procfs prints IPv4 words in host byte order on both native runners.
-	// A Go TCP wildcard can be IPv4 or dual-stack IPv6.
-	wantPort := fmt.Sprintf("%04X", port)
-	found := false
-	for _, table := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
-		data, err := os.ReadFile(table)
-		if table == "/proc/net/tcp6" && errors.Is(err, os.ErrNotExist) {
-			continue // The kernel may have IPv6 disabled.
-		}
-		if err != nil {
-			return fmt.Errorf("read candidate bind table %s: %w", table, err)
-		}
-		for line := range strings.SplitSeq(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 4 || fields[3] != "0A" {
-				continue
-			}
-			addr, port, ok := strings.Cut(fields[1], ":")
-			if !ok || port != wantPort {
-				continue
-			}
-			if len(fields) < 10 {
-				return fmt.Errorf("incomplete LISTEN entry in %s for port %s", table, port)
-			}
-			if !owned["socket:["+fields[9]+"]"] {
-				continue
-			}
-			if !capacityBindMatches(addr, wildcard) {
-				return fmt.Errorf("candidate PID %d listener on port %s has unexpected local address %s in %s",
-					pid, port, addr, table)
-			}
-			found = true
-		}
-	}
-	if !found {
-		return fmt.Errorf("no owned LISTEN socket for candidate PID %d on port %d", pid, port)
-	}
-	return nil
-}
-
-func capacityBindMatches(addr string, wildcard bool) bool {
-	if wildcard {
-		return addr == "00000000" || addr == "00000000000000000000000000000000" ||
-			addr == "0000000000000000FFFF000000000000"
-	}
-	return addr == "0100007F" || addr == "0000000000000000FFFF00000100007F"
-}
-
-func TestRequireCapacityBind(t *testing.T) {
+func TestProbeCapacityControlAbsent(t *testing.T) {
 	t.Parallel()
+	const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	for _, tc := range []struct {
-		name     string
-		network  string
-		bind     string
-		wildcard bool
-		wantErr  bool
+		name                                  string
+		status, start, retire, resume, health int
+		missingCursor                         bool
+		wantErr                               string
 	}{
-		{"IPv4 loopback", "tcp4", "127.0.0.1:0", false, false},
-		{"IPv4 wildcard", "tcp4", "0.0.0.0:0", true, false},
-		{"Go TCP wildcard", "tcp", "0.0.0.0:0", true, false},
-		{"reject loopback fallback", "tcp4", "127.0.0.1:0", true, true},
-		{"reject wildcard for loopback", "tcp4", "0.0.0.0:0", false, true},
+		{"hidden and healthy", 404, 404, 404, 200, 200, false, ""},
+		{"status exposed", 200, 404, 404, 200, 200, false, "action=status"},
+		{"start exposed", 404, 200, 404, 200, 200, false, "action=start"},
+		{"start rejects method", 404, 405, 404, 200, 200, false, "action=start"},
+		{"start redirects", 404, 302, 404, 200, 200, false, "action=start"},
+		{"retirement exposed", 404, 404, 204, 200, 200, false, "action=retire"},
+		{"retirement rejects method", 404, 404, 405, 200, 200, false, "action=retire"},
+		{"retirement redirects", 404, 404, 302, 200, 200, false, "action=retire"},
+		{"rejected retirement invalidates cursor", 404, 404, 404, 410, 200, false, "resume continuation after retirement probe"},
+		{"query yields no cursor", 404, 404, 404, 200, 200, true, "missing continuation cursor"},
+		{"health failed", 404, 404, 404, 200, 503, false, "/healthz"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ln, err := net.Listen(tc.network, tc.bind)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if err := ln.Close(); err != nil {
+			t.Parallel()
+			var ingests atomic.Int32
+			var retirementAttempted atomic.Bool
+			handler := http.NewServeMux()
+			handler.HandleFunc("POST /ingest", func(w http.ResponseWriter, r *http.Request) {
+				const rowFormat = "{\"ts\":%q,\"line\":%q}\n"
+				var want string
+				switch ingests.Add(1) {
+				case 1:
+					want = fmt.Sprintf(rowFormat, fixtureStart, capacityScopeSeed)
+				case 2:
+					want = fmt.Sprintf(rowFormat, fixtureStart, capacityScopeTail)
+				default:
+					t.Error("unexpected extra ingest")
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil || string(body) != want {
+					t.Errorf("ingest body = %q, %v, want %q", body, err, want)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})
+			handler.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.health)
+			})
+			handler.HandleFunc("/_capacity/compaction", func(w http.ResponseWriter, r *http.Request) {
+				var status int
+				switch r.Method + " " + r.URL.RawQuery {
+				case "GET action=status&cutoff=1":
+					status = tc.status
+				case "POST action=start&cutoff=1":
+					status = tc.start
+				case "POST action=retire&cursor=" + token:
+					if retirementAttempted.Swap(true) {
+						t.Error("duplicate retirement request")
+					}
+					status = tc.retire
+				default:
+					t.Errorf("unexpected control request %s %q", r.Method, r.URL.RawQuery)
+					status = http.StatusBadRequest
+				}
+				if status == http.StatusFound {
+					w.Header().Set("Location", "/missing")
+				}
+				w.WriteHeader(status)
+			})
+			handler.HandleFunc("GET /query", func(w http.ResponseWriter, r *http.Request) {
+				var line string
+				switch r.URL.RequestURI() {
+				case queryPath("", 1, capacityScopeFilter):
+					if !tc.missingCursor {
+						w.Header().Set(nextCursor, token)
+					}
+					line = capacityScopeSeed
+				case queryPath(token, 1, capacityScopeFilter):
+					if !retirementAttempted.Load() {
+						t.Error("continuation resumed before retirement was attempted")
+					}
+					if tc.resume != http.StatusOK {
+						http.Error(w, "query capture expired", tc.resume)
+						return
+					}
+					line = capacityScopeTail
+				default:
+					t.Errorf("unexpected page request %q", r.URL.RequestURI())
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "application/x-ndjson")
+				if _, err := fmt.Fprintf(w, "{\"ts\":%q,\"line\":%q}\n", fixtureStart, line); err != nil {
 					t.Error(err)
 				}
 			})
-			err = requireCapacityBind(os.Getpid(), ln.Addr().(*net.TCPAddr).Port, tc.wildcard)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("requireCapacityBind returned %v, want error=%t", err, tc.wantErr)
-			}
-		})
-	}
-}
-
-func TestCheckCapacityControlAbsent(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name                  string
-		status, start, health int
-		wantErr               string
-	}{
-		{"hidden and healthy", 404, 404, 200, ""},
-		{"status exposed", 200, 404, 200, "action=status"},
-		{"start exposed", 404, 200, 200, "action=start"},
-		{"start rejects method", 404, 405, 200, "action=start"},
-		{"start redirects", 404, 302, 200, "action=start"},
-		{"health failed", 404, 404, 503, "/healthz"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			handler := http.NewServeMux()
-			handler.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(tc.health)
-			})
-			for _, probe := range []struct {
-				method, action string
-				status         int
-			}{
-				{http.MethodGet, "status", tc.status},
-				{http.MethodPost, "start", tc.start},
-			} {
-				handler.HandleFunc(probe.method+" /_capacity/compaction", func(w http.ResponseWriter, r *http.Request) {
-					if r.URL.RawQuery != "action="+probe.action+"&cutoff=1" {
-						t.Errorf("unexpected compaction query %q", r.URL.RawQuery)
-						w.WriteHeader(http.StatusBadRequest)
-						return
-					}
-					if probe.status == http.StatusFound {
-						w.Header().Set("Location", "/missing")
-					}
-					w.WriteHeader(probe.status)
-				})
-			}
 			server := httptest.NewServer(handler)
 			defer server.Close()
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 			defer cancel()
 			client := server.Client()
 			client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-			err := checkCapacityControlAbsent(ctx, t, client, server.URL)
+			err := probeCapacityControl(ctx, t, client, server.URL, false)
+			if got := ingests.Load(); got != 2 {
+				t.Errorf("ingests = %d, want 2", got)
+			}
+			if retirementAttempted.Load() == tc.missingCursor {
+				t.Errorf("retirement attempted = %t, want %t", retirementAttempted.Load(), !tc.missingCursor)
+			}
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatal(err)

@@ -61,24 +61,31 @@ fixture, even if escalation to SIGKILL succeeds.
 Dispatch from a workflow ref containing this probe and pass the full
 composed #53 candidate SHA as `revision`. Both native jobs require an
 explicit passing event for `TestReleaseCapacityControlScope` against the
-pinned candidate. The test
-starts three children in separate disposable data directories. Each
-child must acknowledge ingest of one seed row.
+pinned candidate. The test starts four children in separate disposable
+data directories. Each child must acknowledge a one-row batch so cutoff 1
+falls on a committed batch boundary.
 
 | Bind | `BOG_CAPACITY_CONTROL` | Required behavior |
 | --- | --- | --- |
-| `127.0.0.1` | Unset | Status and start at cutoff 1 both return HTTP 404. |
-| `0.0.0.0` | `1` | Status and start at cutoff 1 both return HTTP 404. |
+| `127.0.0.1` | Unset | Status, start, and capture retirement return HTTP 404. |
+| `127.0.0.1` | `0` | Status, start, and capture retirement return HTTP 404. |
+| `0.0.0.0` | `1` | Status, start, and capture retirement return HTTP 404. |
 | `127.0.0.1` | `1` | Status at cutoff 0 reports a complete predecessor with zero covered rows and one committed row. Start at cutoff 1 and bounded status polling must yield a newer complete generation with exactly one covered row and one committed row. |
 
-All requests use `127.0.0.1`. For each child, the verifier checks listener
-ownership and the actual bind in the Linux TCP tables, including the
-dual-stack wildcard case. It checks `/healthz` before and after the
-workload and requires successful child teardown and fixture cleanup.
-The positive case costs one additional launch and fixture directory per
-architecture, with a five-second deadline for start and status polling.
-The live capacity workload also verifies replacement and restart under
-the 128 MiB cap at both fixture sizes.
+The three hidden-control launches acknowledge a second one-row batch.
+The verifier requests status and start at cutoff 1, obtains a
+continuation through a one-row query page, and submits that token to
+`POST /_capacity/compaction?action=retire&cursor=TOKEN`. After HTTP 404,
+the same token must return the exact remaining row and end the walk.
+
+All requests use `127.0.0.1`. For each child, the shared Linux listener
+helper checks ownership and the expected bind of every socket that can
+serve the IPv4 probe. It counts dual-stack wildcards as wildcard binds
+and excludes IPv6-only sockets. The verifier checks `/healthz` before and
+after the workload and requires successful child teardown and fixture
+cleanup. The positive case has a five-second deadline for start and status
+polling. The live capacity workload also verifies replacement and
+restart under the 128 MiB cap at both fixture sizes.
 
 The artifacts include `capacity-control-scope-events.jsonl`,
 `capacity_control_scope.log`, and the producer entry in `producers.txt`.

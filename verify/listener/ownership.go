@@ -8,19 +8,44 @@ import (
 	"strings"
 )
 
+// Bind describes the local address of a listener that accepts IPv4 loopback
+// connections.
+type Bind string
+
+const (
+	BindLoopback Bind = "127.0.0.1"
+	BindWildcard Bind = "0.0.0.0"
+)
+
 // Owns reports whether pid holds every listening socket that can accept
 // connections to 127.0.0.1:port. It returns false with no error while there is
 // no matching listener and an error if a foreign listener is present or
 // ownership cannot be determined. The caller owns the child lifecycle.
 func Owns(pid, port int) (bool, error) {
+	return checkOwnership(pid, port, "")
+}
+
+// OwnsBind applies the same ownership check as Owns and requires every
+// matching socket to have the expected bind. IPv4-mapped addresses count as
+// their IPv4 equivalents, and a dual-stack wildcard counts as BindWildcard.
+// IPv6-only listeners do not participate. A wrong bind returns an error.
+func OwnsBind(pid, port int, expected Bind) (bool, error) {
+	if expected != BindLoopback && expected != BindWildcard {
+		return false, fmt.Errorf("invalid expected candidate listener bind %q", expected)
+	}
+	return checkOwnership(pid, port, expected)
+}
+
+func checkOwnership(pid, port int, expected Bind) (bool, error) {
 	if pid <= 0 || port <= 0 || port > 65535 {
 		return false, fmt.Errorf("invalid candidate listener PID %d or port %d", pid, port)
 	}
-	return owns(pid, port)
+	return owns(pid, port, expected)
 }
 
 type listenerSocket struct {
 	inode        uint64
+	bind         Bind
 	ipv6Wildcard bool
 }
 
@@ -40,15 +65,12 @@ func listenerSockets(table string, port int, ipv6 bool) ([]listenerSocket, error
 		if !ok || gotPort != wantPort {
 			continue
 		}
-		switch addr {
-		case "0100007F", "00000000":
-			if ipv6 {
-				continue
-			}
-		case "0000000000000000FFFF00000100007F", "0000000000000000FFFF000000000000", wildcard6:
-			if !ipv6 {
-				continue
-			}
+		var bind Bind
+		switch {
+		case !ipv6 && addr == "0100007F", ipv6 && addr == "0000000000000000FFFF00000100007F":
+			bind = BindLoopback
+		case !ipv6 && addr == "00000000", ipv6 && addr == "0000000000000000FFFF000000000000", ipv6 && addr == wildcard6:
+			bind = BindWildcard
 		default:
 			continue
 		}
@@ -59,7 +81,7 @@ func listenerSockets(table string, port int, ipv6 bool) ([]listenerSocket, error
 		if err != nil || inode == 0 {
 			return nil, fmt.Errorf("invalid listening socket inode %q", fields[9])
 		}
-		sockets = append(sockets, listenerSocket{inode: inode, ipv6Wildcard: addr == wildcard6})
+		sockets = append(sockets, listenerSocket{inode: inode, bind: bind, ipv6Wildcard: addr == wildcard6})
 	}
 	return sockets, nil
 }

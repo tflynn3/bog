@@ -5,29 +5,30 @@
 in-memory query view. This contract applies to the composed #53 and #59
 runtime. [ADR 0004](0004-retained-history-cutover.md#paging-and-delivery)
 records the earlier immediate-continuation probe. This decision supersedes
-that probe with certification through exhaustion.
+that probe with certification through exhaustion or the first oversized match.
 
 ## Decision
 
 A snapshot walk starts with `page=1`. Before committing a first page with
-`Bog-Next-Cursor`, HTTP certifies that the rest of the walk can reach a
-terminal page under the same configured per-request work budget and
-response byte cap. Certification covers retries and changes to a valid
-`limit`, including smaller limits on resume. The first request pays for
+`Bog-Next-Cursor`, HTTP certifies that the rest of the walk can reach
+exhaustion or the first oversized match under the same configured per-request
+work budget and response byte cap. Certification covers retries and changes
+to a valid `limit`, including smaller limits on resume. The first request pays for
 capture, certification, and its own response within its work allowance.
 The certification must also bound each later request within that same
 allowance, including cursor authentication, source work, response
 preparation, and delivery.
 
-Certify bounded scans on the pinned view through proven exhaustion and
-retain a bounded replay plan. Each replay uses the same source limit and
+Certify bounded scans on the pinned view and retain a bounded replay plan.
+Each retained-source replay uses the same source limit and
 exclusive anchor as a certified scan. HTTP applies the requested row
 limit and byte cap to the replayed rows. This lets a continuation split a
 scan's rows or cross a scan boundary without introducing an uncertified
 seek across a sparse range. Account for positioning, seek, merge, filter,
 lookahead, encoding, and delivery, including the work to establish that
 no further match exists. Bound live captures and plan metadata. An
-ordinary query uses the same request limits without retaining a walk.
+ordinary query uses the same request limits without retaining a walk. The
+legacy in-memory plan certifies replay using its captured ordered match offsets.
 
 Each page emits the longest ordered prefix that fits the row and encoded
 byte caps. If the byte cap trims the result, the continuation starts
@@ -39,9 +40,12 @@ generation replacement. Ties use the global append ordinal.
 
 When the available work or plan bounds cannot certify the walk, return
 503 `query work budget exhausted` before committing any NDJSON or cursor.
-If a matching record cannot fit by itself under the response cap, return
-422 before issuing a cursor for that walk. Query or capture saturation
-can still return 503 `query capacity exhausted`. Hold query admission
+If a matching record cannot fit by itself under the response cap, issue the
+cursor alongside the preceding fitting rows. The request that reaches the
+oversized match as its first row returns 422 with the same exact encoded size
+on every retry while the capture is live. A walk that opens at an oversized
+match returns 422 immediately. Query or capture saturation can still return
+503 `query capacity exhausted`. Hold query admission
 through body delivery. Failures before commitment preserve the request
 cursor for retry while the capture is live. The prepared response has an
 exact `Content-Length` so clients can detect an interrupted body.
@@ -68,14 +72,23 @@ previous issuer returns 400 `invalid cursor`. An authenticated cursor
 whose capture is expired or unavailable returns 410
 `query capture expired`. Start a fresh walk with `page=1`.
 
-The source cleans up failed acquisitions. HTTP releases successful
-acquisitions that publish no cursor, including failed preparation.
-Once a cursor can reach the client, even if the body is interrupted,
-keep the capture retryable through terminal pages until expiry or
-explicit release. Expiry or release bars new operations. Admitted
-requests and storage operations keep their references until they drain.
-Each release is idempotent, and retired storage becomes reclaimable
-after its final reference drains.
+The source cleans up failed acquisitions. HTTP owns successful acquisitions
+and releases openings that prepare no cursor, fail before commitment, or
+encounter a transport failure that confirms headers were never sent. A
+`ResponseWriter` that can guarantee this outcome and prevent a later write
+may wrap `httpapi.ErrQueryHeadersUnsent` in the opening header flush error.
+A generic transport error leaves delivery uncertain. Once a cursor can
+reach the client, keep the capture retryable even if the body is interrupted.
+The input cursor of a terminal page replays its exact bytes until expiry or
+explicit retirement.
+
+Both constructors expose `RetireQueryCapture` and `Close` on the issuing
+handler. Retirement authenticates either cursor format and is idempotent.
+Expiry, retirement, and shutdown bar new resumes. Admitted requests keep
+their references through delivery. After the final user drains, HTTP calls
+`PageSource.Release` once and keeps the capture charged until release returns.
+The command drains HTTP and calls `Close` with a deadline before closing
+storage. [Cursor retirement](0031-retained-cursor-retirement.md)
 
 ## Ownership and qualification
 

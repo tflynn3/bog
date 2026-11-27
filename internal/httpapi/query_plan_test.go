@@ -160,6 +160,60 @@ func TestCertifiedQueryFillsPagesAcrossShortSourceScans(t *testing.T) {
 	}
 }
 
+func TestCertifiedOversizedMatchAtShortScanBoundary(t *testing.T) {
+	stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	rows := []store.Row{
+		{TS: stamp, Line: "opening"},
+		{TS: stamp, Line: "first tie"},
+		{TS: stamp, Line: "second tie"},
+		{TS: stamp, Line: strings.Repeat("<", 64)},
+		{TS: stamp, Line: "after oversized"},
+	}
+	s := new(store.Store)
+	s.Publish(rows)
+	const capBytes = 256
+	open := func(budget uint64) *API {
+		return NewWithPageSource(&shortScanSource{legacyPageSource{store: s}}, nil, capBytes, 1, budget)
+	}
+	const opening = "&page=1&limit=1"
+	low, high := uint64(1), uint64(2048)
+	for low < high {
+		budget := low + (high-low)/2
+		a := open(budget)
+		out := requestCapturePage(a, opening)
+		if err := a.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if out.Code == http.StatusOK {
+			high = budget
+		} else {
+			assertQueryRejection(t, out, http.StatusServiceUnavailable, "query work budget exhausted")
+			low = budget + 1
+		}
+	}
+	a := open(low)
+	closeRetirementTestAPI(t, a)
+	input := issueCapture(t, a)
+	// One response fills across two certified scans and reaches the oversized
+	// scan. A row-limited response reaches the same match via a different cut.
+	wide := requestCapturePage(a, "&limit=1000&cursor="+input)
+	blocked := assertRetainedPage(t, wide, jsonRow(t, rows[1])+jsonRow(t, rows[2]))
+	if blocked == "" {
+		t.Fatal("fitting prefix is missing its cursor")
+	}
+	for i := 1; i <= 2; i++ {
+		out := requestCapturePage(a, "&limit=1&cursor="+input)
+		input = assertRetainedPage(t, out, jsonRow(t, rows[i]))
+	}
+	if input != blocked {
+		t.Fatal("row-limited and wide replays disagree on the blocked cursor")
+	}
+	message := fmt.Sprintf("query record exceeds response byte limit (cap %d bytes, requires %d bytes)", capBytes, len(jsonRow(t, rows[3])))
+	for _, limit := range []string{"1", "1000"} {
+		assertQueryRejection(t, requestCapturePage(a, "&limit="+limit+"&cursor="+blocked), http.StatusUnprocessableEntity, message)
+	}
+}
+
 func TestQueryCertificationBoundsPlanMetadata(t *testing.T) {
 	stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	rows := make([]store.Row, maxCertifiedScans+2)

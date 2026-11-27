@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"net/http"
 	"unicode/utf8"
@@ -129,6 +130,30 @@ func (b *queryResponse) reserveDelivery(work *store.QueryWork) error {
 func (b *queryResponse) write(w http.ResponseWriter, token string) {
 	setQueryPageHeaders(w.Header(), b.size, token)
 	w.WriteHeader(http.StatusOK)
+	b.writeBody(w)
+}
+
+// ErrQueryHeadersUnsent may be wrapped by a ResponseWriter's FlushError
+// when it can guarantee that no response headers were sent and none will
+// be sent later. A generic transport error can follow a partial header write.
+var ErrQueryHeadersUnsent = errors.New("query response headers were not sent")
+
+func (b *queryResponse) writeOpening(w http.ResponseWriter, token string, cursorMayHaveReached *bool) {
+	setQueryPageHeaders(w.Header(), b.size, token)
+	*cursorMayHaveReached = true
+	w.WriteHeader(http.StatusOK)
+	err := http.NewResponseController(w).Flush()
+	if errors.Is(err, ErrQueryHeadersUnsent) {
+		*cursorMayHaveReached = false
+		return
+	}
+	if err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return
+	}
+	b.writeBody(w)
+}
+
+func (b *queryResponse) writeBody(w http.ResponseWriter) {
 	for _, record := range b.rows {
 		if n, err := w.Write(record); err != nil || n != len(record) {
 			// The client can detect the interrupted body using Content-Length.

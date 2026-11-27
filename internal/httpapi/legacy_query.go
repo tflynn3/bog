@@ -1,21 +1,14 @@
 package httpapi
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/binary"
 	"net/http"
 
 	"bog/internal/store"
 )
 
 const (
-	legacyCursorPayload     = 8 + 4 // capture ID and next match offset
-	legacyCursorSize        = legacyCursorPayload + sha256.Size
-	legacyCursorReservation = (legacyCursorSize*8 + 5) / 6
-	legacyCursorWork        = 1 // fixed-size signing or authentication and registry access
-	maxLegacyMatches        = maxCertifiedScans * maxQueryLimit
+	legacyCursorWork = 1 // fixed-size signing or authentication and registry access
+	maxLegacyMatches = maxCertifiedScans * maxQueryLimit
 )
 
 // A legacy capture records the exact ordered matches, including exhaustion,
@@ -26,38 +19,7 @@ type legacyQueryPlan struct {
 	sizes   []int
 }
 
-func (a *API) signLegacyCursor(payload []byte, filter [sha256.Size]byte) []byte {
-	var signed [legacyCursorPayload + sha256.Size]byte
-	copy(signed[:legacyCursorPayload], payload)
-	copy(signed[legacyCursorPayload:], filter[:])
-	return a.cursorMAC(signed[:])
-}
-
-func (a *API) encodeLegacyCursor(id uint64, offset int, filter [sha256.Size]byte) string {
-	var token [legacyCursorSize]byte
-	binary.BigEndian.PutUint64(token[:8], id)
-	binary.BigEndian.PutUint32(token[8:legacyCursorPayload], uint32(offset))
-	copy(token[legacyCursorPayload:], a.signLegacyCursor(token[:legacyCursorPayload], filter))
-	return base64.RawURLEncoding.EncodeToString(token[:])
-}
-
-func (a *API) decodeLegacyCursor(token string, filter [sha256.Size]byte) (uint64, int, error) {
-	var b [legacyCursorSize]byte
-	n, err := base64.RawURLEncoding.Strict().Decode(b[:], []byte(token))
-	if err != nil || n != len(b) ||
-		!hmac.Equal(b[legacyCursorPayload:], a.signLegacyCursor(b[:legacyCursorPayload], filter)) {
-		return 0, 0, store.ErrInvalidQueryCursor
-	}
-	return binary.BigEndian.Uint64(b[:8]), int(binary.BigEndian.Uint32(b[8:legacyCursorPayload])), nil
-}
-
-func (a *API) legacySnapshotQuery(w http.ResponseWriter, params queryParams, work *store.QueryWork) {
-	source := a.captures.source.(*legacyPageSource)
-	if params.page {
-		a.startLegacyQuery(w, params, source, work)
-		return
-	}
-
+func (a *API) resumeLegacyQuery(w http.ResponseWriter, params queryParams, work *store.QueryWork) {
 	if len(params.cursor) != legacyCursorReservation {
 		writeQueryError(w, store.ErrInvalidQueryCursor)
 		return
@@ -67,19 +29,20 @@ func (a *API) legacySnapshotQuery(w http.ResponseWriter, params queryParams, wor
 		return
 	}
 	filter := a.filterDigest(params.filter)
-	id, offset, err := a.decodeLegacyCursor(params.cursor, filter)
-	if err != nil {
-		writeQueryError(w, err)
+	cursor, err := a.decodeLegacyCursor(params.cursor)
+	if err != nil || cursor.filter != filter {
+		writeQueryError(w, store.ErrInvalidQueryCursor)
 		return
 	}
-	capture, err := a.captures.acquire(id)
+	capture, err := a.captures.acquire(cursor.capture)
 	if err != nil {
 		writeQueryError(w, err)
 		return
 	}
 	defer a.captures.done(capture, false)
 
-	plan := source.lookup(capture.sourceID).plan
+	plan := a.legacy.lookup(capture.sourceID).plan
+	offset := cursor.offset
 	if plan == nil || offset <= 0 || offset >= len(plan.sizes) {
 		writeQueryError(w, store.ErrInvalidQueryCursor)
 		return
@@ -91,7 +54,7 @@ func (a *API) legacySnapshotQuery(w http.ResponseWriter, params queryParams, wor
 	}
 	var token string
 	if next < len(plan.sizes) {
-		token = a.encodeLegacyCursor(id, next, filter)
+		token = a.encodeLegacyCursor(legacyCursor{cursor.capture, next, filter})
 	}
 	if err := work.Charge(); err != nil {
 		writeQueryError(w, err)
@@ -100,49 +63,26 @@ func (a *API) legacySnapshotQuery(w http.ResponseWriter, params queryParams, wor
 	response.write(w, token)
 }
 
-func (a *API) startLegacyQuery(w http.ResponseWriter, params queryParams, source *legacyPageSource, work *store.QueryWork) {
-	capture, err := a.captures.reserve()
-	if err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	published := false
-	defer func() { a.captures.done(capture, !published) }()
-
+func (a *API) prepareLegacyOpening(capture *queryCapture, params queryParams, work *store.QueryWork) (queryResponse, string, error) {
 	filter := params.filter
-	matches, err := source.store.CapturePositionedMatches(filter.Start, filter.End, filter.Contains, maxLegacyMatches, work)
+	matches, err := a.legacy.store.CapturePositionedMatches(filter.Start, filter.End, filter.Contains, maxLegacyMatches, work)
 	if err != nil {
-		writeQueryError(w, err)
-		return
+		return queryResponse{}, "", err
 	}
 	plan := &legacyQueryPlan{matches: matches, sizes: make([]int, matches.Len())}
 	response, err := plan.prepare(params.limit, a.maxResponseBytes, uint64(len(filter.Contains)), a.queryWorkBudget, work)
 	if err != nil {
-		writeQueryError(w, err)
-		return
+		return queryResponse{}, "", err
 	}
-	var token string
 	first := len(response.rows)
-	if first < matches.Len() {
-		if err := work.Charge(legacyCursorWork, uint64(len(filter.Contains))); err != nil {
-			writeQueryError(w, err)
-			return
-		}
-		token = a.encodeLegacyCursor(capture.id, first, a.filterDigest(filter))
+	if first == len(plan.sizes) {
+		return response, "", nil
 	}
-	if token != "" {
-		capture.sourceID = source.retain(legacyView{plan: plan})
-		if err := a.captures.publish(capture); err != nil {
-			writeQueryError(w, err)
-			return
-		}
+	if err := work.Charge(legacyCursorWork, uint64(len(filter.Contains))); err != nil {
+		return queryResponse{}, "", err
 	}
-	if err := work.Charge(); err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	published = token != ""
-	response.write(w, token)
+	capture.sourceID = a.legacy.retain(legacyView{plan: plan})
+	return response, a.encodeLegacyCursor(legacyCursor{capture.id, first, a.filterDigest(filter)}), nil
 }
 
 // prepare measures each record once, prepares the longest opening prefix,
@@ -163,10 +103,20 @@ func (p *legacyQueryPlan) prepare(limit, byteCap int, literalWork, budget uint64
 		if err != nil {
 			return queryResponse{}, err
 		}
-		if size > byteCap {
-			return queryResponse{}, &oversizedQueryRecord{byteCap, size}
-		}
 		p.sizes[i] = size
+		if size > byteCap {
+			if i == 0 {
+				return queryResponse{}, &oversizedQueryRecord{byteCap, size}
+			}
+			if !first {
+				if err := window.certify(i, size, byteCap, literalWork, budget); err != nil {
+					return queryResponse{}, err
+				}
+			}
+			// Keep the barrier's exact size. No continuation can cross it.
+			p.sizes = p.sizes[:i+1]
+			return response, response.reserveDelivery(work)
+		}
 		if first && i < limit && size <= byteCap-response.size {
 			if err := appendMeasuredLegacyRow(&response, row.Line, stamp, size, true, work); err != nil {
 				return queryResponse{}, err
@@ -236,6 +186,9 @@ func (p *legacyQueryPlan) replay(offset, limit, byteCap int, work *store.QueryWo
 		}
 		size := p.sizes[offset]
 		if size > byteCap-response.size {
+			if response.size == 0 {
+				return queryResponse{}, 0, &oversizedQueryRecord{byteCap, size}
+			}
 			break
 		}
 		row := p.matches.At(offset).Row

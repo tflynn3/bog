@@ -98,7 +98,7 @@ func listVerifierTestPackages(t *testing.T, arch string) map[string]verifierTest
 func verifierConsumerProblems(rules map[string]rule, consumers map[string]verifierTestConsumer, packages map[string]verifierTestPackage) []string {
 	reached := make(map[string]bool)
 	for path, entry := range rules {
-		if entry.role == verifier && path != operatorCommand {
+		if entry.role == verifier && !isOperatorCommand(path) {
 			maps.Copy(reached, registeredReachability(rules, path))
 		}
 	}
@@ -254,10 +254,19 @@ func TestVerifierConsumerFixtures(t *testing.T) {
 			want: []string{"verifier support " + helper + " has no evidence command or named test consumer", missing},
 		},
 		{
-			name: "operator is outside the evidence roots",
+			name: "backup verification is outside the evidence roots",
 			change: func(rules map[string]rule, consumers map[string]verifierTestConsumer, _ map[string]verifierTestPackage) {
 				delete(consumers, queryModel)
 				rules[operatorCommand] = rule{verifier, []string{queryModel}}
+			},
+			want: []string{missing},
+		},
+		{
+			name: "operator export cannot establish ownership through the client",
+			change: func(rules map[string]rule, consumers map[string]verifierTestConsumer, _ map[string]verifierTestPackage) {
+				delete(consumers, queryModel)
+				rules[exportCommand] = rule{verifier, []string{goClient}}
+				rules[goClient] = rule{standalone, []string{queryModel}}
 			},
 			want: []string{missing},
 		},

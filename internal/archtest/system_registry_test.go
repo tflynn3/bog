@@ -130,7 +130,7 @@ func systemRoleLabel(path string, registeredRole role) string {
 	case testOnly:
 		return "Test-only"
 	case verifier:
-		if path == operatorCommand {
+		if isOperatorCommand(path) {
 			return "Operator command"
 		}
 		return "Verifier command"
@@ -148,6 +148,7 @@ func TestSystemPackageRegistryFixtures(t *testing.T) {
 		release     = "bog/verify/release"
 		serverRow   = "| `cmd/bog` | Server command | Server lifecycle. |\n"
 		operatorRow = "| `cmd/bog-verify` | Operator command | Read-only verification. |\n"
+		exportRow   = "| `cmd/bog-export` | Operator command | HTTP query export. |\n"
 		releaseRow  = "| `verify/release` | Verifier command | Release evidence. |\n"
 		stagedRow   = "| `internal/backup` | Staged | Pinned export and read-only verification. |\n"
 		wiredRow    = "| `internal/backup` | Wired | Verified writable recovery. |\n"
@@ -164,6 +165,7 @@ func TestSystemPackageRegistryFixtures(t *testing.T) {
 		rows        string
 		promoted    bool
 		declaration bool
+		exportRole  string
 		want        []string
 	}{
 		{name: "operator-only backup remains staged", rows: stagedRow + releaseRow, declaration: true},
@@ -191,6 +193,13 @@ func TestSystemPackageRegistryFixtures(t *testing.T) {
 			rows:        stagedRow + strings.Replace(releaseRow, "Verifier command", "Operator command", 1),
 			declaration: true,
 			want:        []string{`role mismatch for ` + release + ` in the package registry table: got "Operator command", want "Verifier command"`},
+		},
+		{
+			name:        "exporter labeled as an evidence verifier",
+			rows:        stagedRow + releaseRow,
+			declaration: true,
+			exportRole:  "Verifier command",
+			want:        []string{`role mismatch for ` + exportCommand + ` in the package registry table: got "Verifier command", want "Operator command"`},
 		},
 		{
 			name: "unregistered staged row", rows: stagedRow + releaseRow + removedRow, declaration: true,
@@ -240,6 +249,8 @@ func TestSystemPackageRegistryFixtures(t *testing.T) {
 			rules := map[string]rule{
 				server:          {role: serverCommand},
 				operatorCommand: {verifier, []string{backup}},
+				exportCommand:   {verifier, []string{goClient}},
+				goClient:        {role: standalone},
 				backup:          {role: staged},
 				release:         {role: verifier},
 			}
@@ -254,7 +265,12 @@ func TestSystemPackageRegistryFixtures(t *testing.T) {
 					owner: "bog-storage", activation: "Prove verified writable restore and restart parity.",
 				}
 			}
-			doc := before + section + tableHeader + serverRow + operatorRow + tt.rows + after
+			exporter := exportRow
+			if tt.exportRole != "" {
+				exporter = strings.Replace(exporter, "Operator command", tt.exportRole, 1)
+			}
+			doc := before + section + tableHeader + serverRow + operatorRow + exporter +
+				"| `internal/client` | Standalone | HTTP client. |\n" + tt.rows + after
 			if got := systemRegistryProblems(doc, rules, declarations); !slices.Equal(got, tt.want) {
 				t.Errorf("systemRegistryProblems() = %q, want %q", got, tt.want)
 			}

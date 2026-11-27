@@ -19,14 +19,15 @@ uses an independent query oracle to derive expected rows from its fixture.
 
 ## Decision
 
-Keep both Linux production roots registered. `cmd/bog` has the server command
-role. `cmd/bog-verify` has the verifier command role. Their registered
-root-module production graphs must satisfy these rules.
+Keep the Linux production roots registered. `cmd/bog` has the server command
+role. Operator commands use the verifier command role in the fitness registry.
+Their registered root-module production graphs must satisfy these rules.
 
 | Root | Excluded destinations, direct or transitive | Intended dependencies |
 | --- | --- | --- |
 | `cmd/bog` | `internal/client`, `verify/query-model` | Server and storage packages reached through the production composition |
 | `cmd/bog-verify` | `internal/wal`, `internal/httpapi`, `internal/readiness` | Read-only backup APIs, production HTTP client, and shared row types |
+| `cmd/bog-export` | `cmd/bog`, `internal/httpapi`, `internal/readiness`, `internal/wal`, `internal/backup`, `internal/checkpoint`, `internal/history`, `internal/idempotency`, and packages at or under `verify` and `bench` | Exactly one direct root-module import, `internal/client`, which may use shared row types |
 
 The server supplies query results without relying on either the caller's
 HTTP client or the independent model used to verify it. The operator
@@ -37,6 +38,10 @@ composition uses them. The HTTP paging seam and storage authority rules
 continue to govern which packages can reach those libraries and the WAL
 owner. [HTTP paging boundary](../../internal/archtest/cutover_boundaries_test.go),
 [Storage authority boundary](../../internal/archtest/storage_authority_test.go)
+
+`cmd/bog-export` reads the server's query view through HTTP. Release evidence
+commands establish production ownership of verifier support packages.
+[Operator export boundary and #53 registry handoff](0032-operator-export-boundary.md)
 
 The exact-import and cycle suite checks the registry against the Linux
 production inventory on amd64 and arm64. The companion checks traverse
@@ -79,6 +84,9 @@ Explicit roles and measured edges require registry updates alongside wiring
 changes and make earlier or transitive activation visible during review.
 
 ## SYSTEM.md handoff for #53
+
+Follow ADR 0032 for the exporter registration and lease handoff.
+[Exporter integration and qualification](0032-operator-export-boundary.md#integration-and-qualification)
 
 Add the operator root outside the server subgraph using the following
 operator edges, observed on both Linux targets at `e345ff8`. Re-measure

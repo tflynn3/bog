@@ -110,7 +110,7 @@ func (s *revisionScenario) resume(ctx context.Context, target Target, held curso
 
 func (s *revisionScenario) rejectRevisionQueries(ctx context.Context, target Target, baseline *rejection, references, tokens []string) error {
 	for _, token := range tokens {
-		request := s.queryRequest(target, 1)
+		request := s.queryRequest(target, 10)
 		request.Cursor = token
 		page, err := s.query(ctx, request, baseline.status)
 		if err != nil {
@@ -123,7 +123,36 @@ func (s *revisionScenario) rejectRevisionQueries(ctx context.Context, target Tar
 	return nil
 }
 
+type revisionCursorObserver struct {
+	QueryObserver
+	issued []string
+}
+
+func (o *revisionCursorObserver) Query(ctx context.Context, request QueryRequest) (Page, error) {
+	page, err := o.QueryObserver.Query(ctx, request)
+	if err == nil && page.NextCursor != "" {
+		o.issued = append(o.issued, page.NextCursor)
+	}
+	return page, err
+}
+
+func (s *revisionScenario) recordRevisionCursors() *revisionCursorObserver {
+	if observer, ok := s.Query.(*revisionCursorObserver); ok {
+		return observer
+	}
+	observer := &revisionCursorObserver{QueryObserver: s.Query}
+	s.Query = observer
+	return observer
+}
+
+func (s *revisionScenario) checkQueries(ctx context.Context) error {
+	// The candidate checks the static scope matrix before the revision probes.
+	s.recordRevisionCursors()
+	return s.scenario.checkQueries(ctx)
+}
+
 func (s *revisionScenario) checkGrantRevisions(ctx context.Context) error {
+	s.recordRevisionCursors()
 	a, b := s.fixture.Streams[0].Selector, s.fixture.Streams[1].Selector
 	owner, expansion := Target{alice, a}, Target{bob, b}
 	held, err := s.open(ctx, owner)
@@ -189,19 +218,36 @@ func (s *revisionScenario) checkMaskingFilters(ctx context.Context, target Targe
 func (s *revisionScenario) checkMaskingRevisions(ctx context.Context) error {
 	a := Target{alice, s.fixture.Streams[0].Selector}
 	b := Target{bob, s.fixture.Streams[1].Selector}
-	original, err := s.open(ctx, a)
-	if err != nil {
-		return err
+	refs := slices.Clone(s.recordRevisionCursors().issued)
+	// Reserve each issued token for one probe. A previous presentation can
+	// consume a cursor and make a later rejection ambiguous.
+	open := func(target Target, witnesses ...*cursorCase) error {
+		for _, witness := range witnesses {
+			held, err := s.open(ctx, target)
+			if err != nil {
+				return err
+			}
+			if slices.Contains(refs, held.token) {
+				return fmt.Errorf("%w: masking scenario requires distinct cursors", ErrIncomplete)
+			}
+			refs = append(refs, held.token)
+			*witness = held
+		}
+		return nil
 	}
-	if err := s.resume(ctx, a, original); err != nil {
+	var originalBaseline, atChange, atRevocation, atRegrant, originalAtRestore cursorCase
+	if err := open(a, &originalBaseline, &atChange, &atRevocation, &atRegrant, &originalAtRestore); err != nil {
+		return fmt.Errorf("open original masking witnesses: %w", err)
+	}
+	if err := s.resume(ctx, a, originalBaseline); err != nil {
 		return fmt.Errorf("original cursor must resume before changing masking rules: %w", err)
 	}
-	other, err := s.open(ctx, b)
-	if err != nil {
-		return err
+	var unaffectedAtChange, unaffectedAtRestore cursorCase
+	if err := open(b, &unaffectedAtChange, &unaffectedAtRestore); err != nil {
+		return fmt.Errorf("open unaffected stream witnesses: %w", err)
 	}
-	modified := modifyToken(original.token, []string{original.token, other.token})
-	refs := []string{original.token, other.token, modified}
+	modified := modifyToken(atChange.token, refs)
+	refs = append(refs, modified)
 	invalid := rejection{status: http.StatusBadRequest}
 	if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{modified}); err != nil {
 		return err
@@ -213,42 +259,53 @@ func (s *revisionScenario) checkMaskingRevisions(ctx context.Context) error {
 	if err := s.setMask(ctx, "fixture-masking-v2", []Replacement{{maskedInput, maskedLine}}); err != nil {
 		return err
 	}
-	if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{original.token}); err != nil {
+	if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{atChange.token}); err != nil {
 		return fmt.Errorf("old masking revision must invalidate authorized cursor: %w", err)
 	}
-	if err := s.setQuery(ctx, a, false); err != nil {
-		return err
-	}
-	if err := s.rejectRevisionQueries(ctx, a, &denied, refs, []string{original.token, modified}); err != nil {
-		return fmt.Errorf("revoked query must deny before masking revision validation: %w", err)
-	}
-	if err := s.setQuery(ctx, a, true); err != nil {
-		return err
-	}
-	if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{original.token}); err != nil {
-		return fmt.Errorf("regranted query must still reject old masking revision: %w", err)
-	}
-	if err := s.resume(ctx, b, other); err != nil {
+	if err := s.resume(ctx, b, unaffectedAtChange); err != nil {
 		return fmt.Errorf("unaffected stream must resume: %w", err)
 	}
 	if err := s.checkMaskingFilters(ctx, a); err != nil {
 		return fmt.Errorf("fresh query must match and page over masked rows: %w", err)
 	}
-	masked, err := s.open(ctx, a)
-	if err != nil {
+	var currentAtRegrant cursorCase
+	if err := open(a, &currentAtRegrant); err != nil {
+		return fmt.Errorf("open current masking witness before revocation: %w", err)
+	}
+	if err := s.setQuery(ctx, a, false); err != nil {
 		return err
 	}
-	if err := s.resume(ctx, a, masked); err != nil {
+	if err := s.rejectRevisionQueries(ctx, a, &denied, refs, []string{atRevocation.token, modified}); err != nil {
+		return fmt.Errorf("revoked query must deny before masking revision validation: %w", err)
+	}
+	if err := s.setQuery(ctx, a, true); err != nil {
+		return err
+	}
+	if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{atRegrant.token}); err != nil {
+		return fmt.Errorf("regranted query must still reject old masking revision: %w", err)
+	}
+	if err := s.resume(ctx, a, currentAtRegrant); err != nil {
+		return fmt.Errorf("regranted query must resume current masking revision: %w", err)
+	}
+	var maskedBaseline, maskedAtRestore cursorCase
+	if err := open(a, &maskedBaseline, &maskedAtRestore); err != nil {
+		return fmt.Errorf("open changed masking witnesses: %w", err)
+	}
+	if err := s.resume(ctx, a, maskedBaseline); err != nil {
 		return fmt.Errorf("masked cursor must resume before restoring rules: %w", err)
 	}
 	if err := s.setMask(ctx, "fixture-masking-v3", nil); err != nil {
 		return err
 	}
-	refs = append(refs, masked.token)
-	if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{original.token, masked.token}); err != nil {
-		return fmt.Errorf("restored masking rules must retain a new revision: %w", err)
+	for _, probe := range []struct {
+		version string
+		held    cursorCase
+	}{{"original", originalAtRestore}, {"changed", maskedAtRestore}} {
+		if err := s.rejectRevisionQueries(ctx, a, &invalid, refs, []string{probe.held.token}); err != nil {
+			return fmt.Errorf("restored masking rules must retain a new revision (%s cursor): %w", probe.version, err)
+		}
 	}
-	if err := s.resume(ctx, b, other); err != nil {
+	if err := s.resume(ctx, b, unaffectedAtRestore); err != nil {
 		return fmt.Errorf("unaffected stream must resume after restoring rules: %w", err)
 	}
 	if err := s.checkMaskingFilters(ctx, a); err != nil {

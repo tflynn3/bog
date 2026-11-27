@@ -39,6 +39,114 @@ func TestPolicyRevisionScenario(t *testing.T) {
 	}
 }
 
+func TestMaskingRevisionCursorWitnesses(t *testing.T) {
+	t.Parallel()
+	const original, changed, restored = "fixture-masking-v1", "fixture-masking-v2", "fixture-masking-v3"
+	for _, tc := range []struct {
+		name, phase     string
+		current, issued string
+		afterRevocation bool
+		reissue         string
+		want            error
+	}{
+		{name: "single-use cursors"},
+		{name: "accepts original after change", current: changed, issued: original,
+			phase: "old masking revision must invalidate", want: ErrViolation},
+		{name: "accepts original after regrant", current: changed, issued: original, afterRevocation: true,
+			phase: "regranted query must still reject old masking revision", want: ErrViolation},
+		{name: "revives original after restore", current: restored, issued: original,
+			phase: "restored masking rules must retain a new revision (original cursor)", want: ErrViolation},
+		{name: "accepts changed cursor after restore", current: restored, issued: changed,
+			phase: "restored masking rules must retain a new revision (changed cursor)", want: ErrViolation},
+		{name: "reissues a masking witness", reissue: "masking",
+			phase: "masking scenario requires distinct cursors", want: ErrIncomplete},
+		{name: "reissues a consumed grant witness", reissue: "grant",
+			phase: "masking scenario requires distinct cursors", want: ErrIncomplete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			faults := &revisionFaults{}
+			adapters := faults.adapters()
+			target := faults.syntheticTarget
+			base := newScenario(adapters.Adapters)
+			s := revisionScenario{scenario: base, model: newPolicyModel(base.fixture), policy: adapters.Policy}
+			if err := s.update(ctx, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.checkIngest(ctx); err != nil {
+				t.Fatal(err)
+			}
+			owner := Target{alice, s.fixture.Streams[0].Selector}
+			var first string
+			if tc.reissue == "grant" {
+				faults.query = func(request QueryRequest, page *Page) error {
+					if request.Target == owner && page.NextCursor != "" {
+						first = page.NextCursor
+					}
+					if request.Target == owner && request.Cursor == first && page.Status == http.StatusOK {
+						delete(target.cursors, request.Cursor)
+					}
+					return nil
+				}
+			}
+			if err := s.checkGrantRevisions(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			var sawRevocation bool
+			presented := make(map[string]bool)
+			faults.query = func(request QueryRequest, page *Page) error {
+				if tc.reissue != "" && page.NextCursor != "" {
+					if first == "" {
+						first = page.NextCursor
+					} else {
+						page.NextCursor = first
+						page.Headers["Bog-Next-Cursor"] = []string{first}
+					}
+				}
+				if request.Cursor == "" {
+					return nil
+				}
+				// The same modified-token control can be presented again for
+				// authorization precedence. Issued witnesses are single-use.
+				if presented[request.Cursor] {
+					t.Error("masking scenario presented an issued cursor twice")
+				}
+				held, issued := target.cursors[request.Cursor]
+				if !issued {
+					return nil
+				}
+				presented[request.Cursor] = true
+				defer delete(target.cursors, request.Cursor)
+				if request.Target != owner {
+					return nil
+				}
+				sawRevocation = sawRevocation || page.Status == http.StatusForbidden
+				current := target.streamPolicy(s.fixture.Streams[0]).MaskingVersion
+				if page.Status == http.StatusBadRequest && current == tc.current && held.maskingVersion == tc.issued &&
+					(!tc.afterRevocation || sawRevocation) {
+					held.maskingVersion = current
+					target.cursors[request.Cursor] = held
+					var err error
+					*page, err = target.Query(ctx, request)
+					return err
+				}
+				return nil
+			}
+			err := s.checkMaskingRevisions(ctx)
+			if tc.want == nil {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if !errors.Is(err, tc.want) || !strings.Contains(err.Error(), tc.phase) {
+				t.Fatalf("got %v, want %v at %q", err, tc.want, tc.phase)
+			}
+		})
+	}
+}
+
 type policyFunc func(context.Context, PolicyRevision) (PolicyAck, error)
 
 func (f policyFunc) ApplyPolicy(ctx context.Context, revision PolicyRevision) (PolicyAck, error) {
@@ -120,6 +228,23 @@ func TestPolicyRevisionEvidenceFailures(t *testing.T) {
 		{"old masking revision accepted", "old masking revision must invalidate", ErrViolation, func(f *revisionFaults) {
 			f.policy = func(revision *PolicyRevision) { revision.Streams[0].MaskingVersion = "unchanged" }
 		}},
+		{"regrant invalidates current masking cursor", "regranted query must resume current masking revision", ErrViolation, func(f *revisionFaults) {
+			revoked := false
+			f.policy = func(revision *PolicyRevision) {
+				if revision.Streams[0].MaskingVersion != "fixture-masking-v2" {
+					return
+				}
+				for _, grant := range revision.Grants {
+					if grant.Target == (Target{alice, "fixture-a"}) {
+						if !grant.Query {
+							revoked = true
+						} else if revoked {
+							revision.Streams[0].MaskingVersion = "fixture-regrant-version"
+						}
+					}
+				}
+			}
+		}},
 		{"raw masking input leaked in header", "fresh query must match", ErrViolation, func(f *revisionFaults) {
 			f.query = func(request QueryRequest, page *Page) error {
 				if request.Contains == maskedLine && page.Status == http.StatusOK {
@@ -128,10 +253,34 @@ func TestPolicyRevisionEvidenceFailures(t *testing.T) {
 				return nil
 			}
 		}},
+		{"masked filter matches original text", "fresh query must match and page over masked rows", ErrViolation, func(f *revisionFaults) {
+			f.query = func(request QueryRequest, page *Page) error {
+				if request.Contains == maskedInput && page.Status == http.StatusOK {
+					page.Rows = []Row{{"2026-01-01T00:00:01Z", maskedLine + " " + replacement}}
+					page.Body = []byte(ndjson(page.Rows[0].Timestamp, page.Rows[0].Line))
+				}
+				return nil
+			}
+		}},
+		{"restored query retains masking on the wire", "fresh query must match and page over restored rows", ErrViolation, func(f *revisionFaults) {
+			f.query = func(request QueryRequest, page *Page) error {
+				if request.Contains == maskedInput && page.Status == http.StatusOK && len(page.Rows) == 1 {
+					page.Body = []byte(ndjson(page.Rows[0].Timestamp, maskedLine+" "+replacement))
+				}
+				return nil
+			}
+		}},
 		{"masking revision reused after reset", "restored masking rules must retain a new revision", ErrViolation, func(f *revisionFaults) {
 			f.policy = func(revision *PolicyRevision) {
 				if revision.Streams[0].MaskingVersion == "fixture-masking-v3" {
 					revision.Streams[0].MaskingVersion = "fixture-masking-v1"
+				}
+			}
+		}},
+		{"restoration invalidates unaffected cursor", "unaffected stream must resume after restoring rules", ErrViolation, func(f *revisionFaults) {
+			f.policy = func(revision *PolicyRevision) {
+				if revision.Streams[0].MaskingVersion == "fixture-masking-v3" {
+					revision.Streams[1].MaskingVersion = "fixture-masking-v3"
 				}
 			}
 		}},

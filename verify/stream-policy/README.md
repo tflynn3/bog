@@ -61,10 +61,8 @@ bounded context. The caller owns target startup and cleanup.
 
 The query probes hold cursors over acknowledged revocation and expansion,
 compare complete denials for valid and modified tokens, and confirm that a
-regrant restores an otherwise valid cursor. A masking revision invalidates
-old tokens even after earlier masking rules return. Fresh pages match over
-masked rows and continuations for an unaffected stream still work. Both decoded
-rows and the actual NDJSON must agree with the expected scoped pages.
+regrant restores an otherwise valid cursor. This entry point shares the
+masking scenario and cursor witness requirements below with `RunCandidate`.
 
 The export probes inspect exact authenticated artifacts for two scopes.
 They revoke an export-only grant at the publication barrier, require no
@@ -104,9 +102,18 @@ with `RunPolicyRevisions` through the same HTTP and policy bindings.
 
 | Masking probe | Required candidate evidence |
 | --- | --- |
-| Acknowledged masking change | An authorized cursor that resumed before the change returns the standard 400 response with no rows or next cursor. Revoking the query grant yields the standard 403, and regrant still leaves the old cursor invalid. |
-| Restored masking rules | The original cursor and a cursor issued under the changed rules both return the standard 400. The unaffected stream's held cursor resumes to the exact remaining rows across both changes. |
+| Acknowledged masking change | Resume a baseline cursor before the change. Present a different, unused cursor from the same starting policy after acknowledgment and require the standard 400 response with no rows or next cursor. |
+| Revocation and regrant | While revoked, require the standard 403 for an unused original-policy cursor and a modified token. After regrant, require the standard 400 for a separate unused original-policy cursor and the exact continuation for an unused changed-policy cursor issued before revocation. |
+| Restored masking rules | Resume a separate baseline under the changed rules before restoration. After acknowledgment, require the standard 400 for unused cursors from both the original and changed rules. |
+| Unaffected stream | Issue two cursors before the first masking change. Resume one after the change and the other after restoration. Both continuations must return the exact remaining rows and terminal NDJSON. |
 | Fresh queries | Unfiltered queries and literal searches for the original text and its masked replacement return the exact independently expected rows and terminal NDJSON under both the changed and restored rules. |
+
+Each issued cursor in the masking scenario is a distinct opaque token and
+is presented only for its assigned check. Successful baseline resumes use
+separately issued cursors for the same query. A missing or repeated witness
+leaves the evidence incomplete because earlier presentation can consume a
+cursor. The synthetic tests exercise that failure mode with single-use
+witnesses, including targets that accept stale cursors at specific transitions.
 
 Export creation must return its final outcome and retrieval must expose the
 original artifact body. Verify its manifest and payload independently using the

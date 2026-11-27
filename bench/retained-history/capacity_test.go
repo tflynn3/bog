@@ -115,6 +115,43 @@ func TestReadinessDeadlineAndChildExit(t *testing.T) {
 	}
 }
 
+func TestChildExitCancelsInFlightReadinessRequest(t *testing.T) {
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+		close(started)
+		<-req.Context().Done()
+		close(finished)
+	}))
+	defer srv.Close()
+	s := newService(srv.URL)
+	defer s.client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	exited := make(chan struct{})
+	result := make(chan error, 1)
+	go func() { result <- s.ready(ctx, exited) }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("readiness request never started")
+	}
+	close(exited)
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "child exited before readiness") || errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("readiness returned %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("child exit did not cancel readiness")
+	}
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		t.Fatal("canceled readiness request left the handler running")
+	}
+}
+
 func TestReportEncodingAndReplacement(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "result.json")

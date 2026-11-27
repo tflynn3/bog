@@ -54,6 +54,14 @@ cgroup count in that case. Times are in nanoseconds. Failed phases and timeouts
 are retained in the report, with unavailable measurements represented by null
 and an explanation. A required measurement failure returns a nonzero exit.
 
+Each live fixture requires `cgroup_memory_limit_bytes` and
+`cgroup_swap_max_bytes` read back from the kernel at 128 MiB and zero,
+respectively. `cgroup_peak_memory_bytes` and `cgroup_oom_kill_count` come
+from the same fixture cgroup after both lifetimes drain, before the cgroup
+is removed. The peak must be positive and within the cap, and
+`memory.events` must contain an explicit zero `oom_kill` counter. Cleanup
+records reaping, subtree emptiness and removal, and fixture store removal.
+
 ## Live qualification
 
 Live mode is the default used by the release gate. The legacy case records a
@@ -63,9 +71,8 @@ using the clean base revision on an arm64 Ubuntu Lima VM with Linux 6.8, an ext4
 fixture filesystem and Go 1.27.0. Compare results on the same host and storage
 configuration when measuring changes.
 
-The runner's live control protocol needs to be wired to the live binary's
-checkpoint control and observed state when those become available. It expects
-a loopback path, default `/_capacity/compaction`, with these operations:
+The live binary exposes an opt-in loopback path, default
+`/_capacity/compaction`, with these operations:
 
 - `POST ?action=start&cutoff=N` starts asynchronous compaction of exactly the
   committed prefix of N rows.
@@ -74,6 +81,10 @@ a loopback path, default `/_capacity/compaction`, with these operations:
   `covered_rows` and `committed_rows`. Coverage and generation describe the
   currently published checkpoint. A completed operation must advance the
   generation and cover exactly the requested cutoff.
+- `POST ?action=retire&cursor=TOKEN` retires the query capture identified by
+  the authenticated continuation token. It returns an empty HTTP 204 on
+  success. The runner uses the input token from the terminal page after
+  retrying that same request and verifying its rows and terminal framing.
 
 Live seeding advances the checkpoint at most every 8,192 rows at both sizes.
 The clustered trial uses the last two seed batches, then seeding finishes at
@@ -83,6 +94,18 @@ that compaction stays active through an acknowledged batch and a continuation.
 It then verifies publication, the expected uncovered tail and further pages
 from the original cursor. A candidate lacking the control path fails in the
 `live_capability` phase.
+
+Live starts use a fixed budget of 2,147,483,648 query work units to certify
+complete walks over the larger history. Fresh and restarted full walks use
+up to 1,000 rows per page. The admission producer exercises the release's
+fixed-budget thresholds separately.
+
+Both native runners validate the additive capacity proof from the gate
+checkout with `-validate-cutover REPORT`. The workflow also sets
+`BOG_RELEASE_REQUIRE_CUTOVER=1` for the release validator owned by #80.
+Schema-v1 archive readers can continue to read reports collected before
+these proof fields were available. Strict native qualification requires them
+at both live scales and independently checks removal of the fixture parent.
 
 ## Cutover diagnostics
 
@@ -103,11 +126,12 @@ A complete 503 with the matching refusal text and no cursor distinguishes
 capacity from work-budget rejection. Check the failure phase, elapsed
 time, time budget, and partial byte count when a response is interrupted.
 
-The live runner verifies one uniquely identifiable acknowledged backfill in
-a fresh query after the original cursor crosses publication and drains.
-Compare those phases with the release saturation sequence before attributing
-a fresh query timeout to admission or response delivery. The restart walk
-still compares the entire fixture. The compaction-running ingest p99 and
+The live runner verifies one uniquely identifiable acknowledged backfill and
+then compares an exact fresh walk after the original cursor crosses
+publication and drains. The clustered walk covers the backfill window and the
+scattered and restarted walks each cover the entire fixture. Compare those
+phases with the release saturation sequence before attributing a fresh query
+timeout to admission or response delivery. The compaction-running ingest p99 and
 sample count cover only acknowledgements after the start response and
 before a status request that observed the same operation still running.
 The existing mixed-load p99 includes every mixed-load acknowledgement.
@@ -124,12 +148,9 @@ release verdict.
 
 ## Architecture integration
 
-Register `bog/bench/retained-history` as a verifier command with no Bog package
-imports in the root architecture registry, and add it to the system package
-table. The existing fitness failure also needs a staged `bog/internal/backup`
-entry allowing its direct import of `bog/internal/store`. Those changes belong
-with the architecture owner. The release job needs a delegated cgroup v2
-parent on its Linux worker.
+`bog/bench/retained-history` is a verifier command with no Bog package
+imports. It observes the pinned candidate over HTTP, through the process
+lifecycle, and through Linux cgroup and filesystem measurements.
 
 ### Publication and pin-drain sample contract
 
@@ -146,8 +167,8 @@ Samples use monotonic nanoseconds relative to the start of their phase.
 The timeline keeps its early samples and most recent samples and counts
 any omitted intermediate samples. Phase boundaries include the held
 capture, compaction start, overlap, exact publication, held exhaustion,
-fresh visibility and the drain observation. The report also carries the
-phase failure when work stops early. The start request to first validated
+terminal retry, explicit retirement, drain and fresh parity. The report also
+carries the phase failure when work stops early. The start request to first validated
 completion is a client-observed upper bound on publication lag. The send
 time of the last validated running request gives a conservative lower
 bound. These bounds include observation delay.
@@ -167,13 +188,10 @@ fields carry individual unavailable reasons. A supplied zero is valid.
 
 Filesystem samples report apparent checkpoint staging bytes, published pin
 record count and oldest record modification age separately. They cannot
-establish reservations, pin liveness or reclaim eligibility. Cursor
-exhaustion establishes client completion. Runtime pin drain requires a
-positive predecessor count while the held cursor is outstanding followed
-by an observed zero after exhaustion. An unconfirmed drain has a reason,
-and status polling for drain has a separate bounded budget within the
-fixture deadline. A predecessor count that remains positive through the
-drain budget fails the workload. Missing runtime instrumentation is diagnostic evidence
-for the existing #53 storage and #71 resource handoff. The established
-capacity verdict still requires exact cutoffs, concurrent overlap, query
-parity, restart and cleanup in both fixtures.
+establish reservations, pin liveness or reclaim eligibility. The runtime
+must report a positive predecessor count after terminal replay while the
+capture is held, followed by an observed zero after explicit retirement.
+The existing `retired_pins_after_exhaustion` field records that post-retirement
+sample. Drain polling has a bounded budget within the fixture deadline.
+The workload fails if the held sample is missing or zero, or if the drain
+budget ends without a zero. Other runtime metrics remain diagnostic.

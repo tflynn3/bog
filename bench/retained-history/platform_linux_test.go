@@ -12,6 +12,75 @@ import (
 	"time"
 )
 
+func TestMemoryLimitReadback(t *testing.T) {
+	const memoryLimit = 128 << 20
+	for _, tc := range []struct {
+		name, swapContents string
+		swap               *uint64
+		wantError          bool
+	}{
+		{"swap disabled", "9\n", new(uint64), false},
+		{"different swap readback", "12\n", new(uint64(2)), true},
+		{"missing swap control", "", nil, true},
+		{"invalid swap readback", "max\n", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte("999999999\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.swapContents != "" {
+				if err := os.WriteFile(filepath.Join(dir, "memory.swap.max"), []byte(tc.swapContents), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var got resources
+			err := got.configureMemory(dir, memoryLimit)
+			if (err != nil) != tc.wantError || got.CgroupLimit == nil || *got.CgroupLimit != memoryLimit ||
+				(got.CgroupSwap == nil) != (tc.swap == nil) || (tc.swap != nil && *got.CgroupSwap != *tc.swap) {
+				t.Fatalf("swap readback = %v, memory limit = %v, error = %v", got.CgroupSwap, got.CgroupLimit, err)
+			}
+		})
+	}
+}
+
+func TestCollectCgroupOOMCount(t *testing.T) {
+	for _, tc := range []struct {
+		name, events string
+		count        *uint64
+	}{
+		{"zero", "oom 2\noom_kill 0\n", new(uint64)},
+		{"nonzero", "oom 2\noom_kill 1\n", new(uint64(1))},
+		{"missing", "oom 2\n", nil},
+		{"invalid", "oom_kill -1\n", nil},
+		{"missing file", "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			files := map[string]string{"memory.peak": "4096\n", "io.stat": "8:0 rbytes=0 wbytes=12\n"}
+			if tc.events != "" {
+				files["memory.events"] = tc.events
+			}
+			for name, value := range files {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := result{Diagnostics: &capacityDiagnostics{Unavailable: make(map[string]string)},
+				resources: resources{Unavailable: make(map[string]string)}}
+			r.collect(dir, true)
+			if r.CgroupPeak == nil || *r.CgroupPeak != 4096 {
+				t.Fatalf("missing cgroup memory peak: %+v", r.resources)
+			}
+			if (r.CgroupOOM == nil) != (tc.count == nil) ||
+				(tc.count != nil && *r.CgroupOOM != *tc.count) ||
+				(r.Unavailable["cgroup_oom_kill_count"] != "") != (tc.count == nil) {
+				t.Fatalf("OOM count = %v, unavailable = %v", r.CgroupOOM, r.Unavailable)
+			}
+		})
+	}
+}
+
 func TestChildOpensFixtureFromRelativeWorkDir(t *testing.T) {
 	const workDir = "local disk"
 	for _, tc := range []struct {

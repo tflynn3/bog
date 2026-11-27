@@ -17,13 +17,14 @@ import (
 )
 
 type scriptedReplacement struct {
-	cutoff                        int
-	query, appendDone, overlapped chan struct{}
-	running, resumed, exhausted   bool
+	cutoff                             int
+	query, appendDone, overlapped      chan struct{}
+	running, resumed, retried, retired bool
+	terminalCursor                     string
 }
 
 func TestMixedLoadKeepsOriginalCutoffs(t *testing.T) {
-	for _, failure := range []string{"", "bad_publication", "timeout"} {
+	for _, failure := range []string{"", "bad_publication", "timeout", "missing_held", "zero_held", "missing_drain", "bad_retry", "retire_failed", "bad_fresh"} {
 		name := failure
 		if name == "" {
 			name = "success"
@@ -45,14 +46,38 @@ func testMixedLoad(t *testing.T, failure string) {
 	var appended, snapshot []row
 	var generation uint64
 	var covered int
+	var capture int
 	var op *scriptedReplacement
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		q := req.URL.Query()
 		switch req.URL.Path {
 		case "/compact":
+			if q.Get("action") == "retire" {
+				mu.Lock()
+				defer mu.Unlock()
+				cursor := q.Get("cursor")
+				if req.Method != http.MethodPost || cursor == "" || op == nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if cursor == op.terminalCursor {
+					if !op.retried {
+						t.Error("retired held capture before retrying its terminal page")
+					}
+					if failure == "retire_failed" && op == scatter {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					op.retired = true
+				}
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 			cutoff, err := strconv.Atoi(q.Get("cutoff"))
-			if err != nil {
-				t.Error(err)
+			action := q.Get("action")
+			if err != nil || action == "start" && req.Method != http.MethodPost ||
+				action == "status" && req.Method != http.MethodGet || action != "start" && action != "status" {
+				t.Errorf("invalid control request %s %s: %v", req.Method, req.URL, err)
 				w.WriteHeader(400)
 				return
 			}
@@ -60,7 +85,7 @@ func testMixedLoad(t *testing.T, failure string) {
 			defer mu.Unlock()
 			state := "complete"
 			switch {
-			case q.Get("action") == "start" && (cutoff == cluster.cutoff || cutoff == scatter.cutoff):
+			case action == "start" && (cutoff == cluster.cutoff || cutoff == scatter.cutoff):
 				op = cluster
 				if cutoff == scatter.cutoff {
 					op = scatter
@@ -97,8 +122,16 @@ func testMixedLoad(t *testing.T, failure string) {
 			}{compaction{generation, covered, len(appended), state}, map[string]uint64{"staging_used_bytes": 0}}
 			if op != nil && cutoff == op.cutoff && state == "complete" {
 				reply.Metrics["retired_generation_pins"] = 1
-				if op.exhausted {
+				if op.retired {
 					reply.Metrics["retired_generation_pins"] = 0
+				}
+				if op == scatter {
+					switch {
+					case failure == "missing_held", failure == "missing_drain" && op.retired:
+						delete(reply.Metrics, "retired_generation_pins")
+					case failure == "zero_held":
+						reply.Metrics["retired_generation_pins"] = 0
+					}
 				}
 			}
 			if err := json.NewEncoder(w).Encode(reply); err != nil && req.Context().Err() == nil {
@@ -149,11 +182,11 @@ func testMixedLoad(t *testing.T, failure string) {
 			end, e2 := time.Parse(time.RFC3339Nano, q.Get("end"))
 			limit, e3 := strconv.Atoi(q.Get("limit"))
 			offset := 0
-			if cursor := q.Get("cursor"); cursor != "" {
-				var err error
-				offset, err = strconv.Atoi(cursor)
-				if err != nil {
-					t.Error(err)
+			cursor := q.Get("cursor")
+			var cursorCapture int
+			if cursor != "" {
+				if _, err := fmt.Sscanf(cursor, "%d:%d", &cursorCapture, &offset); err != nil {
+					t.Error("invalid cursor:", err)
 					w.WriteHeader(400)
 					return
 				}
@@ -177,6 +210,7 @@ func testMixedLoad(t *testing.T, failure string) {
 			}
 			mu.Lock()
 			if offset == 0 {
+				capture++
 				snapshot = nil
 				for _, r := range appended {
 					if !r.TS.Before(start) && r.TS.Before(end) && strings.Contains(r.Line, q.Get("contains")) {
@@ -184,6 +218,8 @@ func testMixedLoad(t *testing.T, failure string) {
 					}
 				}
 				slices.SortStableFunc(snapshot, func(a, b row) int { return a.TS.Compare(b.TS) })
+			} else if cursorCapture != capture {
+				t.Error("continuation reused the wrong capture")
 			}
 			if offset < 0 || offset > len(snapshot) {
 				mu.Unlock()
@@ -193,11 +229,24 @@ func testMixedLoad(t *testing.T, failure string) {
 			}
 			stop := min(offset+limit, len(snapshot))
 			page := slices.Clone(snapshot[offset:stop])
-			if offset > 0 && active != nil && !active.running && covered == active.cutoff {
-				active.resumed, active.exhausted = true, stop == len(snapshot)
+			if offset > 0 && active != nil && !active.running && covered == active.cutoff && !active.retired {
+				active.resumed = true
+				if stop == len(snapshot) {
+					if active.terminalCursor == "" {
+						active.terminalCursor = cursor
+					} else if active.terminalCursor == cursor {
+						active.retried = true
+						if active == scatter && failure == "bad_retry" {
+							page[0].Line = "wrong row"
+						}
+					}
+				}
+			}
+			if failure == "bad_fresh" && active == scatter && active.retired && q.Get("contains") == "" && offset == 0 {
+				page[0].Line = "wrong fresh row"
 			}
 			if stop < len(snapshot) {
-				w.Header().Set("Bog-Next-Cursor", fmt.Sprint(stop))
+				w.Header().Set("Bog-Next-Cursor", fmt.Sprintf("%d:%d", capture, stop))
 			}
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/x-ndjson")
@@ -224,7 +273,8 @@ func testMixedLoad(t *testing.T, failure string) {
 		t.Fatalf("incomplete clustered evidence: %+v (load error %v)", clustered, err)
 	}
 	if failure != "" {
-		if err == nil || scattered.Status != "fail" || scattered.Publication != nil ||
+		earlyFailure := failure == "bad_publication" || failure == "timeout"
+		if err == nil || scattered.Status != "fail" || (scattered.Publication == nil) != earlyFailure ||
 			scattered.Samples[len(scattered.Samples)-1].Event != "phase_failure" ||
 			!slices.ContainsFunc(scattered.Samples, func(s phaseSample) bool { return s.Event == "overlap" }) {
 			t.Fatalf("expected partial failed evidence: %+v, err %v", scattered, err)
@@ -232,16 +282,30 @@ func testMixedLoad(t *testing.T, failure string) {
 		if failure == "timeout" && !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
 			t.Fatal("script did not cancel the operation")
 		}
+		wantPhase := map[string]string{
+			"missing_held": "capture_retirement", "zero_held": "capture_retirement", "missing_drain": "pin_drain",
+			"bad_retry": "terminal_retry", "retire_failed": "capture_retirement", "bad_fresh": "fresh_walk",
+		}[failure]
+		if wantPhase != "" && r.Phase != wantPhase {
+			t.Fatalf("failure phase = %q, want %q, error %v", r.Phase, wantPhase, err)
+		}
 		return
 	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scattered.Status != "pass" || scattered.PinDrain.Status != "observed" || !scattered.FreshVisible || !scattered.HeldExhausted {
+	if scattered.Status != "pass" || scattered.PinDrain.Status != "observed" || !scattered.FreshVisible ||
+		!scattered.HeldExhausted || !scattered.TerminalRetried || !scattered.CaptureRetired ||
+		!scattered.FreshExact || scattered.FreshRows != f.SeedRows+f.TailRows {
 		t.Fatalf("incomplete scattered evidence: %+v", scattered)
 	}
+	for i, want := range newBackfillTimelines(f) {
+		if err := r.Diagnostics.Backfills[i].validateCutover(want, f); err != nil {
+			t.Fatalf("%s timeline fails cutover validation: %v", want.Pattern, err)
+		}
+	}
 	mu.Lock()
-	resumed := cluster.resumed && scatter.resumed
+	resumed := cluster.resumed && scatter.resumed && cluster.retried && scatter.retried && cluster.retired && scatter.retired
 	mu.Unlock()
 	if !resumed {
 		t.Fatal("both captured cursors must survive publication")

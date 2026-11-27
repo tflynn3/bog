@@ -77,13 +77,33 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	}
 
 	setPhase("after_publication_continuation")
-	for held.cursor != "" {
-		if _, err := held.page(ctx, s, f); err != nil {
-			return published, fmt.Errorf("resume after compaction: %w", err)
-		}
+	terminal, err := held.exhaust(ctx, s, f)
+	if err != nil {
+		return published, fmt.Errorf("resume after compaction: %w", err)
 	}
 	p.HeldExhausted = true
 	p.boundary("held_exhausted")
+	setPhase("terminal_retry")
+	cursor := terminal.cursor
+	terminal.phase = r.Phase
+	terminal.seen = map[string]bool{cursor: true}
+	if _, err := terminal.page(ctx, s, f); err != nil {
+		return published, fmt.Errorf("retry terminal page: %w", err)
+	}
+	if terminal.cursor != "" || terminal.offset != held.offset {
+		return published, errors.New("retry of terminal page returned a different page boundary")
+	}
+	p.TerminalRetried = true
+	p.boundary("terminal_retried")
+	setPhase("capture_retirement")
+	if err := p.observeHeldPin(ctx); err != nil {
+		return published, err
+	}
+	if err := s.retireCapture(ctx, o.control, cursor); err != nil {
+		return published, fmt.Errorf("explicitly retire held capture: %w", err)
+	}
+	p.CaptureRetired = true
+	p.boundary("capture_retired")
 	setPhase("pin_drain")
 	if err := p.observeDrain(ctx, drainBudget); err != nil {
 		return published, err
@@ -102,6 +122,21 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
 	}
 	p.FreshVisible = true
 	p.boundary("fresh_visible")
+	setPhase("fresh_walk")
+	var exact *walk
+	if scattered {
+		exact = f.newWalk(p.FinalCutoff, false)
+	} else {
+		exact = f.walkFor(p.FinalCutoff, held.filter)
+	}
+	exact.phase, exact.pageLimit = r.Phase, 1000
+	_, err = exact.exhaust(ctx, s, f)
+	p.FreshRows = exact.offset
+	if err != nil {
+		return published, fmt.Errorf("fresh exact walk: %w", err)
+	}
+	p.FreshExact = true
+	p.boundary("fresh_walk_complete")
 	return published, nil
 }
 

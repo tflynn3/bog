@@ -85,17 +85,35 @@ func (s service) requestBounded(ctx context.Context, method, path string, body i
 
 func (s service) ready(ctx context.Context, exited <-chan struct{}) error {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-exited:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	var last error
 	for {
 		select {
-		case <-ctx.Done():
-			return fmt.Errorf("readiness: %w", errors.Join(ctx.Err(), last))
 		case <-exited:
 			return fmt.Errorf("child exited before readiness: %w", errors.Join(errors.New("early exit"), last))
 		default:
+		}
+		if err := ctx.Err(); err != nil {
+			select {
+			case <-exited:
+				return fmt.Errorf("child exited before readiness: %w", errors.Join(errors.New("early exit"), last))
+			default:
+				return fmt.Errorf("readiness: %w", errors.Join(err, last))
+			}
 		}
 		res, data, err := s.request(ctx, http.MethodGet, "/ready", nil)
 		if err == nil && res.StatusCode == http.StatusOK {
@@ -137,6 +155,7 @@ type walk struct {
 	want             []int
 	offset           int
 	pages            int
+	pageLimit        int
 	firstResumeLimit int
 	cursor           string
 	seen             map[string]bool
@@ -147,6 +166,9 @@ func (w *walk) page(ctx context.Context, s service, f fixture) (_ time.Duration,
 	var attempt queryAttempt
 	defer func() { recordQuery(s.queryPhases, w.phase, attempt, err) }()
 	limit := [...]int{1, 193, 509}[w.pages%3]
+	if w.pageLimit > 0 {
+		limit = w.pageLimit
+	}
 	if w.pages == 1 && w.firstResumeLimit > 0 {
 		limit = w.firstResumeLimit
 	}
@@ -207,6 +229,20 @@ func (w *walk) page(ctx context.Context, s service, f fixture) (_ time.Duration,
 	return elapsed, nil
 }
 
+// exhaust returns the request that produced the terminal page, including its
+// input cursor. Replaying this copy leaves the completed walk unchanged.
+func (w *walk) exhaust(ctx context.Context, s service, f fixture) (walk, error) {
+	for {
+		request := *w
+		if _, err := w.page(ctx, s, f); err != nil {
+			return walk{}, err
+		}
+		if w.cursor == "" {
+			return request, nil
+		}
+	}
+}
+
 type compaction struct {
 	Generation    uint64 `json:"generation"`
 	CoveredRows   int    `json:"covered_rows"`
@@ -221,15 +257,11 @@ type compactionReply struct {
 
 func (s service) compact(ctx context.Context, path, action string, cutoff int) (compactionReply, error) {
 	var reply compactionReply
-	u, err := url.ParseRequestURI(path)
-	if err != nil || u.Host != "" || !strings.HasPrefix(path, "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-		return reply, errors.New("invalid compaction control path")
-	}
 	method := http.MethodGet
 	if action != "status" {
 		method = http.MethodPost
 	}
-	res, data, err := s.requestBounded(ctx, method, path+"?"+url.Values{"action": {action}, "cutoff": {strconv.Itoa(cutoff)}}.Encode(), nil, nil, 64<<10)
+	res, data, err := s.controlRequest(ctx, method, path, url.Values{"action": {action}, "cutoff": {strconv.Itoa(cutoff)}})
 	if err != nil {
 		return reply, err
 	}
@@ -254,6 +286,30 @@ func (s service) compact(ctx context.Context, path, action string, cutoff int) (
 		return reply, fmt.Errorf("invalid compaction %s state or row counters", action)
 	}
 	return compactionReply{compaction{*wire.Generation, *wire.CoveredRows, *wire.CommittedRows, *wire.State}, wire.Metrics}, nil
+}
+
+func (s service) controlRequest(ctx context.Context, method, path string, params url.Values) (*http.Response, []byte, error) {
+	u, err := url.ParseRequestURI(path)
+	if err != nil || u.Host != "" || !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, nil, errors.New("invalid compaction control path")
+	}
+	return s.requestBounded(ctx, method, path+"?"+params.Encode(), nil, nil, 64<<10)
+}
+
+func (s service) retireCapture(ctx context.Context, path, cursor string) error {
+	if cursor == "" {
+		return errors.New("capture retirement requires a continuation cursor")
+	}
+	params := url.Values{"action": {"retire"}, "cursor": {cursor}}
+	res, data, err := s.controlRequest(ctx, http.MethodPost, path, params)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusNoContent || len(data) != 0 {
+		return fmt.Errorf("retire capture: HTTP %d, body bytes %d", res.StatusCode, len(data))
+	}
+	return nil
 }
 
 func (s service) waitCompaction(ctx context.Context, path string, cutoff int, generation uint64) (compaction, error) {

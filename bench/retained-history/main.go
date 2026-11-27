@@ -69,11 +69,15 @@ type cleanupProof struct {
 	CandidateReaped bool   `json:"candidate_reaped"`
 	SubtreeEmpty    bool   `json:"subtree_empty"`
 	SubtreeRemoved  bool   `json:"subtree_removed"`
+	StoreRemoved    bool   `json:"store_removed"`
 	Detail          string `json:"detail,omitempty"`
 }
 
 type resources struct {
 	CgroupPeak  *uint64                      `json:"cgroup_peak_memory_bytes"`
+	CgroupLimit *uint64                      `json:"cgroup_memory_limit_bytes"`
+	CgroupSwap  *uint64                      `json:"cgroup_swap_max_bytes"`
+	CgroupOOM   *uint64                      `json:"cgroup_oom_kill_count"`
 	PeakRSS     *uint64                      `json:"peak_rss_bytes"`
 	PeakFDs     *uint64                      `json:"peak_descriptors"`
 	DeviceIO    map[string]map[string]uint64 `json:"device_io"`
@@ -174,7 +178,9 @@ func createFixtureRoot(parent string) (string, error) {
 
 func run(ctx context.Context, args []string) (err error) {
 	var o options
+	var cutoverReport string
 	f := flag.NewFlagSet("retained-history", flag.ContinueOnError)
+	f.StringVar(&cutoverReport, "validate-cutover", "", "validate the cutover proof in an existing capacity report")
 	f.StringVar(&o.binary, "binary", "", "absolute path to pinned Linux Bog binary")
 	f.StringVar(&o.revision, "revision", "", "full lowercase commit SHA")
 	f.StringVar(&o.fixture, "fixture", "", "fixture ID (linux-release-v1)")
@@ -186,6 +192,12 @@ func run(ctx context.Context, args []string) (err error) {
 	f.DurationVar(&o.timeout, "timeout", 20*time.Minute, "overall probe deadline")
 	if err := f.Parse(args); err != nil {
 		return err
+	}
+	if cutoverReport != "" {
+		if f.NArg() != 0 || f.NFlag() != 1 {
+			return errors.New("-validate-cutover takes a report path and runs independently of fixture flags")
+		}
+		return validateCutoverFile(cutoverReport)
 	}
 	if f.NArg() != 0 || !filepath.IsAbs(o.binary) || !regexp.MustCompile("^[0-9a-f]{40}$").MatchString(o.revision) ||
 		o.fixture != "linux-release-v1" || o.report == "" || o.timeout <= 0 || (o.mode != "live" && o.mode != "legacy") {

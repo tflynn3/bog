@@ -206,8 +206,10 @@ func TestPinDrainStatusTransitions(t *testing.T) {
 		wantError bool
 	}{
 		{"positive then drained", new(uint64(1)), []string{"2", "0"}, "observed", false},
-		{"zero without held sample", nil, []string{"0"}, "unavailable", false},
-		{"counter unavailable", new(uint64(1)), []string{"null"}, "unavailable", false},
+		{"zero without held sample", nil, nil, "unavailable", true},
+		{"zero held sample", new(uint64(0)), nil, "unavailable", true},
+		{"counter unavailable", new(uint64(1)), []string{"null"}, "pending", true},
+		{"gap before zero", new(uint64(1)), []string{"2", "null", "0"}, "observed", false},
 		{"still pinned", new(uint64(1)), []string{"1"}, "pending", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -233,7 +235,8 @@ func TestPinDrainStatusTransitions(t *testing.T) {
 			}
 			err := p.observeDrain(t.Context(), limit)
 			if (err != nil) != tc.wantError || p.PinDrain.Status != tc.want ||
-				len(p.Samples) < len(tc.counts) || p.Samples[0].Event != "after_exhaustion" {
+				len(p.Samples) < len(tc.counts) ||
+				(len(p.Samples) > 0 && p.Samples[0].Event != "after_retirement") {
 				t.Fatalf("drain returned %v with proof %+v", err, p.PinDrain)
 			}
 		})

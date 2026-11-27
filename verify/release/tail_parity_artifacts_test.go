@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 
 	"bog/internal/backup"
@@ -25,6 +24,8 @@ import (
 const (
 	tailManifestLimit   = 256 << 10
 	tailParityByteLimit = 4 << 10
+	tailBackupName      = "bog.backup"
+	tailBackupMetaLimit = 136 // The v2 wire size also accommodates v1 metadata.
 )
 
 func requireTailOnlyDirectory(root *os.Root) error {
@@ -40,33 +41,81 @@ func requireTailOnlyDirectory(root *os.Root) error {
 }
 
 func readTailParityImage(ctx context.Context, dir, magic string) (_ tailParityPoint, err error) {
+	if err := ctx.Err(); err != nil {
+		return tailParityPoint{}, fmt.Errorf("open tail parity image %q: %w", dir, err)
+	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return tailParityPoint{}, err
+		return tailParityPoint{}, fmt.Errorf("open tail parity image %q: %w", dir, artifactOpenError(err))
 	}
-	defer func() { err = errors.Join(err, root.Close()) }()
-	meta, err := root.Open("bog.backup")
-	if err != nil {
-		return tailParityPoint{}, err
+	defer func() {
+		if closeErr := root.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close tail parity image %q: %w", dir, closeErr))
+		}
+	}()
+	if err := checkTailBackupMagic(ctx, root, magic); err != nil {
+		return tailParityPoint{}, fmt.Errorf("read tail parity image %q: %w", dir, err)
 	}
-	var header [8]byte
-	_, readErr := io.ReadFull(meta, header[:])
-	if err := errors.Join(readErr, meta.Close()); err != nil {
-		return tailParityPoint{}, err
-	}
-	if string(header[:]) != magic {
-		return tailParityPoint{}, fmt.Errorf("backup magic %q, want %q", header, magic)
+	// Identify errors on the fixed image entries before backup verification
+	// checks the directory inventory. Backup validates the manifest, the
+	// named segments, and the committed range and digest of the suffix.
+	for _, artifact := range []struct {
+		name  string
+		limit int64
+	}{
+		{"bog.checkpoint", tailManifestLimit},
+		{"bog.wal.tail", tailParityByteLimit},
+	} {
+		f, _, err := openRegular(ctx, root, artifact.name, artifact.limit)
+		if err != nil {
+			return tailParityPoint{}, fmt.Errorf("open tail parity image %q artifact %q: %w", dir, artifact.name, err)
+		}
+		if err := f.Close(); err != nil {
+			return tailParityPoint{}, fmt.Errorf("close tail parity image %q artifact %q: %w", dir, artifact.name, err)
+		}
 	}
 	p, tail, err := backup.VerifyPinnedRecovery(ctx, root, func(start, end int64) error {
 		if end-start > tailParityByteLimit {
-			return fmt.Errorf("fixture suffix exceeds %d bytes", tailParityByteLimit)
+			return fmt.Errorf("declared suffix bog.wal.tail: %w", artifactSizeError(tailParityByteLimit))
 		}
 		return nil
 	})
 	if err != nil {
-		return tailParityPoint{}, err
+		if errors.Is(err, backup.ErrIntegrity) && !errors.Is(err, os.ErrNotExist) {
+			err = fmt.Errorf("%w: %w", errArtifactMalformed, err)
+		}
+		return tailParityPoint{}, fmt.Errorf("verify tail parity image %q: %w", dir, err)
 	}
-	return reportTailParityPoint(p), tail.Close()
+	if err := errors.Join(ctx.Err(), tail.Close()); err != nil {
+		return tailParityPoint{}, fmt.Errorf("finish tail parity image %q artifact %q: %w", dir, "bog.wal.tail", err)
+	}
+	return reportTailParityPoint(p), nil
+}
+
+func checkTailBackupMagic(ctx context.Context, root *os.Root, magic string) error {
+	data, err := readArtifact(ctx, root, tailBackupName, tailBackupMetaLimit)
+	if err != nil {
+		return fmt.Errorf("read backup magic: %w", err)
+	}
+	const magicSize = 8
+	if len(data) < magicSize {
+		return fmt.Errorf("read backup magic %q: %w: %w", tailBackupName, errArtifactMalformed, io.ErrUnexpectedEOF)
+	}
+	if got := string(data[:magicSize]); got != magic {
+		return fmt.Errorf("read backup magic %q: %w: got %q, want %q", tailBackupName, errArtifactMalformed, got, magic)
+	}
+	wantSize := tailBackupMetaLimit
+	if magic == "BOGBAK01" {
+		wantSize = 128
+	}
+	if len(data) < wantSize {
+		return fmt.Errorf("read backup metadata %q: %w: got %d bytes, want %d: %w",
+			tailBackupName, errArtifactMalformed, len(data), wantSize, io.ErrUnexpectedEOF)
+	}
+	if len(data) > wantSize {
+		return fmt.Errorf("read backup metadata %q: %w", tailBackupName, artifactSizeError(int64(wantSize)))
+	}
+	return nil
 }
 
 func reportTailParityPoint(p backup.RecoveryPoint) tailParityPoint {
@@ -80,6 +129,7 @@ func reportTailParityPoint(p backup.RecoveryPoint) tailParityPoint {
 // checked byte for byte where independently known. Readers use those bounded
 // snapshots and the manifest's named segments in the pinned directory.
 type tailParityView struct {
+	ctx      context.Context
 	root     *os.Root
 	manifest []byte
 	suffix   []byte
@@ -91,11 +141,11 @@ func (v tailParityView) OpenManifest() (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(v.manifest)), nil
 }
 func (v tailParityView) OpenSegment(name string) (io.ReadCloser, error) {
-	f, _, err := openTailArtifact(v.root, name, checkpoint.MaxBlockSize)
+	f, _, err := openRegular(v.ctx, v.root, name, checkpoint.MaxBlockSize)
 	if err != nil {
 		return nil, err
 	}
-	return f, nil
+	return boundedArtifactFile(v.ctx, f, checkpoint.MaxBlockSize), nil
 }
 func (v tailParityView) OpenSuffix() (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(v.suffix)), nil
@@ -118,13 +168,13 @@ func exportTailParityCycle(ctx context.Context, root *os.Root, exported string, 
 func exportSelectedTailParity(ctx context.Context, root *os.Root, exported string, fixture tailCycleFixture, cycle *tailParityCycle, tail selectedParityTail) error {
 	a := tail.authority
 	manifestName := "bog-checkpoint-" + a.Generation
-	raw, err := readTailArtifact(root, manifestName, tailManifestLimit)
+	raw, err := readArtifact(ctx, root, manifestName, tailManifestLimit)
 	if err != nil {
 		return fmt.Errorf("read selected checkpoint: %w", err)
 	}
 	m, id, err := checkpoint.DecodeManifest(raw)
 	if err != nil {
-		return fmt.Errorf("decode selected checkpoint %s: %w", manifestName, err)
+		return fmt.Errorf("decode selected checkpoint %s: %w: %w", manifestName, errArtifactMalformed, err)
 	}
 	wantAdvance := checkpoint.Advance{
 		Generation: cycle.Input.Generation, CoveredOffset: cycle.Input.CoveredOffset,
@@ -133,10 +183,10 @@ func exportSelectedTailParity(ctx context.Context, root *os.Root, exported strin
 	if m.Version != 2 || checkpoint.GenerationManifestName(id) != manifestName ||
 		m.CoveredOffset != a.CoveredOffset || m.NextOrdinal != uint64(a.NextOrdinal) ||
 		m.Advance == nil || *m.Advance != wantAdvance {
-		return fmt.Errorf("selected checkpoint %s differs from expected advance at cutoff %d", manifestName, a.NextOrdinal)
+		return fmt.Errorf("selected checkpoint %s: %w: differs from expected advance at cutoff %d", manifestName, errArtifactMalformed, a.NextOrdinal)
 	}
 	view := tailParityView{
-		root: root, manifest: raw, suffix: tail.suffix,
+		ctx: ctx, root: root, manifest: raw, suffix: tail.suffix,
 		point: backup.RecoveryPoint{
 			Generation: id, CoveredOffset: a.CoveredOffset, NextOrdinal: uint64(a.NextOrdinal),
 			CommittedEnd: a.CommittedEnd, CommittedOrdinal: uint64(a.CommittedOrdinal), SuffixSHA256: sha256.Sum256(tail.suffix),
@@ -178,46 +228,6 @@ func verifyParityRestartAppend(ctx context.Context, root *os.Root, previous sele
 	return nil
 }
 
-func openTailArtifact(root *os.Root, name string, limit int64) (*os.File, os.FileInfo, error) {
-	info, err := root.Lstat(name)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !info.Mode().IsRegular() || info.Size() > limit {
-		return nil, nil, fmt.Errorf("artifact %s must be a regular file at most %d bytes", name, limit)
-	}
-	// Nonblocking prevents a substituted FIFO from hanging the probe.
-	f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	opened, err := f.Stat()
-	if err == nil && (!opened.Mode().IsRegular() || !os.SameFile(info, opened) || opened.Size() > limit) {
-		err = fmt.Errorf("artifact %s changed while opening", name)
-	}
-	if err != nil {
-		return nil, nil, errors.Join(err, f.Close())
-	}
-	return f, opened, nil
-}
-
-func readBoundedTailArtifact(f *os.File, limit int64) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(f, limit+1))
-	if err == nil && int64(len(data)) > limit {
-		err = fmt.Errorf("artifact %s exceeds %d bytes", f.Name(), limit)
-	}
-	return data, err
-}
-
-func readTailArtifact(root *os.Root, name string, limit int64) ([]byte, error) {
-	f, _, err := openTailArtifact(root, name, limit)
-	if err != nil {
-		return nil, err
-	}
-	data, err := readBoundedTailArtifact(f, limit)
-	return data, errors.Join(err, f.Close())
-}
-
 func TestExportTailParityCycle(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -239,7 +249,7 @@ func TestExportTailParityCycle(t *testing.T) {
 		{name: "bad selector checksum", want: "checksum mismatch", mutate: func(t *testing.T, dir string, _ tailParityAuthority, _ tailCycleFixture) {
 			writeFixture(t, filepath.Join(dir, tailAuthorityName), []byte(`{"payload":{},"sha256":"corrupt"}`))
 		}},
-		{name: "oversize selector", want: "regular file at most", mutate: func(t *testing.T, dir string, _ tailParityAuthority, _ tailCycleFixture) {
+		{name: "oversize selector", want: "artifact exceeds byte limit", mutate: func(t *testing.T, dir string, _ tailParityAuthority, _ tailCycleFixture) {
 			writeFixture(t, filepath.Join(dir, tailAuthorityName), make([]byte, tailAuthorityLimit+1))
 		}},
 		{name: "missing selected checkpoint with identical orphan", want: "read selected checkpoint", mutate: func(t *testing.T, dir string, a tailParityAuthority, _ tailCycleFixture) {
@@ -268,7 +278,7 @@ func TestExportTailParityCycle(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{name: "extra byte on selected tail", want: "regular file at most", mutate: func(t *testing.T, dir string, a tailParityAuthority, f tailCycleFixture) {
+		{name: "extra byte on selected tail", want: "artifact exceeds byte limit", mutate: func(t *testing.T, dir string, a tailParityAuthority, f tailCycleFixture) {
 			writeFixture(t, filepath.Join(dir, a.Tail), append(bytes.Clone(f.suffix), 0))
 		}},
 		{name: "corrupt selected tail with identical orphan", want: "bytes or digest", mutate: func(t *testing.T, dir string, a tailParityAuthority, f tailCycleFixture) {
@@ -386,4 +396,85 @@ func writeTailArtifactFixture(t *testing.T, dir string, f tailCycleFixture, inpu
 	}
 	writeFixture(t, filepath.Join(dir, checkpoint.GenerationManifestName(id)), raw)
 	return sum
+}
+
+func TestReadTailParityImageInvalidArtifacts(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		artifact string
+		data     []byte
+		want     error
+		phase    string
+	}{
+		{"missing metadata", tailBackupName, nil, os.ErrNotExist, "read backup magic"},
+		{"FIFO metadata", tailBackupName, nil, errArtifactNonregular, "read backup magic"},
+		{"empty metadata", tailBackupName, []byte{}, errArtifactMalformed, "read backup magic"},
+		{"truncated magic", tailBackupName, []byte("BOGBAK"), io.ErrUnexpectedEOF, "read backup magic"},
+		{"wrong magic", tailBackupName, []byte("BOGBAK02"), errArtifactMalformed, "read backup magic"},
+		{"truncated metadata", tailBackupName, []byte("BOGBAK01"), io.ErrUnexpectedEOF, "read backup metadata"},
+		{"oversized v1 metadata", tailBackupName, append([]byte("BOGBAK01"), make([]byte, 121)...), errArtifactOversized, "read backup metadata"},
+		{"oversized metadata", tailBackupName, make([]byte, tailBackupMetaLimit+1), errArtifactOversized, "read backup magic"},
+		{"missing checkpoint", "bog.checkpoint", nil, os.ErrNotExist, "open tail parity image"},
+		{"FIFO checkpoint", "bog.checkpoint", nil, errArtifactNonregular, "open tail parity image"},
+		{"oversized checkpoint", "bog.checkpoint", make([]byte, tailManifestLimit+1), errArtifactOversized, "open tail parity image"},
+		{"missing tail", "bog.wal.tail", nil, os.ErrNotExist, "open tail parity image"},
+		{"FIFO tail", "bog.wal.tail", nil, errArtifactNonregular, "open tail parity image"},
+		{"oversized tail", "bog.wal.tail", make([]byte, tailParityByteLimit+1), errArtifactOversized, "open tail parity image"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			for name, data := range map[string][]byte{
+				tailBackupName:   append([]byte("BOGBAK01"), make([]byte, 120)...),
+				"bog.checkpoint": {},
+				"bog.wal.tail":   {},
+			} {
+				if name != tc.artifact {
+					writeFixture(t, filepath.Join(dir, name), data)
+				}
+			}
+			path := filepath.Join(dir, tc.artifact)
+			if tc.data != nil {
+				writeFixture(t, path, tc.data)
+			}
+			check := func() error {
+				point, err := readTailParityImage(t.Context(), dir, "BOGBAK01")
+				if point != (tailParityPoint{}) {
+					return fmt.Errorf("invalid artifact returned proof %+v: %v", point, err)
+				}
+				return err
+			}
+			var err error
+			if tc.want == errArtifactNonregular {
+				err = checkFIFO(t, path, check)
+			} else {
+				err = check()
+			}
+			if !errors.Is(err, tc.want) || !strings.Contains(err.Error(), tc.phase) ||
+				!strings.Contains(err.Error(), tc.artifact) || !strings.Contains(err.Error(), dir) {
+				t.Fatalf("read = %v; want %v and %s for %s in %s", err, tc.want, tc.phase, tc.artifact, dir)
+			}
+		})
+	}
+}
+
+func TestReadTailParityImageCanceled(t *testing.T) {
+	t.Parallel()
+	dir, root, fixture, _, cycle := newTailArtifactFixture(t)
+	bundle := filepath.Join(dir, "export")
+	tail, err := exportTailParityCycle(t.Context(), root, bundle, fixture, &cycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeTailFixture(t, tail.file)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	point, err := readTailParityImage(ctx, bundle, "BOGBAK02")
+	if point != (tailParityPoint{}) || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), bundle) {
+		t.Fatalf("read = %+v, %v; want canceled for %s", point, err, bundle)
+	}
+	if _, err := readTailParityImage(t.Context(), bundle, "BOGBAK02"); err != nil {
+		t.Fatalf("canceled read affected the valid image: %v", err)
+	}
 }

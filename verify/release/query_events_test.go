@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,7 +51,7 @@ func TestValidateQueryQualification(t *testing.T) {
 			model, handlers := filepath.Join(dir, "model.jsonl"), filepath.Join(dir, "handlers.jsonl")
 			writeFixture(t, model, []byte(tc.model))
 			writeFixture(t, handlers, []byte(tc.handlers))
-			err := validateQueryQualification(model, handlers, id)
+			err := validateQueryQualification(t.Context(), model, handlers, id)
 			if tc.want == "" {
 				if err != nil {
 					t.Fatal(err)
@@ -60,14 +62,14 @@ func TestValidateQueryQualification(t *testing.T) {
 		})
 	}
 	t.Run("both evidence paths required", func(t *testing.T) {
-		if err := validateQueryQualification("model.jsonl", "", id); err == nil || !strings.Contains(err.Error(), "requires both") {
+		if err := validateQueryQualification(t.Context(), "model.jsonl", "", id); err == nil || !strings.Contains(err.Error(), "requires both") {
 			t.Fatalf("missing handler path: %v", err)
 		}
 	})
 	t.Run("both files missing", func(t *testing.T) {
 		dir := t.TempDir()
 		model, handlers := filepath.Join(dir, "model.jsonl"), filepath.Join(dir, "handlers.jsonl")
-		err := validateQueryQualification(model, handlers, id)
+		err := validateQueryQualification(t.Context(), model, handlers, id)
 		if !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), model) || !strings.Contains(err.Error(), handlers) {
 			t.Fatalf("missing events: %v", err)
 		}
@@ -110,4 +112,158 @@ func queryEventLine(t *testing.T, action, test, output string) string {
 		t.Fatal(err)
 	}
 	return string(event) + "\n"
+}
+
+func TestQueryEventReadBounds(t *testing.T) {
+	t.Parallel()
+	id := identity{}
+	pass := queryEventLine(t, "pass", "", "")
+	irrelevant := queryEventLine(t, "output", "TestOptional", "diagnostic")
+	t.Run("aggregate limit includes ignored events", func(t *testing.T) {
+		stream := pass + strings.Repeat(irrelevant, 20)
+		for _, excess := range []int{0, 1, len(irrelevant)} {
+			// A reader without Stat, as when a file grows after open.
+			limit := int64(len(stream) - excess)
+			err := validateQueryEvents(t.Context(), strings.NewReader(stream), limit, nil, nil, id)
+			if excess == 0 && err != nil {
+				t.Fatalf("exact-size stream rejected: %v", err)
+			}
+			if excess != 0 && (!errors.Is(err, errArtifactOversized) || !strings.Contains(err.Error(), fmt.Sprint(limit))) {
+				t.Fatalf("stream %d bytes over budget = %v", excess, err)
+			}
+		}
+	})
+	t.Run("line limit", func(t *testing.T) {
+		const newline = "\n"
+		line := strings.TrimSuffix(irrelevant, newline)
+		exact := line + strings.Repeat(" ", maxQueryEventLineBytes-len(line))
+		for _, tc := range []struct {
+			name, wire string
+			want       error
+		}{
+			{"exact with newline", exact + newline, nil},
+			{"exact without newline", exact, nil},
+			{"one over with newline", exact + " " + newline, errArtifactOversized},
+			{"one over without newline", exact + " ", errArtifactOversized},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := validateQueryEvents(t.Context(), strings.NewReader(pass+tc.wire), maxQueryEventBytes, nil, nil, id)
+				if !errors.Is(err, tc.want) || (err != nil && !strings.Contains(err.Error(), "line 2")) {
+					t.Fatalf("validation = %v; want %v on line 2", err, tc.want)
+				}
+			})
+		}
+	})
+	t.Run("canceled while collecting evidence", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		source := io.MultiReader(strings.NewReader(pass), artifactTestReader(func([]byte) (int, error) {
+			cancel()
+			return 0, io.EOF
+		}))
+		err := validateQueryEvents(ctx, source, maxQueryEventBytes, nil, nil, id)
+		if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "read Go test events at line 2") {
+			t.Fatalf("validation = %v; want cancellation after the passing event", err)
+		}
+	})
+}
+
+func TestMalformedQueryEvents(t *testing.T) {
+	t.Parallel()
+	pass := queryEventLine(t, "pass", "", "")
+	for _, tc := range []struct {
+		name, line, detail string
+	}{
+		{"syntax", `{"Action":`, "malformed JSON object"},
+		{"blank", "", "malformed JSON object"},
+		{"null root", "null", "expected JSON object"},
+		{"array", "[]", "malformed JSON object"},
+		{"missing action", `{"Package":"bog/verify/query-model"}`, "Action"},
+		{"missing package", `{"Action":"pass"}`, "Package"},
+		{"mis-cased package", `{"Action":"pass","package":"bog/verify/query-model"}`, "Package"},
+		{"null test", `{"Action":"pass","Package":"bog/verify/query-model","Test":null}`, "Test"},
+		{"nonstring test", `{"Action":"pass","Package":"bog/verify/query-model","Test":123}`, "Test"},
+		{"null output", `{"Action":"output","Package":"bog/verify/query-model","Output":null}`, "Output"},
+		{"repeated field", `{"Action":"fail","Action":"pass","Package":"bog/verify/query-model"}`, "malformed JSON object"},
+		{"trailing value", `{"Action":"pass","Package":"bog/verify/query-model"}{}`, "malformed JSON object"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateQueryEvents(t.Context(), strings.NewReader(pass+tc.line+"\n"), maxQueryEventBytes, nil, nil, identity{})
+			if !errors.Is(err, errArtifactMalformed) || !strings.Contains(err.Error(), "decode Go test event at line 2") ||
+				!strings.Contains(err.Error(), tc.detail) {
+				t.Fatalf("validation = %v; want malformed line 2 mentioning %q", err, tc.detail)
+			}
+		})
+	}
+	build := `{"Action":"build-output","ImportPath":"bog/unrelated","Output":"diagnostic"}` + "\n"
+	other := `{"Action":"pass","Package":"bog/other","Extension":{"extra":true}}` + "\r\n"
+	if err := validateQueryEvents(t.Context(), strings.NewReader(build+other+pass), maxQueryEventBytes, nil, nil, identity{}); err != nil {
+		t.Fatalf("build diagnostics and irrelevant test events should be accepted: %v", err)
+	}
+}
+
+func TestBothQueryEventFilesCheckInputs(t *testing.T) {
+	t.Parallel()
+	id := identity{Revision: testRevision, BinarySHA256: strings.Repeat("a", 64)}
+	for _, input := range []struct {
+		name  string
+		model bool
+	}{
+		{"query model events", true},
+		{"query handler events", false},
+	} {
+		t.Run(input.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name  string
+				want  error
+				phase string
+			}{
+				{"missing", os.ErrNotExist, "open"},
+				{"FIFO", errArtifactNonregular, "open"},
+				{"oversized", errArtifactOversized, "open"},
+				{"malformed", errArtifactMalformed, "validate"},
+				{"canceled", context.Canceled, "open"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					dir := t.TempDir()
+					model := filepath.Join(dir, "model.jsonl")
+					handler := filepath.Join(dir, "handler.jsonl")
+					path := handler
+					if input.model {
+						path = model
+						writeFixture(t, handler, []byte(passingQueryEvents(t, queryHandlerTests, nil, id)))
+					} else {
+						writeFixture(t, model, []byte(passingQueryEvents(t, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id)))
+					}
+
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					check := func() error { return validateQueryQualification(ctx, model, handler, id) }
+					var err error
+					switch tc.name {
+					case "FIFO":
+						err = checkFIFO(t, path, check)
+					case "oversized":
+						writeFixture(t, path, nil)
+						if err := os.Truncate(path, maxQueryEventBytes+1); err != nil {
+							t.Fatal(err)
+						}
+						err = check()
+					case "malformed":
+						writeFixture(t, path, []byte("{}\n"))
+						err = check()
+					case "canceled":
+						cancel()
+						err = check()
+					default:
+						err = check()
+					}
+					prefix := fmt.Sprintf("%s: %s %q:", input.name, tc.phase, path)
+					if !errors.Is(err, tc.want) || !strings.Contains(err.Error(), prefix) {
+						t.Fatalf("validation = %v; want %v with %q", err, tc.want, prefix)
+					}
+				})
+			}
+		})
+	}
 }

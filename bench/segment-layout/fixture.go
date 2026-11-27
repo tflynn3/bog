@@ -108,11 +108,15 @@ func ordered(a, b checkpoint.BlockRow) int {
 	return cmp.Compare(a.Ordinal, b.Ordinal)
 }
 
-func partition(rows []checkpoint.BlockRow) (blocks [][]checkpoint.BlockRow) {
+func partition(rows []checkpoint.BlockRow) [][]checkpoint.BlockRow {
+	return partitionAt(rows, blockTarget)
+}
+
+func partitionAt(rows []checkpoint.BlockRow, target int) (blocks [][]checkpoint.BlockRow) {
 	start, size := 0, blockHeader
 	for i, row := range rows {
-		width := 24 + len(row.Row.Line)
-		if size+width > blockTarget && i > start {
+		width := encodedRowBytes(row)
+		if size+width > target && i > start {
 			blocks = append(blocks, rows[start:i])
 			start, size = i, blockHeader
 		}
@@ -157,4 +161,22 @@ func reference(rows []checkpoint.BlockRow, q query) []checkpoint.BlockRow {
 		return a.Row.TS.Compare(b.Row.TS)
 	})
 	return matches
+}
+
+func (input fixtureInput) successiveAppends() []backfill {
+	bursts := input.backfills()
+	forward := slices.Clone(bursts[0].batch)
+	next := input.anchors[len(input.anchors)-1].Row.TS.Add(time.Second)
+	for i := range forward {
+		forward[i].Row.TS = next
+	}
+	appends := append([]backfill{{"forward", forward}}, bursts...)
+	ordinal := uint64(len(input.rows))
+	for _, change := range appends {
+		for i := range change.batch {
+			change.batch[i].Ordinal = ordinal
+			ordinal++
+		}
+	}
+	return appends
 }

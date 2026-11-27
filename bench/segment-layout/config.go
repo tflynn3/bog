@@ -25,6 +25,7 @@ type config struct {
 	fixtureSeed                   uint64
 	binary, binaryRevision        string
 	timeout                       time.Duration
+	incremental                   bool
 }
 
 func parseConfig(args []string, revision string, output io.Writer) (config, error) {
@@ -41,6 +42,7 @@ func parseConfig(args []string, revision string, output io.Writer) (config, erro
 	flags.StringVar(&cfg.profile, "fixture", "mixed", "fixture profile (mixed or entropy)")
 	flags.StringVar(&cfg.dir, "dir", "", "parent for temporary benchmark files (defaults to OS temp directory)")
 	flags.StringVar(&cfg.revision, "revision", revision, "source revision to record")
+	flags.BoolVar(&cfg.incremental, "incremental", false, "compare successive experimental segment publications")
 	smoke := flags.Bool("smoke", false, "use the fixed small fixture and one sample per query")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
@@ -77,6 +79,9 @@ func parseConfig(args []string, revision string, output io.Writer) (config, erro
 	}
 	if cfg.timeout <= 0 || (cfg.binary == "") != (cfg.binaryRevision == "") {
 		return config{}, fmt.Errorf("require a positive -timeout and provide -bog-bin and -bog-revision together")
+	}
+	if cfg.incremental && cfg.binary != "" {
+		return config{}, fmt.Errorf("-bog-bin is only supported by the full-rewrite benchmark")
 	}
 	return cfg, nil
 }

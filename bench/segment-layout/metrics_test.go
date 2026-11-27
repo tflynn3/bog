@@ -8,18 +8,21 @@ import (
 
 func TestParseConfig(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		args    []string
-		scale   string
-		batches int
-		runs    int
-		wantErr bool
+		name        string
+		args        []string
+		scale       string
+		batches     int
+		runs        int
+		wantErr     bool
+		incremental bool
 	}{
 		{name: "default", scale: "medium", batches: 2048, runs: 21},
 		{name: "small", args: []string{"-scale", "small"}, scale: "small", batches: 64, runs: 21},
 		{name: "large", args: []string{"-scale", "large", "-fixture", "entropy", "-runs", "2"}, scale: "large", batches: 8192, runs: 2},
 		{name: "custom", args: []string{"-batches", "17"}, scale: "custom", batches: 17, runs: 21},
 		{name: "smoke", args: []string{"-smoke", "-runs", "5"}, scale: "smoke", batches: 64, runs: 1},
+		{name: "incremental smoke", args: []string{"-incremental", "-smoke"}, scale: "smoke", batches: 64, runs: 1, incremental: true},
+		{name: "incremental with production binary", args: []string{"-incremental", "-bog-bin", "candidate", "-bog-revision", "test"}, wantErr: true},
 		{name: "unknown scale", args: []string{"-scale", "gigantic"}, wantErr: true},
 		{name: "conflict", args: []string{"-batches", "2", "-scale", "small"}, wantErr: true},
 		{name: "zero batches", args: []string{"-batches", "0"}, wantErr: true},
@@ -33,7 +36,7 @@ func TestParseConfig(t *testing.T) {
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("parseConfig error = %v", err)
 			}
-			if err == nil && (cfg.scale != tc.scale || cfg.batches != tc.batches || cfg.runs != tc.runs || cfg.revision != "test") {
+			if err == nil && (cfg.scale != tc.scale || cfg.batches != tc.batches || cfg.runs != tc.runs || cfg.incremental != tc.incremental || cfg.revision != "test") {
 				t.Errorf("unexpected config %+v", cfg)
 			}
 		})

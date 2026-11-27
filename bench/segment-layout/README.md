@@ -32,6 +32,68 @@ query. Use `-seed` to select the PCG seed (default 44) and `-timeout`
 to bound each query sample or compaction scenario (default 5m). Fixture rows, block counts and file byte counts are reproducible for
 the same profile, size and dependency versions. Timings vary.
 
+## Successive publications
+
+Run the incremental experiment on native Linux.
+
+```sh
+go run . -incremental -smoke -seed 44
+go run . -incremental -dir /path/to/data -fixture entropy -scale medium -seed 44 -runs 21
+```
+
+This mode emits schema v4 with `mode: "incremental"`. The default invocation
+emits the schema v3 full-rewrite experiment described below. Incremental mode
+uses the same scales and profiles, with an initial publication followed by
+three cumulative four-row appends. The forward append shares the timestamp just
+after the final ordinary batch. The clustered and scattered appends use exact
+duplicates from the initial history with new ordinals. All nine codec and size
+combinations see the same rows at each cutoff.
+
+The layouts use raw, LZ4, and Zstd with 16, 64, and 256 KiB uncompressed segment
+targets. Each segment is an immutable file containing one v1 checkpoint block
+in the benchmark container. The existing maximum-frame row gets a singleton
+segment above the target. Each publication writes and syncs the changed
+segment files and a new manifest. It carries forward sealed segments and
+repacks the previous tail only when the first appended row fits there.
+The benchmark keeps the predecessor readable while the successor is built.
+Every selected publication is reopened and checked against the full independent
+append-order oracle, including exact timestamps, ordinals, and line bytes.
+
+- **Reuse and writes.** `reused_bytes` counts complete segment files referenced
+  by both consecutive manifests. `rewritten_bytes` counts complete new segment
+  files, including newly appended segments and any replacement tail.
+  Their sum is `retained_bytes`. `retired_bytes` counts the predecessor's
+  segment files dropped from the new manifest. The initial publication reports
+  zero reuse and retirement. `manifest_bytes` gives the additional logical
+  bytes written for publication metadata. These counts exclude filesystem
+  metadata, WAL bytes, and device write amplification.
+- **Decode allocations.** A fresh Linux worker loads the manifest, then scans
+  its segments one at a time without retaining results. `allocations` and
+  `allocation_bytes` are Go runtime counter deltas across the scan, including
+  segment opens, validation, codec setup and decode. `peak_rss_bytes` is the
+  worker's whole-process Linux high-water mark, including runtime and codec
+  overhead.
+- **Decode working set.** `peak_working_bytes` accounts for the largest live
+  block's stored payload, a separate expansion buffer if needed, decoded row
+  structs, and copied lines. Its bound allows two payload buffers up to the
+  raw block limit plus the maximum decoded row and line footprint at that
+  limit. The bound scales with the configured target and the oversized
+  singleton, independent of the number of segments. Ordinary and oversized
+  peaks are reported separately so the singleton cannot mask the effect of
+  segment size. The working-set accounting excludes metadata, codec internals,
+  allocator overhead, and accumulated query results.
+- **Query latency under compaction.** For every append trial, a full-range
+  sparse query scans the immutable predecessor in the same process while the
+  writer builds and syncs the successor. The report includes sample durations,
+  overlap with the timed writer interval, and nearest-rank p95. Query timing
+  includes dispatching the paired writer, file reads, decode, filtering, and result
+  ordering. Oracle comparison and trial cleanup are outside the timer. The
+  last trial's successor advances the chain. The filesystem cache is left in
+  place, and these measurements characterize the experimental layout.
+
+The production codec decision remains open. The separate full-rewrite mode
+provides the production checkpoint and pinned-server comparison.
+
 ## Fixture and queries
 
 The mixed profile cycles ordinary batch sizes of 1, 7, 64 and 256 with

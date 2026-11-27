@@ -12,32 +12,6 @@ import (
 	"testing"
 )
 
-func scanMemoryPeakRSS() (uint64, error) {
-	status, err := os.ReadFile("/proc/self/status")
-	if err != nil {
-		return 0, err
-	}
-	return parseScanMemoryPeakRSS(string(status))
-}
-
-func parseScanMemoryPeakRSS(status string) (uint64, error) {
-	for line := range strings.SplitSeq(status, "\n") {
-		value, ok := strings.CutPrefix(line, "VmHWM:")
-		if !ok {
-			continue
-		}
-		fields := strings.Fields(value)
-		if len(fields) == 2 && fields[1] == "kB" {
-			kib, err := strconv.ParseUint(fields[0], 10, 54)
-			if err == nil && kib > 0 {
-				return kib * 1024, nil
-			}
-		}
-		return 0, fmt.Errorf("invalid worker peak RSS: %q", line)
-	}
-	return 0, errors.New("missing VmHWM in worker /proc/self/status")
-}
-
 func scanMemoryFixtureFDs(procFD, fixture string) ([]string, error) {
 	entries, err := os.ReadDir(procFD)
 	if err != nil {
@@ -166,9 +140,12 @@ func TestScanMemoryLinuxMetrics(t *testing.T) {
 		{"wrong unit", "VmHWM: 5 MB", 0},
 		{"negative", "VmHWM: -1 kB", 0},
 		{"overflow", "VmHWM: 18014398509481984 kB", 0},
+		{"duplicate", "VmHWM: 5 kB\nVmHWM: 6 kB", 0},
+		{"oversized", "VmHWM: 5 kB\n" + strings.Repeat("other\n", scanMemoryProcBytes/6+1), 0},
+		{"long line", "VmHWM: 5 kB\n" + strings.Repeat("x", scanMemoryProcBytes), 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseScanMemoryPeakRSS(tc.status)
+			got, err := parseScanMemoryStatus(strings.NewReader(tc.status), "VmHWM")
 			if got != tc.want || (err != nil) != (tc.want == 0) {
 				t.Fatalf("peak RSS = %d, %v, want %d", got, err, tc.want)
 			}

@@ -29,7 +29,6 @@ const (
 	scanMemoryWorkerEnv = "BOG_FUZZ_RETAINED_SCAN_MEMORY"
 	scanMemoryCgroupEnv = "BOG_FUZZ_RETAINED_SCAN_CGROUP"
 	scanMemorySegments  = 1024
-	scanMemoryPageBytes = 4 << 10
 	scanMemoryDiskCap   = 10 << 20
 	scanMemoryLock      = "bog.checkpoint.lock"
 )
@@ -39,6 +38,9 @@ func TestRetainedScanMemory(t *testing.T) {
 	must(t, err)
 	fixture := seedScanMemory(t, path)
 	configured := httpapi.DefaultQueryConcurrency
+	if configured != scanMemoryReaders {
+		t.Fatalf("scan qualification requires %d server readers, got %d", scanMemoryReaders, configured)
+	}
 	for _, scenario := range []struct {
 		name  string
 		scans int
@@ -66,18 +68,29 @@ func runScanMemoryProcess(t *testing.T, path string, count int) scanMemoryReport
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^TestRetainedScanMemoryWorker$", "-test.count=1")
 	cmd.WaitDelay = time.Second
-	cmd.Env = append(cmd.Environ(), scanMemoryWorkerEnv+"="+strconv.Itoa(count), scanMemoryCgroupEnv+"="+group)
+	cmd.Env = append(cmd.Environ(), scanMemoryWorkerEnv+"="+strconv.Itoa(count), scanMemoryCgroupEnv+"="+group,
+		"GOMAXPROCS="+strconv.Itoa(scanMemoryReaders))
 	cmd.Dir = path
-	output, err := cmd.CombinedOutput()
-	if err != nil || ctx.Err() != nil {
-		t.Fatalf("%s worker at concurrency %d: context=%v process=%v\n%s", scanMemorySeed, count, ctx.Err(), err, output)
+	output, runErr := runBoundedReplayWorker(cmd)
+	var startup scanMemoryStartup
+	if err := errors.Join(decodeScanMemoryRecord(output, scanMemoryStartupPrefix, &startup), startup.validate()); err != nil {
+		t.Fatalf("%s harness startup at concurrency %d: %v\n%s",
+			scanMemorySeed, count, errors.Join(err, ctx.Err(), runErr), output)
+	}
+	logScanMemoryRecord(t, scanMemoryStartupPrefix, startup)
+	if err := errors.Join(ctx.Err(), runErr); err != nil {
+		t.Fatalf("%s reader workload at concurrency %d: %v\n%s", scanMemorySeed, count, err, output)
 	}
 	report, err := decodeScanMemoryReport(output)
-	must(t, err)
+	if err != nil {
+		t.Fatalf("reader workload evidence: %v\n%s", err, output)
+	}
 	if group == "" {
 		report.CgroupUnavailable = unavailable
 	}
-	must(t, report.validate(group != ""))
+	if err := report.validate(group != ""); err != nil {
+		t.Fatalf("reader workload evidence: %v", err)
+	}
 	if report.Arch != runtime.GOARCH || report.GoVersion != runtime.Version() {
 		t.Fatalf("unexpected worker runtime: %s %s", report.Arch, report.GoVersion)
 	}
@@ -89,109 +102,160 @@ func TestRetainedScanMemoryWorker(t *testing.T) {
 	if raw == "" {
 		t.Skip("started by TestRetainedScanMemory")
 	}
-	count, err := strconv.Atoi(raw)
-	must(t, err)
-	if count != 1 && count != httpapi.DefaultQueryConcurrency {
-		t.Fatalf("invalid measurement concurrency %d", count)
+	count, err := parseScanMemoryReaders(raw)
+	if err != nil {
+		t.Fatalf("harness startup: %v", err)
 	}
 	path, err := os.Getwd()
-	must(t, err)
+	if err != nil {
+		t.Fatalf("harness startup: %v", err)
+	}
 	group := os.Getenv(scanMemoryCgroupEnv)
 	if group != "" {
-		must(t, enterScanMemoryCgroup(group))
+		if err := enterScanMemoryCgroup(group); err != nil {
+			t.Fatalf("harness startup: enter scan memory cgroup: %v", err)
+		}
 	}
-	setWorkerLimits(t)
-	report := runRetainedScanMemory(t, path, group, count)
-	data, err := json.Marshal(report)
-	must(t, err)
-	_, err = fmt.Printf("%s%s\n", scanMemoryReportPrefix, data)
-	must(t, err)
+	startup, err := prepareScanMemoryWorker()
+	if err != nil {
+		t.Fatalf("harness startup: %v", err)
+	}
+	if err := writeScanMemoryRecord(scanMemoryStartupPrefix, startup); err != nil {
+		t.Fatalf("harness startup: write startup evidence: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), scanMemoryDeadline)
+	defer cancel()
+	started := time.Now()
+	before := scanMemoryTotalAlloc()
+	report, workErr := runRetainedScanMemory(ctx, path, group, count, scanMemoryRows(t))
+	after := scanMemoryTotalAlloc()
+	report.ElapsedNS = int64(time.Since(started))
+	workErr = errors.Join(workErr, ctx.Err(), checkScanMemoryBytes("workload allocation", before, after, report.Limits.Allocated))
+	if report.ElapsedNS > report.Limits.DeadlineNS {
+		workErr = errors.Join(workErr, fmt.Errorf("workload elapsed %s: %w", time.Duration(report.ElapsedNS), context.DeadlineExceeded))
+	}
+	if workErr != nil {
+		t.Fatalf("reader workload: %v", workErr)
+	}
+	report.AllocatedBytes = after - before
+	if err := writeScanMemoryRecord(scanMemoryReportPrefix, report); err != nil {
+		t.Fatalf("reader workload: write evidence: %v", err)
+	}
 }
 
-func runRetainedScanMemory(t *testing.T, path, group string, count int) scanMemoryReport {
-	t.Helper()
-	rows := scanMemoryRows(t)
+func parseScanMemoryReaders(raw string) (int, error) {
+	// The worker protocol accepts exactly the single-reader control and
+	// the eight-reader qualification case.
+	switch raw {
+	case "1":
+		return 1, nil
+	case "8":
+		return scanMemoryReaders, nil
+	default:
+		return 0, errors.New("invalid measurement concurrency; expected 1 or 8")
+	}
+}
+
+func writeScanMemoryRecord(prefix string, record any) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Printf("%s%s\n", prefix, data)
+	return err
+}
+
+func scanMemoryTotalAlloc() uint64 {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return stats.TotalAlloc
+}
+
+func runRetainedScanMemory(ctx context.Context, path, group string, count int, rows []checkpoint.BlockRow) (report scanMemoryReport, err error) {
+	report = scanMemoryReport{
+		Seed: scanMemorySeed, Arch: runtime.GOARCH, GoVersion: runtime.Version(),
+		Concurrency: count, ConfiguredConcurrency: httpapi.DefaultQueryConcurrency, Limits: scanMemoryBudget(count),
+	}
+	fixtureBytes, err := scanMemoryFixtureBytes(ctx, path)
+	if err != nil {
+		return report, err
+	}
 	info := scanMemoryFixture{
-		Bytes: scanMemoryFixtureBytes(t, path), Files: scanMemorySegments + 1,
+		Bytes: fixtureBytes, Files: scanMemorySegments + 1,
 		Rows: len(rows), Segments: scanMemorySegments, PageBytes: scanMemoryPageBytes,
 		MaxLineBytes: len(rows[0].Row.Line),
-	}
-	report := scanMemoryReport{
-		Seed: scanMemorySeed, Arch: runtime.GOARCH, GoVersion: runtime.Version(),
-		Concurrency: count, ConfiguredConcurrency: httpapi.DefaultQueryConcurrency,
 	}
 	budget := checkpoint.NewBudget(checkpoint.Limits{
 		checkpoint.PinnedGenerations: 1,
 		checkpoint.LiveCaptures:      uint64(count),
 	})
-	idleFDs, err := scanMemoryFixtureFDs("/proc/self/fd", path)
-	must(t, err)
-	if len(idleFDs) != 0 {
-		t.Fatalf("fixture descriptors before opening catalog: %v", idleFDs)
+	if err := checkRetainedReaderFDs(path, nil); err != nil {
+		return report, err
 	}
 	catalog := history.NewCatalog(budget)
-	defer func() { must(t, catalog.Close()) }()
-	generation, err := catalog.Replace(t.Context(), path)
-	must(t, err)
+	var generation history.Generation
+	defer func() {
+		err = errors.Join(err, catalog.Close(), checkRetainedReaderBudget(budget))
+		finalFDs, fdErr := retainedReaderFDs(path)
+		if fdErr != nil || len(finalFDs) != 0 {
+			err = errors.Join(err, fdErr, fmt.Errorf("fixture descriptors after catalog close: %v", finalFDs))
+		}
+		report.FinalFDs = len(finalFDs)
+		report.FinalPins = budget.Usage().InUse[checkpoint.PinnedGenerations]
+		if generation.Drained != nil {
+			select {
+			case <-generation.Drained:
+				report.GenerationDrained = true
+			default:
+				err = errors.Join(err, errors.New("generation still pinned after catalog close"))
+			}
+		}
+	}()
+	generation, err = catalog.Replace(ctx, path)
+	if err != nil {
+		return report, fmt.Errorf("load catalog: %w", err)
+	}
 	info.Generation = fmt.Sprintf("%x", generation.ID)
 	info.CoveredWALBytes = generation.Boundary.CoveredOffset
 	report.Fixture = info
 	if generation.Boundary.NextOrdinal != uint64(len(rows)) {
-		t.Fatalf("generation row count = %d, want %d", generation.Boundary.NextOrdinal, len(rows))
+		return report, fmt.Errorf("generation row count = %d, want %d", generation.Boundary.NextOrdinal, len(rows))
 	}
-	catalogFDs, err := scanMemoryFixtureFDs("/proc/self/fd", path)
-	must(t, err)
+	catalogFDs, err := retainedReaderFDs(path)
+	if err != nil {
+		return report, err
+	}
 	const pinFDs = 2
 	if len(catalogFDs) != pinFDs {
-		t.Fatalf("catalog fixture descriptors = %v, want %d (directory and pin)", catalogFDs, pinFDs)
+		return report, fmt.Errorf("catalog fixture descriptors = %v, want %d (directory and pin)", catalogFDs, pinFDs)
 	}
 	report.CatalogFDs = len(catalogFDs)
 
 	query := history.Query{Start: start, End: start.Add(3 * time.Second)}
-	measureRetainedScans(t, catalog, budget, query, rows[0], path, catalogFDs, &report)
-	usageRSS, err := scanMemoryPeakRSS()
-	must(t, err)
-	report.PeakRSS = usageRSS
+	if err := measureRetainedScans(ctx, catalog, budget, query, rows[0], path, catalogFDs, &report); err != nil {
+		return report, err
+	}
+	report.PeakRSS, err = readScanMemoryStatus("VmHWM")
+	if err != nil {
+		return report, err
+	}
 	if group != "" {
 		peak, err := readScanMemoryCgroupPeak(group)
-		must(t, err)
+		if err != nil {
+			return report, err
+		}
 		report.CgroupPeak = &peak
 	}
-	// Retry is outside the memory sample and uses the same metered query.
-	ctx, cancel := context.WithTimeout(t.Context(), interruptionDeadline)
-	defer cancel()
-	reader, err := catalog.Acquire(generation.ID)
-	must(t, err)
-	defer func() { must(t, reader.Close()) }()
-	retried, scanErr := retryScanMemoryRows(ctx, reader, query, rows)
-	must(t, errors.Join(scanErr, reader.Close()))
-	report.RetryRows = retried
-	afterRetry, err := scanMemoryFixtureFDs("/proc/self/fd", path)
-	must(t, err)
-	if !slices.Equal(afterRetry, catalogFDs) {
-		t.Fatalf("fixture descriptors after retry = %v, want %v", afterRetry, catalogFDs)
+	// Exercise the work limit and verify exact retry outside the heap
+	// sample. Both paths still count toward the worker allocation limit.
+	err = rejectScanMemoryWork(ctx, catalog, query, uint64(info.MaxLineBytes-1))
+	if err := errors.Join(err, checkScanMemoryIdle(path, catalogFDs, budget)); err != nil {
+		return report, err
 	}
-
-	must(t, catalog.Close())
-	select {
-	case <-generation.Drained:
-	default:
-		t.Fatal("generation still pinned after cancellation, retry and catalog close")
-	}
-	finalUsage := budget.Usage().InUse
-	if finalUsage != (checkpoint.Limits{}) {
-		t.Fatalf("resource reservations after catalog close: %v", finalUsage)
-	}
-	report.FinalPins = finalUsage[checkpoint.PinnedGenerations]
-	finalFDs, err := scanMemoryFixtureFDs("/proc/self/fd", path)
-	must(t, err)
-	if len(finalFDs) != 0 {
-		t.Fatalf("fixture descriptors after catalog close: %v", finalFDs)
-	}
-	report.FinalFDs = len(finalFDs)
-	report.GenerationDrained = true
-	runtime.KeepAlive(rows) // Keep the exact retry oracle in all heap samples.
-	return report
+	report.WorkRejections = 1
+	report.RetryRows, err = retryScanMemory(ctx, catalog, query, rows, report.Limits.WorkPerReader)
+	return report, errors.Join(err, checkScanMemoryIdle(path, catalogFDs, budget))
 }
 
 func scanMemoryAppendRuns(t *testing.T, yield func([]checkpoint.BlockRow)) {
@@ -301,29 +365,42 @@ func maximumScanMemoryFrame(t *testing.T, framed []byte) []byte {
 	return framed
 }
 
-func scanMemoryFixtureBytes(t *testing.T, path string) int64 {
-	t.Helper()
+func scanMemoryFixtureBytes(ctx context.Context, path string) (int64, error) {
 	names := scanMemoryNames()
 	var total int64
 	for _, name := range names[:len(names)-1] {
-		info, err := os.Stat(filepath.Join(path, name))
-		must(t, err)
-		if !info.Mode().IsRegular() || info.Size() > checkpoint.MaxBlockSize {
-			t.Fatalf("invalid fixture file %s: %v", name, info)
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		info, err := os.Lstat(filepath.Join(path, name))
+		if err != nil {
+			return 0, err
+		}
+		limit := int64(checkpoint.MaxBlockSize)
+		if name == manifestFile {
+			limit = maxArtifactSize - 1
+		}
+		if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit {
+			return 0, fmt.Errorf("%w: invalid fixture file %s: %v", errReplayLimit, name, info)
+		}
+		if info.Size() > scanMemoryDiskCap-maxOutputFile-total {
+			return 0, fmt.Errorf("%w: fixture exceeds disk cap at %s", errReplayLimit, name)
 		}
 		total += info.Size()
 	}
-	if total > scanMemoryDiskCap-maxOutputFile {
-		t.Fatalf("fixture bytes %d exceed cap", total)
-	}
-	return total
+	return total, nil
 }
 
 func logScanMemoryReport(t *testing.T, report scanMemoryReport) {
 	t.Helper()
-	data, err := json.Marshal(report)
+	logScanMemoryRecord(t, scanMemoryReportPrefix, report)
+}
+
+func logScanMemoryRecord(t *testing.T, prefix string, record any) {
+	t.Helper()
+	data, err := json.Marshal(record)
 	must(t, err)
-	t.Logf("%s%s", scanMemoryReportPrefix, data)
+	t.Logf("%s%s", prefix, data)
 }
 
 func TestScanMemoryOverflowFixture(t *testing.T) {

@@ -153,14 +153,31 @@ fixture runs alongside the separate 128 MiB capacity verifier fixtures.
 
 ## Peak memory for concurrent retained scans
 
-Run on native Linux amd64 and arm64 and retain the two
-`retained_scan_memory` JSON records from the verbose test output.
+Run on native Linux amd64 and arm64 from a clean checkout of the full
+candidate SHA. On each runner, capture the revision, kernel, Go environment,
+and uncached race output together. Use Bash so the log capture preserves a
+failing test's exit status.
 
 ```sh
-BOG_TEST_CGROUP_PARENT=/sys/fs/cgroup/path/to/delegation \
-  go test -race -count=1 -v -timeout=2m -run '^TestRetainedScanMemory$' ./verify/fuzz
+set -o pipefail
+(
+  set -e
+  test -z "$(git status --porcelain)"
+  git rev-parse HEAD
+  uname -sm
+  CGO_ENABLED=1 go env -json GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH CGO_ENABLED
+  CGO_ENABLED=1 go test -race -count=1 -v -timeout=2m \
+    -run '^TestRetainedScanMemory$' ./verify/fuzz
+) 2>&1 | tee "${TMPDIR:-/tmp}/retained-scan-$(uname -m).log"
 ```
 
+Qualification requires a passing `server-concurrency` subtest and its
+`retained_scan_startup` and `retained_scan_memory` JSON records, with workload
+concurrency eight, for the same candidate SHA on both architectures. Native
+qualification logs for this change are pending.
+
+Export `BOG_TEST_CGROUP_PARENT` with a delegated cgroup path before running to
+require isolated cgroup memory measurement.
 The parent must have the cgroup v2 memory controller enabled for its
 children and permit creating and entering a child cgroup. If the variable
 is omitted, the harness tries the current cgroup as the parent. On hosts
@@ -170,6 +187,21 @@ fresh workers enters its own cgroup before loading the catalog. The
 parent seeds the shared fixture outside those cgroups, so filesystem
 cache charged during seeding can remain outside the measured groups.
 The harness removes each group after its worker exits.
+
+Each worker measures `VmSize` before constructing the row oracle or loading
+the fixture. Its address-space ceiling allows 4 GiB of additional virtual
+mappings for Go arenas, OS threads, and race instrumentation. The startup
+record identifies the baseline and applied limit. Failures before that
+record are reported as harness startup failures. Once startup succeeds,
+the parent reports worker failures as reader workload failures.
+
+The 30-second workload budget covers fixture inspection, catalog loading,
+scans, rejection, retry, and cleanup. Each scan has 16 Mi work units. The
+sampled heap growth limit is 16 MiB per reader. Cumulative Go allocation
+allows 48 MiB for fixture inspection, loading, and retry, plus 20 MiB per
+reader. The eight-reader case therefore allows 128 MiB sampled heap growth
+and 208 MiB cumulative Go allocation. These limits are separate from the
+release capacity cgroup runs.
 
 The fixture uses 1,024 overlapping segments within a 10 MiB disk budget.
 Its first ordered row contains the largest unescaped line that fits a
@@ -192,9 +224,11 @@ heap with and without active scan state.
 The barrier closes reader handles while scan reservations are still
 charged. Cancellation joins the scans under one deadline and checks that
 capture reservations and fixture descriptors return to their catalog
-baseline. A fresh reader verifies every timestamp, line and append
-ordinal in order. Closing the catalog releases the generation pin and
-its reservations and descriptors.
+baseline. A scan with insufficient work to materialize the first line must
+reject before visiting a row. A fresh reader then verifies every timestamp,
+line, and append ordinal in order. Closing the catalog must drain the
+generation and release its reservations and descriptors. The unit tests also
+exercise oversized parser input, partial reader admission, and scan failure.
 
 ## Bounded replay oracle
 

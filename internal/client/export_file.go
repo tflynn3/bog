@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -26,14 +25,13 @@ const (
 
 // FileExportProgressStore persists a single checkpoint in a trusted, existing
 // directory on a local filesystem that supports atomic replacement and file
-// and directory sync. Use one owner for the checkpoint path, as required by
-// ExportProgressStore. The opening body may contain sensitive query rows.
-// Sibling names beginning with .export-progress-stage- are reserved for
-// staging and recovery.
+// and directory sync. Individual operations acquire exclusive ownership.
+// ExportSession holds ownership for the entire run. The opening body may
+// contain sensitive query rows. Names beginning with .export-progress-stage-
+// and the .export-progress-locks directory belong to the store.
 type FileExportProgressStore struct {
-	dir   string
-	name  string
-	stage string
+	dir  string
+	name string
 }
 
 // NewFileExportProgressStore locates the checkpoint at path. Construction
@@ -51,35 +49,61 @@ func NewFileExportProgressStore(path string) (*FileExportProgressStore, error) {
 	if strings.HasPrefix(strings.ToLower(name), exportStagePrefix) {
 		return nil, errors.New("export checkpoint path uses the reserved staging prefix")
 	}
-	key := sha256.Sum256([]byte(name))
-	return &FileExportProgressStore{
-		dir: filepath.Dir(abs), name: name, stage: exportStagePrefix + hex.EncodeToString(key[:]),
-	}, nil
+	for part := range strings.SplitSeq(abs, string(filepath.Separator)) {
+		if strings.EqualFold(part, exportLocksDir) {
+			return nil, errors.New("export checkpoint path uses the reserved lock directory")
+		}
+	}
+	return &FileExportProgressStore{dir: filepath.Dir(abs), name: name}, nil
+}
+
+func (s *FileExportProgressStore) Load(ctx context.Context, maxPageBytes int64) (_ ExportProgress, found bool, resultErr error) {
+	if err := withQueryCancellation(ctx, nil); err != nil {
+		return ExportProgress{}, false, err
+	}
+	lease, err := s.Acquire()
+	if err != nil {
+		return ExportProgress{}, false, err
+	}
+	defer func() { resultErr = joinQueryErrors(resultErr, lease.Close()) }()
+	return lease.Load(ctx, maxPageBytes)
+}
+
+func (s *FileExportProgressStore) Save(ctx context.Context, progress ExportProgress) (resultErr error) {
+	if err := withQueryCancellation(ctx, nil); err != nil {
+		return err
+	}
+	lease, err := s.Acquire()
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = joinQueryErrors(resultErr, lease.Close()) }()
+	return lease.Save(ctx, progress)
 }
 
 // Load returns the complete durable checkpoint, if present. Syncing the
 // directory also settles a previous Save whose rename succeeded but whose
 // directory sync failed or was interrupted.
-func (s *FileExportProgressStore) Load(ctx context.Context, maxPageBytes int64) (_ ExportProgress, found bool, resultErr error) {
-	if err := withQueryCancellation(ctx, nil); err != nil {
+func (s *FileExportProgressLease) Load(ctx context.Context, maxPageBytes int64) (_ ExportProgress, found bool, resultErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkOpen(ctx); err != nil {
 		return ExportProgress{}, false, err
 	}
 	if maxPageBytes <= 0 || maxPageBytes == math.MaxInt64 {
 		return ExportProgress{}, false, errors.New("invalid export page byte limit")
 	}
-	root, err := os.OpenRoot(s.dir)
+	root := s.root
+	removed, err := s.recoverStages()
 	if err != nil {
-		return ExportProgress{}, false, fmt.Errorf("open export checkpoint directory: %w", err)
-	}
-	defer func() {
-		resultErr = exportIOError(resultErr, "close export checkpoint directory root", root.Close())
-	}()
-	if err := s.removeStage(root); err != nil {
 		return ExportProgress{}, false, err
 	}
 
 	info, err := root.Lstat(s.name)
 	if errors.Is(err, os.ErrNotExist) {
+		if removed {
+			return ExportProgress{}, false, syncExportDirectory(root)
+		}
 		return ExportProgress{}, false, nil
 	}
 	if err != nil {
@@ -116,8 +140,16 @@ func (s *FileExportProgressStore) Load(ctx context.Context, maxPageBytes int64) 
 // replaces the checkpoint and syncs the same directory. A pre-rename failure
 // leaves the old checkpoint in place. A post-rename failure leaves a complete
 // replacement whose durability must be re-established by Load.
-func (s *FileExportProgressStore) Save(ctx context.Context, progress ExportProgress) (resultErr error) {
-	if err := withQueryCancellation(ctx, nil); err != nil {
+func (s *FileExportProgressLease) Save(ctx context.Context, progress ExportProgress) error {
+	return s.save(ctx, progress, (*os.Root).Rename, syncExportDirectory)
+}
+
+func (s *FileExportProgressLease) save(ctx context.Context, progress ExportProgress,
+	rename func(*os.Root, string, string) error, syncDir func(*os.Root) error,
+) (resultErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkOpen(ctx); err != nil {
 		return err
 	}
 	if err := progress.validate(math.MaxInt64); err != nil {
@@ -128,26 +160,32 @@ func (s *FileExportProgressStore) Save(ctx context.Context, progress ExportProgr
 		return err
 	}
 
-	root, err := os.OpenRoot(s.dir)
-	if err != nil {
-		return fmt.Errorf("open export checkpoint directory: %w", err)
-	}
-	defer func() {
-		resultErr = exportIOError(resultErr, "close export checkpoint directory root", root.Close())
-	}()
-	if err := s.removeStage(root); err != nil {
+	root, stage := s.root, s.stages[0]
+	if _, err := s.recoverStages(); err != nil {
 		return err
 	}
-	file, err := root.OpenFile(s.stage, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if !s.lockSynced {
+		// A surviving stage must have a durable owner name, even if this
+		// is the first save and there is no installed checkpoint yet.
+		if err := s.lock.Sync(); err != nil {
+			return fmt.Errorf("sync export checkpoint lock: %w", err)
+		}
+		if err := syncExportDirectoryAt(root, exportLocksDir); err != nil {
+			return err
+		}
+		if err := syncExportDirectory(root); err != nil {
+			return err
+		}
+		s.lockSynced = true
+	}
+	file, err := root.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return fmt.Errorf("stage export checkpoint: %w", err)
 	}
 	renamed := false
 	defer func() {
 		if !renamed {
-			if err := s.removeStage(root); err != nil {
-				resultErr = joinQueryErrors(resultErr, err)
-			}
+			resultErr = exportIOError(resultErr, "remove staged export checkpoint", root.Remove(stage))
 		}
 	}()
 
@@ -159,22 +197,11 @@ func (s *FileExportProgressStore) Save(ctx context.Context, progress ExportProgr
 	if err := withQueryCancellation(ctx, nil); err != nil {
 		return err
 	}
-	if err := root.Rename(s.stage, s.name); err != nil {
+	if err := rename(root, stage, s.name); err != nil {
 		return fmt.Errorf("install export checkpoint: %w", err)
 	}
 	renamed = true
-	return withQueryCancellation(ctx, syncExportDirectory(root))
-}
-
-func (s *FileExportProgressStore) removeStage(root *os.Root) error {
-	// Only the installed name carries progress. A process that stopped
-	// before rename may have left its staged file, which is safe to discard
-	// under the checkpoint's exclusive ownership contract.
-	err := root.Remove(s.stage)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return exportIOError(nil, "remove staged export checkpoint", err)
+	return withQueryCancellation(ctx, syncDir(root))
 }
 
 func encodeExportCheckpoint(progress ExportProgress) (body, metadata []byte, err error) {
@@ -289,7 +316,11 @@ func exportCheckpointChecksum(metadata, body []byte) [sha256.Size]byte {
 }
 
 func syncExportDirectory(root *os.Root) error {
-	dir, err := root.Open(".")
+	return syncExportDirectoryAt(root, ".")
+}
+
+func syncExportDirectoryAt(root *os.Root, name string) error {
+	dir, err := root.Open(name)
 	if err != nil {
 		return fmt.Errorf("open export checkpoint directory for sync: %w", err)
 	}

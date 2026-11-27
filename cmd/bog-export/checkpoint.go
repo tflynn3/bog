@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -32,14 +31,13 @@ func checkpointPath(path string) (string, error) {
 // checks whether this invocation was asked to start or resume. Later loads
 // in the same invocation can recover from a retried query request.
 type checkpointProgress struct {
-	*client.FileExportProgressStore
-	lock   *os.File
+	*client.FileExportProgressLease
 	resume bool
 	loaded bool
 }
 
 func (p *checkpointProgress) Load(ctx context.Context, maxBytes int64) (client.ExportProgress, bool, error) {
-	progress, found, err := p.FileExportProgressStore.Load(ctx, maxBytes)
+	progress, found, err := p.FileExportProgressLease.Load(ctx, maxBytes)
 	if err != nil {
 		return client.ExportProgress{}, false, err
 	}
@@ -56,17 +54,10 @@ func (p *checkpointProgress) Load(ctx context.Context, maxBytes int64) (client.E
 }
 
 func (p *checkpointProgress) close() error {
-	return releaseCheckpointLock(p.lock)
+	return p.Close()
 }
 
-func releaseCheckpointLock(lock *os.File) error {
-	// Keep the lock file in place so concurrent opens share an inode.
-	// Unlock explicitly before close. A concurrent fork can briefly
-	// inherit the descriptor before exec closes it.
-	return errors.Join(syscall.Flock(int(lock.Fd()), syscall.LOCK_UN), lock.Close())
-}
-
-func openCheckpoint(path string, resume bool, out io.Writer) (_ *checkpointProgress, resultErr error) {
+func openCheckpoint(path string, resume bool, out io.Writer) (*checkpointProgress, error) {
 	outputInfo, err := appendFileInfo(out)
 	if err != nil {
 		return nil, err
@@ -76,50 +67,14 @@ func openCheckpoint(path string, resume bool, out io.Writer) (_ *checkpointProgr
 		return nil, err
 	}
 
-	base := filepath.Base(path)
-	// Case-fold the lock key to serialize aliases on case-insensitive
-	// filesystems as well. The progress file itself retains its spelling.
-	key := sha256.Sum256([]byte(strings.ToLower(base)))
-	lockPath := filepath.Join(filepath.Dir(path), fmt.Sprintf("%s%x", checkpointLockPrefix, key))
-	// O_NONBLOCK keeps startup bounded even if the lock path was replaced
-	// with a special file. Never follow a symlink for the lock.
-	lock, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
+	lease, err := store.Acquire()
 	if err != nil {
-		return nil, fmt.Errorf("open export checkpoint lock: %w", err)
+		return nil, err
 	}
-	release := lock.Close
-	defer func() {
-		if resultErr != nil {
-			resultErr = errors.Join(resultErr, release())
-		}
-	}()
-
-	info, err := lock.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat export checkpoint lock: %w", err)
+	if err := lease.CheckOutput(outputInfo); err != nil {
+		return nil, errors.Join(err, lease.Close())
 	}
-	if !info.Mode().IsRegular() || os.SameFile(outputInfo, info) {
-		return nil, errors.New("checkpoint lock must be a regular file separate from stdout")
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, fmt.Errorf("lock export checkpoint: %w", err)
-	}
-	release = func() error { return releaseCheckpointLock(lock) }
-
-	// The store may replace the progress file or remove a stale stage.
-	// Keep stdout separate from both, including through hard links.
-	stageKey := sha256.Sum256([]byte(base))
-	stage := filepath.Join(filepath.Dir(path), fmt.Sprintf(".export-progress-stage-%x", stageKey))
-	for _, candidate := range []string{path, stage} {
-		info, err := os.Lstat(candidate)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("stat checkpoint entry: %w", err)
-		}
-		if err == nil && os.SameFile(outputInfo, info) {
-			return nil, errors.New("checkpoint files must be separate from stdout")
-		}
-	}
-	return &checkpointProgress{FileExportProgressStore: store, lock: lock, resume: resume}, nil
+	return &checkpointProgress{FileExportProgressLease: lease, resume: resume}, nil
 }
 
 func appendFileInfo(out io.Writer) (os.FileInfo, error) {

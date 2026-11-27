@@ -127,9 +127,10 @@ func TestExportAcknowledgmentTransitions(t *testing.T) {
 				return nil
 			}}
 			var delivered []int
+			var checkpoint ExportProgressStore = store
 			sink := func(_ context.Context, delivery ExportPage) error {
 				delivered = append(delivered, delivery.Number)
-				prior := loadTestExport(t, store)
+				prior := loadTestExport(t, checkpoint)
 				switch delivery.Number {
 				case 1:
 					wantRows := []string{"tie", "tie"}
@@ -176,7 +177,17 @@ func TestExportAcknowledgmentTransitions(t *testing.T) {
 				t.Fatalf("checkpoint after failure: %+v, found=%t, error=%v", progress, found, err)
 			}
 
-			resumed := newTestExport(t, c, q, 2, newTestExportStore(t, path), sink)
+			lease, err := store.Acquire()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := lease.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			checkpoint = lease
+			resumed := newTestExport(t, c, q, 2, lease, sink)
 			for range 2 { // The second successful run must be a no-op.
 				if err := resumed.Run(t.Context()); err != nil {
 					t.Fatal(err)
@@ -185,7 +196,7 @@ func TestExportAcknowledgmentTransitions(t *testing.T) {
 			if !slices.Equal(delivered, tc.wantDelivered) || !slices.Equal(requests, tc.wantRequests) {
 				t.Fatalf("delivered %v, requested %q", delivered, requests)
 			}
-			finished := loadTestExport(t, store)
+			finished := loadTestExport(t, lease)
 			if !finished.Complete || finished.AcknowledgedPages != 2 || finished.Opening != nil || finished.Cursor != "" {
 				t.Fatalf("final checkpoint: %+v", finished)
 			}

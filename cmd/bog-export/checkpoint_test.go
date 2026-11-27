@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -176,4 +177,59 @@ func assertSinkRows(t *testing.T, path, want string) {
 	if string(data) != want {
 		t.Errorf("sink contains %q, want %q", data, want)
 	}
+}
+
+func TestCheckpointRejectsLegacyStageLinkedToStdout(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	original := filepath.Join(dir, "Progress")
+	seed := filepath.Join(dir, "seed")
+	store, err := client.NewFileExportProgressStore(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(t.Context(), client.ExportProgress{
+		Version: client.ExportProgressVersion, AcknowledgedPages: 1, Complete: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(seed, original); err != nil {
+		t.Fatal(err)
+	}
+	alias := checkpointCaseAlias(t, original)
+	out := openAppendSink(t, filepath.Join(dir, "rows"))
+	stage := filepath.Join(dir, fmt.Sprintf(".export-progress-stage-%x", sha256.Sum256([]byte("Progress"))))
+	if err := os.Link(out.Name(), stage); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := openCheckpoint(alias, true, out)
+	if progress != nil {
+		err = errors.Join(err, progress.close())
+	}
+	if err == nil || !strings.Contains(err.Error(), "separate from stdout") {
+		t.Fatalf("open checkpoint with a stage linked to stdout: %v", err)
+	}
+	if _, err := os.Lstat(stage); err != nil {
+		t.Fatalf("stage changed during stdout validation: %v", err)
+	}
+}
+
+func checkpointCaseAlias(t *testing.T, path string) string {
+	t.Helper()
+	alias := filepath.Join(filepath.Dir(path), strings.ToLower(filepath.Base(path)))
+	info, err := os.Lstat(alias)
+	if errors.Is(err, os.ErrNotExist) {
+		return path
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(info, orig) {
+		return alias
+	}
+	return path
 }

@@ -36,7 +36,7 @@ func TestResumeAcrossPageAcknowledgment(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
 			dir := t.TempDir()
-			checkpoint := filepath.Join(dir, "progress")
+			checkpoint := filepath.Join(dir, "Progress")
 			log := filepath.Join(dir, "workers.txt")
 			marker := filepath.Join(dir, "synced")
 			sink := openAppendSink(t, filepath.Join(dir, "rows.ndjson"))
@@ -107,8 +107,9 @@ func TestResumeAcrossPageAcknowledgment(t *testing.T) {
 				t.Fatalf("continuation was not preserved: %+v", saved)
 			}
 
+			resumeArgs := argsFor(server.URL, "-checkpoint", checkpointCaseAlias(t, checkpoint), "-resume")
 			for _, run := range []string{"resume", "already complete"} {
-				cmd := exportProcess(ctx, append(args, "-resume")...)
+				cmd := exportProcess(ctx, resumeArgs...)
 				cmd.Stdout, cmd.Stderr = sink, &stderr
 				stderr.Reset()
 				if err := cmd.Run(); err != nil || stderr.Len() != 0 {
@@ -160,7 +161,15 @@ func TestCheckpointExcludesConcurrentExport(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 	defer cancel()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "progress")
+	path := filepath.Join(dir, "Progress")
+	probe := filepath.Join(dir, "Probe")
+	if err := os.WriteFile(probe, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	competingPath := path
+	if checkpointCaseAlias(t, probe) != probe {
+		competingPath = filepath.Join(dir, "progress")
+	}
 	out := openAppendSink(t, filepath.Join(dir, "rows.ndjson"))
 	requested := make(chan struct{})
 	var requests atomic.Int32
@@ -195,7 +204,7 @@ func TestCheckpointExcludesConcurrentExport(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("first export never reached the query")
 	}
-	second := exportProcess(ctx, args...)
+	second := exportProcess(ctx, argsFor(server.URL, "-checkpoint", competingPath)...)
 	second.Stdout, second.Stderr = out, &secondStderr
 	if status := exitStatus(t, second.Run()); status != exitIncomplete || !strings.Contains(secondStderr.String(), "lock export checkpoint") {
 		t.Errorf("second export exit = %d, stderr = %q", status, secondStderr.String())

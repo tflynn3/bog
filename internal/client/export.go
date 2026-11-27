@@ -39,9 +39,10 @@ type ExportPage struct {
 // using the page number scoped to its own durable export identity.
 type ExportSink func(context.Context, ExportPage) error
 
-// ExportProgressStore holds one export's checkpoint. A caller must arrange
-// exclusive use of that checkpoint for the duration of Run, including across
-// sessions and processes. Use a separate checkpoint for each independent export.
+// ExportProgressStore holds one export's checkpoint. File stores acquire
+// exclusive ownership for Run. Callers using custom stores or wrappers must
+// arrange equivalent ownership across sessions and processes. Use a separate
+// checkpoint for each independent export.
 //
 // Save atomically replaces the full record and returns nil only once it is
 // durable. An error may leave either the old or the new record in place.
@@ -110,7 +111,7 @@ func (c *Client) NewExportSession(q Query, maxPages int, progress ExportProgress
 // Run loads progress and exports pages until terminal acknowledgment is durable.
 // On failure, call Run again with an active context to resume from the store.
 // An expired capture surfaces as ErrCaptureExpired and leaves progress intact.
-func (s *ExportSession) Run(ctx context.Context) error {
+func (s *ExportSession) Run(ctx context.Context) (resultErr error) {
 	if ctx == nil {
 		return errors.New("nil export context")
 	}
@@ -129,7 +130,20 @@ func (s *ExportSession) Run(ctx context.Context) error {
 	if maxBytes < 0 || maxBytes == math.MaxInt64 {
 		return errors.New("invalid export page byte limit")
 	}
-	progress, found, err := s.store.Load(ctx, maxBytes)
+	store := s.store
+	if owner, ok := store.(interface {
+		beginExportRun() (ExportProgressStore, func() error, error)
+	}); ok {
+		leased, end, err := owner.beginExportRun()
+		if err != nil {
+			return withQueryCancellation(ctx, err)
+		}
+		defer func() { resultErr = joinQueryErrors(resultErr, end()) }()
+		if leased != nil {
+			store = leased
+		}
+	}
+	progress, found, err := store.Load(ctx, maxBytes)
 	if err = withQueryCancellation(ctx, err); err != nil {
 		return fmt.Errorf("load export progress: %w", err)
 	}
@@ -154,16 +168,16 @@ func (s *ExportSession) Run(ctx context.Context) error {
 		if progress.AcknowledgedPages >= s.maxPages {
 			return fmt.Errorf("after %d acknowledged pages: %w", progress.AcknowledgedPages, ErrPageBudget)
 		}
-		if err := s.deliver(ctx, &progress, maxBytes); err != nil {
+		if err := s.deliver(ctx, store, &progress, maxBytes); err != nil {
 			return err
 		}
 	}
 	return withQueryCancellation(ctx, nil)
 }
 
-func (s *ExportSession) deliver(ctx context.Context, progress *ExportProgress, maxBytes int64) error {
+func (s *ExportSession) deliver(ctx context.Context, store ExportProgressStore, progress *ExportProgress, maxBytes int64) error {
 	number := progress.AcknowledgedPages + 1
-	page, err := s.page(ctx, progress, maxBytes)
+	page, err := s.page(ctx, store, progress, maxBytes)
 	if err = withQueryCancellation(ctx, err); err != nil {
 		return fmt.Errorf("prepare export page %d: %w", number, err)
 	}
@@ -179,7 +193,7 @@ func (s *ExportSession) deliver(ctx context.Context, progress *ExportProgress, m
 	}
 
 	advanced := progress.advance(page.NextCursor)
-	err = s.store.Save(ctx, advanced)
+	err = store.Save(ctx, advanced)
 	if err = withQueryCancellation(ctx, err); err != nil {
 		return fmt.Errorf("save acknowledgment for export page %d: %w", number, err)
 	}
@@ -187,7 +201,7 @@ func (s *ExportSession) deliver(ctx context.Context, progress *ExportProgress, m
 	return nil
 }
 
-func (s *ExportSession) page(ctx context.Context, progress *ExportProgress, maxBytes int64) (Page, error) {
+func (s *ExportSession) page(ctx context.Context, store ExportProgressStore, progress *ExportProgress, maxBytes int64) (Page, error) {
 	if progress.Opening != nil {
 		return progress.Opening.replay(ctx, maxBytes, s.query.Limit)
 	}
@@ -205,7 +219,7 @@ func (s *ExportSession) page(ctx context.Context, progress *ExportProgress, maxB
 	if err := withQueryCancellation(ctx, nil); err != nil {
 		return Page{}, err
 	}
-	err = s.store.Save(ctx, *progress)
+	err = store.Save(ctx, *progress)
 	if err = withQueryCancellation(ctx, err); err != nil {
 		return Page{}, fmt.Errorf("journal opening page: %w", err)
 	}

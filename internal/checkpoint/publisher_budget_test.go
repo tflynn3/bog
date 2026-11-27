@@ -331,6 +331,8 @@ func TestCeilingMergeRecoversBothManifestRenameOutcomes(t *testing.T) {
 			requirePublicationOK(t, legacy.dir.Sync())
 			_, err = legacy.OpenPublished()
 			requirePublicationOK(t, err)
+			const unrelated = segmentPrefix + "ffffffffffffffffffffffffffffffff"
+			requirePublicationOK(t, pub.writeNew(unrelated, []byte("keep me")))
 			before := checkpointNames(t, path)
 
 			budget := NewBudget(Limits{StagingBytes: 256 << 10})
@@ -361,20 +363,32 @@ func TestCeilingMergeRecoversBothManifestRenameOutcomes(t *testing.T) {
 			if len(candidate.Segments) >= MaxSegments {
 				t.Fatal("failed attempt did not actually build a merged successor")
 			}
-			requirePublicationOK(t, publisher.RecoverCaptured(func() (*Manifest, error) {
+			validate := func() (*Manifest, error) {
 				p, err := legacy.readPublished(false)
 				if err != nil {
 					return nil, err
 				}
 				m := p.Manifest()
 				return &m, nil
-			}))
+			}
+			reservation, err := budget.Reserve(ctx, StagingBytes, 1)
+			requirePublicationOK(t, err)
+			defer reservation.Release()
+			for range 2 {
+				requirePublicationOK(t, publisher.RecoverCaptured(validate))
+			}
+			if budget.Usage().InUse[StagingBytes] != 1 {
+				t.Fatal("repeated recovery changed an unrelated reservation")
+			}
+			reservation.Release()
 			if budget.Usage().InUse[StagingBytes] != 0 {
 				t.Fatal("recovery did not release the staging charge")
 			}
 			recovered, err := legacy.OpenPublished()
 			requirePublicationOK(t, err)
+			authorityEnd := int64(cutoff)
 			if won {
+				authorityEnd = end
 				if m := recovered.Manifest(); m.NextOrdinal != nextOrdinal || !slices.Equal(m.Segments, candidate.Segments) {
 					t.Fatal("recovery did not select the winning merge")
 				}
@@ -388,6 +402,22 @@ func TestCeilingMergeRecoversBothManifestRenameOutcomes(t *testing.T) {
 					t.Fatal("retry did not install merged authority")
 				}
 			}
+			var expected, actual []BlockRow
+			requirePublicationOK(t, scanCapturedFrames(ctx, input, int64(len(magic)), authorityEnd, 0,
+				func(_, _ int64, first uint64, rows []store.Row) error {
+					for i, row := range rows {
+						expected = append(expected, BlockRow{Row: row, Ordinal: first + uint64(i)})
+					}
+					return nil
+				}))
+			slices.SortFunc(expected, compareMergeRows)
+			requirePublicationOK(t, recovered.Scan(func(row BlockRow) error {
+				actual = append(actual, row)
+				return nil
+			}))
+			if !slices.Equal(actual, expected) || string(readFixture(t, path, unrelated)) != "keep me" {
+				t.Fatal("recovery changed exact row order or unrelated content")
+			}
 			// Publication recovery owns only attempt outputs. The history
 			// reclaimer is responsible for retiring the replaced inputs.
 			for _, s := range old.Segments {
@@ -399,7 +429,12 @@ func TestCeilingMergeRecoversBothManifestRenameOutcomes(t *testing.T) {
 }
 
 func TestCeilingStagedReplacementSettlement(t *testing.T) {
-	for _, mode := range []string{"overlap refused", "exact overlap", "cancel before publish", "rename lost"} {
+	modes := []string{"overlap refused", "exact overlap", "cancel before publish", "rename lost", "failed cleanup"}
+	faults := []stagingStep{writeSuccessor, syncSuccessor, closeSuccessor, syncOverlap, unlinkPrior, syncRetirement, linkFinal, unlinkStageLink}
+	for _, step := range faults {
+		modes = append(modes, string(step))
+	}
+	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
 			path, legacy, _ := capturedPublicationFixture(t)
 			previous, err := legacy.Publish()
@@ -441,6 +476,36 @@ func TestCeilingStagedReplacementSettlement(t *testing.T) {
 			base.stage = &publisher.stage
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
+			faultStep := stagingStep(mode)
+			if mode == "failed cleanup" {
+				faultStep = unlinkPrior
+			}
+			const blocker = stageDir + "/keep-unrecognized"
+			faultSeen := false
+			ctx = context.WithValue(ctx, stagingFaultKey{}, func(step stagingStep) error {
+				if step != faultStep {
+					return nil
+				}
+				faultSeen = true
+				if step != linkFinal && step != unlinkStageLink {
+					if used := budget.Usage().InUse[StagingBytes]; used != overlap {
+						t.Errorf("charged %d bytes at %s, want %d", used, step, overlap)
+					}
+					want := 3
+					if step == syncRetirement {
+						want = 2
+					}
+					if names := checkpointNames(t, filepath.Join(path, stageDir)); len(names) != want {
+						t.Errorf("at %s, staged %v, want %d files", step, names, want)
+					}
+				}
+				if mode == "failed cleanup" {
+					if err := legacy.root.WriteFile(blocker, []byte("unrelated"), 0600); err != nil {
+						t.Error(err)
+					}
+				}
+				return syscall.EIO
+			})
 			scan := func(visit func(uint64, []store.Row) error) error { return visit(2, suffix) }
 			attempt := func(p *publication, ctx context.Context) (*Manifest, error) {
 				m := newManifest(previous.CoveredOffset+64, previous.SourceSHA256)
@@ -503,6 +568,30 @@ func TestCeilingStagedReplacementSettlement(t *testing.T) {
 				requirePublicationOK(t, publisher.RecoverCaptured(func() (*Manifest, error) {
 					return previous, base.checkPrevious(t.Context(), previous)
 				}))
+			default:
+				uncertain := mode == "failed cleanup"
+				if !faultSeen || got != nil || !errors.Is(err, syscall.EIO) || errors.Is(err, ErrPublicationUncertain) != uncertain {
+					t.Fatalf("fault %q: seen=%v published=%v err=%v", mode, faultSeen, got != nil, err)
+				}
+				if uncertain {
+					if used := budget.Usage().InUse[StagingBytes]; used != overlap || !publisher.stage.pending {
+						t.Fatalf("failed cleanup settled early: usage %d, pending %v", used, publisher.stage.pending)
+					}
+					authority := func() (*Manifest, error) {
+						return previous, base.checkPrevious(t.Context(), previous)
+					}
+					if err := publisher.RecoverCaptured(authority); !errors.Is(err, ErrIntegrity) ||
+						budget.Usage().InUse[StagingBytes] != overlap {
+						t.Fatalf("recovery ignored blocked cleanup or released charges: %v", err)
+					}
+					if data := readFixture(t, path, blocker); string(data) != "unrelated" {
+						t.Fatal("recovery changed the unrecognized file")
+					}
+					requirePublicationOK(t, legacy.root.Remove(blocker))
+					for range 2 {
+						requirePublicationOK(t, publisher.RecoverCaptured(authority))
+					}
+				}
 			}
 			if mode != "overlap refused" && budget.Usage().Peak[StagingBytes] != overlap {
 				t.Fatalf("replacement peak missed overlap: %+v, want %d", budget.Usage(), overlap)
@@ -516,7 +605,7 @@ func TestCeilingStagedReplacementSettlement(t *testing.T) {
 					t.Fatal("failed attempt changed authority or left files")
 				}
 			}
-			if mode == "rename lost" {
+			if mode == "rename lost" || faultSeen {
 				retry, err := attempt(&publication{root: legacy.root, dir: legacy.dir, stage: &publisher.stage}, t.Context())
 				requirePublicationOK(t, err)
 				assertCeilingReplacement(t, legacy, retry, old, original, suffix)
@@ -614,10 +703,23 @@ func TestStagedBlockSlotCapAndReuse(t *testing.T) {
 		t.Fatalf("accepted corrupt staged bytes: %v", err)
 	}
 
-	// Simulate interruption after writing the single overlap file and
-	// before unlinking the replaced slot or recording the intent.
-	_, err = a.writeBlock(replacement)
-	requirePublicationOK(t, err)
+	// Interrupt a second slot after the overlap barrier. Both files and
+	// both reservations survive at the live slot cap.
+	overlapSlot := a.files[1]
+	a.ctx = context.WithValue(t.Context(), stagingFaultKey{}, func(step stagingStep) error {
+		if step == unlinkPrior {
+			return syscall.EIO
+		}
+		return nil
+	})
+	replacement[0].Ordinal = 1
+	if err := a.replaceBlock(1, replacement); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("interrupt replacement at ceiling: %v", err)
+	}
+	if a.files[1] != overlapSlot || len(p.stage.charges) != MaxSegments+1 ||
+		budget.Usage().InUse[StagingBytes] != after.InUse[StagingBytes]+uint64(current.Size) {
+		t.Fatalf("interrupted slot changed selection or accounting: %+v", budget.Usage())
+	}
 	err = recoverCapturedWithBudget(legacy.root, legacy.dir,
 		func() (*Manifest, error) { return nil, os.ErrNotExist }, p.stage)
 	if !errors.Is(err, os.ErrNotExist) || budget.Usage().InUse[StagingBytes] != 0 {

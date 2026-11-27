@@ -400,13 +400,46 @@ func runCheckpointCeiling(t *testing.T) {
 	}
 
 	suite := t
-	for _, name := range []string{"cancel-staged-block", "manifest-budget", "sigkill-1", "rename-enoent", "sigkill-2"} {
+	for _, name := range []string{
+		"cancel-staged-block", "manifest-budget", "sigkill-staged", "recover-overlap",
+		"recover-retirement", "sigkill-1", "rename-enoent", "sigkill-2",
+	} {
 		if !t.Run(name, func(t *testing.T) {
 			switch name {
 			case "cancel-staged-block":
 				cancelCeilingStaging(t, path, p, owner, committed, initial, before, budget)
 			case "manifest-budget":
 				rejectCeilingManifestBudget(t, p, owner, committed, initial, budget)
+			case "sigkill-staged":
+				must(t, owner.Close())
+				stop := startInterrupted(t, "checkpoint-staged", path, "")
+				inv := inspectCeiling(t, path)
+				assertCeilingFiles(t, inv.root, before.root)
+				if len(inv.stage) != 1 {
+					t.Fatalf("interrupted staging has %d entries, want one segment", len(inv.stage))
+				}
+				for name, file := range inv.stage {
+					if !strings.HasPrefix(name, ceilingSegment) || file.size <= 0 || file.size > ceilingRewrites {
+						t.Fatalf("unexpected staged segment %s: %+v", name, file)
+					}
+				}
+				inv.report(t, "staged-before-intent", budget)
+				stop()
+				owner = openCeilingOwner(t, suite, path, committed)
+				p = checkpoint.NewPublisher(root, dir, budget)
+				checkCeilingWhilePending(t, p, dir, owner, catalog, old, baseline, committed, initial)
+				for range 2 {
+					recoverCeiling(t, p, dir, owner, baseline, committed, initial)
+				}
+			case "recover-overlap", "recover-retirement":
+				writeInterruptedReplacement(t, root, dir, committed, name == "recover-retirement")
+				inv := inspectCeiling(t, path)
+				assertCeilingFiles(t, inv.root, before.root)
+				inv.report(t, name, budget)
+				checkCeilingWhilePending(t, p, dir, owner, catalog, old, baseline, committed, initial)
+				for range 2 {
+					recoverCeiling(t, p, dir, owner, baseline, committed, initial)
+				}
 			case "sigkill-1", "sigkill-2":
 				must(t, owner.Close())
 				stop := startInterrupted(t, "checkpoint", path, "")
@@ -437,6 +470,49 @@ func runCheckpointCeiling(t *testing.T) {
 	}
 
 	checkCeilingAdvance(t, path, dir, owner, catalog, p, budget, held, old, baseline, committed, initial, before)
+}
+
+// Build the v1 pre-intent crash images with the public encoder. The real
+// packing fixture stays small enough for the bounded verifier worker.
+func writeInterruptedReplacement(t *testing.T, root *os.Root, dir *os.File, committed ceilingCommit, retired bool) {
+	t.Helper()
+	must(t, root.Mkdir(checkpointStage, 0700))
+	must(t, root.Chmod(checkpointStage, 0700))
+	stage, err := root.Open(checkpointStage)
+	must(t, err)
+	defer func() { must(t, stage.Close()) }()
+	rows := make([]checkpoint.BlockRow, 2)
+	for i := range rows {
+		rows[i] = checkpoint.BlockRow{Row: committed.rows[i], Ordinal: uint64(i)}
+	}
+	predecessor := checkpointStage + "/" + ceilingSegment + "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	successor := checkpointStage + "/" + ceilingSegment + "ffffffffffffffffffffffffffffffff"
+	writeBlock := func(name string, rows []checkpoint.BlockRow) {
+		data, err := checkpoint.EncodeBlock(rows)
+		must(t, err)
+		f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		must(t, err)
+		err = f.Chmod(0600)
+		if err == nil {
+			var n int
+			n, err = f.Write(data)
+			if err == nil && n != len(data) {
+				err = io.ErrShortWrite
+			}
+		}
+		if err == nil {
+			err = f.Sync()
+		}
+		must(t, errors.Join(err, f.Close()))
+	}
+	writeBlock(predecessor, rows[:1])
+	writeBlock(successor, rows)
+	must(t, stage.Sync())
+	if retired {
+		must(t, root.Remove(predecessor))
+		must(t, stage.Sync())
+	}
+	must(t, dir.Sync())
 }
 
 func openCeilingOwner(t, suite *testing.T, path string, point ceilingCommit) *wal.Log {

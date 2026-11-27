@@ -273,7 +273,7 @@ func checkpointInterruption(t *testing.T, f recoveryFixture) {
 	checkTruncatedCheckpointReplay(t, successor)
 }
 
-func interruptCheckpoint(t *testing.T, path string, park func()) {
+func interruptCheckpoint(t *testing.T, mode, path string, park func()) {
 	log := openOwner(t, path)
 	c, err := log.Capture(t.Context())
 	must(t, err)
@@ -285,6 +285,17 @@ func interruptCheckpoint(t *testing.T, path string, park func()) {
 	must(t, errors.Join(err, lock.Close()))
 	input := readArtifact(t, filepath.Join(path, walFile))
 	ctx := phaseContext{t.Context(), func() {
+		if mode == "checkpoint-staged" {
+			entries, err := os.ReadDir(filepath.Join(path, checkpointStage))
+			if errors.Is(err, os.ErrNotExist) {
+				return
+			}
+			must(t, err)
+			if len(entries) == 1 && strings.HasPrefix(entries[0].Name(), ceilingSegment) {
+				park()
+			}
+			return
+		}
 		_, err := os.Lstat(filepath.Join(path, checkpointStage, "installed-v1"))
 		if errors.Is(err, os.ErrNotExist) {
 			return
@@ -293,7 +304,7 @@ func interruptCheckpoint(t *testing.T, path string, park func()) {
 		park()
 	}}
 	_, err = checkpoint.PublishCaptured(ctx, root, dir, c, c.CommittedEnd(), previous, c.NextOrdinal(), digest(input))
-	t.Fatalf("checkpoint returned before the install barrier: %v", err)
+	t.Fatalf("checkpoint returned before the %s barrier: %v", mode, err)
 }
 
 // Storage checks cancellation between phases. A worker parks at the first

@@ -6,7 +6,10 @@
 //
 // FetchPage validates every page for direct callers, Walk, WalkFrom, and
 // BoundedWalk. It exposes rows and the continuation together after checking
-// HTTP framing, the byte ceiling, NDJSON records, and the cursor header.
+// HTTP framing, the byte ceiling, NDJSON records, the cursor header, and body
+// close. Complete NDJSON records are decoded as the body arrives. The client
+// holds those rows until the transport confirms the frame boundary, including
+// when the encoded body exactly fills the byte ceiling.
 // FetchPage errors from an HTTP response retain its status in HTTPError. Use
 // errors.Is to distinguish ErrPageBytes for declared or streamed overflow,
 // ErrMalformedPage for protocol violations, ErrPageInterrupted for body

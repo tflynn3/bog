@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -19,6 +20,7 @@ const (
 	testWorkerLog  = "BOG_EXPORT_TEST_WORKER_LOG"
 	testWorkerMode = "BOG_EXPORT_TEST_WORKER_MODE"
 	testSyncMarker = "BOG_EXPORT_TEST_SYNC_MARKER"
+	testSyncNumber = "BOG_EXPORT_TEST_SYNC_NUMBER"
 )
 
 func runTestOutputWorker() int {
@@ -50,21 +52,55 @@ func runTestOutputWorker() int {
 			case "hold probe":
 				time.Sleep(time.Minute)
 				return exitIncomplete
-			case "hold sync":
-				return runOutputWorker(heldSyncFile{os.Stdout, os.Getenv(testSyncMarker)})
+			case "partial fourth record":
+				return runOutputWorker(&partialRecordFile{File: os.Stdout, beforeFault: 3})
+			case "hold sync", "fail sync":
+				number := 1
+				if value := os.Getenv(testSyncNumber); value != "" {
+					var err error
+					number, err = strconv.Atoi(value)
+					if err != nil || number < 1 {
+						return exitIncomplete
+					}
+				}
+				return runOutputWorker(&heldSyncFile{
+					File: os.Stdout, marker: os.Getenv(testSyncMarker), remaining: number, fail: mode == "fail sync",
+				})
 			}
 		}
 	}
 	return runOutputWorker(os.Stdout)
 }
 
-type heldSyncFile struct {
+const partialRecordBytes = 5
+
+type partialRecordFile struct {
 	*os.File
-	marker string
+	beforeFault int
 }
 
-func (file heldSyncFile) Sync() error {
-	if err := file.File.Sync(); err != nil {
+func (file *partialRecordFile) Write(p []byte) (int, error) {
+	if file.beforeFault > 0 {
+		file.beforeFault--
+		return file.File.Write(p)
+	}
+	n, err := file.File.Write(p[:min(len(p), partialRecordBytes)])
+	return n, errors.Join(errors.New("injected partial record write"), err)
+}
+
+type heldSyncFile struct {
+	*os.File
+	marker    string
+	remaining int
+	fail      bool
+}
+
+func (file *heldSyncFile) Sync() error {
+	file.remaining--
+	if file.remaining == 0 && file.fail {
+		return errors.New("injected output sync failure")
+	}
+	if err := file.File.Sync(); err != nil || file.remaining != 0 {
 		return err
 	}
 	// Publish evidence of the durable output, then wait without replying to

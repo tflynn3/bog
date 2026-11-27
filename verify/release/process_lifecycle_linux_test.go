@@ -49,6 +49,19 @@ func TestCandidateFixtureProcess(t *testing.T) {
 		return
 	case "ignore-stop":
 		signal.Ignore(candidateStopSignal)
+	case "ignore-term":
+		signal.Ignore(syscall.SIGTERM)
+	case "graceful-exit", "graceful-fail":
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		defer signal.Stop(signals)
+		go func() {
+			<-signals
+			if *mode == "graceful-fail" {
+				os.Exit(19)
+			}
+			os.Exit(0)
+		}()
 	}
 
 	if err := os.WriteFile(filepath.Join(*dir, "pid"), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
@@ -263,9 +276,11 @@ func TestStopDoesNotClaimAnUnreapedExit(t *testing.T) {
 	}{
 		{"successful exit before stop", "exit 0", "status 0", candidateStopSignal},
 		{"successful exit before crash", "exit 0", "status 0", syscall.SIGKILL},
+		{"successful exit before graceful stop", "exit 0", "status 0", syscall.SIGTERM},
 		{"external SIGHUP before stop", "kill -HUP $$", "signal: hangup", candidateStopSignal},
 		{"external SIGKILL before stop", "kill -KILL $$", "signal: killed", candidateStopSignal},
 		{"external SIGKILL before crash", "kill -KILL $$", "signal: killed", syscall.SIGKILL},
+		{"external SIGTERM before graceful stop", "kill -TERM $$", "signal: terminated", syscall.SIGTERM},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -289,6 +304,50 @@ func TestStopDoesNotClaimAnUnreapedExit(t *testing.T) {
 			got := candidateSignalExitError(p.stopSignal, waitErr)
 			if got == nil || !strings.Contains(got.Error(), tc.diagnostic) {
 				t.Errorf("exit diagnosis = %v, want %q", got, tc.diagnostic)
+			}
+		})
+	}
+}
+
+func TestGracefulStopRequiresZeroExit(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		mode, want string
+		timeout    time.Duration
+	}{
+		{"graceful-exit", "", candidateStopTimeout},
+		{"graceful-fail", "candidate graceful shutdown did not exit with status 0: exit status 19", candidateStopTimeout},
+		{"default-term", "candidate graceful shutdown did not exit with status 0: signal: terminated", candidateStopTimeout},
+		{"ignore-term", "candidate graceful shutdown did not exit with status 0: signal: killed\ncandidate did not exit within teardown deadline", 200 * time.Millisecond},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			raw := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+			defer raw.CloseIdleConnections()
+			var pid int
+			stop := func(p *candidateProcess, _ time.Duration) error {
+				return p.gracefulStop(tc.timeout)
+			}
+			err := superviseDirectory(ctx, fixtureCandidate(t), t.TempDir(), raw, []string{"-fixture-mode=" + tc.mode},
+				"", stop, func(_ context.Context, _ string, p *candidateProcess, port int, owns listenerOwner) error {
+					pid = p.process.Pid
+					if err := p.requireListenerOn(port, owns); err != nil {
+						return err
+					}
+					// The drain probe may signal first and wait after it releases its peer.
+					return p.requestStop(syscall.SIGTERM)
+				})
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || err.Error() != tc.want {
+				t.Fatalf("graceful stop = %v, want %q", err, tc.want)
+			}
+			if _, err := candidateExited(pid, true); !errors.Is(err, syscall.ECHILD) {
+				t.Errorf("leader was not reaped: %v", err)
 			}
 		})
 	}

@@ -77,6 +77,12 @@ func candidateExitError(stopSent bool, waitErr error) error {
 }
 
 func candidateSignalExitError(stopSignal syscall.Signal, waitErr error) error {
+	if stopSignal == syscall.SIGTERM {
+		if waitErr == nil {
+			return nil
+		}
+		return fmt.Errorf("candidate graceful shutdown did not exit with status 0: %w", waitErr)
+	}
 	var exit *exec.ExitError
 	if errors.As(waitErr, &exit) {
 		if status, ok := exit.Sys().(syscall.WaitStatus); ok && stopSignal != 0 && status.Signaled() && status.Signal() == stopSignal {
@@ -92,7 +98,10 @@ func candidateSignalExitError(stopSignal syscall.Signal, waitErr error) error {
 func (p *candidateProcess) requestStop(signal syscall.Signal) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.stopSignal != 0 && p.stopSignal != signal {
+	if p.stopSignal != 0 {
+		if p.stopSignal == signal {
+			return nil
+		}
 		return fmt.Errorf("candidate stop already requested with %s", p.stopSignal)
 	}
 	if p.observed {
@@ -137,6 +146,21 @@ func (p *candidateProcess) stop(timeout time.Duration) error {
 // crashStop requires the leader to exit from the requested SIGKILL.
 func (p *candidateProcess) crashStop(timeout time.Duration) error {
 	return p.stopWithSignal(syscall.SIGKILL, timeout)
+}
+
+// gracefulStop requires a requested SIGTERM followed by a zero exit status.
+func (p *candidateProcess) gracefulStop(timeout time.Duration) error {
+	return p.stopWithSignal(syscall.SIGTERM, timeout)
+}
+
+func (p *candidateProcess) cleanup(timeout time.Duration) error {
+	p.mu.Lock()
+	signal := p.stopSignal
+	p.mu.Unlock()
+	if signal == 0 {
+		signal = candidateStopSignal
+	}
+	return p.stopWithSignal(signal, timeout)
 }
 
 func (p *candidateProcess) stopWithSignal(signal syscall.Signal, timeout time.Duration) error {
@@ -285,7 +309,18 @@ func serveDirectoryOn(ctx context.Context, binary, dir string, client *http.Clie
 	})
 }
 
-func serveDirectoryWithCandidate(ctx context.Context, binary, dir string, client *http.Client, flags []string, bind listener.Bind, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string, int) error) (err error) {
+func serveDirectoryWithCandidate(ctx context.Context, binary, dir string, client *http.Client, flags []string, bind listener.Bind, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string, int) error) error {
+	return superviseDirectory(ctx, binary, dir, client, flags, bind, stopAfterProbe,
+		func(ctx context.Context, base string, p *candidateProcess, port int, owns listenerOwner) error {
+			probeErr := check(ctx, base, p.process.Pid)
+			// Keep the probe diagnostic first if the listener disappeared.
+			return errors.Join(probeErr, p.requireListenerOn(port, owns))
+		})
+}
+
+// A probe that initiates shutdown must verify listener ownership before
+// signaling, since the listener is expected to close during the probe.
+func superviseDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, bind listener.Bind, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string, *candidateProcess, int, listenerOwner) error) (err error) {
 	network, listenHost, probeHost, err := candidateListenConfig(bind)
 	if err != nil {
 		return err
@@ -310,7 +345,7 @@ func serveDirectoryWithCandidate(ctx context.Context, binary, dir string, client
 	}
 	probeComplete := false
 	defer func() {
-		stop := (*candidateProcess).stop
+		stop := (*candidateProcess).cleanup
 		if probeComplete && ctx.Err() == nil {
 			stop = stopAfterProbe
 		}
@@ -330,10 +365,7 @@ func serveDirectoryWithCandidate(ctx context.Context, binary, dir string, client
 	if err := probes.Err(); err != nil {
 		return err
 	}
-	probeErr := check(probes, base, p.process.Pid)
-	// Keep the probe diagnostic first even when the listener or process
-	// disappeared during the last request.
-	err = errors.Join(probeErr, p.requireListenerOn(addr.Port, owns))
+	err = check(probes, base, p, addr.Port, owns)
 	probeComplete = err == nil
 	return err
 }

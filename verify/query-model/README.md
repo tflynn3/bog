@@ -159,3 +159,55 @@ capacity-control interfaces do not expose. Use both reports for #129 and keep
 the instrumented fixture measurements attributed to the fixture and its
 recorded host. The cgroup workload results come from the native capacity
 producer.
+
+## Selective query admission beside live cursors (#136)
+
+`TestPinnedQueryModelSelectiveAdmission` uses the pinned candidate launcher
+and the ordinary legacy pagination issuer. It records the full candidate
+revision, binary SHA-256, architecture, and workload settings. The launcher
+sets four query slots, 16,777,216 work units per request, and a 256-byte
+response cap. The legacy issuer supplies the 24 MiB aggregate scan budget and
+64-capture ceiling by default.
+
+- **Alongside cursor.** A broad opening over 400,000 acknowledged rows leaves
+  its cursor live. Concurrent requests require a framed empty body, an exact
+  sparse walk with three matches, and the next broad page. The sparse walk
+  includes tied duplicates, a changed row limit, and byte-identical
+  terminal replay. The independent ledger checks every accepted page.
+- **Scan exhaustion.** A fresh issuer opens broad cursors over a separate
+  65,536-row seed. The workload reaches the aggregate scan limit with capture
+  slots still free and no concurrent requests. It requires an exact, complete
+  `503 query scan capacity exhausted` response twice, with no rows or
+  cursor header or trailer. It then verifies a live cursor still resumes.
+  Slot, response, and per-request work refusals fail this check.
+- **Cancellation and expiry.** The portable race fixture sets a smaller scan
+  budget and pauses an opening during allocation. A competing broad opening
+  must get the scan-capacity refusal while selective requests and a resume fit.
+  The fixture cancels the paused request, verifies its clean 408, joins the
+  handler, and requires the same broad opening to succeed. Its virtual-clock
+  expiry test exercises the real issuer timer. The separate pinned expiry run
+  waits for the real 15-minute deadline, verifies the cursor and scan pressure
+  shortly before it, and requires a new broad opening before probing the
+  expired cursor for a clean 410. Recovery before the stale lookup witnesses
+  timer-driven release.
+
+Run the portable checks with:
+
+```sh
+go test -race -count=1 ./verify/query-model -run '^TestSelective'
+```
+
+Set `BOG_RELEASE_BINARY` and `BOG_RELEASE_REVISION` to the clean native Linux
+candidate and its full revision. Run the admission and wall-clock expiry
+checks in separate invocations on each native architecture:
+
+```sh
+go test -json -race -count=1 ./verify/query-model -run '^TestPinnedQueryModelSelectiveAdmission$'
+BOG_QUERY_VERIFY_136_EXPIRY=1 go test -json -race -count=1 -timeout=17m \
+  ./verify/query-model -run '^TestPinnedQueryModelSelectiveAdmissionExpiry$'
+```
+
+Require passing events for both admission subtests and the expiry test. The
+`pinned_selective_admission` records contain acknowledged row counts, checked
+pages and refusals, and the duration from the first opening request to
+recovered capacity in the expiry run.

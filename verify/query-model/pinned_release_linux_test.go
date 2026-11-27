@@ -141,8 +141,13 @@ func servePinnedQuery(t *testing.T, ctx context.Context, binary, dir string, bud
 
 func withPinnedQueryEndpoint(t *testing.T, ctx context.Context, binary, dir string, budget int, retained bool, run func(model.CaptureDeliveryFixture) error) error {
 	t.Helper()
+	return withConfiguredPinnedQueryEndpoint(t, ctx, binary, dir, budget, 1, retained, run)
+}
+
+func withConfiguredPinnedQueryEndpoint(t *testing.T, ctx context.Context, binary, dir string, budget, concurrency int, retained bool, run func(model.CaptureDeliveryFixture) error) error {
+	t.Helper()
 	command := func(addr string) *exec.Cmd {
-		cmd := exec.Command(binary, "-addr="+addr, "-data-dir="+dir, "-query-concurrency=1",
+		cmd := exec.Command(binary, "-addr="+addr, "-data-dir="+dir, "-query-concurrency="+strconv.Itoa(concurrency),
 			"-query-max-response-bytes=256", "-query-work-budget="+strconv.Itoa(budget))
 		for _, entry := range os.Environ() {
 			if !strings.HasPrefix(entry, "BOG_CAPACITY_CONTROL=") {

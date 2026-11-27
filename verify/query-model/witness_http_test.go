@@ -65,6 +65,10 @@ func newWitnessClient(base string, transport http.RoundTripper, cap int64) (*cli
 		}
 		typ, _, typeErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
 		if err != nil {
+			if r.StatusCode == http.StatusServiceUnavailable &&
+				cleanQueryRefusal(r, typ, typeErr, err, model.SelectiveScanCapacityBody) {
+				return model.WirePage{}, model.ErrSelectiveScanCapacity
+			}
 			failure := &model.FixedBudgetHTTPError{StatusCode: r.StatusCode, Cause: err}
 			if cleanQueryFailure(r, typ, typeErr, err) {
 				failure.Cause = nil
@@ -103,6 +107,10 @@ func cleanQueryFailure(r *http.Response, mediaType string, mediaErr, err error) 
 	default:
 		return false
 	}
+	return cleanQueryRefusal(r, mediaType, mediaErr, err, want)
+}
+
+func cleanQueryRefusal(r *http.Response, mediaType string, mediaErr, err error, want string) bool {
 	status, ok := err.(*client.HTTPError)
 	if !ok || status.StatusCode != r.StatusCode || status.Cause != nil || status.Body != want ||
 		mediaErr != nil || mediaType != "text/plain" || r.Uncompressed {

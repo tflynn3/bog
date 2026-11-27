@@ -31,7 +31,12 @@ func (p *child) exited() bool {
 	}
 }
 
-const capacityControlEnv = "BOG_CAPACITY_CONTROL"
+const (
+	capacityControlEnv = "BOG_CAPACITY_CONTROL"
+	// Certifying the largest walk charges both scanning and encoding its
+	// roughly 386 MiB of lines, plus indexes, lookahead and delivery.
+	liveQueryWorkBudget = 2 << 30
+)
 
 func startChild(binary, dir, group, mode string) (*child, string, error) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -44,8 +49,12 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 	}
 	// A gate keeps the candidate from running before it enters the cgroup.
 	// This also works on Linux environments that filter clone3.
-	cmd := exec.Command("/bin/sh", "-c", `read -r gate && [ "$gate" = start ] && exec "$@"`, "capacity",
-		binary, "-addr", addr, "-data-dir", dir)
+	args := []string{"-c", `read -r gate && [ "$gate" = start ] && exec "$@"`, "capacity",
+		binary, "-addr", addr, "-data-dir", dir}
+	if mode == "live" {
+		args = append(args, "-query-work-budget", strconv.FormatUint(liveQueryWorkBudget, 10))
+	}
+	cmd := exec.Command("/bin/sh", args...)
 	cmd.Dir = dir
 	env := cmd.Environ()
 	cmd.Env = make([]string, 0, len(env)+1)
@@ -93,7 +102,7 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 	return p, "http://" + addr, errors.Join(err, gate.Close())
 }
 
-func openGroup(parent string, limit uint64) (string, error) {
+func openGroup(parent string, limit uint64, measured *resources) (string, error) {
 	if parent == "" {
 		data, err := os.ReadFile("/proc/self/cgroup")
 		if err != nil {
@@ -119,22 +128,43 @@ func openGroup(parent string, limit uint64) (string, error) {
 	}
 	// Return the owned directory even if configuration fails so it goes
 	// through the same teardown as a fully provisioned fixture.
-	for _, limit := range []struct{ name, value string }{
-		{"memory.max", strconv.FormatUint(limit, 10)},
-		{"memory.swap.max", "0"},
+	return group, measured.configureMemory(group, limit)
+}
+
+func (r *resources) configureMemory(group string, memoryLimit uint64) error {
+	for _, limit := range []struct {
+		name     string
+		value    uint64
+		observed **uint64
+	}{
+		{"memory.max", memoryLimit, &r.CgroupLimit},
+		{"memory.swap.max", 0, &r.CgroupSwap},
 	} {
-		if err := writeCgroupFile(group, limit.name, limit.value); err != nil {
-			return group, err
+		if err := writeCgroupFile(group, limit.name, strconv.FormatUint(limit.value, 10)); err != nil {
+			return fmt.Errorf("configure %s: %w", limit.name, err)
 		}
-		data, err := os.ReadFile(filepath.Join(group, limit.name))
+		observed, err := readCgroupUint(group, limit.name)
 		if err != nil {
-			return group, err
+			return err
 		}
-		if strings.TrimSpace(string(data)) != limit.value {
-			return group, fmt.Errorf("%s did not retain limit %s: %q", limit.name, limit.value, data)
+		*limit.observed = &observed
+		if observed != limit.value {
+			return fmt.Errorf("%s readback is %d, configured %d", limit.name, observed, limit.value)
 		}
 	}
-	return group, nil
+	return nil
+}
+
+func readCgroupUint(group, name string) (uint64, error) {
+	data, err := os.ReadFile(filepath.Join(group, name))
+	if err != nil {
+		return 0, err
+	}
+	value, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", name, err)
+	}
+	return value, nil
 }
 
 func writeCgroupFile(group, name, value string) error {
@@ -233,16 +263,11 @@ func (r *result) sample(ctx context.Context, p *child, dir string, live bool) <-
 	return done
 }
 
-func (r *resources) collect(group string) {
-	peak, err := os.ReadFile(filepath.Join(group, "memory.peak"))
+func (r *result) collect(group string, live bool) {
+	peak, err := readCgroupUint(group, "memory.peak")
 	if err == nil {
-		n, parseErr := strconv.ParseUint(strings.TrimSpace(string(peak)), 10, 64)
-		err = parseErr
-		if err == nil {
-			r.CgroupPeak = &n
-		}
-	}
-	if err != nil {
+		r.CgroupPeak = &peak
+	} else {
 		r.unavailable("cgroup_peak_memory", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(group, "io.stat"))
@@ -251,6 +276,19 @@ func (r *resources) collect(group string) {
 	}
 	if err != nil {
 		r.unavailable("device_io", err)
+	}
+	data, err := os.ReadFile(filepath.Join(group, "memory.events"))
+	if err == nil {
+		r.Diagnostics.MemoryEvents, err = memoryEvents(string(data))
+	}
+	if err != nil {
+		r.Diagnostics.Unavailable["cgroup_memory_events"] = diagnosticError(err)
+		if live {
+			r.unavailable("cgroup_oom_kill_count", err)
+		}
+	} else {
+		count := r.Diagnostics.MemoryEvents["oom_kill"]
+		r.CgroupOOM = &count
 	}
 }
 
@@ -269,9 +307,20 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 		if err := os.Mkdir(dir, 0700); err != nil {
 			return err
 		}
-		defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
+		defer func() {
+			removeErr := os.RemoveAll(dir)
+			r.Cleanup.StoreRemoved = removeErr == nil
+			if removeErr != nil {
+				if r.Cleanup.Detail != "" {
+					removeErr = fmt.Errorf("%s: %w", r.Cleanup.Detail, removeErr)
+				}
+				r.Cleanup.Status = "fail"
+				r.Cleanup.Detail = removeErr.Error()
+				err = errors.Join(err, removeErr)
+			}
+		}()
 		r.disk(dir)
-		group, err := openGroup(o.cgroupParent, f.MemoryBytes)
+		group, err := openGroup(o.cgroupParent, f.MemoryBytes, &r.resources)
 		var p *child
 		var candidate *candidateEvidence
 		var earlyCleanupErr error
@@ -281,16 +330,7 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 					candidate.ExitedBeforeCleanup = p.exited()
 				}
 				var shutdownErr, cleanupErr error
-				r.Cleanup, shutdownErr, cleanupErr = teardownGroup(group, p, func() {
-					r.collect(group)
-					data, err := os.ReadFile(filepath.Join(group, "memory.events"))
-					if err == nil {
-						r.Diagnostics.MemoryEvents, err = memoryEvents(string(data))
-					}
-					if err != nil {
-						r.Diagnostics.Unavailable["cgroup_memory_events"] = diagnosticError(err)
-					}
-				})
+				r.Cleanup, shutdownErr, cleanupErr = teardownGroup(group, p, func() { r.collect(group, o.mode == "live") })
 				cleanupErr = errors.Join(earlyCleanupErr, cleanupErr)
 				if cleanupErr != nil {
 					r.Cleanup.Status, r.Cleanup.Detail = "fail", cleanupErr.Error()
@@ -336,6 +376,8 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 		"device_io": len(r.DeviceIO) == 0, "disk_headroom": r.InitialFree == nil || r.MinFree == nil,
 		"ingest_p99": r.IngestP99 == nil, "backfill_query_p99": r.QueryP99 == nil,
 		"start_to_ready": r.StartReady == nil, "restart_to_ready": r.RestartReady == nil,
+		"cgroup_memory_limit_bytes": r.CgroupLimit == nil, "cgroup_swap_max_bytes": r.CgroupSwap == nil,
+		"cgroup_oom_kill_count": o.mode == "live" && r.CgroupOOM == nil,
 	} {
 		if _, haveReason := r.Unavailable[key]; missing && !haveReason {
 			r.Unavailable[key] = "no sample collected"
@@ -351,10 +393,17 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 		r.Phase, r.Detail = "measurement", "required measurements unavailable"
 	case *r.CgroupPeak == 0 || *r.CgroupPeak > f.MemoryBytes || *r.PeakFDs == 0 || *r.MinFree == 0:
 		r.Phase, r.Detail = "measurement", "required resource measurements outside fixture bounds"
+	case o.mode == "live" && (r.CgroupOOM == nil || *r.CgroupOOM != 0):
+		r.Phase, r.Detail = "measurement", "live fixture requires an observed zero cgroup OOM-kill count"
 	default:
 		r.Phase, r.Workload = "complete", "pass"
 		if r.Cleanup.Status == "pass" {
 			r.Status = "pass"
+			if o.mode == "live" {
+				if err := r.validateCutover(f); err != nil {
+					r.Phase, r.Workload, r.Status, r.Detail = "cutover_proof", "fail", "fail", err.Error()
+				}
+			}
 		}
 	}
 	return r
@@ -379,6 +428,10 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 		<-sampled
 	}()
 	probe := newService(base)
+	if o.mode == "live" {
+		// First pages certify the complete walk before writing headers.
+		probe.client.Timeout = 45 * time.Second
+	}
 	probe.queryPhases = r.Diagnostics.Queries
 	defer probe.client.CloseIdleConnections()
 	if err := probe.ready(ctx, p.done); err != nil {

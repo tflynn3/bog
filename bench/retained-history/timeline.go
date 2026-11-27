@@ -148,7 +148,11 @@ type backfillTimeline struct {
 	FinalCutoff     int                       `json:"expected_committed_rows"`
 	HeldRows        int                       `json:"held_rows_checked"`
 	HeldExhausted   bool                      `json:"held_cursor_exhausted"`
+	TerminalRetried bool                      `json:"terminal_page_retried"`
+	CaptureRetired  bool                      `json:"capture_retired"`
 	FreshVisible    bool                      `json:"fresh_backfill_visible"`
+	FreshExact      bool                      `json:"fresh_walk_exact"`
+	FreshRows       int                       `json:"fresh_rows_checked"`
 	Publication     *publicationProof         `json:"publication"`
 	PinDrain        pinDrainProof             `json:"pin_drain"`
 	Samples         []phaseSample             `json:"samples"`
@@ -168,7 +172,7 @@ func newBackfillTimeline(pattern string, held, cutoff, final int) *backfillTimel
 	return &backfillTimeline{
 		Pattern: pattern, HeldCutoff: held, RequestedCutoff: cutoff, FinalCutoff: final,
 		Status: "not_started", Samples: []phaseSample{},
-		PinDrain: pinDrainProof{Status: "unavailable", Reason: "phase did not reach held cursor exhaustion"},
+		PinDrain: pinDrainProof{Status: "unavailable", Reason: "phase did not reach explicit capture retirement"},
 	}
 }
 
@@ -297,7 +301,7 @@ func (p *backfillProbe) pollPublication(ctx context.Context, previous uint64, af
 		if event == "publication" && err == nil {
 			p.Publication = &publicationProof{c.Generation, p.lastRunning.Sub(p.startSent), received.Sub(p.startSent)}
 		}
-		if err == nil && p.Publication != nil && p.PinDrain.Held == nil {
+		if err == nil && p.Publication != nil && metrics.RetiredPins != nil && *metrics.RetiredPins > 0 {
 			p.PinDrain.Held = metrics.RetiredPins
 		}
 	}
@@ -328,52 +332,73 @@ func (p *backfillProbe) validateRunning(c compaction, previous uint64, committed
 	return nil
 }
 
+func (p *backfillProbe) observePublishedPins(ctx context.Context, event string) (*uint64, error) {
+	c, sent, received, err := p.request(ctx, "status")
+	if err == nil && (c.State != "complete" || c.Generation != p.Publication.Generation ||
+		c.CoveredRows != p.RequestedCutoff || c.CommittedRows != p.FinalCutoff) {
+		err = fmt.Errorf("published state changed during pin observation: %+v", c.compaction)
+	}
+	metrics := p.record(event, sent, received, c, err)
+	if err != nil {
+		return nil, err
+	}
+	return metrics.RetiredPins, nil
+}
+
+func (p *backfillProbe) observeHeldPin(ctx context.Context) error {
+	count, err := p.observePublishedPins(ctx, "before_retirement")
+	p.PinDrain.Held = count
+	switch {
+	case err != nil:
+		p.PinDrain.Reason = "held pin status unavailable: " + diagnosticError(err)
+		return err
+	case count == nil || *count == 0:
+		p.PinDrain.Reason = "candidate did not expose a positive predecessor pin count while the capture was held"
+		return errors.New(p.PinDrain.Reason)
+	default:
+		p.PinDrain.Status, p.PinDrain.Reason = "pending", "capture retirement and drain have yet to be observed"
+		return nil
+	}
+}
+
 func (p *backfillProbe) observeDrain(ctx context.Context, limit time.Duration) error {
-	p.PinDrain.Reason = "candidate did not expose a positive predecessor pin count while the cursor was held"
+	if p.PinDrain.Held == nil || *p.PinDrain.Held == 0 {
+		p.PinDrain.Reason = "candidate did not expose a positive predecessor pin count while the capture was held"
+		return errors.New(p.PinDrain.Reason)
+	}
 	budget, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	ticker := time.NewTicker(timelineSampleInterval)
 	defer ticker.Stop()
-	for event := "after_exhaustion"; ; event = "drain_poll" {
+	for event := "after_retirement"; ; event = "drain_poll" {
 		request, stop := context.WithTimeout(budget, diagnosticRequestLimit)
-		c, sent, received, err := p.request(request, "status")
+		count, err := p.observePublishedPins(request, event)
 		stop()
-		if err == nil && (c.State != "complete" || c.Generation != p.Publication.Generation ||
-			c.CoveredRows != p.RequestedCutoff || c.CommittedRows != p.FinalCutoff) {
-			err = fmt.Errorf("published state changed during pin drain: %+v", c.compaction)
-			p.record(event, sent, received, c, err)
-			return err
-		}
-		metrics := p.record(event, sent, received, c, err)
-		if metrics.RetiredPins != nil {
-			p.PinDrain.After = metrics.RetiredPins
-		}
 		switch {
 		case ctx.Err() != nil:
 			return ctx.Err()
 		case err != nil:
 			p.PinDrain.Reason = "drain status unavailable: " + diagnosticError(err)
-			if errors.Is(err, context.DeadlineExceeded) && p.PinDrain.Status != "pending" {
-				return nil
+			if !errors.Is(err, context.DeadlineExceeded) {
+				return err
 			}
-			return err
-		case metrics.RetiredPins == nil:
-			p.PinDrain.Reason = metrics.Unavailable["retired_generation_pins"]
-			return nil
-		case p.PinDrain.Held == nil || *p.PinDrain.Held == 0:
-			return nil
-		case *metrics.RetiredPins == 0:
+		case count == nil:
+			p.PinDrain.Reason = "drain status did not include a valid retired_generation_pins count"
+		case *count == 0:
+			p.PinDrain.After = count
 			p.PinDrain.Status, p.PinDrain.Reason = "observed", ""
 			return nil
+		default:
+			p.PinDrain.After = count
+			p.PinDrain.Reason = "predecessor pins still present at the last drain sample"
 		}
 		p.PinDrain.Status = "pending"
-		p.PinDrain.Reason = "predecessor pins still present at the last drain sample"
 		select {
 		case <-budget.Done():
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return fmt.Errorf("predecessor pins did not drain within %s", limit)
+			return fmt.Errorf("predecessor pin drain unconfirmed after %s: %s", limit, p.PinDrain.Reason)
 		case <-ticker.C:
 		}
 	}

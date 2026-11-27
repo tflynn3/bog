@@ -249,10 +249,9 @@ func (r *result) recordMixed(writes []ingestSample, reads []time.Duration, runni
 func (f fixture) recover(ctx context.Context, s service) (int, error) {
 	w := f.newWalk(f.SeedRows+f.TailRows, false)
 	w.phase = "restart_walk"
-	for w.pages == 0 || w.cursor != "" {
-		if _, err := w.page(ctx, s, f); err != nil {
-			return w.offset, err
-		}
+	if f.scatteredTail {
+		w.pageLimit = 1000
 	}
-	return w.offset, nil
+	_, err := w.exhaust(ctx, s, f)
+	return w.offset, err
 }

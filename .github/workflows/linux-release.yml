@@ -167,7 +167,16 @@ jobs:
             work=$(mktemp -d "$RUNNER_TEMP/bog-capacity.XXXXXXXX") || exit
             cleanup() {
               local status=$?
-              if ! rm -rf -- "$work" && (( status == 0 )); then status=1; fi
+              if ! rm -f -- "$work/capacity"; then
+                printf 'capacity_producer_cleanup_failed=%s\n' "$work/capacity" >&2
+                if (( status == 0 )); then status=1; fi
+              fi
+              if rmdir -- "$work"; then
+                printf 'capacity_fixture_parent_removed=%s\n' "$work" || status=1
+              else
+                printf 'capacity_fixture_cleanup_failed=%s\n' "$work" >&2
+                if (( status == 0 )); then status=1; fi
+              fi
               exit "$status"
             }
             trap cleanup EXIT
@@ -220,6 +229,7 @@ jobs:
         timeout-minutes: 3
         env:
           BOG_RELEASE_REQUIRE_RETARGET: '1'
+          BOG_RELEASE_REQUIRE_CUTOVER: '1'
         run: |
           {
             failed=0
@@ -227,6 +237,7 @@ jobs:
             go run ./verify/release validate -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
+            go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1
             exit "$failed"
           } 2>&1 | tee "$EVIDENCE/validation.log"
 

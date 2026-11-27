@@ -117,7 +117,7 @@ func TestDelegatedSubtreeTeardown(t *testing.T) {
 	if parent == "" {
 		t.Skip("set BOG_TEST_CGROUP_PARENT to a delegated cgroup v2 parent")
 	}
-	root, err := openGroup(parent, 128<<20)
+	root, err := openGroup(parent, 128<<20, &resources{})
 	if root != "" {
 		t.Cleanup(func() {
 			if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {

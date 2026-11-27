@@ -5,8 +5,11 @@
 One Linux process, one HTTP listener, one WAL owner, and one pinned local
 data directory form Bog's deployment and consistency unit. `cmd/bog` opens
 the listener after the owner acquires the exclusive directory lock and
-recovers committed state. The owner holds the lock through HTTP drain. A
-drain failure leaves the WAL open and locked until process exit.
+recovers committed state. In the #53 composition, the same owner selects
+writable recovery authority and serializes durable append visibility,
+snapshot capture, and generation activation. The lock covers startup and
+the drain of HTTP requests and storage work. A drain failure leaves the
+owner locked until process exit.
 
 The WAL owner orders appends and decides when a complete batch becomes
 durable and query-visible. The service requires a trusted, service-owned
@@ -17,17 +20,20 @@ access layer. [Single-writer decision](../adr/0001-single-writer-retained-histor
 
 ## Observed Linux production imports
 
-The graph was measured at `6105ab8eb78d56412c7cc14c6385aaed21bb10ac`,
-the #53 architecture companion's base. `go list -deps` reports identical
-root-module production edges on Linux amd64 (v1) and arm64 (v8.0) with cgo
-disabled and the fitness suite's build settings. Arrows point from importer
-to direct dependency. Nodes with no outgoing arrows have zero direct
-root-module production imports. Test-only packages appear in the registry
-below.
+The graph was measured at Cycle 86's base,
+`5fdbe223b87b3c6d22b2e9d038b8595ac09db456`. Both Linux amd64 (v1) and
+arm64 (v8.0) report the same direct root-module production imports and
+transitive server reachability with cgo disabled. `cmd/bog` reaches
+`internal/httpapi`, `internal/readiness`, `internal/wal`, and
+`internal/store` on both targets. The #53 command wiring is required to
+measure the cutover graph. [Cutover measurement](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification)
+Arrows point from importer to direct dependency. Nodes without outgoing
+arrows have zero direct root-module production imports. The registry also
+lists test-only packages.
 
 ```mermaid
 flowchart TD
-    subgraph Runtime["Server and reachable libraries"]
+    subgraph Runtime["Measured server dependency tree"]
         Cmd["cmd/bog"]
         HTTP["internal/httpapi"]
         Ready["internal/readiness"]
@@ -44,7 +50,7 @@ flowchart TD
         WAL --> Store
     end
     Operator["cmd/bog-verify"]
-    subgraph Staged["Staged for server activation"]
+    subgraph Staged["Staged libraries outside the measured server tree"]
         Checkpoint["internal/checkpoint"]
         History["internal/history"]
         Backup["internal/backup"]
@@ -92,7 +98,7 @@ flowchart TD
 
 ## Retained-history handoff
 
-#53 composes the retained `PageSource` in `cmd/bog` and injects it through
+#53 will compose the retained `PageSource` in `cmd/bog` and inject it through
 `httpapi.NewWithPageSource`. HTTP owns admission, cursor authentication and
 expiry, fixed-budget certification through exhaustion, and NDJSON framing.
 The adapter pins the validated generation and the matching durable,
@@ -100,7 +106,11 @@ query-visible tail together under WAL owner synchronization. A held cursor
 keeps its original view across replacement while fresh walks see later
 commits. The earlier of the source expiry and HTTP deadline governs new
 resumes. Admitted paging and export operations keep their references to
-completion. [Runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
+completion. Ordinary cursors remain retryable through the terminal page.
+The opt-in loopback capacity control can explicitly retire the fixture's
+capture after exhaustion so the fixture can measure the predecessor's pin
+drain within its deadline. Retirement bars new resumes while admitted
+operations drain. [Runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
 [Fixed-budget continuations](../adr/0006-fixed-budget-query-continuations.md)
 
 The cutover validates ordinary WAL, retained checkpoint plus committed
@@ -158,11 +168,14 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `bench/segment-layout` | Nested-module benchmark | Checkpoint layout experiment outside the root module |
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
-`bog-storage` owns the four staged libraries' server activation. Remove each
-staging declaration when server reachability changes its role. Keyed retries
-require the production WAL to commit and recover retry records atomically
-with their batches. Exercise concurrent same-key submissions, conflicting
-bodies, and retries after an ambiguous response and process restart.
+`bog-storage` owns checkpoint, history, and backup activation in #53. For
+each library reached on both Linux targets, record the direct imports in
+the diagram and fitness registry, mark the library wired, and remove its
+staging declaration in the runtime PR. `bog-storage` also owns idempotency
+activation. Keyed retries require the
+production WAL to commit and recover retry records atomically with their
+batches. Exercise concurrent same-key submissions, conflicting bodies, and
+retries after an ambiguous response and process restart.
 [Staging declarations](../../internal/archtest/staged_packages_test.go),
 [Ingest retry contract](../ingest-retries.md)
 
@@ -171,10 +184,10 @@ bodies, and retries after an ambiguous response and process restart.
 | Rank | Property | Design choice and cost |
 | --- | --- | --- |
 | 1 | Durability | Acknowledge only durable whole batches and activate only durably published generations. Fence on uncertainty and fail startup on invalid committed authority, even when availability suffers. |
-| 2 | Exact queries | Preserve timestamp and ordinal order through restart, restore, and replacement. Certification spends work before cursor issuance, and pinned generations and tails delay reclamation. |
-| 3 | Bounded resources | Bound query work, response bytes, and concurrency. The retained path also bounds replay, append reservations, live captures, pinned generations, and staging. At capacity it can defer maintenance and refuse whole batches. |
-| 4 | Recovery time | Legacy startup replays the full committed WAL. Retained startup validates generation and writable authority, then replays a bounded committed suffix. Validation adds I/O before the listener opens. |
-| 5 | Throughput | Group syncs across admitted commits and prune provably irrelevant scan work. Retaining and hashing the readable v1 WAL prefix costs disk space and bandwidth. Tail-only v1 restores keep the verified checkpoint boundary and have finite writable tail capacity. |
+| 2 | Exact queries | Preserve timestamp and ordinal order through restart, restore, and replacement. Certification spends work before cursor issuance. Retrying a terminal page requires pinned generations and tails until expiry or explicit retirement, which delays reclamation. |
+| 3 | Bounded resources | Bound query work, response bytes, and concurrency. The retained path bounds replay, whole-batch append reservations, live captures, pinned generations, and staging. Capacity pressure can defer maintenance and refuse whole batches. Release credits after durable activation and reference drain. |
+| 4 | Recovery time | Ordinary WAL recovery replays the full committed prefix. Retained startup validates the generation and writable authority, then replays a bounded committed suffix. Validation adds I/O before the listener opens. |
+| 5 | Throughput | Group syncs across admitted commits and prune provably irrelevant scan work. Keeping and hashing the readable v1 prefix costs disk space and bandwidth. Tail-only v1 restores keep the verified checkpoint boundary and have finite writable tail capacity. |
 
 ## Operator verification boundary
 
@@ -222,7 +235,8 @@ details, reports, exit statuses, and logs. `verifier-race.log` includes the
 bounded backup and history corruption corpus. The capacity sample
 records publication at the requested cutoff. Runtime pin drain requires
 a positive retired-generation pin count while the held cursor is live
-and an observed zero after exhaustion. Missing runtime metrics carry an
+and an observed zero after exhaustion and explicit retirement of the
+fixture capture. Missing runtime metrics carry an
 unavailable reason. Record the configured resource limits and exercise
 whole-batch and maintenance refusal, recovery when capacity returns, and
 expiry with admitted operations still draining.
@@ -244,8 +258,10 @@ The Architecture workflow runs `go test -count=1 ./internal/archtest`.
 The suite lists packages with `GOOS=linux`, `GOAMD64=v1`, `GOARM64=v8.0`,
 `CGO_ENABLED=0`, `GOENV=off`, empty `GOFLAGS`, `GO111MODULE=on`, and
 `GOWORK=off`, once for each target. Exact imports, cycles, package kinds,
-and server reachability are checked against both inventories. Test
-imports and nested modules are outside the root-module production registry.
+and server reachability are checked against both inventories. The
+paging, storage authority, command, and oracle restrictions also traverse
+the measured production graph across module boundaries. Test imports and
+nested modules are outside the root-module production registry.
 
 - HTTP owns the paging seam. It cannot reach checkpoint, history, or
   backup, even through a registered intermediary. Readiness can observe

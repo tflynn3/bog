@@ -1,12 +1,13 @@
 package capacityevidence
 
 import (
+	"bytes"
 	"crypto/sha256"
-	"encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -55,35 +56,116 @@ type RuntimeMetricIssue uint8
 const (
 	RuntimeMetricMissing RuntimeMetricIssue = iota + 1
 	RuntimeMetricMalformed
+	RuntimeMetricDuplicate
 )
 
-// DecodeRuntimeMetrics decodes each known member independently so a malformed
-// member does not discard valid observations from the same snapshot.
-// Unknown members are ignored. Live diagnostics for missing or malformed
-// members are returned separately from the values.
-func DecodeRuntimeMetrics(fields map[string]json.RawMessage) (RuntimeMetrics, map[string]RuntimeMetricIssue) {
+// ErrRuntimeMetricsAbsent indicates an omitted or null live metrics object.
+var ErrRuntimeMetricsAbsent = errors.New("live metrics object is absent")
+
+// DecodeRuntimeMetrics reads the raw live metrics object before any map
+// conversion can collapse repeated names. Each known member supplies an
+// observation only if it occurs once and has a valid value. Unknown members
+// are ignored. An absent or invalid object returns an error and marks every
+// known member missing.
+func DecodeRuntimeMetrics(raw []byte) (RuntimeMetrics, map[string]RuntimeMetricIssue, error) {
 	var m RuntimeMetrics
+	counters := m.counters()
+	members := make(map[string]runtimeMetricMember, len(counters)+1)
+	for _, field := range counters {
+		members[field.name] = runtimeMetricMember{}
+	}
+	members[OldestPinnedGenerationMetric] = runtimeMetricMember{}
+	err := readRuntimeMetricMembers(raw, members)
+	if err != nil {
+		clear(members)
+	}
+
 	issues := make(map[string]RuntimeMetricIssue)
-	for _, field := range m.counters() {
-		raw, ok := fields[field.name]
-		if !ok {
-			issues[field.name] = RuntimeMetricMissing
+	for _, field := range counters {
+		member := members[field.name]
+		if issue := member.issue(); issue != 0 {
+			issues[field.name] = issue
 			continue
 		}
-		if err := jsonv2.Unmarshal(raw, field.dest); err != nil || *field.dest == nil {
+		if err := jsonv2.Unmarshal(member.raw, field.dest); err != nil || *field.dest == nil {
 			*field.dest = nil
 			issues[field.name] = RuntimeMetricMalformed
 		}
 	}
-	raw, ok := fields[OldestPinnedGenerationMetric]
-	if !ok {
-		issues[OldestPinnedGenerationMetric] = RuntimeMetricMissing
-	} else if id, err := decodePinnedGeneration(raw); err != nil {
+	member := members[OldestPinnedGenerationMetric]
+	if issue := member.issue(); issue != 0 {
+		issues[OldestPinnedGenerationMetric] = issue
+	} else if id, err := decodePinnedGeneration(member.raw); err != nil {
 		issues[OldestPinnedGenerationMetric] = RuntimeMetricMalformed
 	} else {
 		m.OldestPinnedGeneration = id
 	}
-	return m, issues
+	return m, issues, err
+}
+
+type runtimeMetricMember struct {
+	raw       jsontext.Value
+	duplicate bool
+}
+
+func (m runtimeMetricMember) issue() RuntimeMetricIssue {
+	switch {
+	case m.duplicate:
+		return RuntimeMetricDuplicate
+	case m.raw == nil:
+		return RuntimeMetricMissing
+	default:
+		return 0
+	}
+}
+
+func readRuntimeMetricMembers(raw []byte, members map[string]runtimeMetricMember) error {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return ErrRuntimeMetricsAbsent
+	}
+	// Match the compaction envelope's permissive syntax reader. Known values
+	// still use strict typed decoding after their member counts are established.
+	dec := jsontext.NewDecoder(bytes.NewReader(raw), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
+	start, err := dec.ReadToken()
+	if err != nil {
+		return err
+	}
+	if start.Kind() != '{' {
+		return errors.New("runtime metrics must be a JSON object")
+	}
+	for {
+		name, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		if name.Kind() == '}' {
+			break
+		}
+		key := name.String()
+		member, known := members[key]
+		if !known || member.raw != nil || member.duplicate {
+			if err := dec.SkipValue(); err != nil {
+				return err
+			}
+			if known {
+				members[key] = runtimeMetricMember{duplicate: true}
+			}
+			continue
+		}
+		value, err := dec.ReadValue()
+		if err != nil {
+			return err
+		}
+		members[key] = runtimeMetricMember{raw: value.Clone()}
+	}
+	switch _, err := dec.ReadToken(); err {
+	case io.EOF:
+		return nil
+	case nil:
+		return errors.New("unexpected trailing data after runtime metrics")
+	default:
+		return err
+	}
 }
 
 var errPinnedGeneration = errors.New("must be a lowercase hexadecimal SHA-256 digest or null")

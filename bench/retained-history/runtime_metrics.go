@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 
 	"bog/verify/capacityevidence"
@@ -15,19 +14,19 @@ const (
 type runtimeSample = capacityevidence.RuntimeMetrics
 
 func readRuntimeMetrics(raw json.RawMessage, statusErr error) runtimeSample {
-	var fields map[string]json.RawMessage
+	if statusErr != nil {
+		raw = nil
+	}
+	m, issues, err := capacityevidence.DecodeRuntimeMetrics(raw)
 	var absent string
 	switch {
 	case statusErr != nil:
 		absent = "compaction status unavailable: " + diagnosticError(statusErr)
-	case len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")):
+	case err == capacityevidence.ErrRuntimeMetricsAbsent:
 		absent = "candidate did not expose metrics"
-	case json.Unmarshal(raw, &fields) != nil:
+	case err != nil:
 		absent = "candidate metrics must be a JSON object"
-		// A decode error can leave a partially populated map.
-		fields = nil
 	}
-	m, issues := capacityevidence.DecodeRuntimeMetrics(fields)
 	if len(issues) == 0 {
 		return m
 	}
@@ -43,6 +42,9 @@ func readRuntimeMetrics(raw json.RawMessage, statusErr error) runtimeSample {
 }
 
 func runtimeMetricReason(field string, issue capacityevidence.RuntimeMetricIssue) string {
+	if issue == capacityevidence.RuntimeMetricDuplicate {
+		return "candidate supplied a duplicate metric"
+	}
 	switch field {
 	case pendingCompactionsMetric, oldestPinnedGenerationMetric:
 		if issue == capacityevidence.RuntimeMetricMissing {

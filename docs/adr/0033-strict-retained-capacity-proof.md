@@ -44,6 +44,24 @@ existing ordered exhaustion, replay, retirement, and pin-drain evidence.
 The report carries the verdict without embedding response bodies.
 [Retained cursor retirement](0031-retained-cursor-retirement.md)
 
+The benchmark passes the raw live compaction `metrics` object to
+`capacityevidence.DecodeRuntimeMetrics`. A known member must occur exactly
+once to supply an observation. Repeated names, including equivalent JSON
+escape spellings, make the member unavailable regardless of value or order.
+Valid siblings remain observable, unknown members are ignored, and omitted
+or malformed members retain their existing diagnostics. A failed status
+probe or invalid metrics object makes all metrics unavailable. Repeated
+`retired_generation_pins` cannot establish either the positive held count
+or the post-retirement zero. A subsequent unambiguous zero within the
+existing drain budget can still establish drain after a valid held count.
+
+Tracking member multiplicity requires a token pass over each bounded
+control reply's metrics object before decoding individual values. The
+decoder retains at most one raw value per known member and skips unknown
+values. It adds work to the verifier's status polling. The schema-v1
+report shape and historical validation contract stay the same.
+[Capacity observation validation](0028-capacity-observation-validation.md)
+
 ## Ownership and qualification
 
 Release Verification owns the producer, shared validator, and fixtures.

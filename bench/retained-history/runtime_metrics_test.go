@@ -3,8 +3,13 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"bog/verify/capacityevidence"
 )
@@ -55,6 +60,7 @@ func TestOptionalRuntimeMetrics(t *testing.T) {
 		noMetrics    = "candidate did not expose metrics"
 		wrongMetrics = "candidate metrics must be a JSON object"
 		failedProbe  = "compaction status unavailable: probe failed"
+		duplicate    = "candidate supplied a duplicate metric"
 		pin          = `"` + testPinnedGeneration + `"`
 	)
 	for _, tc := range []struct {
@@ -85,7 +91,10 @@ func TestOptionalRuntimeMetrics(t *testing.T) {
 		{"short digest", `{"oldest_pinned_generation":"abcd"}`, nil, "null", "null", missing, badPin},
 		{"uppercase digest", `{"oldest_pinned_generation":"` + strings.ToUpper(testPinnedGeneration) + `"}`, nil, "null", "null", missing, badPin},
 		{"nonhex digest", `{"oldest_pinned_generation":"` + strings.Repeat("g", 64) + `"}`, nil, "null", "null", missing, badPin},
+		{"repeated pending count", `{"pending_compactions":1,"pending_compactions":0,"oldest_pinned_generation":` + pin + `}`, nil, "null", pin, duplicate, ""},
+		{"repeated generation", `{"pending_compactions":0,"oldest_pinned_generation":` + pin + `,"oldest_pinned_generation":null}`, nil, "0", "null", "", duplicate},
 		{"failed probe", `{"pending_compactions":0,"oldest_pinned_generation":null}`, errors.New("probe failed"), "null", "null", failedProbe, failedProbe},
+		{"failed probe with duplicates", `{"pending_compactions":0,"pending_compactions":1,"oldest_pinned_generation":null}`, errors.New("probe failed"), "null", "null", failedProbe, failedProbe},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := readRuntimeMetrics(json.RawMessage(tc.raw), tc.statusErr)
@@ -126,6 +135,11 @@ func TestLiveRuntimeMetricsRoundTrip(t *testing.T) {
 			drained: `{"retired_generation_pins":0,"pending_compactions":"0"}`,
 		},
 		{
+			name:    "duplicate diagnostics beside valid pin counts",
+			held:    `{"retired_generation_pins":1,"oldest_pinned_generation":` + pin + `,"oldest_pinned_generation":null}`,
+			drained: `{"retired_generation_pins":0,"pending_compactions":1,"pending_compactions":0}`,
+		},
+		{
 			name:    "omitted and malformed diagnostics cannot substitute for retired pin zero",
 			held:    `{"retired_generation_pins":1}`,
 			drained: `{"retired_generation_pins":-1,"pending_compactions":0,"oldest_pinned_generation":null}`,
@@ -136,6 +150,24 @@ func TestLiveRuntimeMetricsRoundTrip(t *testing.T) {
 			held:    `{"retired_generation_pins":null,"oldest_pinned_generation":` + pin + `}`,
 			drained: `{"retired_generation_pins":0}`,
 			problem: "before_retirement must observe the positive held pin count",
+		},
+		{
+			name:    "duplicate held pins ending in a positive count",
+			held:    `{"retired_generation_pins":0,"retired_generation_pins":1}`,
+			drained: `{"retired_generation_pins":0}`,
+			problem: "before_retirement must observe the positive held pin count",
+		},
+		{
+			name:    "duplicate drain pins ending in zero",
+			held:    `{"retired_generation_pins":1}`,
+			drained: `{"retired_generation_pins":1,"retired_generation_pins":0}`,
+			problem: "fresh visibility sample must follow observed pin drain",
+		},
+		{
+			name:    "duplicate drain pins starting at zero",
+			held:    `{"retired_generation_pins":1}`,
+			drained: `{"retired_generation_pins":0,"retired_generation_pins":1}`,
+			problem: "fresh visibility sample must follow observed pin drain",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -166,6 +198,80 @@ func TestLiveRuntimeMetricsRoundTrip(t *testing.T) {
 					tc.problem != "" && (err == nil || !strings.Contains(err.Error(), tc.problem)) {
 					t.Errorf("strict validation error = %v, want %q", err, tc.problem)
 				}
+			}
+		})
+	}
+}
+
+func TestLivePinProbeWithRepeatedMetrics(t *testing.T) {
+	t.Parallel()
+	const (
+		positive = `"retired_generation_pins":1`
+		zero     = `"retired_generation_pins":0`
+	)
+	for _, tc := range []struct {
+		name    string
+		replies []string
+	}{
+		{"reject repeated held count", []string{zero + "," + positive}},
+		{"skip zero as last duplicate", []string{positive, positive + "," + zero, zero}},
+		{"skip zero as first duplicate", []string{positive, zero + "," + positive, zero}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				i := int(calls.Add(1)) - 1
+				if r.Method != http.MethodGet || r.URL.Query().Get("action") != "status" || i >= len(tc.replies) {
+					t.Errorf("unexpected status probe %d: %s %s", i, r.Method, r.URL)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				_, err := fmt.Fprintf(w, `{"state":"complete","generation":4,"covered_rows":128,"committed_rows":192,"metrics":{%s,"pending_compactions":0}}`, tc.replies[i])
+				if err != nil {
+					t.Errorf("write status reply: %v", err)
+				}
+			}))
+			defer server.Close()
+			s := newService(server.URL)
+			defer s.client.CloseIdleConnections()
+			p := backfillProbe{
+				backfillTimeline: newBackfillTimeline("clustered", 64, 128, 192),
+				service:          s,
+				control:          "/compact",
+				dir:              t.TempDir(),
+				origin:           time.Now(),
+			}
+			p.Publication = &publicationProof{Generation: 4}
+			heldErr := p.observeHeldPin(t.Context())
+			duplicateIndex := 0
+			if len(tc.replies) == 1 {
+				if heldErr == nil || p.PinDrain.Held != nil {
+					t.Fatalf("ambiguous held count accepted: proof %+v, error %v", p.PinDrain, heldErr)
+				}
+			} else {
+				if heldErr != nil {
+					t.Fatal(heldErr)
+				}
+				retiredAt := p.boundary("capture_retired")
+				if err := p.observeDrain(t.Context(), retiredAt, drainBudget); err != nil {
+					t.Fatal(err)
+				}
+				if p.PinDrain.Status != "observed" || p.PinDrain.After == nil || *p.PinDrain.After != 0 {
+					t.Fatalf("unambiguous zero did not establish drain: %+v", p.PinDrain)
+				}
+				duplicateIndex = 2 // Held status, retirement, then the first drain status.
+			}
+			if got := int(calls.Load()); got != len(tc.replies) {
+				t.Fatalf("issued %d status probes, want %d", got, len(tc.replies))
+			}
+			if len(p.Samples) <= duplicateIndex {
+				t.Fatalf("missing ambiguous status sample: %+v", p.Samples)
+			}
+			m := p.Samples[duplicateIndex].Candidate
+			if m.RetiredPins != nil || m.Unavailable["retired_generation_pins"] != "candidate supplied a duplicate metric" ||
+				m.PendingCompactions == nil || *m.PendingCompactions != 0 || m.Unavailable[pendingCompactionsMetric] != "" {
+				t.Fatalf("ambiguous pin count or valid sibling misclassified: %+v", m)
 			}
 		})
 	}

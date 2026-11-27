@@ -45,6 +45,46 @@ surfaces with retained witnesses. `MaxEvidenceBytes` bounds each observation.
 Ordinary application rejections are observations. Adapter errors, cancellation,
 and missing or unsupported evidence fail with `ErrIncomplete`. Mismatches
 fail with `ErrViolation`. Diagnostics identify the failed phase without
-including fixture values or raw adapter errors. This fixture qualifies the
-evidence checks. Live policy changes, restore, and release-binary qualification
-require separate scenarios.
+including fixture values or raw adapter errors.
+
+## Extended conformance and qualification
+
+`RunConformance` runs the static matrix and then exercises the same
+disposable target with acknowledged policy updates and controlled append
+interruptions. Its reference model derives expectations from the fixture,
+the test's append schedule, and acknowledged policy changes. It orders
+queries by UTC timestamp and append order for ties, applies masking before
+literal matching, and captures expected rows at cursor issuance. Each
+request still selects one canonical stream from an interleaved dataset.
+
+| Probe | Evidence |
+| --- | --- |
+| Held and fresh query walks | Preserve the held view across a backfill. A fresh walk includes the backfill and its intentional duplicates in exact order and excludes the upper time bound. Compare observed rows and raw NDJSON through the terminal page. |
+| Policy changes between pages | Revoking a grant yields the same 403 for initial, valid-cursor, and modified-cursor requests. Regrant permits the original cursor. Enabling or disabling masking invalidates earlier revisions. Fresh queries match masked values, and revocation takes precedence over stale revisions. |
+| Held and fresh artifacts | An export created before the backfill retains its original contents after the backfill and after revocation and regrant. New exports include only the requested stream's committed rows, including its row outside the query range, and authenticate all applicable redaction policy versions. |
+| Interrupted append before commit | Recover neither the batch nor its retry outcome. Two concurrent same-key submissions then return success with exactly one copy of the whole batch. |
+| Interrupted append after commit | Recover the complete redacted batch and its original retry outcome together after the response is lost. A revoked ingest grant blocks the retry. Once regranted, exact bytes return the committed result even under a new redaction policy. Changing the original bytes while preserving decoded rows still conflicts. A fresh key uses the new policy. |
+
+`PolicyObserver` applies controls to the trusted policy authority and
+acknowledges once new admissions use them. `CommitObserver` interrupts
+one submission at the requested boundary and stops the target. The adapter
+must observe that boundary independently of the HTTP response. `Reopen`
+rebuilds service state from the same durable directory. `Inspect` reads the
+running target's committed view. Supply complete committed bytes with
+inspectable row, key, and policy witnesses, plus rows and scoped retry
+outcomes independently decoded from that same boundary. Provision the
+fixture inside the active retry window and preserve its policy authority
+across restarts. The two same-key submissions may overlap. All other
+observations are serial, and adapters must honor cancellation and bound
+their observations. The caller owns startup, cleanup, and failure recovery.
+
+`RunConformance` records synthetic conformance in `Report.SyntheticPassed`.
+`QualifyShippedAdapter` separately records `Report.Qualified` for one full
+revision and binary SHA-256. The release caller supplies the pinned identity
+and an independent observer that checks the serving process at startup,
+after each reopen, and at completion. Run that entry point with adapters
+that drive the shipped process and inspect its durable authority. Failed or
+unsupported observations leave both fields unset. The in-package tests use
+synthetic fixtures to verify the checks and report handling. Shipped-adapter
+qualification remains pending until a shared-deployment implementation
+provides the required observers and passes the scenario.

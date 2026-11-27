@@ -238,7 +238,14 @@ func checkMarkers(data []byte, markers []string) error {
 
 func inspectResponse(response Response, markers []string) error {
 	return inspectSurfaces(response, func(surface []byte) error {
-		return checkMarkers(surface, markers)
+		if err := checkMarkers(surface, markers); err != nil {
+			return err
+		}
+		// Application headers and error bodies can carry URI-encoded values.
+		if bytes.ContainsRune(surface, '%') {
+			return checkMarkers(uriUnescaped(jsonUnescaped(surface)), markers)
+		}
+		return nil
 	})
 }
 

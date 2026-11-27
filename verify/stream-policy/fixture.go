@@ -63,8 +63,11 @@ func ReferenceFixture() Fixture {
 			{Target{bob, "fixture-b"}, false, false, true},
 			{Target{exporter, "fixture-a"}, false, false, true},
 		},
-		Replacements: []Replacement{{plain, replacement}, {escaped, replacement}},
-		FailOn:       failed,
+		Replacements: []Replacement{
+			{plain, replacement}, {escaped, replacement}, {maskInputSecret, replacement},
+			{rawBackfill + " ", ""}, {rawInterrupted + " ", ""},
+		},
+		FailOn: failed,
 	}
 }
 

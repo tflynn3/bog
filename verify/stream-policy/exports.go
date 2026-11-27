@@ -45,6 +45,27 @@ func (s *scenario) createArtifacts(ctx context.Context) ([]scopedArtifact, []str
 }
 
 func (s *scenario) checkExports(ctx context.Context) error {
+	return s.checkExportMatrix(ctx, s.checkArtifact)
+}
+
+func (c *conformance) checkExports(ctx context.Context) error {
+	return c.checkExportMatrix(ctx, func(ctx context.Context, target matrixTarget, id string) error {
+		records, versions := c.model.export(target.grant.Target)
+		return c.checkArtifactSnapshot(ctx, target, id, records, versions, nil)
+	})
+}
+
+func (c *conformance) checkArtifactSnapshot(ctx context.Context, target matrixTarget, id string, want []Record, versions, extraForbidden []string) error {
+	forbidden := []string{backfillKey, rollbackKey, interruptedKey, freshPolicyKey}
+	if target.stream.Scope != c.fixture.Streams[0].Scope {
+		forbidden = append(forbidden, changedRedactionVersion)
+	}
+	return c.scenario.checkArtifactSnapshot(ctx, target, id, want, versions, append(forbidden, extraForbidden...))
+}
+
+type artifactCheck func(context.Context, matrixTarget, string) error
+
+func (s *scenario) checkExportMatrix(ctx context.Context, check artifactCheck) error {
 	artifacts, references, err := s.createArtifacts(ctx)
 	if err != nil {
 		return err
@@ -58,7 +79,7 @@ func (s *scenario) checkExports(ctx context.Context) error {
 			}
 		}
 		for _, artifact := range artifacts {
-			if err := s.checkDownloadPair(ctx, target, artifact, &downloadDenial, references); err != nil {
+			if err := s.checkDownloadPair(ctx, target, artifact, &downloadDenial, references, check); err != nil {
 				return err
 			}
 		}
@@ -66,12 +87,12 @@ func (s *scenario) checkExports(ctx context.Context) error {
 	return nil
 }
 
-func (s *scenario) checkDownloadPair(ctx context.Context, target matrixTarget, artifact scopedArtifact, denial *rejection, references []string) error {
+func (s *scenario) checkDownloadPair(ctx context.Context, target matrixTarget, artifact scopedArtifact, denial *rejection, references []string, check artifactCheck) error {
 	phase := "artifact requested without an export grant"
 	if target.grant.Export {
 		phase = "artifact requested in another authorized stream"
 		if target.stream.Scope == artifact.source.stream.Scope {
-			if err := s.checkArtifact(ctx, target, artifact.id); err != nil {
+			if err := check(ctx, target, artifact.id); err != nil {
 				return fmt.Errorf("authorized export download in stream %d (principal %d, source principal %d): %w",
 					target.selectorIndex, target.principalIndex, artifact.source.principalIndex, err)
 			}
@@ -140,6 +161,11 @@ func (s *scenario) createArtifact(ctx context.Context, target matrixTarget) (str
 }
 
 func (s *scenario) checkArtifact(ctx context.Context, target matrixTarget, id string) error {
+	want, _ := s.forScope(target.stream.Scope)
+	return s.checkArtifactSnapshot(ctx, target, id, want, []string{target.stream.PolicyVersion}, nil)
+}
+
+func (s *scenario) checkArtifactSnapshot(ctx context.Context, target matrixTarget, id string, want []Record, versions, extraForbidden []string) error {
 	artifact, err := s.Export.FetchExport(ctx, target.grant.Target, id)
 	if err := observation(ctx, err); err != nil {
 		return err
@@ -148,6 +174,7 @@ func (s *scenario) checkArtifact(ctx context.Context, target matrixTarget, id st
 		return err
 	}
 	forbidden := append(s.scopedMarkers(target.stream.Scope), key)
+	forbidden = append(forbidden, extraForbidden...)
 	if err := inspectResponse(artifact.Response, forbidden); err != nil {
 		return err
 	}
@@ -156,12 +183,12 @@ func (s *scenario) checkArtifact(ctx context.Context, target matrixTarget, id st
 		len(manifest.PolicyVersions) == 0 || artifact.Records == nil {
 		return ErrIncomplete
 	}
-	if manifest.Scope != target.stream.Scope || !slices.Equal(manifest.PolicyVersions, []string{target.stream.PolicyVersion}) {
+	if manifest.Scope != target.stream.Scope || len(manifest.PolicyVersions) != len(versions) ||
+		!slices.Equal(slices.Sorted(slices.Values(manifest.PolicyVersions)), versions) {
 		return fmt.Errorf("%w: export manifest scope or policy version differs", ErrViolation)
 	}
 	if err := checkMarkers([]byte(manifest.Version), forbidden); err != nil {
 		return err
 	}
-	want, _ := s.forScope(target.stream.Scope)
 	return inspectRecords(artifact.Bytes, artifact.Records, want, forbidden)
 }

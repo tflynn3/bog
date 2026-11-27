@@ -7,6 +7,8 @@ import (
 	"os"
 	"slices"
 	"syscall"
+
+	"bog/verify/capacityevidence"
 )
 
 // The fixture generates the entire submitted row from its append ordinal.
@@ -187,6 +189,15 @@ func (t *restartTrial) beforeStart(stopped cleanupProof, stopErr error) error {
 	return err
 }
 
+func checkpointObservation(c compaction) capacityevidence.CompactionObservation {
+	return capacityevidence.CompactionObservation{
+		State:         c.State,
+		Generation:    c.Generation,
+		CoveredRows:   c.CoveredRows,
+		CommittedRows: c.CommittedRows,
+	}
+}
+
 func (t *restartTrial) verify(ctx context.Context, s service, control string, f fixture) (err error) {
 	e := t.evidence
 	defer func() {
@@ -208,12 +219,10 @@ func (t *restartTrial) verify(ctx context.Context, s service, control string, f 
 		statusErr = fmt.Errorf("observe recovered checkpoint: %w", statusErr)
 	} else {
 		e.Recovered = &current.compaction
-		if err := current.validatePublication(e.Publication.CoveredRows, 0); err != nil {
-			statusErr = fmt.Errorf("recovered checkpoint: %w", err)
-		} else if current.CommittedRows != e.Ledger.Acknowledged {
-			statusErr = fmt.Errorf("recovered checkpoint reports %d committed rows, ledger has %d",
-				current.CommittedRows, e.Ledger.Acknowledged)
-		}
+		recovered := checkpointObservation(*e.Recovered)
+		statusErr = capacityevidence.ValidateRecoveredCheckpoint(
+			checkpointObservation(*e.Publication), &recovered, e.Ledger.Acknowledged,
+		)
 	}
 	if err := t.verifyLedger(ctx, s, f); err != nil {
 		e.Phase = "restart_walk"

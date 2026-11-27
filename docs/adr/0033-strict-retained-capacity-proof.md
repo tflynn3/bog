@@ -21,9 +21,11 @@ restarted walk. All four device/inode pairs must match. Require affirmative
 first-candidate reaping and an empty fixture cgroup before restart.
 
 The restart publication snapshot must match the record's completed
-scattered compaction. The recovered checkpoint must report the same
-complete state and generation, cover exactly seed rows plus the first
-64-row tail batch, and report all seed and tail rows committed. The
+scattered compaction. The capacity producer and release admission both
+use `capacityevidence.ValidateRecoveredCheckpoint` to check that recovery
+reports a complete checkpoint with the published generation and cutoff,
+and a committed row count equal to the acknowledged ledger. The cutoff
+covers exactly the seed rows plus the first 64-row tail batch. The
 acknowledged ledger must pass and reach exhaustion with no failure and
 with a positive number of complete pages. Its acknowledged and matched
 row counts must both equal seed rows plus 2,048. Its acknowledged batch

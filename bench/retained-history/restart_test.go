@@ -172,7 +172,8 @@ func TestRestartWalkAgainstAcknowledgedLedger(t *testing.T) {
 		{"early termination", "did not advance or terminate"},
 		{"repeated cursor", "invalid or repeated cursor"},
 		{"unterminated row", "unterminated NDJSON row"},
-		{"checkpoint not recovered", "recovered checkpoint: unexpected compaction"},
+		{"checkpoint not recovered", "recovered checkpoint generation 0, want published generation 15"},
+		{"different recovered generation", "recovered checkpoint generation 16, want published generation 15"},
 		{"incorrect recovered committed count", "ledger has 1216"},
 		{"path removed during walk", "after restarted workload"},
 	} {
@@ -211,10 +212,12 @@ func TestRestartWalkAgainstAcknowledgedLedger(t *testing.T) {
 			}
 			var openings, continuations atomic.Int32
 			recovered := compaction{15, cutoff, total, "complete"}
-			if tc.name == "checkpoint not recovered" {
+			switch tc.name {
+			case "checkpoint not recovered":
 				recovered.Generation, recovered.CoveredRows = 0, 0
-			}
-			if tc.name == "incorrect recovered committed count" {
+			case "different recovered generation":
+				recovered.Generation++
+			case "incorrect recovered committed count":
 				recovered.CommittedRows = cutoff
 			}
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -279,6 +282,8 @@ func TestRestartWalkAgainstAcknowledgedLedger(t *testing.T) {
 			err := trial.verify(t.Context(), s, "/compact", f)
 			e := trial.evidence
 			e.finish(err)
+			want := restartLedgerProof{Status: "pass", Acknowledged: total, Batches: total / f.BatchRows,
+				SuffixRows: total - cutoff, Matched: total, MatchedSuffix: total - cutoff, Pages: 2, Exhausted: true}
 			if tc.want != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.want) || e.Status != "fail" ||
 					!strings.Contains(e.Failure, tc.want) {
@@ -290,10 +295,12 @@ func TestRestartWalkAgainstAcknowledgedLedger(t *testing.T) {
 				if tc.name == "missing suffix" && e.Ledger.MatchedSuffix != 0 {
 					t.Fatalf("missing suffix was counted in evidence: %+v", e.Ledger)
 				}
+				if tc.name == "different recovered generation" &&
+					(e.Phase != "recovered_checkpoint" || e.Recovered == nil || *e.Recovered != recovered || e.Ledger != want) {
+					t.Fatalf("checkpoint mismatch must retain the recovered status and exact walk: %+v, ledger %+v", e, e.Ledger)
+				}
 				return
 			}
-			want := restartLedgerProof{Status: "pass", Acknowledged: total, Batches: total / f.BatchRows,
-				SuffixRows: total - cutoff, Matched: total, MatchedSuffix: total - cutoff, Pages: 2, Exhausted: true}
 			if err != nil || e.Status != "pass" || e.Ledger != want || e.Recovered == nil || *e.Recovered != recovered ||
 				e.AfterWalk == nil || *e.AfterWalk != *e.Original || openings.Load() != 1 || continuations.Load() != 1 {
 				t.Fatalf("verify = %v, evidence %+v, query starts %d, resumes %d", err, e, openings.Load(), continuations.Load())

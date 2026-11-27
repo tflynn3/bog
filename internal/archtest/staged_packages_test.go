@@ -13,17 +13,17 @@ type stagingDeclaration struct {
 	activation string
 }
 
-// Both Linux inventories at 26535d86d556b still leave the retained libraries
-// outside cmd/bog. Remove each declaration with its role change once the
-// reviewed Storage handoff meets these criteria.
+// Both Linux inventories at 62d13b7fa374 leave the retained libraries outside
+// cmd/bog. Remove each #108 declaration with its role change when the reviewed
+// Storage revision shows reachability and satisfies ADR 0049.
 var stagedPackages = map[string]stagingDeclaration{
 	"bog/internal/checkpoint": {
 		owner:      "bog-storage",
-		activation: "#108 validates and publishes checkpoint generations through the pinned WAL owner and proves durable replacement at the requested cutoff.",
+		activation: "#108 validates and durably selects a checkpoint successor under pinned storage authority before live activation at the requested cutoff.",
 	},
 	"bog/internal/history": {
 		owner:      "bog-storage",
-		activation: "#108 serves ordered checkpoint and tail rows through the command-owned page source and proves a held HTTP cursor survives generation replacement.",
+		activation: "#108 serves ordered checkpoint and suffix rows through the command-owned page source and proves a held cursor through replacement and acknowledged backfill, exact fresh and restarted walks, and final pin drain.",
 	},
 	"bog/internal/backup": {
 		owner:      "bog-storage",
@@ -174,6 +174,12 @@ func TestRetainedCutoverStaging(t *testing.T) {
 			name:         "operator-only backup still needs its declaration",
 			operatorOnly: true,
 			want:         []string{"staged package " + backup + " has no staging declaration"},
+		},
+		{
+			name:             "promoted history still needs its staging declaration removed",
+			operatorOnly:     true,
+			keepDeclarations: []string{backup, history},
+			want:             []string{"stale staging declaration for " + history + ": package is registered as runtime library"},
 		},
 		{
 			name:                  "operator-only backup cannot be promoted",

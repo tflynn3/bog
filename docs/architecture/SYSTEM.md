@@ -18,14 +18,12 @@ authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
 The Linux amd64 and arm64 production inventories at
-`26535d86d556b9700bfb8a8b6c2c8379dcbfc094` agree on the 19 root-module
+`62d13b7fa3744feb213d227de10e8ee2b496b4a7` agree on the 19 root-module
 production packages and 23 direct imports between them shown below.
-`cmd/bog` reaches HTTP, readiness, store, and WAL and recovers an ordinary
-WAL into an in-memory store. The command still uses path-based readiness
-and the in-memory paging constructor. The WAL can capture a published
-prefix, and the command has yet to compose that capability with a
-retained generation. #108's writable restore, live replacement, and
-retained paging await the reviewed Storage handoff.
+The entire root-module closure of `cmd/bog` consists of the command plus
+HTTP, readiness, store, and WAL. The command recovers an ordinary WAL into
+an in-memory store. Writable restore, live replacement, and retained
+paging await the reviewed #108 Storage handoff.
 [Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
 [Retained runtime promotion](../adr/0049-retained-runtime-promotion.md)
 
@@ -50,7 +48,7 @@ composed #108 runtime on both native Linux runners.
 
 ```mermaid
 flowchart TD
-    subgraph Runtime["Server production closure on Linux amd64 and arm64"]
+    subgraph Runtime["Measured server production closure on Linux amd64 and arm64"]
         Cmd["cmd/bog"]
         HTTP["internal/httpapi"]
         Ready["internal/readiness"]
@@ -108,9 +106,10 @@ flowchart TD
 - **Query.** Results match a case-sensitive literal within a half-open
   time range and are ordered by UTC timestamp and global append ordinal.
   That order preserves ties, duplicates, and backfill. The measured
-  server supplies the replayed in-memory store through
-  `httpapi.NewWithQueryLimits`. Query concurrency, scan work, and encoded
-  response bytes have independent caps.
+  server builds the replayed store in `cmd/bog.run` and passes it through
+  `newReadyHandler` to `httpapi.NewWithQueryLimits`, which wraps it in the
+  legacy page source. Query concurrency, scan work, and encoded response
+  bytes have independent caps.
 - **Recovery.** The measured server validates and replays the committed
   ordinary WAL before listening. Under the directory lock, it rejects
   restored layouts containing `bog.backup` or `bog.wal.tail`. The offline
@@ -119,10 +118,11 @@ flowchart TD
   `GET /ready` combines disk headroom and the terminal WAL group outcome.
   A confirmed rollback reports `wal_rollback` until a later durable
   outcome. An uncertain outcome reports `recovery_required` while the
-  process serves. The measured command samples by configured path. The
-  #108 handoff calls for `readiness.NewHandlerForDirectory` with a
-  fresh, unlocked open relative to the WAL's pinned directory. The
-  command owns that handle and cancels probes before closing it.
+  process serves. The measured command passes `c.dir` to
+  `readiness.NewHandler`, which uses path-based `Statfs`. It cancels
+  probes before `http.Server.Shutdown` and calls `wal.Log.Close` after a
+  successful HTTP drain. WAL close waits for its running commit group
+  before closing the files and pinned directory.
   [Readiness descriptor handoff](../adr/0005-pinned-writable-recovery-authority.md#readiness-descriptor-handoff-60)
 
 ## Retained-history handoff
@@ -132,7 +132,12 @@ flowchart TD
 including admission, cursor authentication and expiry, fixed-budget
 certification through exhaustion, and NDJSON framing.
 The adapter pins the validated generation and the matching durable,
-query-visible tail together under WAL owner synchronization. A held cursor
+query-visible suffix together under WAL owner synchronization. At the
+measured revision, `wal.Log.Capture` pins the published WAL prefix, its
+exclusive byte end, and next append ordinal under the WAL mutex. The
+reviewed wiring must show how the command selects the matching
+generation and suffix bounds in the same synchronization scope as append
+publication and activation. A held cursor
 keeps its original view across replacement while fresh walks see later
 commits. The earlier of the source expiry and HTTP deadline governs new
 resumes. Admitted paging and export operations keep their references to
@@ -162,13 +167,24 @@ reference drain.
 [Tail-only recovery view](../adr/0035-tail-only-retained-recovery-contract.md),
 [Independent recovery-view consumers](../adr/0037-independent-recovery-view-consumers.md)
 
+At cutover, the command passes an independently opened, unlocked handle
+to `readiness.NewHandlerForDirectory`. Open it relative to the locked WAL
+directory so `Fstatfs` still samples the active filesystem after the
+configured path is retargeted. An independent open gives probes a
+separate file description from the locked one.
+
 The cutover's opt-in loopback capacity control uses the same publication path.
 Charge replay and whole-batch append reservations before reading or
 writing the tail. Charge capture, pin, and staging capacity before doing
 work. Credit reclaimed capacity after durable publication and activation
 and once references to the covered data drain. Stop admitting new work
-during shutdown, drain HTTP and storage work, then close storage and the
-pinned directory. [Resource admission](../adr/0010-retained-resource-admission.md),
+during shutdown and cancel readiness sampling before closing the probe
+handle. Drain HTTP, then close the HTTP API to retire captures and wait
+for admitted readers and source releases. Drain storage work before
+closing the WAL owner and releasing the directory lock. Review cleanup
+on startup failure and lock retention on failed drain.
+[Query delivery and shutdown](../adr/0039-query-delivery-and-retained-cutover.md),
+[Resource admission](../adr/0010-retained-resource-admission.md),
 [Storage budget interfaces](../../internal/history/LIMITS.md)
 
 ## Package registry
@@ -186,10 +202,10 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 
 | Package or entry point | Role | Responsibility |
 | --- | --- | --- |
-| `cmd/bog` | Server command | Recovery, listener, and lifecycle. Owns retained composition at #108 cutover. |
+| `cmd/bog` | Server command | Ordinary WAL recovery, listener, and lifecycle. Owns retained composition at #108 cutover. |
 | `internal/httpapi` | Wired | HTTP validation, admission, cursors, and response framing |
 | `internal/readiness` | Wired | Disk headroom and write outcome observation |
-| `internal/wal` | Wired | Directory locking, commit, replay, and WAL capture |
+| `internal/wal` | Wired | Pinned directory locking, commit, replay, and published-prefix capture |
 | `internal/store` | Wired | Row decoding, publication, and ordered queries |
 | `internal/checkpoint` | Staged | Checkpoint format, bounded WAL scans, and durable generation publication |
 | `internal/history` | Staged | Generation validation, ordered scans, pins, and reclamation |
@@ -212,9 +228,9 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
 `bog-storage` owns #108 activation for checkpoint, history, and backup.
-All three remain staged in the measured revision. Promote each library in
-the command wiring PR once both Linux inventories of the reviewed Storage
-SHA confirm server reachability and Storage supplies the activation
+Both measured Linux closures leave all three staged. Promote each library
+in the command wiring PR once both Linux inventories of the reviewed
+Storage SHA confirm server reachability and Storage supplies the activation
 evidence required by ADR 0049.
 Idempotency remains staged under its own criteria. Keyed retries require
 the production WAL to commit and recover retry records atomically with
@@ -229,7 +245,7 @@ bodies, and retries after an ambiguous response and process restart.
 | Rank | Property | Measured server | #108 decision and cost |
 | --- | --- | --- | --- |
 | 1 | Durability | Acknowledge whole batches after durable commit and fence on uncertain WAL outcomes. | Sync the successor and durably select it before activation. Preserve whole-batch acknowledgments across selection and writable restore. Fencing during uncertain publication costs write availability. |
-| 2 | Exact queries | Preserve timestamp and append ordinal order in memory and through ordinary WAL replay. | Pin a generation and its exact committed suffix together. Merge by UTC timestamp and append ordinal through compaction and restart. Certification spends work before cursor issuance, and live pins delay reclamation. |
+| 2 | Exact queries | Preserve timestamp and append ordinal order in memory and through ordinary WAL replay. | Pin a generation and its exact committed suffix together. Merge by UTC timestamp and append ordinal through compaction and restart. Certification spends work before cursor issuance. Retiring a cursor stops new resumes, and admitted users can keep predecessor storage charged until the last reference drains. |
 | 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Reserve replay, whole-batch ingest, capture, pin, and staging capacity before work. Capacity pressure can defer maintenance and refuse whole batches while admitted work drains. Verify both live scales under 128 MiB with swap disabled on each native architecture. |
 | 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the selected generation and writable authority, then replay its bounded committed suffix. Manifest, segment, and suffix validation adds startup I/O. |
 | 5 | Throughput | Group syncs across admitted commits. | Prune provably irrelevant scans and serialize activation with appends. Keeping and hashing the readable v1 WAL prefix costs disk space and I/O. A verified tail-only v1 restore has finite writable tail capacity. |
@@ -305,10 +321,11 @@ through exhaustion with the independent append-log oracle.
 [Recovery parity contract](../../verify/release/README.md),
 [Immediate post-restore crash evidence](../adr/0027-immediate-post-restore-crash-evidence.md)
 
-The baseline includes the native query replay startup checks for verified
-bind collisions. Native qualification for this baseline is pending.
-The two Linux inventories measure build topology, and the cross-build
-checks compilation. Native verdicts require the pinned-binary producers.
+The baseline includes query replay startup checks for verified bind
+collisions. For the measured baseline with this architecture update,
+both Linux inventories, portable architecture vet and race checks, and
+the Linux amd64 cross-build pass. Native qualification of the composed
+#108 candidate remains pending on both amd64 and arm64.
 
 The three producers exercise a separate pinned server process through HTTP,
 process lifecycle, and disposable filesystem fixtures. Their Linux production
@@ -349,11 +366,20 @@ details, reports, exit statuses, and logs. `verifier-race.log` includes the
 bounded backup and history corruption corpus. The capacity sample
 records publication at the requested cutoff. Runtime pin drain requires
 a positive retired-generation pin count while the held cursor is live
-and an observed zero after explicit retirement and drain. Missing runtime
-metrics carry an unavailable reason. Record the configured resource limits and exercise
+and an observed zero after explicit retirement and drain. The
+`verify/release` retirement fixture exercises the reclamation check with
+two admitted readers, explicit cursor retirement, and a rejected new
+resume. It checks that after the first reader drains the predecessor
+artifact and candidate descriptor remain pinned, then checks that the
+last reader's completion removes both while preserving successor
+artifacts. The deliberate-pin and missing-reader cases exercise rejection
+and bounded teardown. Native qualification still requires the composed
+candidate's observed behavior. Missing runtime metrics carry an
+unavailable reason. Record the configured resource limits and exercise
 whole-batch and maintenance refusal, recovery when capacity returns, and
 expiry with admitted operations still draining.
 [Capacity evidence contract](../../bench/retained-history/README.md#publication-and-pin-drain-sample-contract),
+[Retirement fixture](../../verify/release/retirement_linux_test.go),
 [Resource qualification](../adr/0010-retained-resource-admission.md#qualification)
 
 ## Stream policy conformance
@@ -384,8 +410,10 @@ The constructor fitness guard landed in `b27b41ff9fcd46f3497725b052075e8353a0ede
 Storage carries #47 and #15 in #108 and coordinates role promotion with
 Core Architecture in the reviewed command wiring PR. Recheck write leases
 at dispatch and at the Storage handoff. At the reviewed Storage SHA,
-compare both Linux inventories and rerun the architecture suite. The wiring
-PR updates `internal/archtest/architecture_test.go` with the exact
+compare both Linux inventories and rerun the architecture suite. Verify the
+write leases cover the composition and architecture files before landing
+the combined change. The wiring PR updates
+`internal/archtest/architecture_test.go` with the exact
 imports and roles, `internal/archtest/staged_packages_test.go` with the
 remaining staging declarations, and `docs/architecture/SYSTEM.md` with the
 measured revision, diagram, and role table. Preserve the operator backup
@@ -414,7 +442,8 @@ The Architecture workflow runs `go test -count=1 ./internal/archtest`.
 The suite lists packages with `GOOS=linux`, `GOAMD64=v1`, `GOARM64=v8.0`,
 `CGO_ENABLED=0`, `GOENV=off`, empty `GOFLAGS`, `GO111MODULE=on`, and
 `GOWORK=off`, once for each target. Exact imports, cycles, package kinds,
-and server reachability are checked against both inventories. The diagram
+and server reachability are checked against both inventories. Each direct
+production edge has one registry declaration. The diagram
 fitness test checks every declared production node and directed edge, the
 Runtime closure, and Staged membership against the same registry. Test
 imports and nested modules are outside the root-module production registry.

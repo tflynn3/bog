@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"bog/verify/capacityevidence"
 )
 
 var publicationReports = []struct {
@@ -40,19 +42,19 @@ func TestReportPublicationStages(t *testing.T) {
 			t.Parallel()
 			for _, tc := range []struct {
 				stage, diagnostic, operations string
-				state                         reportPublicationState
+				state                         capacityevidence.ReportPublicationState
 				wantErr                       error
 			}{
-				{"encode", "encode release report", "", reportUnpublished, nil},
-				{"open directory", "open report directory", "open directory", reportUnpublished, fault},
-				{"create", "create staging report", "open directory,create,close directory", reportUnpublished, fault},
-				{"write", "write staging report", "open directory,create,write,close file,remove,close directory", reportUnpublished, fault},
-				{"short write", "write staging report", "open directory,create,write,close file,remove,close directory", reportUnpublished, io.ErrShortWrite},
-				{"sync file", "sync staging report", "open directory,create,write,sync file,close file,remove,close directory", reportUnpublished, fault},
-				{"close file", "close staging report", "open directory,create,write,sync file,close file,remove,close directory", reportUnpublished, fault},
-				{"rename", "rename staging report", "open directory,create,write,sync file,close file,rename,remove,close directory", reportUnpublished, fault},
-				{"sync directory", "sync report directory", "open directory,create,write,sync file,close file,rename,sync directory,close directory", reportDurabilityUncertain, fault},
-				{"close directory", "close report directory", "open directory,create,write,sync file,close file,rename,sync directory,close directory", reportDurablyPublished, fault},
+				{"encode", "encode report", "", capacityevidence.ReportUnpublished, nil},
+				{"open directory", "open report directory", "open directory", capacityevidence.ReportUnpublished, fault},
+				{"create", "create staging report", "open directory,create,close directory", capacityevidence.ReportUnpublished, fault},
+				{"write", "write staging report", "open directory,create,write,close file,remove,close directory", capacityevidence.ReportUnpublished, fault},
+				{"short write", "write staging report", "open directory,create,write,close file,remove,close directory", capacityevidence.ReportUnpublished, io.ErrShortWrite},
+				{"sync file", "sync staging report", "open directory,create,write,sync file,close file,remove,close directory", capacityevidence.ReportUnpublished, fault},
+				{"close file", "close staging report", "open directory,create,write,sync file,close file,remove,close directory", capacityevidence.ReportUnpublished, fault},
+				{"rename", "rename staging report", "open directory,create,write,sync file,close file,rename,remove,close directory", capacityevidence.ReportUnpublished, fault},
+				{"sync directory", "sync report directory", "open directory,create,write,sync file,close file,rename,sync directory,close directory", capacityevidence.ReportDurabilityUncertain, fault},
+				{"close directory", "close report directory", "open directory,create,write,sync file,close file,rename,sync directory,close directory", capacityevidence.ReportDurablyPublished, fault},
 			} {
 				t.Run(tc.stage, func(t *testing.T) {
 					t.Parallel()
@@ -70,14 +72,14 @@ func TestReportPublicationStages(t *testing.T) {
 					if tc.stage == "encode" {
 						replacement.Cases[producer.required[0]] = outcome{Evidence: jsontext.Value(`{"invalid":}`)}
 					}
-					ops := publicationFaults{t: t, dir: dir, path: path, stage: tc.stage, fault: fault}
-					err = ops.publisher().writeReport(path, replacement)
+					ops := publicationFaults{t: t, path: path, stage: tc.stage, fault: fault}
+					err = ops.publisher().WriteReport(path, replacement)
 					assertPublicationError(t, err, path, tc.state, tc.diagnostic, tc.wantErr)
 					if got := strings.Join(ops.calls, ","); got != tc.operations {
 						t.Fatalf("publication operations = %q, want %q", got, tc.operations)
 					}
 					got := readPublishedReport(t, path)
-					if tc.state == reportUnpublished {
+					if tc.state == capacityevidence.ReportUnpublished {
 						if !bytes.Equal(got, previous) {
 							t.Fatalf("previous bytes changed: got %q, want %q", got, previous)
 						}
@@ -103,9 +105,9 @@ func TestReportPublicationFailedFirstAttemptLeavesNoReport(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "admission.json")
 	fault := errors.New("rename failed")
-	ops := publicationFaults{t: t, dir: dir, path: path, stage: "rename", fault: fault}
-	err := ops.publisher().writeReport(path, publicationFixture(admissionCases, "first attempt"))
-	assertPublicationError(t, err, path, reportUnpublished, "rename staging report", fault)
+	ops := publicationFaults{t: t, path: path, stage: "rename", fault: fault}
+	err := ops.publisher().WriteReport(path, publicationFixture(admissionCases, "first attempt"))
+	assertPublicationError(t, err, path, capacityevidence.ReportUnpublished, "rename staging report", fault)
 	assertReportDirectory(t, dir)
 }
 
@@ -116,20 +118,22 @@ func TestReportPublicationKeepsCleanupFailures(t *testing.T) {
 	renameErr := errors.New("rename failed")
 	removeErr := errors.New("staging removal failed")
 	closeErr := errors.New("directory close failed")
-	publisher := localReportPublisher()
-	publisher.rename = func(_, _ string) error { return renameErr }
-	publisher.remove = func(path string) error { return errors.Join(os.Remove(path), removeErr) }
-	publisher.openDir = func(path string) (reportDirectory, error) {
-		dir, err := os.Open(path)
+	publisher := capacityevidence.ReportPublisher{}
+	publisher.OpenDir = func(path string) (capacityevidence.ReportDirectory, error) {
+		dir, err := capacityevidence.OpenReportDirectory(path)
 		if err != nil {
 			return nil, err
 		}
-		return faultDirectory{sync: dir.Sync, close: func() error {
-			return errors.Join(dir.Close(), closeErr)
-		}}, nil
+		return faultReportDirectory{
+			openExclusive: dir.OpenExclusive,
+			rename:        func(_, _ string) error { return renameErr },
+			remove:        func(name string) error { return errors.Join(dir.Remove(name), removeErr) },
+			sync:          dir.Sync,
+			close:         func() error { return errors.Join(dir.Close(), closeErr) },
+		}, nil
 	}
-	err := publisher.writeReport(path, publicationFixture(publicationReports[1].required, "first attempt"))
-	assertPublicationError(t, err, path, reportUnpublished, "rename staging report", renameErr)
+	err := publisher.WriteReport(path, publicationFixture(publicationReports[1].required, "first attempt"))
+	assertPublicationError(t, err, path, capacityevidence.ReportUnpublished, "rename staging report", renameErr)
 	for _, cleanupErr := range []error{removeErr, closeErr} {
 		if !errors.Is(err, cleanupErr) {
 			t.Errorf("lost cleanup error %v in %v", cleanupErr, err)
@@ -209,10 +213,10 @@ func TestConcurrentReportPublication(t *testing.T) {
 }
 
 type publicationFaults struct {
-	t                *testing.T
-	dir, path, stage string
-	fault            error
-	calls            []string
+	t           *testing.T
+	path, stage string
+	fault       error
+	calls       []string
 }
 
 func (f *publicationFaults) call(name string) error {
@@ -223,48 +227,33 @@ func (f *publicationFaults) call(name string) error {
 	return nil
 }
 
-func (f *publicationFaults) publisher() reportPublisher {
-	return reportPublisher{
-		openDir: func(path string) (reportDirectory, error) {
-			if err := f.call("open directory"); err != nil {
-				return nil, err
-			}
-			dir, err := os.Open(path)
-			if err != nil {
-				return nil, err
-			}
-			return faultDirectory{
-				sync: func() error {
-					if err := f.call("sync directory"); err != nil {
-						return err
-					}
-					return dir.Sync()
-				},
-				close: func() error { return errors.Join(dir.Close(), f.call("close directory")) },
-			}, nil
-		},
-		createTemp: func(dir, pattern string) (reportStagingFile, error) {
-			if err := f.call("create"); err != nil {
-				return nil, err
-			}
-			if dir != f.dir {
-				f.t.Errorf("staging directory = %q, want %q", dir, f.dir)
-			}
-			file, err := os.CreateTemp(dir, pattern)
-			if err != nil {
-				return nil, err
-			}
-			return faultStagingFile{
-				File: file,
-				write: func(data []byte) (int, error) {
-					err := f.call("write")
-					if err != nil || f.stage == "short write" {
-						n, shortErr := file.Write(data[:len(data)/2])
-						return n, errors.Join(shortErr, err)
-					}
-					return file.Write(data)
-				},
-				faultDirectory: faultDirectory{
+func (f *publicationFaults) publisher() capacityevidence.ReportPublisher {
+	return capacityevidence.ReportPublisher{OpenDir: func(path string) (capacityevidence.ReportDirectory, error) {
+		if err := f.call("open directory"); err != nil {
+			return nil, err
+		}
+		dir, err := capacityevidence.OpenReportDirectory(path)
+		if err != nil {
+			return nil, err
+		}
+		return faultReportDirectory{
+			openExclusive: func(name string) (capacityevidence.ReportStagingFile, error) {
+				if err := f.call("create"); err != nil {
+					return nil, err
+				}
+				file, err := dir.OpenExclusive(name)
+				if err != nil {
+					return nil, err
+				}
+				return faultStagingFile{
+					write: func(data []byte) (int, error) {
+						err := f.call("write")
+						if err != nil || f.stage == "short write" {
+							n, shortErr := file.Write(data[:len(data)/2])
+							return n, errors.Join(shortErr, err)
+						}
+						return file.Write(data)
+					},
 					sync: func() error {
 						if err := f.call("sync file"); err != nil {
 							return err
@@ -272,42 +261,56 @@ func (f *publicationFaults) publisher() reportPublisher {
 						return file.Sync()
 					},
 					close: func() error { return errors.Join(file.Close(), f.call("close file")) },
-				},
-			}, nil
-		},
-		rename: func(from, to string) error {
-			if filepath.Dir(from) != f.dir || to != f.path {
-				f.t.Errorf("unexpected rename from %q to %q", from, to)
-			}
-			if err := f.call("rename"); err != nil {
-				return err
-			}
-			return os.Rename(from, to)
-		},
-		remove: func(path string) error { return errors.Join(os.Remove(path), f.call("remove")) },
-	}
+				}, nil
+			},
+			rename: func(from, to string) error {
+				if filepath.Base(from) != from || to != filepath.Base(f.path) {
+					f.t.Errorf("unexpected rename from %q to %q", from, to)
+				}
+				if err := f.call("rename"); err != nil {
+					return err
+				}
+				return dir.Rename(from, to)
+			},
+			remove: func(name string) error { return errors.Join(dir.Remove(name), f.call("remove")) },
+			sync: func() error {
+				if err := f.call("sync directory"); err != nil {
+					return err
+				}
+				return dir.Sync()
+			},
+			close: func() error { return errors.Join(dir.Close(), f.call("close directory")) },
+		}, nil
+	}}
 }
 
-type faultDirectory struct {
+type faultReportDirectory struct {
+	openExclusive func(string) (capacityevidence.ReportStagingFile, error)
+	rename        func(string, string) error
+	remove        func(string) error
+	sync, close   func() error
+}
+
+func (d faultReportDirectory) OpenExclusive(name string) (capacityevidence.ReportStagingFile, error) {
+	return d.openExclusive(name)
+}
+func (d faultReportDirectory) Rename(from, to string) error { return d.rename(from, to) }
+func (d faultReportDirectory) Remove(name string) error     { return d.remove(name) }
+func (d faultReportDirectory) Sync() error                  { return d.sync() }
+func (d faultReportDirectory) Close() error                 { return d.close() }
+
+type faultStagingFile struct {
+	write       func([]byte) (int, error)
 	sync, close func() error
 }
 
-func (d faultDirectory) Sync() error  { return d.sync() }
-func (d faultDirectory) Close() error { return d.close() }
-
-type faultStagingFile struct {
-	*os.File
-	faultDirectory
-	write func([]byte) (int, error)
-}
-
 func (f faultStagingFile) Write(data []byte) (int, error) { return f.write(data) }
-func (f faultStagingFile) Sync() error                    { return f.faultDirectory.Sync() }
-func (f faultStagingFile) Close() error                   { return f.faultDirectory.Close() }
+func (f faultStagingFile) Sync() error                    { return f.sync() }
+func (f faultStagingFile) Close() error                   { return f.close() }
 
-func assertPublicationError(t *testing.T, err error, path string, state reportPublicationState, diagnostic string, cause error) {
+func assertPublicationError(t *testing.T, err error, path string, state capacityevidence.ReportPublicationState, diagnostic string, cause error) {
 	t.Helper()
-	var publicationErr *reportPublicationError
+	var publicationErr *capacityevidence.ReportPublicationError
 	if !errors.As(err, &publicationErr) || publicationErr.State != state || publicationErr.Path != path {
 		t.Fatalf("expected publication error for %q with state %q, got %v", path, state, err)
 	}
@@ -357,4 +360,179 @@ func assertReportDirectory(t *testing.T, dir string, names ...string) {
 	if !slices.Equal(names, got) {
 		t.Fatalf("report directory entries = %v, want %v", got, names)
 	}
+}
+
+func TestReportPublicationPinsParent(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		retarget string
+		fail     string
+		state    capacityevidence.ReportPublicationState
+	}{
+		{"parent moved before staging", "open", "", capacityevidence.ReportDurablyPublished},
+		{"parent moved before rename", "rename", "", capacityevidence.ReportDurablyPublished},
+		{"parent moved before failed rename", "rename", "rename", capacityevidence.ReportUnpublished},
+		{"parent moved before failed sync", "sync", "sync", capacityevidence.ReportDurabilityUncertain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			parent := t.TempDir()
+			active, moved := filepath.Join(parent, "active"), filepath.Join(parent, "moved")
+			path := filepath.Join(active, "report.json")
+			if err := os.Mkdir(active, 0700); err != nil {
+				t.Fatal(err)
+			}
+			old := publicationFixture(admissionCases, "original")
+			if err := writeReport(path, old); err != nil {
+				t.Fatal(err)
+			}
+
+			decoy := []byte("replacement parent")
+			retarget := func() error {
+				if err := os.Rename(active, moved); err != nil {
+					return err
+				}
+				if err := os.Mkdir(active, 0700); err != nil {
+					return err
+				}
+				return os.WriteFile(path, decoy, 0600)
+			}
+			failure := errors.New("injected publication failure")
+			publisher := capacityevidence.ReportPublisher{OpenDir: func(path string) (capacityevidence.ReportDirectory, error) {
+				dir, err := capacityevidence.OpenReportDirectory(path)
+				if err != nil {
+					return nil, err
+				}
+				if tc.retarget == "open" {
+					if err := retarget(); err != nil {
+						return nil, errors.Join(err, dir.Close())
+					}
+				}
+				return faultReportDirectory{
+					openExclusive: dir.OpenExclusive,
+					remove:        dir.Remove,
+					close:         dir.Close,
+					rename: func(from, to string) error {
+						if tc.retarget == "rename" {
+							if err := retarget(); err != nil {
+								return err
+							}
+						}
+						if tc.fail == "rename" {
+							return failure
+						}
+						return dir.Rename(from, to)
+					},
+					sync: func() error {
+						if tc.retarget == "sync" {
+							if err := retarget(); err != nil {
+								return err
+							}
+						}
+						if tc.fail == "sync" {
+							return failure
+						}
+						return dir.Sync()
+					},
+				}, nil
+			}}
+			replacement := publicationFixture(admissionCases, "replacement")
+			err := publisher.WriteReport(path, replacement)
+			switch tc.fail {
+			case "rename":
+				assertPublicationError(t, err, path, tc.state, "rename staging report", failure)
+			case "sync":
+				assertPublicationError(t, err, path, tc.state, "sync report directory", failure)
+			default:
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := readPublishedReport(t, path); !bytes.Equal(got, decoy) {
+				t.Fatalf("replacement parent changed: %q", got)
+			}
+			want := replacement
+			if tc.state == capacityevidence.ReportUnpublished {
+				want = old
+			}
+			assertPublishedBytes(t, readPublishedReport(t, filepath.Join(moved, "report.json")), want, admissionCases)
+			assertReportDirectory(t, moved, "report.json")
+			assertReportDirectory(t, active, "report.json")
+		})
+	}
+}
+
+func TestReportPublicationSymlinks(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	selected, decoy := filepath.Join(root, "selected"), filepath.Join(root, "decoy")
+	for _, dir := range []string{selected, decoy} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parent := filepath.Join(root, "parent")
+	if err := os.Symlink(selected, parent); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(decoy, "report.json")
+	sentinel := []byte("never follow this report link")
+	writeFixture(t, target, sentinel)
+	if err := os.Symlink(target, filepath.Join(selected, "report.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	var collision string
+	publisher := capacityevidence.ReportPublisher{OpenDir: func(path string) (capacityevidence.ReportDirectory, error) {
+		dir, err := capacityevidence.OpenReportDirectory(path)
+		if err != nil {
+			return nil, err
+		}
+		return faultReportDirectory{
+			openExclusive: func(name string) (capacityevidence.ReportStagingFile, error) {
+				if collision == "" {
+					collision = name
+					// Force a staging collision with a symlink and redirect
+					// future lookups of the original parent path.
+					if err := os.Symlink(target, filepath.Join(selected, collision)); err != nil {
+						return nil, err
+					}
+					if err := os.Remove(parent); err != nil {
+						return nil, err
+					}
+					if err := os.Symlink(decoy, parent); err != nil {
+						return nil, err
+					}
+				}
+				return dir.OpenExclusive(name)
+			},
+			remove: dir.Remove,
+			rename: dir.Rename,
+			sync:   dir.Sync,
+			close:  dir.Close,
+		}, nil
+	}}
+	results := publicationFixture(admissionCases, "published under the pinned parent")
+	if err := publisher.WriteReport(filepath.Join(parent, "report.json"), results); err != nil {
+		t.Fatal(err)
+	}
+	selectedReport := filepath.Join(selected, "report.json")
+	info, err := os.Lstat(selectedReport)
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("published report must replace the symlink with a regular file: %v, %v", info, err)
+	}
+	assertPublishedBytes(t, readPublishedReport(t, selectedReport), results, admissionCases)
+	if got := readPublishedReport(t, target); !bytes.Equal(got, sentinel) {
+		t.Fatalf("symlink target changed: %q", got)
+	}
+	if link, err := os.Readlink(filepath.Join(selected, collision)); err != nil || link != target {
+		t.Fatalf("staging collision was modified: %q, %v", link, err)
+	}
+	names := []string{collision, "report.json"}
+	slices.Sort(names)
+	assertReportDirectory(t, selected, names...)
+	assertReportDirectory(t, decoy, "report.json")
 }

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"bog/verify/capacityevidence"
 )
 
 const testRevision = "0ab9ea87c20ebf0c585f384523059abb65cb79d8"
@@ -304,6 +306,31 @@ func TestValidateCommand(t *testing.T) {
 	if err := run(t.Context(), parityArgs); err != nil {
 		t.Fatalf("cutover rejected recovery parity: %v", err)
 	}
+	complete := parity.Cases[restoredParityCase]
+	for _, tc := range []struct {
+		name  string
+		proof outcome
+		want  string
+	}{
+		{"skipped writable restore", outcome{Status: "skip", Evidence: complete.Evidence}, `expected pass, got "skip"`},
+		{"unacknowledged append", outcome{Status: "pass", Evidence: jsontext.Value(strings.Replace(restoredParityJSON, `"post_restore_204":true`, `"post_restore_204":false`, 1))}, "post_restore_204=false"},
+		{"missing restart after append", outcome{Status: "pass", Evidence: jsontext.Value(strings.Replace(restoredParityJSON, `,"restart_rows":7`, "", 1))}, "restart_rows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parity.Cases[restoredParityCase] = tc.proof
+			if err := writeReport(parityPath, parity); err != nil {
+				t.Fatal(err)
+			}
+			if err := run(t.Context(), parityArgs); err == nil || !strings.Contains(err.Error(), "restored parity report") ||
+				!strings.Contains(err.Error(), restoredParityCase) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("strict parity validation = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	parity.Cases[restoredParityCase] = complete
+	if err := writeReport(parityPath, parity); err != nil {
+		t.Fatal(err)
+	}
 	missing := filepath.Join(dir, "capacity.json")
 	if err := os.Remove(missing); err != nil {
 		t.Fatal(err)
@@ -378,7 +405,7 @@ func TestAdmissionReportRetainsFixtureAndProbeFailures(t *testing.T) {
 	}
 	badPath := filepath.Join(path, "admission.json")
 	err = writeReport(badPath, report{id, cases})
-	assertPublicationError(t, err, badPath, reportUnpublished, "open report directory", nil)
+	assertPublicationError(t, err, badPath, capacityevidence.ReportUnpublished, "open report directory", nil)
 }
 
 func writeFixture(t *testing.T, path string, data []byte) {

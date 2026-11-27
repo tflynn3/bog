@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"debug/buildinfo"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,9 +16,11 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+
+	"bog/verify/capacityevidence"
 )
 
-const capacityCase = "retained_history_capacity"
+const capacityCase = capacityevidence.Case
 
 type fixture struct {
 	SeedRows      int    `json:"seed_rows"`
@@ -33,11 +34,11 @@ type fixture struct {
 func fixtures(mode string) []fixture {
 	sizes := []int{8192, 32768}
 	if mode == "live" {
-		sizes = []int{196608, 393216}
+		sizes = []int{capacityevidence.SmallScale, capacityevidence.LargeScale}
 	}
 	var result []fixture
 	for _, size := range sizes {
-		result = append(result, fixture{size, 2048, 1024, 64, 128 << 20, mode == "live"})
+		result = append(result, fixture{size, capacityevidence.TailRows, capacityevidence.LineBytes, capacityevidence.BatchRows, capacityevidence.MemoryLimit, mode == "live"})
 	}
 	return result
 }
@@ -144,23 +145,8 @@ func pinBinary(source, dest, revision string) (digest string, err error) {
 	return digest, nil
 }
 
-func writeReport(path string, r report) (err error) {
-	f, err := os.CreateTemp(filepath.Dir(path), ".capacity-report-*")
-	if err != nil {
-		return err
-	}
-	name := f.Name()
-	defer func() {
-		if removeErr := os.Remove(name); !errors.Is(removeErr, os.ErrNotExist) {
-			err = errors.Join(err, removeErr)
-		}
-	}()
-	encoder := json.NewEncoder(f)
-	encoder.SetIndent("", "  ")
-	if err := errors.Join(encoder.Encode(r), f.Sync(), f.Close()); err != nil {
-		return err
-	}
-	return os.Rename(name, path)
+func writeReport(path string, r report) error {
+	return (capacityevidence.ReportPublisher{}).WriteReport(path, r)
 }
 
 func createFixtureRoot(parent string) (string, error) {
@@ -176,7 +162,7 @@ func createFixtureRoot(parent string) (string, error) {
 	return os.MkdirTemp(absoluteParent, "bog-capacity-")
 }
 
-func run(ctx context.Context, args []string) (err error) {
+func run(ctx context.Context, args []string, publish func(string, report) error) (err error) {
 	var o options
 	var cutoverReport string
 	f := flag.NewFlagSet("retained-history", flag.ContinueOnError)
@@ -200,7 +186,7 @@ func run(ctx context.Context, args []string) (err error) {
 		return validateCutoverFile(cutoverReport)
 	}
 	if f.NArg() != 0 || !filepath.IsAbs(o.binary) || !regexp.MustCompile("^[0-9a-f]{40}$").MatchString(o.revision) ||
-		o.fixture != "linux-release-v1" || o.report == "" || o.timeout <= 0 || (o.mode != "live" && o.mode != "legacy") {
+		o.fixture != capacityevidence.FixtureID || o.report == "" || o.timeout <= 0 || (o.mode != "live" && o.mode != "legacy") {
 		return errors.New("require absolute -binary, full lowercase -revision, -fixture linux-release-v1, and -report; see -help")
 	}
 	source, sourceErr := os.Stat(o.binary)
@@ -222,7 +208,7 @@ func run(ctx context.Context, args []string) (err error) {
 			c.Status, c.Detail = "fail", err.Error()
 		}
 		r.Cases[key] = c
-		err = errors.Join(err, writeReport(o.report, r))
+		err = errors.Join(err, publish(o.report, r))
 	}()
 	dir, err := createFixtureRoot(o.workDir)
 	if err != nil {
@@ -255,7 +241,7 @@ func run(ctx context.Context, args []string) (err error) {
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := run(ctx, os.Args[1:])
+	err := run(ctx, os.Args[1:], writeReport)
 	stop()
 	if err != nil && !errors.Is(err, flag.ErrHelp) {
 		log.Fatal(err)

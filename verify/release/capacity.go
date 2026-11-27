@@ -7,13 +7,15 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"bog/verify/capacityevidence"
 )
 
 const (
-	capacityFixtureID = "linux-release-v1"
-	capacityMemory    = 128 << 20
-	capacityTail      = 2048
-	capacityBatch     = 64
+	capacityFixtureID = capacityevidence.FixtureID
+	capacityMemory    = capacityevidence.MemoryLimit
+	capacityTail      = capacityevidence.TailRows
+	capacityBatch     = capacityevidence.BatchRows
 )
 
 type compactionEvidence struct {
@@ -40,7 +42,6 @@ type capacityEvidence struct {
 	TimedOut      *bool              `json:"timed_out"`
 	RecoveredRows int                `json:"recovered_rows"`
 	Compaction    compactionEvidence `json:"compaction"`
-	Diagnostics   jsontext.Value     `json:"diagnostics"`
 	Cleanup       struct {
 		Status          string `json:"status"`
 		CandidateReaped bool   `json:"candidate_reaped"`
@@ -49,16 +50,21 @@ type capacityEvidence struct {
 		StoreRemoved    bool   `json:"store_removed"`
 		Detail          string `json:"detail"`
 	} `json:"cleanup"`
+	// Preserve historical decoding of optional readbacks when present.
+	CgroupLimit *uint64 `json:"cgroup_memory_limit_bytes"`
+	CgroupSwap  *uint64 `json:"cgroup_swap_max_bytes"`
+	CgroupOOM   *uint64 `json:"cgroup_oom_kill_count"`
+	CgroupPeak  uint64  `json:"cgroup_peak_memory_bytes"`
+	capacityMeasurements
+}
+
+type capacityMeasurements struct {
 	StartReady    int64                         `json:"start_to_ready_ns"`
 	RestartReady  int64                         `json:"restart_to_ready_ns"`
 	IngestP99     int64                         `json:"ingest_p99_ns"`
 	QueryP99      int64                         `json:"backfill_query_p99_ns"`
 	IngestSamples int                           `json:"ingest_samples"`
 	QuerySamples  int                           `json:"backfill_query_samples"`
-	CgroupLimit   *uint64                       `json:"cgroup_memory_limit_bytes"`
-	CgroupSwap    *uint64                       `json:"cgroup_swap_max_bytes"`
-	CgroupOOM     *uint64                       `json:"cgroup_oom_kill_count"`
-	CgroupPeak    uint64                        `json:"cgroup_peak_memory_bytes"`
 	PeakRSS       uint64                        `json:"peak_rss_bytes"`
 	PeakFDs       uint64                        `json:"peak_descriptors"`
 	InitialFree   uint64                        `json:"initial_disk_free_bytes"`
@@ -67,7 +73,7 @@ type capacityEvidence struct {
 	Unavailable   map[string]string             `json:"unavailable"`
 }
 
-func validateCapacity(rawMode, outcome jsontext.Value, fixture string, requireCutover bool) error {
+func validateCapacity(rawMode, outcome jsontext.Value, fixture string) error {
 	var mode string
 	if err := json.Unmarshal(rawMode, &mode); err != nil || mode != "live" || fixture != capacityFixtureID {
 		return errors.New("capacity requires live mode and fixture linux-release-v1")
@@ -76,7 +82,7 @@ func validateCapacity(rawMode, outcome jsontext.Value, fixture string, requireCu
 	if _, err := decodeFields(outcome, map[string]any{"evidence": &records}); err != nil {
 		return fmt.Errorf("capacity evidence: %w", err)
 	}
-	const small, large = 196608, 393216
+	const small, large = capacityevidence.SmallScale, capacityevidence.LargeScale
 	if len(records) != 2 {
 		return fmt.Errorf("capacity requires exactly one record each for %d and %d seed rows", small, large)
 	}
@@ -87,16 +93,16 @@ func validateCapacity(rawMode, outcome jsontext.Value, fixture string, requireCu
 			return fmt.Errorf("unexpected or duplicate capacity fixture size %d", size)
 		}
 		seen[size] = true
-		if err := r.validate(requireCutover); err != nil {
+		if err := r.validateHistorical(); err != nil {
 			return fmt.Errorf("capacity fixture %d: %w", size, err)
 		}
 	}
 	return nil
 }
 
-func (r capacityEvidence) validate(requireCutover bool) error {
+func (r capacityEvidence) validateHistorical() error {
 	f := r.Fixture
-	if f.TailRows != capacityTail || f.LineBytes != 1024 || f.BatchRows != capacityBatch || f.MemoryBytes != capacityMemory {
+	if f.TailRows != capacityTail || f.LineBytes != capacityevidence.LineBytes || f.BatchRows != capacityBatch || f.MemoryBytes != capacityMemory {
 		return errors.New("incorrect fixture dimensions or memory limit")
 	}
 	if r.Status != "pass" || r.Workload != "pass" || r.Phase != "complete" || r.TimedOut == nil || *r.TimedOut {
@@ -114,11 +120,31 @@ func (r capacityEvidence) validate(requireCutover bool) error {
 	if cleanup.Status != "pass" || !cleanup.CandidateReaped || !cleanup.SubtreeEmpty || !cleanup.SubtreeRemoved || cleanup.Detail != "" {
 		return errors.New("cleanup must prove candidate reaping, subtree emptiness, and subtree removal")
 	}
+	if r.CgroupPeak == 0 || r.CgroupPeak > capacityMemory {
+		return errors.New("missing or invalid resource measurements")
+	}
+	return r.capacityMeasurements.validate()
+}
+
+func validateCutoverMeasurements(outcome jsontext.Value) error {
+	var records []capacityMeasurements
+	if _, err := decodeFields(outcome, map[string]any{"evidence": &records}); err != nil {
+		return fmt.Errorf("capacity measurements: %w", err)
+	}
+	for i, r := range records {
+		if err := r.validate(); err != nil {
+			return fmt.Errorf("capacity record %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
+func (r capacityMeasurements) validate() error {
 	if r.StartReady <= 0 || r.RestartReady <= 0 || r.IngestP99 <= 0 || r.QueryP99 <= 0 ||
 		r.IngestSamples != capacityTail/capacityBatch || r.QuerySamples <= 0 {
 		return errors.New("missing or invalid timing measurements or sample counts")
 	}
-	if r.CgroupPeak == 0 || r.CgroupPeak > capacityMemory || r.PeakRSS == 0 || r.PeakFDs == 0 ||
+	if r.PeakRSS == 0 || r.PeakFDs == 0 ||
 		r.MinFree == 0 || r.InitialFree < r.MinFree || len(r.Unavailable) != 0 {
 		return errors.New("missing or invalid resource measurements")
 	}
@@ -137,9 +163,6 @@ func (r capacityEvidence) validate(requireCutover bool) error {
 				return fmt.Errorf("invalid I/O counter %q for device %q", name, device)
 			}
 		}
-	}
-	if requireCutover {
-		return r.validateCutover()
 	}
 	return nil
 }

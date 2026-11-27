@@ -82,9 +82,11 @@ func TestPageFraming(t *testing.T) {
 			if (err == nil) != tt.ok {
 				t.Fatalf("page=%+v err=%v", p, err)
 			}
-			if tt.name == "truncated boundary" {
+			if tt.name == "truncated boundary" || tt.name == "broken chunk" {
 				var he *HTTPError
-				if !errors.As(err, &he) || he.StatusCode != 200 || !errors.Is(err, io.ErrUnexpectedEOF) {
+				if !errors.As(err, &he) || he.StatusCode != http.StatusOK ||
+					!errors.Is(err, io.ErrUnexpectedEOF) || !errors.Is(err, ErrPageInterrupted) ||
+					errors.Is(err, ErrMalformedPage) || errors.Is(err, ErrPageBytes) {
 					t.Fatalf("status/cause: %v", err)
 				}
 			}

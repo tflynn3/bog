@@ -6,14 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 )
 
 // ErrPageBudget means the last allowed page still had a continuation.
 var ErrPageBudget = errors.New("query page budget exhausted before a terminal page")
-
-// ErrPageBytes means an encoded query response exceeded the configured byte ceiling.
-var ErrPageBytes = errors.New("query response exceeds page byte ceiling")
 
 // BoundedWalk is a pull-based snapshot walk. It retains only the request
 // cursor and one cycle-detection anchor, independent of the page budget.
@@ -47,7 +43,7 @@ func (w *BoundedWalk) NextPage(ctx context.Context) (Page, error) {
 	if w.terminal {
 		return Page{}, io.EOF
 	}
-	if err := ctx.Err(); err != nil {
+	if err := withQueryCancellation(ctx, nil); err != nil {
 		return Page{}, err
 	}
 	if w.pages == w.maxPages {
@@ -55,18 +51,9 @@ func (w *BoundedWalk) NextPage(ctx context.Context) (Page, error) {
 	}
 	p, err := w.client.FetchPage(ctx, w.query, w.cursor)
 	if err != nil {
-		// FetchPage uses the same size diagnostic for declared lengths and
-		// streamed bodies. Only classify it in the successful query-body path.
-		var response *HTTPError
-		if errors.As(err, &response) && response.StatusCode == http.StatusOK && response.Cause != nil {
-			diagnostic, _, _ := strings.Cut(response.Cause.Error(), "\n")
-			if diagnostic == "read query page: response exceeds size limit" {
-				err = fmt.Errorf("%w: %w", ErrPageBytes, err)
-			}
-		}
 		return Page{}, fmt.Errorf("fetch page %d: %w", w.pages+1, err)
 	}
-	if err := ctx.Err(); err != nil {
+	if err := withQueryCancellation(ctx, nil); err != nil {
 		return Page{}, err
 	}
 	if p.NextCursor != "" {

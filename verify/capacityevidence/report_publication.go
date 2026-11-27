@@ -1,6 +1,7 @@
 package capacityevidence
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -101,9 +102,22 @@ func (p ReportPublisher) WriteReport(path string, results any) (err error) {
 		}
 	}()
 
+	state, err = replaceReport(context.Background(), dir, name, data)
+	return err
+}
+
+// replaceReport borrows the pinned dir from its caller and owns any staging
+// file it creates. name must be a validated basename. Cancellation observed
+// before rename leaves the destination untouched. Once rename succeeds, the
+// transaction attempts directory sync even if the context is canceled.
+func replaceReport(ctx context.Context, dir ReportDirectory, name string, data []byte) (state ReportPublicationState, err error) {
+	state = ReportUnpublished
+	if err := ctx.Err(); err != nil {
+		return state, err
+	}
 	staged, stagedName, err := createStagingReport(dir)
 	if err != nil {
-		return fmt.Errorf("create staging report: %w", err)
+		return state, fmt.Errorf("create staging report: %w", err)
 	}
 	defer func() {
 		if state == ReportUnpublished {
@@ -126,15 +140,17 @@ func (p ReportPublisher) WriteReport(path string, results any) (err error) {
 		err = errors.Join(err, fmt.Errorf("close staging report: %w", closeErr))
 	}
 	if err != nil {
-		return err
+		return state, err
+	}
+	if err := ctx.Err(); err != nil {
+		return state, err
 	}
 	if err := dir.Rename(stagedName, name); err != nil {
-		return fmt.Errorf("rename staging report: %w", err)
+		return state, fmt.Errorf("rename staging report: %w", err)
 	}
 	state = ReportDurabilityUncertain
 	if err := dir.Sync(); err != nil {
-		return fmt.Errorf("sync report directory: %w", err)
+		return state, fmt.Errorf("sync report directory: %w", err)
 	}
-	state = ReportDurablyPublished
-	return nil
+	return ReportDurablyPublished, nil
 }

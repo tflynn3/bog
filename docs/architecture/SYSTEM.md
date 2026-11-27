@@ -23,7 +23,8 @@ root-module production edges on Linux amd64 (v1) and arm64 (v8.0) with cgo
 disabled and the fitness suite's build settings. Arrows point from importer
 to direct dependency. Nodes with no outgoing arrows have zero direct
 root-module production imports. Test-only packages appear in the registry
-below.
+below. The graph also includes the fixture-backed stream policy verifier support
+added in #86.
 
 ```mermaid
 flowchart TD
@@ -65,6 +66,7 @@ flowchart TD
         Capacity["bench/retained-history"]
         Listener["verify/listener"]
         Model["verify/query-model (independent oracle)"]
+        StreamPolicy["verify/stream-policy (fixture conformance)"]
         Admission --> Listener
         Capacity --> Listener
     end
@@ -159,6 +161,7 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `bench/retained-history` | Verifier command | Legacy baseline and live capacity evidence |
 | `verify/listener` | Verifier support | Linux IPv4 loopback listener ownership for release and capacity |
 | `verify/query-model` | Verifier support | Independent append-log oracle for expected query results |
+| `verify/stream-policy` | Verifier support | Fixture-backed checks of stream isolation and pre-append redaction |
 | `bench/segment-layout` | Nested-module benchmark | Checkpoint layout experiment outside the root module |
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
@@ -239,6 +242,18 @@ expiry with admitted operations still draining.
 [Capacity evidence contract](../../bench/retained-history/README.md#publication-and-pin-drain-sample-contract),
 [Resource qualification](../adr/0010-retained-resource-admission.md#qualification)
 
+## Stream policy conformance
+
+Security Verification owns the fixture-backed runner for the proposed
+shared-deployment contract. It compares authorized query and cursor results,
+retry outcomes, committed bytes and replayed records, and scoped export
+evidence. Positive controls require exact retained values and durable byte
+witnesses. Missing adapter evidence leaves conformance incomplete. This
+milestone runs against deterministic synthetic adapters. Live server
+qualification requires adapters that observe a shared-deployment implementation.
+[Proposed stream authorization and durable redaction contract](../shared-deployment/stream-authorization-redaction.md),
+[Runner and adapter contract](../../verify/stream-policy/README.md)
+
 ## Fitness and registry ownership
 
 Core engineering owns the architecture record and fitness registry.
@@ -270,6 +285,10 @@ imports and nested modules are outside the root-module production registry.
   [Operator boundary](../../internal/archtest/operator_boundary_test.go),
   [Oracle boundary](../../internal/archtest/verifier_boundaries_test.go),
   [Release evidence boundary](../../internal/archtest/release_evidence_boundary_test.go)
+- Stream policy conformance runs outside every registered production command
+  dependency tree. Its own production imports cannot reach internal packages
+  or command roots, including through an intermediary.
+  [Stream policy boundary](../../internal/archtest/stream_policy_boundary_test.go)
 - The release and capacity producers are the only production consumers of
   the listener helper. The check follows indirect imports as well.
   [Candidate listener boundary](../../internal/archtest/listener_boundary_test.go)

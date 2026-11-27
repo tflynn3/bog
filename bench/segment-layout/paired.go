@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -42,6 +43,7 @@ type coldCodecPair struct {
 	StorageReadRounds int               `json:"storage_read_observed_rounds"`
 	PeakRSS           coldDeltaSummary  `json:"peak_worker_rss_bytes"`
 	Rewrite           *coldRewriteDelta `json:"rewrite_amplification,omitempty"`
+	Tradeoffs         *coldTradeoffs    `json:"tradeoffs,omitempty"`
 	Decision          string            `json:"decision"`
 }
 
@@ -147,17 +149,7 @@ func validatePairEncoding(raw json.RawMessage, pairing *coldPairing) error {
 	if err != nil {
 		return err
 	}
-	var given, expected any
-	if err := json.Unmarshal(wire.Pairing, &given); err != nil {
-		return err
-	}
-	if err := json.Unmarshal(canonical, &expected); err != nil {
-		return err
-	}
-	if !reflect.DeepEqual(given, expected) {
-		return errors.New("incomplete cold codec comparison fields")
-	}
-	return nil
+	return validateColdFields(wire.Pairing, canonical, "cold codec comparison")
 }
 
 func (r coldReport) derivePairs(input fixtureInput) ([]coldCodecPair, error) {
@@ -165,7 +157,7 @@ func (r coldReport) derivePairs(input fixtureInput) ([]coldCodecPair, error) {
 	if p == nil || !validColdRunID(p.RunID) || p.FixtureSHA256 != coldFixtureDigest(r.Fixture, input) {
 		return nil, errors.New("cold pairing fixture or execution identity mismatch")
 	}
-	probes := coldQueries()
+	probes := coldQueryPlan(r.SchemaVersion)
 	bursts := input.backfills()
 	allLayouts := append([]coldLayout{r.Production}, r.Experimental...)
 	var pairs []coldCodecPair
@@ -185,6 +177,20 @@ func (r coldReport) derivePairs(input fixtureInput) ([]coldCodecPair, error) {
 				return nil, fmt.Errorf("%s: measured WAL growth %d, fixture frame %d", phase, got, wantWAL)
 			}
 		}
+		var shapes []coldBlockShape
+		if r.SchemaVersion == coldMatrixSchema {
+			shapes = coldBlockShapes(coldPhaseBlocks(input.rows, rows))
+			all := coldLimits(shapes, query{start: firstTime, end: endTime}, false)
+			for j, l := range layouts {
+				pub := r.Experimental[j].Phases[phaseIndex]
+				index := int64(all.visited) * int64(headerSize+l.indexWidth())
+				if pub.Segments != all.visited || pub.RetainedBytes <= index ||
+					pub.RetainedBytes-index > all.rawPayload ||
+					(l.codec == rawCodec && pub.RetainedBytes-index != all.rawPayload) {
+					return nil, fmt.Errorf("%s/%s: stored bytes or segment count disagree with fixture", l.name(), phase)
+				}
+			}
+		}
 		// Check every probe, including the complete generation, before using
 		// this phase's timings or publication counters in the comparisons.
 		digests := make([]string, len(probes))
@@ -192,19 +198,45 @@ func (r coldReport) derivePairs(input fixtureInput) ([]coldCodecPair, error) {
 			want := reference(rows, q)
 			digest := coldRowsDigest(want)
 			digests[qi] = digest
-			pairIDs := make([]string, coldRuns(q, r.Fixture.SparseRuns))
+			pairIDs := make([]string, coldQueryRuns(r.SchemaVersion, q, r.Fixture.SparseRuns))
 			for i := range pairIDs {
 				pairIDs[i] = p.pairID(phase, q, i+1)
 			}
-			for _, l := range allLayouts {
+			var limits [2]coldScanLimits
+			var selectivity coldSelectivity
+			if shapes != nil {
+				selectivity = measureColdSelectivity(rows, q, len(want))
+				limits = [2]coldScanLimits{coldLimits(shapes, q, false), coldLimits(shapes, q, true)}
+			}
+			for li, l := range allLayouts {
 				got := l.Phases[phaseIndex].Queries[qi]
 				if err := validateColdProofs(l.Name, got, len(want), digest, pairIDs); err != nil {
 					return nil, fmt.Errorf("%s/%s/%s: %w", l.Name, phase, q.name, err)
 				}
+				if shapes != nil {
+					if *got.Selectivity != selectivity {
+						return nil, fmt.Errorf("%s/%s/%s: incorrect selectivity counts", l.Name, phase, q.name)
+					}
+					if li == 0 {
+						continue
+					}
+					shape := limits[0]
+					if layouts[li-1].prune {
+						shape = limits[1]
+					}
+					for i, s := range got.Samples {
+						if err := shape.validate(s, layouts[li-1], l.Phases[phaseIndex].RetainedBytes); err != nil {
+							return nil, fmt.Errorf("%s/%s/%s round %d: %w", l.Name, phase, q.name, i+1, err)
+						}
+						if *s.Scan != *got.Samples[0].Scan {
+							return nil, fmt.Errorf("%s/%s/%s: experimental scan counters vary between rounds", l.Name, phase, q.name)
+						}
+					}
+				}
 			}
 		}
 		for qi, q := range probes {
-			if q.literal != sparseLiteral {
+			if !coldComparisonProbe(r.SchemaVersion, q) {
 				continue
 			}
 			for i, left := range layouts {
@@ -286,6 +318,13 @@ func compareColdCodecs(left, right coldLayout, phase, qi int, bloom bool, digest
 			WrittenBytes: delta, Ratio: float64(delta) / float64(a.AppendedWALBytes),
 		}
 	}
+	if base.Selectivity != nil {
+		tradeoffs, err := compareColdTradeoffs(basePhase, candidatePhase, base, candidate)
+		if err != nil {
+			return coldCodecPair{}, fmt.Errorf("%s vs %s/%s/%s: %w", right.Name, left.Name, pair.Phase, pair.Query, err)
+		}
+		pair.Tradeoffs = &tradeoffs
+	}
 	pair.Decision = coldPairDecision(pair)
 	return pair, nil
 }
@@ -327,6 +366,12 @@ func coldPairDecision(p coldCodecPair) string {
 		lower = lower || p.Rewrite.WrittenBytes < 0
 		higher = higher || p.Rewrite.WrittenBytes > 0
 	}
+	if p.Tradeoffs != nil {
+		for _, delta := range p.Tradeoffs.metricDeltas() {
+			lower = lower || delta < 0
+			higher = higher || delta > 0
+		}
+	}
 	switch {
 	case lower && higher:
 		return "tradeoff_or_variable"
@@ -337,4 +382,58 @@ func coldPairDecision(p coldCodecPair) string {
 	default:
 		return "equal"
 	}
+}
+
+// Numeric tokens are preserved so large counters cannot round into a match.
+func validateColdFields(given, canonical []byte, label string) error {
+	decode := func(data []byte) (any, error) {
+		var value any
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		err := dec.Decode(&value)
+		return value, err
+	}
+	a, err := decode(given)
+	if err != nil {
+		return err
+	}
+	b, err := decode(canonical)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(a, b) {
+		return fmt.Errorf("incomplete or noncanonical %s fields", label)
+	}
+	return nil
+}
+
+type coldTradeoffs struct {
+	ColdP95         int64 `json:"cold_p95_ns_delta"`
+	ProcessReadP95  int64 `json:"process_read_bytes_p95_delta"`
+	StorageReadP95  int64 `json:"storage_read_bytes_p95_delta"`
+	PayloadBytes    int64 `json:"payload_bytes_read_delta"`
+	StoredBytes     int64 `json:"stored_segment_and_manifest_bytes_delta"`
+	SegmentsVisited int64 `json:"segments_visited_delta"`
+	SegmentsDecoded int64 `json:"segments_decoded_delta"`
+	PeakDecode      int64 `json:"peak_decode_bytes_delta"`
+}
+
+func compareColdTradeoffs(a, b coldPhase, base, candidate coldQueryReport) (coldTradeoffs, error) {
+	left, right := base.Samples[0], candidate.Samples[0]
+	stored, err := signedColdDelta(b.storedBytes(), a.storedBytes())
+	if err != nil {
+		return coldTradeoffs{}, fmt.Errorf("stored bytes: %w", err)
+	}
+	return coldTradeoffs{
+		ColdP95: candidate.P95NS - base.P95NS, ProcessReadP95: candidate.ReadBytesP95 - base.ReadBytesP95,
+		StorageReadP95: candidate.StorageReadBytesP95 - base.StorageReadBytesP95, PayloadBytes: right.Payload.Bytes - left.Payload.Bytes,
+		StoredBytes: stored, SegmentsVisited: int64(right.Scan.SegmentsVisited - left.Scan.SegmentsVisited),
+		SegmentsDecoded: int64(right.Scan.SegmentsDecoded - left.Scan.SegmentsDecoded),
+		PeakDecode:      int64(*candidate.PeakDecodeBytes - *base.PeakDecodeBytes),
+	}, nil
+}
+
+func (d coldTradeoffs) metricDeltas() []int64 {
+	return []int64{d.ColdP95, d.ProcessReadP95, d.StorageReadP95, d.PayloadBytes, d.StoredBytes,
+		d.SegmentsVisited, d.SegmentsDecoded, d.PeakDecode}
 }

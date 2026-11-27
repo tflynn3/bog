@@ -159,7 +159,7 @@ func testColdReport() coldReport {
 				} else if q.name == "absent" {
 					m.Matches = 0
 				}
-				for run := range coldRuns(q, report.Fixture.SparseRuns) {
+				for run := range coldQueryRuns(report.SchemaVersion, q, report.Fixture.SparseRuns) {
 					s := coldSample{ElapsedNS: int64(run+1) * 10, ReadBytes: 8000, StorageReadBytes: int64(run) * 4096,
 						GoAllocationBytes: 10000, PeakRSSBytes: 40000}
 					if !production {

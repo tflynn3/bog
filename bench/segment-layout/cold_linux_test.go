@@ -16,33 +16,35 @@ import (
 )
 
 func TestColdComparisonReport(t *testing.T) {
-	for _, profile := range []string{"mixed", "entropy"} {
-		t.Run(profile, func(t *testing.T) {
-			t.Parallel()
-			parent := t.TempDir()
-			cfg := config{cold: true, dir: parent, revision: "test", profile: profile, scale: "custom",
-				batches: 4, runs: 2, fixtureSeed: seed, timeout: time.Minute}
-			var out bytes.Buffer
-			if err := run(t.Context(), cfg, &out); err != nil {
-				t.Fatal(err)
-			}
-			if err := validateBenchmarkReport(bytes.NewReader(out.Bytes())); err != nil {
-				t.Fatal(err)
-			}
-			var report coldReport
-			if err := json.Unmarshal(out.Bytes(), &report); err != nil {
-				t.Fatal(err)
-			}
-			if report.SchemaVersion != pairedColdSchema || report.Pairing == nil || len(report.Pairing.Comparisons) != 36 {
-				t.Fatalf("missing schema v6 comparisons: version %d, pairing %v", report.SchemaVersion, report.Pairing)
-			}
-			assertEmpty(t, parent)
-			if err := run(t.Context(), cfg, failedReportWriter{}); !errors.Is(err, io.ErrClosedPipe) {
-				t.Fatalf("report write error = %v", err)
-			}
-			assertEmpty(t, parent)
-		})
+	t.Parallel()
+	parent := t.TempDir()
+	cfg := config{cold: true, dir: parent, revision: "test", profile: "entropy", scale: "custom",
+		batches: 4, runs: 2, fixtureSeed: seed, timeout: time.Minute}
+	var out bytes.Buffer
+	if err := run(t.Context(), cfg, &out); err != nil {
+		t.Fatal(err)
 	}
+	if err := validateBenchmarkReport(bytes.NewReader(out.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	var report coldMatrixReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.SchemaVersion != coldMatrixSchema || len(report.Profiles) != 2 ||
+		report.Profiles[0].Fixture.Profile != "entropy" || report.Profiles[1].Fixture.Profile != "mixed" {
+		t.Fatalf("unexpected matrix version or profiles: %d, %v", report.SchemaVersion, report.Protocol.ProfileOrder)
+	}
+	for _, p := range report.Profiles {
+		if p.Pairing == nil || len(p.Pairing.Comparisons) != 72 {
+			t.Fatalf("%s: incomplete paired matrix", p.Fixture.Profile)
+		}
+	}
+	assertEmpty(t, parent)
+	if err := run(t.Context(), cfg, failedReportWriter{}); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("report write error = %v", err)
+	}
+	assertEmpty(t, parent)
 }
 
 func TestCanceledColdComparisonPublishesNothing(t *testing.T) {

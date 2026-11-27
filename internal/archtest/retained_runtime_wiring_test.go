@@ -27,6 +27,8 @@ type retainedConstructors struct {
 	retainedPaging     bool
 }
 
+const retainedPagingConstructor = "bog/internal/httpapi.NewWithPageSourceAndQueryResources"
+
 // Apply the guard even if the command wiring and role changes disagree.
 // The inventory check separately reports the missing or premature promotion.
 func retainedRuntimeConstructors(rules map[string]rule, reachable map[string]bool) retainedConstructors {
@@ -112,13 +114,16 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, required ret
 			return os.Open(exports[path])
 		}),
 	}
-	uses := make(map[*ast.Ident]types.Object)
-	if _, err := cfg.Check(server, fset, files, &types.Info{Uses: uses}); err != nil {
+	info := types.Info{
+		Uses:  make(map[*ast.Ident]types.Object),
+		Types: make(map[ast.Expr]types.TypeAndValue),
+	}
+	if _, err := cfg.Check(server, fset, files, &info); err != nil {
 		t.Fatalf("resolve %s constructor references: %v", server, err)
 	}
 	// Required constructors need a direct call. Keep scanning all typed uses
 	// below so storing or passing a legacy constructor still fails the guard.
-	called := make(map[*ast.Ident]bool)
+	called := make(map[*ast.Ident]*ast.CallExpr)
 	for _, file := range files {
 		for node := range ast.Preorder(file) {
 			call, ok := node.(*ast.CallExpr)
@@ -127,9 +132,9 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, required ret
 			}
 			switch fun := ast.Unparen(call.Fun).(type) {
 			case *ast.Ident:
-				called[fun] = true
+				called[fun] = call
 			case *ast.SelectorExpr:
-				called[fun.Sel] = true
+				called[fun.Sel] = call
 			}
 		}
 	}
@@ -137,13 +142,13 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, required ret
 		"bog/internal/readiness.NewHandlerForDirectory": {},
 	}
 	if required.retainedPaging {
-		missing["bog/internal/httpapi.NewWithPageSourceAndQueryResources"] = struct{}{}
+		missing[retainedPagingConstructor] = struct{}{}
 	}
 	var problems []string
-	for _, ident := range slices.SortedFunc(maps.Keys(uses), func(a, b *ast.Ident) int {
+	for _, ident := range slices.SortedFunc(maps.Keys(info.Uses), func(a, b *ast.Ident) int {
 		return int(a.Pos() - b.Pos())
 	}) {
-		constructor, ok := uses[ident].(*types.Func)
+		constructor, ok := info.Uses[ident].(*types.Func)
 		if !ok || constructor.Pkg() == nil || constructor.Parent() != constructor.Pkg().Scope() {
 			continue
 		}
@@ -151,26 +156,65 @@ func retainedRuntimeWiringProblems(t *testing.T, root, arch string, required ret
 		if path == "bog/internal/httpapi" && !required.retainedPaging {
 			continue
 		}
-		if called[ident] {
-			delete(missing, path+"."+name)
+		qualifiedName := path + "." + name
+		call := called[ident]
+		if call != nil {
+			delete(missing, qualifiedName)
 		}
-		replacement := retainedConstructorReplacement(path, name)
-		if replacement == "" {
+		var problem string
+		pos := ident.Pos()
+		switch {
+		case call != nil && qualifiedName == retainedPagingConstructor:
+			arg := call.Args[0]
+			source := info.TypeOf(arg)
+			// A multi-result call can supply all of the constructor's arguments.
+			if tuple, ok := source.(*types.Tuple); ok {
+				source = tuple.At(0).Type()
+			}
+			if !implementsRetainedPageSource(t, constructor.Pkg(), source) {
+				pos = arg.Pos()
+				problem = fmt.Sprintf("retained runtime source passed to httpapi.%s must statically implement both httpapi.PageSource and httpapi.PageSourceScanBound (got %s)",
+					name, types.TypeString(source, (*types.Package).Name))
+			}
+		default:
+			if replacement := retainedConstructorReplacement(path, name); replacement != "" {
+				problem = fmt.Sprintf("retained runtime must use %s instead of %s.%s",
+					replacement, constructor.Pkg().Name(), name)
+			}
+		}
+		if problem == "" {
 			continue
 		}
-		pos := fset.PositionFor(ident.Pos(), false)
-		file, err := filepath.Rel(root, pos.Filename)
+		position := fset.PositionFor(pos, false)
+		file, err := filepath.Rel(root, position.Filename)
 		if err != nil {
 			t.Fatalf("resolve constructor source path: %v", err)
 		}
-		problems = append(problems, fmt.Sprintf("%s:%d:%d: retained runtime must use %s instead of %s.%s",
-			file, pos.Line, pos.Column, replacement, constructor.Pkg().Name(), name))
+		problems = append(problems, fmt.Sprintf("%s:%d:%d: %s", file, position.Line, position.Column, problem))
 	}
 	for _, constructor := range slices.Sorted(maps.Keys(missing)) {
 		problems = append(problems, fmt.Sprintf("cmd/bog (linux/%s): retained runtime must call %s",
 			arch, strings.TrimPrefix(constructor, "bog/internal/")))
 	}
 	return problems
+}
+
+func implementsRetainedPageSource(t *testing.T, httpapi *types.Package, source types.Type) bool {
+	t.Helper()
+	for _, name := range []string{"PageSource", "PageSourceScanBound"} {
+		decl, ok := httpapi.Scope().Lookup(name).(*types.TypeName)
+		if !ok {
+			t.Fatalf("missing type httpapi.%s", name)
+		}
+		iface, ok := decl.Type().Underlying().(*types.Interface)
+		if !ok {
+			t.Fatalf("httpapi.%s must be an interface", name)
+		}
+		if !types.Implements(source, iface) {
+			return false
+		}
+	}
+	return true
 }
 
 func retainedConstructorReplacement(path, name string) string {
@@ -219,9 +263,35 @@ func retainedAPI() *api.API {
 `
 		dotImportedPageSource = `package main
 import . "bog/internal/httpapi"
-func retainedAPI(source PageSource) *API {
-	return NewWithPageSourceAndQueryResources(source, nil, 1024, 2, 100,
+
+type boundedSource interface {
+	PageSource
+	PageSourceScanBound
+}
+
+func newBoundedSource() boundedSource { return retainedSource{} }
+
+func factoryAPI() *API {
+	return NewWithPageSourceAndQueryResources(newBoundedSource(), nil, 1024, 2, 100,
 		QueryResourceLimits{ResponseBytes: 2048, ScanBytes: 8192, Captures: 2})
+}
+`
+		unboundedPageSource = `package main
+import . "bog/internal/httpapi"
+import "bog/internal/store"
+
+type unboundedSource struct{ PageSource }
+
+func unboundedAPI() *API {
+	return NewWithPageSourceAndQueryResources(unboundedSource{}, nil, 1024, 2, 100, QueryResourceLimits{})
+}
+
+func pagingArgs() (PageSource, interface{ Append([]byte, []store.Row) error }, int, int, uint64, QueryResourceLimits) {
+	return retainedSource{}, nil, 1024, 2, 100, QueryResourceLimits{}
+}
+
+func erasedAPI() *API {
+	return NewWithPageSourceAndQueryResources(pagingArgs())
 }
 `
 		directoryHandler = `package main
@@ -288,6 +358,11 @@ var _ = httpapi.NewWithQueryResources
 		"readiness_linux_test.go":      directoryHandler,
 		"readiness_darwin.go":          directoryHandler,
 		"paging_tagged.go":             "//go:build retained_wiring_fixture\n\n" + pageSource,
+	}
+	mixedScanBoundWiring := map[string]string{
+		"paging.go":             pageSource,
+		"paging_linux_arm64.go": unboundedPageSource,
+		"readiness.go":          directoryHandler,
 	}
 	for _, tt := range []struct {
 		name      string
@@ -382,12 +457,29 @@ var _ = httpapi.NewWithQueryResources
 			sources: retainedWiring,
 		},
 		{
-			name:      "observed history accepts dot-imported constructor calls",
+			name:      "observed history accepts a dot-imported call with a composed factory result",
 			arch:      "amd64",
 			reachable: []string{history},
 			sources: map[string]string{
-				"paging.go":    dotImportedPageSource,
+				"paging.go":    pageSource,
+				"factory.go":   dotImportedPageSource,
 				"readiness.go": dotImportedDirectoryHandler,
+			},
+		},
+		{
+			name:    "amd64 ignores arm64 sources missing the scan bound",
+			arch:    "amd64",
+			wired:   []string{history},
+			sources: mixedScanBoundWiring,
+		},
+		{
+			name:      "observed history checks every arm64 call including multi-result arguments",
+			arch:      "arm64",
+			reachable: []string{history},
+			sources:   mixedScanBoundWiring,
+			want: []string{
+				"cmd/bog/paging_linux_arm64.go:8:44: retained runtime source passed to httpapi.NewWithPageSourceAndQueryResources must statically implement both httpapi.PageSource and httpapi.PageSourceScanBound (got main.unboundedSource)",
+				"cmd/bog/paging_linux_arm64.go:16:44: retained runtime source passed to httpapi.NewWithPageSourceAndQueryResources must statically implement both httpapi.PageSource and httpapi.PageSourceScanBound (got httpapi.PageSource)",
 			},
 		},
 		{

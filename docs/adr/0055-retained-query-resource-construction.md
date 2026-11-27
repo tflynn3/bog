@@ -63,10 +63,16 @@ durable selection and the last storage reference drains.
 This changes the paging row of ADR 0053. When `internal/history` is
 registered as wired or measured reachable from `cmd/bog` on a target,
 require a direct typed call to `httpapi.NewWithPageSourceAndQueryResources`
-in that target's selected production command sources. Check Linux amd64
-and arm64 independently. Reject every typed reference, including a
-function value, to `httpapi.NewWithPageSource` and the store-backed
-`httpapi.New`, `httpapi.NewWithQueryMaxResponseBytes`,
+in that target's selected production command sources. At every direct
+call, require the source argument's static type to implement both
+`httpapi.PageSource` and `httpapi.PageSourceScanBound`. A concrete adapter
+or a factory returning an interface that embeds both satisfies the check.
+A factory returning only `httpapi.PageSource` fails the check even if its
+current return value also implements the scan bound. A dynamic source that
+lacks the scan bound causes HTTP to refuse scan admission at runtime.
+Check Linux amd64 and arm64 independently. Reject every typed reference,
+including a function value, to `httpapi.NewWithPageSource` and the
+store-backed `httpapi.New`, `httpapi.NewWithQueryMaxResponseBytes`,
 `httpapi.NewWithQueryLimits`, and `httpapi.NewWithQueryResources`.
 
 The staged baseline permits compatibility constructors. When any of
@@ -78,20 +84,24 @@ unlocked open relative to the pinned WAL directory.
 [Retained serving constructor calls](0053-retained-serving-constructor-calls.md),
 [Constructor fitness check](../../internal/archtest/retained_runtime_wiring_test.go)
 
-The guard establishes call presence. For #108, trace the installed HTTP
-handler to the command adapter and verify both interfaces. Review the
-scan bound against the adapter's scratch and result allocations and the
-configured resource limits against overlapping serving and maintenance
-work. Trace capture ownership through retirement, response delivery, and
-shutdown. Verify the pinned readiness descriptor and startup cleanup,
-and retain the WAL lock through successful HTTP, API, and storage drain
-or until process exit if drain fails.
+The guard establishes call presence and the source's static interface
+contract. For #108, trace the serving path to the constructor and verify
+that the command installs the resulting handler with the intended adapter.
+Review the numerical scan bound against the adapter's scratch and result
+allocations and the configured resource limits against overlapping
+serving and maintenance work. Trace capture ownership through retirement,
+response delivery, and shutdown. Verify the pinned readiness descriptor
+and startup cleanup. Review probe cancellation before HTTP drain, API
+close after HTTP drain, and storage drain before closing the WAL owner.
+Keep the WAL lock held until process exit if drain fails.
+[Retained composition and shutdown](0039-query-delivery-and-retained-cutover.md#retained-composition-and-shutdown)
 
-Queue the matching `SYSTEM.md` wording, topology, and role changes with
-the #108 promotion after the current documentation lease clears. Promote
-using both production inventories of the reviewed Storage revision and
-the activation evidence in ADR 0049. Rerun architecture fitness on the
-composed revision. Qualify that same clean revision on native Linux amd64
-and arm64 using each runner's SHA-256-pinned binary, including the live
-capacity and pin-drain evidence under the release memory cap.
+Coordinate the matching `SYSTEM.md` wording, topology, and role changes
+with Storage's #108 cutover PR after the current documentation lease
+clears. Promote using both production inventories of the reviewed
+Storage revision and the activation evidence in ADR 0049. Rerun
+architecture fitness on the composed revision. Qualify that same clean
+revision on native Linux amd64 and arm64 using each runner's
+SHA-256-pinned binary, including the live capacity and pin-drain evidence
+under the release memory cap and retained shutdown evidence.
 [Retained runtime promotion](0049-retained-runtime-promotion.md)

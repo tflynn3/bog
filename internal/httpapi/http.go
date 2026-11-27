@@ -15,7 +15,6 @@ type appender interface {
 }
 type API struct {
 	captures         queryCaptures
-	legacyQueryStore *store.Store
 	routes           http.Handler
 	wal              appender
 	fatal            func()
@@ -46,9 +45,7 @@ func NewWithQueryMaxResponseBytes(s *store.Store, w appender, maxBytes int) http
 // commit returns 408 "request cancelled". These errors use plain text. Each
 // handler has its own signing key for continuation cursors.
 func NewWithQueryLimits(s *store.Store, w appender, maxBytes, concurrency int, workBudget uint64) http.Handler {
-	a := newAPIForSource(&legacyPageSource{store: s}, w, maxBytes, workBudget)
-	a.legacyQueryStore = s
-	return a.handler(concurrency)
+	return NewWithPageSource(&legacyPageSource{store: s}, w, maxBytes, concurrency, workBudget)
 }
 
 // NewWithPageSource installs the storage adapter for both ordinary and snapshot
@@ -64,6 +61,18 @@ func NewWithPageSource(source PageSource, w appender, maxBytes, concurrency int,
 
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.routes.ServeHTTP(w, r)
+}
+
+// RetireCursor authenticates a cursor and retires its entire capture. Any
+// token from the capture may be used, including after the terminal page.
+// Repeating retirement succeeds. Existing requests keep their references.
+// An idle capture is released before the call returns.
+func (a *API) RetireCursor(token string) error {
+	cursor, err := a.decodeCursor(token)
+	if err != nil {
+		return err
+	}
+	return a.captures.retireID(cursor.Capture)
 }
 
 // Close retires captures and waits for admitted capture users and source

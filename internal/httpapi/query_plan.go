@@ -17,9 +17,8 @@ const (
 	maxOpaqueBytes    = 1024
 )
 
-// A plan stores one anchor per source scan rather than retaining rows or an
-// entry for each possible client page. The cursor selects a scan and an offset
-// into its results. Both are authenticated along with the last emitted position.
+// Every scan uses the same source limit, independent of the client's page
+// size. A cursor selects a scan and offset and binds the last emitted position.
 type certifiedScan struct {
 	after PagePosition
 	count int
@@ -31,7 +30,14 @@ func validOpaque(value string) bool {
 	return len(value) > 0 && len(value) <= maxOpaqueBytes && utf8.ValidString(value)
 }
 
-func checkSnapshotScan(result PageResult, req PageRequest, work *store.QueryWork) error {
+func (a *API) snapshotScan(ctx context.Context, req PageRequest, meter *snapshotWork) (PageResult, error) {
+	if err := meter.charge(16 + uint64(len(req.After))); err != nil {
+		return PageResult{}, err
+	}
+	return a.captures.source.Page(ctx, req, meter.work)
+}
+
+func checkSnapshotScan(result PageResult, req PageRequest, meter *snapshotWork) error {
 	if (result.Capture != "" && result.Capture != req.Capture) ||
 		len(result.Rows) > req.Limit ||
 		(len(result.Rows) == 0 && (result.More || req.After != "")) {
@@ -39,7 +45,10 @@ func checkSnapshotScan(result PageResult, req PageRequest, work *store.QueryWork
 	}
 	previous := req.After
 	for _, row := range result.Rows {
-		if err := work.Charge(1); err != nil {
+		if len(row.Position) > maxOpaqueBytes {
+			return errPageSourceContract
+		}
+		if err := meter.charge(16 + 4*uint64(len(row.Position))); err != nil {
 			return err
 		}
 		if !validOpaque(string(row.Position)) || row.Position == req.After || row.Position == previous {
@@ -59,13 +68,24 @@ func (a *API) startQuery(w http.ResponseWriter, ctx context.Context, filter Page
 	published := false
 	defer func() { a.captures.done(capture, !published) }()
 
-	req := PageRequest{Filter: filter, Limit: limit, Snapshot: true}
-	result, err := a.captures.source.Page(ctx, req, work)
+	meter := snapshotWork{work: work}
+	req := PageRequest{Filter: filter, Limit: maxQueryLimit, Snapshot: true}
+	// The registry owns any successful acquisition even if its metadata
+	// cannot be used or the remaining budget cannot certify the walk.
+	result, err := a.snapshotScan(ctx, req, &meter)
 	if err != nil {
 		writeQueryError(w, err)
 		return
 	}
 	capture.sourceID = result.Capture
+	if len(capture.sourceID) > maxOpaqueBytes {
+		writeQueryError(w, errPageSourceContract)
+		return
+	}
+	if err := meter.charge(uint64(len(capture.sourceID))); err != nil {
+		writeQueryError(w, err)
+		return
+	}
 	if !validOpaque(capture.sourceID) {
 		writeQueryError(w, errPageSourceContract)
 		return
@@ -78,133 +98,118 @@ func (a *API) startQuery(w http.ResponseWriter, ctx context.Context, filter Page
 		writeQueryError(w, ErrCaptureExpired)
 		return
 	}
+
 	req.Capture = capture.sourceID
-	response := queryResponse{maxBytes: a.maxResponseBytes}
-	last, more, err := a.prepareFirstPage(ctx, req, result, &response, work)
-	if err == nil {
-		err = response.reserveDelivery(work)
-	}
+	page := snapshotPage{response: queryResponse{maxBytes: a.maxResponseBytes}, limit: limit}
+	err = a.certifyQuery(ctx, capture, req, result, &page, &meter)
 	if err != nil {
 		writeQueryError(w, err)
 		return
 	}
-	if !more {
-		response.write(w, "")
-		return
+	var token string
+	if page.more {
+		// Reserve the same authentication work as a resume, including its
+		// optional outgoing token, before making the capture reachable.
+		if err := meter.reserveCursor(filter.Contains); err != nil {
+			writeQueryError(w, err)
+			return
+		}
+		token = a.encodeCursor(page.cursor(capture, a.filterDigest(filter)))
+		if err := work.Charge(); err != nil {
+			writeQueryError(w, err)
+			return
+		}
+		if err := a.captures.publish(capture); err != nil {
+			writeQueryError(w, err)
+			return
+		}
+		published = true
 	}
-
-	// Start the replay plan at the actual byte/row cut, including when the
-	// source's first result already proved exhaustion beyond the cut.
-	req.After = PagePosition(strings.Clone(string(last)))
-	req.Limit = maxQueryLimit
-	if err := a.certifyQuery(ctx, capture, req, work); err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	// A replay can validate one token and create another. It can hash the
-	// first anchor once, and certification already covers later positions.
-	// Reserve that allowance in the first request, whose cursor work fits it.
-	if err := work.Charge(2*cursorTokenWork, uint64(len(filter.Contains)), cursorBlockWork(len(last))); err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	cursor := capture.cursor(a.filterDigest(filter), 0, 0, last)
-	token := a.encodeCursor(cursor)
-	if err := work.Charge(); err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	if err := a.captures.publish(capture); err != nil {
-		writeQueryError(w, err)
-		return
-	}
-	published = true
-	response.write(w, token)
+	page.response.write(w, token)
 }
 
-// A source may return a short scan with lookahead. Keep filling the HTTP
-// page until its row or byte cap is reached, or the source proves exhaustion.
-func (a *API) prepareFirstPage(ctx context.Context, req PageRequest, result PageResult, response *queryResponse, work *store.QueryWork) (PagePosition, bool, error) {
-	last := req.After
-	for {
-		if err := checkSnapshotScan(result, req, work); err != nil {
-			return "", false, err
-		}
-		n, err := response.appendRows(result.Rows, work)
-		if err != nil {
-			return "", false, err
-		}
-		if n != 0 {
-			last = result.Rows[n-1].Position
-		}
-		if n < len(result.Rows) {
-			return last, true, nil
-		}
-		req.Limit -= n
-		if req.Limit == 0 || !result.More {
-			return last, result.More, nil
-		}
-		req.After = last
-		if err := work.Charge(1); err != nil {
-			return "", false, err
-		}
-		result, err = a.captures.source.Page(ctx, req, work)
-		if err != nil {
-			return "", false, err
-		}
-	}
-}
-
-// Each replay visits a subset of the certified scans, at most once per
-// request. Its encoder handles each considered row at most once. Certification
-// measures every row (including a potential byte-trimmed row), and the sum
-// of the rounded delivery charges bounds delivery of any subset.
-func (a *API) certifyQuery(ctx context.Context, capture *queryCapture, req PageRequest, work *store.QueryWork) error {
-	measure := queryResponse{}
-	for len(capture.scans) < maxCertifiedScans {
-		if err := work.Charge(1); err != nil {
+// The first request visits every scan and measures every record. It reserves
+// record preparation and delivery even for rows outside its first page. Any
+// replay visits a subset of these scans and rows, so both the source work and
+// the rounded HTTP work fit the budget established here.
+func (a *API) certifyQuery(ctx context.Context, capture *queryCapture, req PageRequest, result PageResult, page *snapshotPage, meter *snapshotWork) error {
+	for scan := 0; ; scan++ {
+		if err := checkSnapshotScan(result, req, meter); err != nil {
 			return err
-		}
-		result, err := a.captures.source.Page(ctx, req, work)
-		if err != nil {
-			return err
-		}
-		// The first response was trimmed or had lookahead. Each later scan
-		// was preceded by lookahead. Both imply at least one match here.
-		if err := checkSnapshotScan(result, req, work); err != nil {
-			return err
-		}
-		for _, row := range result.Rows {
-			// Reserve row setup and any cursor anchor hashing during replay.
-			if err := work.Charge(1, cursorBlockWork(len(row.Position))); err != nil {
-				return err
-			}
-			_, size, _, err := measure.measureRow(row.Row, a.maxResponseBytes, false, work)
-			if err != nil {
-				return err
-			}
-			if size > a.maxResponseBytes {
-				return &oversizedQueryRecord{a.maxResponseBytes, size}
-			}
-			if err := work.Charge(queryDeliveryWork(size)); err != nil {
-				return err
-			}
 		}
 		capture.scans = append(capture.scans, certifiedScan{req.After, len(result.Rows)})
-		if !result.More {
-			return nil
+		if err := page.consume(result, scan, 0, true, meter); err != nil {
+			return err
 		}
-		req.After = PagePosition(strings.Clone(string(result.Rows[len(result.Rows)-1].Position)))
+		if !result.More {
+			return meter.work.Charge()
+		}
+		if len(capture.scans) == maxCertifiedScans {
+			return store.ErrQueryWorkExhausted
+		}
+		last := result.Rows[len(result.Rows)-1].Position
+		req.After = PagePosition(strings.Clone(string(last)))
+		var err error
+		result, err = a.snapshotScan(ctx, req, meter)
+		if err != nil {
+			return err
+		}
 	}
-	return store.ErrQueryWorkExhausted
 }
 
-func (c *queryCapture) cursor(filter [32]byte, scan, offset int, last PagePosition) cursorData {
-	if offset == c.scans[scan].count {
+// snapshotPage tracks the cut even while certification continues past it.
+type snapshotPage struct {
+	response     queryResponse
+	limit        int
+	scan, offset int
+	last         PagePosition
+	more         bool
+}
+
+func (p *snapshotPage) consume(result PageResult, scan, offset int, certify bool, meter *snapshotWork) error {
+	for i, row := range result.Rows[offset:] {
+		if p.limit == 0 {
+			p.more = true
+		}
+		if p.more && !certify {
+			return nil
+		}
+		// A snapshot charges for two encoding passes, JSON escaping and
+		// eventual delivery. Reserving the same amount for measured-only rows
+		// makes the bound independent of the starting offset and page size.
+		if err := meter.reserveRecord(row.Row.Line); err != nil {
+			return err
+		}
+		stamp, size, _, err := p.response.measureRow(row.Row, 0, false, meter.work, true)
+		if err != nil {
+			return err
+		}
+		if size > p.response.maxBytes {
+			return &oversizedQueryRecord{p.response.maxBytes, size}
+		}
+		if p.more || size > p.response.maxBytes-p.response.size {
+			p.more = true
+			continue
+		}
+		if err := p.response.appendMeasured(row.Row.Line, stamp, size, meter.work); err != nil {
+			return err
+		}
+		p.scan, p.offset, p.last = scan, offset+i+1, row.Position
+		p.limit--
+	}
+	if p.limit == 0 && result.More {
+		p.more = true
+	}
+	return nil
+}
+
+func (p *snapshotPage) cursor(capture *queryCapture, filter [32]byte) cursorData {
+	scan, offset := p.scan, p.offset
+	if offset == capture.scans[scan].count {
 		scan++
 		offset = 0
 	}
-	return cursorData{Capture: c.id, Filter: filter, Scan: uint16(scan), Offset: uint16(offset), After: positionDigest(last)}
+	return cursorData{Capture: capture.id, Filter: filter, Scan: uint16(scan), Offset: uint16(offset), After: positionDigest(p.last)}
 }
 
 func (a *API) resumeQuery(w http.ResponseWriter, ctx context.Context, filter PageFilter, limit int, raw string, work *store.QueryWork) {
@@ -212,7 +217,8 @@ func (a *API) resumeQuery(w http.ResponseWriter, ctx context.Context, filter Pag
 		writeQueryError(w, store.ErrInvalidQueryCursor)
 		return
 	}
-	if err := work.Charge(cursorTokenWork, uint64(len(filter.Contains))); err != nil {
+	meter := snapshotWork{work: work}
+	if err := meter.reserveCursor(filter.Contains); err != nil {
 		writeQueryError(w, err)
 		return
 	}
@@ -228,76 +234,59 @@ func (a *API) resumeQuery(w http.ResponseWriter, ctx context.Context, filter Pag
 	}
 	defer a.captures.done(capture, false)
 
-	response := queryResponse{maxBytes: a.maxResponseBytes}
-	token, err := a.replayQuery(ctx, capture, cursor, filter, limit, &response, work)
-	if err != nil {
+	page := snapshotPage{response: queryResponse{maxBytes: a.maxResponseBytes}, limit: limit}
+	if err := a.replayQuery(ctx, capture, cursor, filter, &page, &meter); err != nil {
 		if errors.Is(err, ErrCaptureExpired) {
 			a.captures.retire(capture)
 		}
 		writeQueryError(w, err)
 		return
 	}
-	response.write(w, token)
+	var token string
+	if page.more {
+		token = a.encodeCursor(page.cursor(capture, cursor.Filter))
+	}
+	if err := work.Charge(); err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	page.response.write(w, token)
 }
 
-func (a *API) replayQuery(ctx context.Context, capture *queryCapture, cursor cursorData, filter PageFilter, limit int, response *queryResponse, work *store.QueryWork) (string, error) {
+func (a *API) replayQuery(ctx context.Context, capture *queryCapture, cursor cursorData, filter PageFilter, page *snapshotPage, meter *snapshotWork) error {
 	scan, offset := int(cursor.Scan), int(cursor.Offset)
 	if scan >= len(capture.scans) || offset >= capture.scans[scan].count {
-		return "", store.ErrInvalidQueryCursor
+		return store.ErrInvalidQueryCursor
 	}
-	var last PagePosition
-	for scan < len(capture.scans) {
+	for ; scan < len(capture.scans); scan++ {
 		step := capture.scans[scan]
-		if err := work.Charge(1); err != nil {
-			return "", err
-		}
 		req := PageRequest{Filter: filter, Limit: maxQueryLimit, Snapshot: true, Capture: capture.sourceID, After: step.after}
-		result, err := a.captures.source.Page(ctx, req, work)
+		result, err := a.snapshotScan(ctx, req, meter)
 		if err != nil {
-			return "", err
+			return err
 		}
-		if err := checkSnapshotScan(result, req, work); err != nil {
-			return "", err
+		if err := checkSnapshotScan(result, req, meter); err != nil {
+			return err
 		}
 		if len(result.Rows) != step.count || result.More != (scan+1 < len(capture.scans)) {
-			return "", errPageSourceContract
+			return errPageSourceContract
 		}
 		if result.More && result.Rows[step.count-1].Position != capture.scans[scan+1].after {
-			return "", errPageSourceContract
+			return errPageSourceContract
 		}
 		if scan == int(cursor.Scan) {
 			anchor := step.after
 			if offset > 0 {
 				anchor = result.Rows[offset-1].Position
 			}
-			if err := work.Charge(cursorBlockWork(len(anchor))); err != nil {
-				return "", err
-			}
 			if positionDigest(anchor) != cursor.After {
-				return "", errPageSourceContract
+				return errPageSourceContract
 			}
 		}
-		rows := result.Rows[offset:min(offset+limit, step.count)]
-		n, err := response.appendRows(rows, work)
-		if err != nil {
-			return "", err
+		if err := page.consume(result, scan, offset, false, meter); err != nil || page.more {
+			return err
 		}
-		if n != 0 {
-			offset += n
-			last = rows[n-1].Position
-			limit -= n
-		}
-		if offset < step.count || (limit == 0 && result.More) {
-			if err := work.Charge(cursorTokenWork, cursorBlockWork(len(last))); err != nil {
-				return "", err
-			}
-			if err := response.reserveDelivery(work); err != nil {
-				return "", err
-			}
-			return a.encodeCursor(capture.cursor(cursor.Filter, scan, offset, last)), nil
-		}
-		scan++
 		offset = 0
 	}
-	return "", response.reserveDelivery(work)
+	return nil
 }

@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"errors"
 	"log"
 	"sync"
 	"time"
@@ -116,7 +115,18 @@ func (s *queryCaptures) retire(c *queryCapture) {
 	}
 }
 
-func (s *queryCaptures) release(c *queryCapture) {
+func (s *queryCaptures) retireID(id uint64) error {
+	s.mu.Lock()
+	c := s.live[id]
+	release := c != nil && s.retireLocked(c)
+	s.mu.Unlock()
+	if release {
+		return s.release(c)
+	}
+	return nil
+}
+
+func (s *queryCaptures) release(c *queryCapture) error {
 	var err error
 	if c.sourceID != "" {
 		err = s.source.Release(c.sourceID)
@@ -127,12 +137,15 @@ func (s *queryCaptures) release(c *queryCapture) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.live, c.id)
-	if s.closed {
-		s.err = errors.Join(s.err, err)
-		if len(s.live) == 0 {
-			close(s.drained)
-		}
+	// Save the first release error for Close, including errors reported
+	// after deferred retirement. Keep error storage bounded.
+	if s.err == nil {
+		s.err = err
 	}
+	if s.closed && len(s.live) == 0 {
+		close(s.drained)
+	}
+	return err
 }
 
 func (s *queryCaptures) close(ctx context.Context) error {

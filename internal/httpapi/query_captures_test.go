@@ -231,10 +231,17 @@ func TestQueryReleasesUnpublishedCaptures(t *testing.T) {
 		status int
 	}{
 		{"terminal", "&page=1", DefaultQueryWorkBudget, 200},
-		{"uncertified", "&page=1&limit=1", 40, 503},
+		{"uncertified", "&page=1&limit=1", 72, 503},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			source := captureFixtureSource()
+			if tc.status == 503 {
+				// The budget covers the acquisition scan, then fails while
+				// measuring the second record for a future page.
+				stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+				source.store = new(store.Store)
+				source.store.Publish([]store.Row{{TS: stamp, Line: "first"}, {TS: stamp, Line: strings.Repeat("x", 60)}})
+			}
 			a := NewWithPageSource(source, nil, 4096, 1, tc.budget)
 			for range maxQueryCaptures + 1 {
 				out := requestCapturePage(a, tc.params)

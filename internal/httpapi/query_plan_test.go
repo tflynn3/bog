@@ -162,12 +162,12 @@ func TestCertifiedQueryFillsPagesAcrossShortSourceScans(t *testing.T) {
 
 func TestQueryCertificationBoundsPlanMetadata(t *testing.T) {
 	stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	rows := make([]store.Row, maxCertifiedScans+2)
+	rows := make([]store.Row, maxCertifiedScans+1)
 	for i := range rows {
 		rows[i] = store.Row{TS: stamp, Line: "match"}
 	}
 	s := new(store.Store)
-	s.Publish(rows)
+	s.Publish(rows[:maxCertifiedScans])
 	source := &shortScanSource{legacyPageSource{store: s}}
 	a := NewWithPageSource(source, nil, 4096, 1, DefaultQueryWorkBudget)
 	t.Cleanup(func() {
@@ -177,12 +177,17 @@ func TestQueryCertificationBoundsPlanMetadata(t *testing.T) {
 			t.Error(err)
 		}
 	})
+	out := requestCapturePage(a, "&page=1&limit=1")
+	token := out.Header().Get("Bog-Next-Cursor")
+	if out.Code != 200 || token == "" {
+		t.Fatalf("exact plan bound failed: status=%d body=%q", out.Code, out.Body.String())
+	}
+	if err := a.RetireCursor(token); err != nil {
+		t.Fatal(err)
+	}
+	s.Publish(rows[maxCertifiedScans:])
 	assertQueryRejection(t, requestCapturePage(a, "&page=1&limit=1"), 503, "query work budget exhausted")
 	if len(source.views) != 0 {
 		t.Fatal("certification failure retained the unpublished source view")
-	}
-	out := requestCapturePage(a, "&page=1&limit=2")
-	if out.Code != 200 || out.Header().Get("Bog-Next-Cursor") == "" {
-		t.Fatalf("exact plan bound failed: status=%d body=%q", out.Code, out.Body.String())
 	}
 }

@@ -207,6 +207,10 @@ func (after readIO) delta(before readIO) (logical, storage int64, err error) {
 }
 
 func validateBenchmarkReport(in io.Reader) error {
+	return readBenchmarkReport(in, nil)
+}
+
+func readBenchmarkReport(in io.Reader, candidate *candidateIdentity) error {
 	dec := json.NewDecoder(in)
 	var raw json.RawMessage
 	if err := dec.Decode(&raw); err != nil {
@@ -224,8 +228,11 @@ func validateBenchmarkReport(in io.Reader) error {
 	if err := json.Unmarshal(raw, &header); err != nil {
 		return err
 	}
+	if candidate != nil && header.Version != coldMatrixSchema {
+		return errors.New("live candidate qualification requires a schema v8 cold matrix")
+	}
 	if hasColdMatrixEvidence(header.Version) {
-		return validateColdMatrixJSON(raw)
+		return validateColdMatrixJSON(raw, candidate)
 	}
 	if header.Version == 5 || header.Version == pairedColdSchema {
 		var report coldReport
@@ -468,12 +475,13 @@ type liveReport struct {
 }
 
 type publicationMeasurement struct {
-	Scenario           string        `json:"scenario"`
-	CoveredRows        int           `json:"covered_rows"`
-	ElapsedNS          int64         `json:"elapsed_ns"`
-	PeakRSSBytes       uint64        `json:"peak_rss_bytes,omitempty"`
-	HTTPQueryParity    bool          `json:"http_query_parity,omitempty"`
-	WriteAmplification amplification `json:"write_amplification"`
+	Scenario           string           `json:"scenario"`
+	CoveredRows        int              `json:"covered_rows"`
+	ElapsedNS          int64            `json:"elapsed_ns"`
+	PeakRSSBytes       uint64           `json:"peak_rss_bytes,omitempty"`
+	HTTPQueryParity    bool             `json:"http_query_parity,omitempty"`
+	Publication        *livePublication `json:"publication,omitempty"`
+	WriteAmplification amplification    `json:"write_amplification"`
 }
 
 func (r liveReport) validate(phases []coldPhase) error {

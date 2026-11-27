@@ -55,13 +55,20 @@ func collectCold(ctx context.Context, cfg config) (_ coldMatrixReport, err error
 		RunID: hex.EncodeToString(runID[:]), Environment: env,
 		Protocol: protocol,
 	}
+	var candidate pinnedCandidate
+	if cfg.binary != "" {
+		candidate, err = pinLiveCandidate(cfg, dir)
+		if err != nil {
+			return coldMatrixReport{}, err
+		}
+	}
 	for _, profile := range result.Protocol.ProfileOrder {
 		profileDir := filepath.Join(dir, profile)
 		if err := os.Mkdir(profileDir, 0700); err != nil {
 			return coldMatrixReport{}, err
 		}
 		cfg.profile = profile
-		report, err := collectColdProfile(ctx, cfg, profileDir, result.RunID, env)
+		report, err := collectColdProfile(ctx, cfg, profileDir, result.RunID, env, candidate)
 		if err != nil {
 			return coldMatrixReport{}, fmt.Errorf("%s: %w", profile, err)
 		}
@@ -73,10 +80,15 @@ func collectCold(ctx context.Context, cfg config) (_ coldMatrixReport, err error
 	if err := result.validateHeader(); err != nil {
 		return coldMatrixReport{}, err
 	}
+	if cfg.requireLive {
+		if err := result.requireCandidate(candidate.identity); err != nil {
+			return coldMatrixReport{}, err
+		}
+	}
 	return result, ctx.Err()
 }
 
-func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env map[string]any) (coldReport, error) {
+func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env map[string]any, candidate pinnedCandidate) (coldReport, error) {
 	input := fixture(cfg.batches, cfg.profile == "entropy", cfg.fixtureSeed)
 	result := coldReport{
 		SchemaVersion: coldMatrixSchema, Mode: "cold", Revision: cfg.revision, Environment: env,
@@ -91,15 +103,25 @@ func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env 
 		targets[i+1].name = l.name()
 	}
 	denominators := make(map[string]uint64)
+	for _, burst := range bursts[1:] {
+		scenario, err := describeColdBackfill(burst)
+		if err != nil {
+			return coldReport{}, fmt.Errorf("%s backfill fixture: %w", burst.name, err)
+		}
+		result.Backfills = append(result.Backfills, scenario)
+		denominators[burst.name] = scenario.AppendedWALBytes
+	}
+	if candidate.path != "" {
+		live, err := candidate.measure(ctx, cfg, dir, input, denominators)
+		if err != nil {
+			return coldReport{}, err
+		}
+		result.Live = live
+	}
 	for phaseIndex, burst := range bursts {
 		rows := input.rows
 		if phaseIndex != 0 {
 			rows = input.withBackfill(burst)
-			scenario, err := describeColdBackfill(burst)
-			if err != nil {
-				return coldReport{}, fmt.Errorf("%s backfill fixture: %w", burst.name, err)
-			}
-			result.Backfills = append(result.Backfills, scenario)
 		}
 		prepareCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
 		err := prepareColdTargets(prepareCtx, cfg, dir, burst, rows, targets)
@@ -107,8 +129,8 @@ func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env 
 		if err != nil {
 			return coldReport{}, fmt.Errorf("%s publication: %w", burst.name, err)
 		}
-		if phaseIndex != 0 {
-			denominators[burst.name] = targets[0].phases[phaseIndex].Rewrite.AppendedWALBytes
+		if phaseIndex != 0 && targets[0].phases[phaseIndex].Rewrite.AppendedWALBytes != denominators[burst.name] {
+			return coldReport{}, fmt.Errorf("%s: component WAL growth disagrees with fixture", burst.name)
 		}
 		if err := sampleColdPhase(ctx, cfg, targets, rows, phaseIndex, result.Pairing); err != nil {
 			return coldReport{}, fmt.Errorf("%s: %w", burst.name, err)
@@ -120,13 +142,6 @@ func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env 
 	result.Production = coldLayout{productionV1, targets[0].phases}
 	for i, l := range layouts {
 		result.Experimental = append(result.Experimental, coldLayout{l.name(), targets[i+1].phases})
-	}
-	if cfg.binary != "" {
-		live, err := measureLive(ctx, cfg, dir, input, denominators)
-		if err != nil {
-			return coldReport{}, err
-		}
-		result.Live = live
 	}
 	if err := matrixBudgets(cfg.timeout).validateMeasurements(result); err != nil {
 		return coldReport{}, err

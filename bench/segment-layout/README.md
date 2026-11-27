@@ -171,25 +171,50 @@ allows them. Historical cold schemas v5 through v7 remain readable.
 | `peak_worker_rss_bytes` | Worker high-water RSS through the scan, including startup and reader initialization. |
 | `rewrite_amplification` | For experiments, new synced segment and snapshot manifest bytes. For the v1 component, the publisher's Linux `wchar` delta including transient staging writes. The denominator in both is the same actual committed WAL suffix, including the frame header. |
 
-After #53 ships loopback compaction, rerun with a clean pinned native Linux
-binary from the same shipped revision on each target architecture.
+### Retained release candidate handoff
+
+After Storage hands off the reviewed #108 candidate to Release Verification,
+dispatch **Segment layout qualification** with its full lowercase SHA in
+`revision`. The workflow checks out the benchmark at the workflow SHA and
+builds the candidate separately at the supplied SHA on native Linux amd64
+and arm64, with the Linux release workflow's toolchain and build flags.
+Each architecture uploads a schema v8 report for both profiles, candidate
+build information, a SHA-256 checksum, and an archive containing both
+executables. Pull requests and dispatches with an empty revision run the
+existing smoke jobs.
+
+For a manual run, use the same clean native candidate and compute its
+digest from the binary you intend to qualify. The benchmark verifies the
+embedded command path, clean Git revision, OS and architecture before
+running the pinned copy.
 
 ```sh
-go run . -cold -dir /path/to/data -fixture mixed -scale medium -seed 44 \
-  -runs 21 -revision "$(git rev-parse HEAD)" \
-  -bog-bin /path/to/pinned/bog -bog-revision "$candidate_revision" > cold-live-medium.json
-go run . -validate-report cold-live-medium.json
+digest=$(sha256sum "$candidate_binary" | cut -d ' ' -f 1)
+"$artifacts/segment-layout" -cold -require-live -scale medium -seed 44 -runs 21 \
+  -dir "$work" -report "$artifacts/cold-live-medium.json" \
+  -bog-bin "$candidate_binary" -bog-revision "$candidate_revision"
+"$artifacts/segment-layout" -validate-report "$artifacts/cold-live-medium.json" \
+  -require-live -bog-revision "$candidate_revision" -bog-sha256 "$digest" \
+  -bog-arch "$(go env GOHOSTARCH)"
 ```
 
-The live section measures process-attributed filesystem writes around
-the compaction request and completion. It checks the published cutoff,
-ordered loopback query results for a bounded sparse query and all three
-short literals, and the full persisted checkpoint after shutdown. A
-missing candidate or unavailable control endpoint is recorded in the live
-section. The live comparison is pending #53. The historical measurements
-below describe the earlier full-rewrite experiment. Use schema v8 evidence
-to assess the incremental format, including compressed size, Bloom metadata
-cost, cold query latency and I/O, and backfill amplification.
+Strict mode requires positive process-attributed compaction writes for the
+clustered and scattered backfills in both profiles. Each trial records
+the initial generation before ingest, acknowledges the exact backfill,
+and observes completion at the exact committed and covered cutoff in a
+newer generation. It checks ordered HTTP results for a bounded sparse
+query and all three short literals, and verifies the full persisted
+checkpoint after shutdown, including append ordinals. Unavailable control
+fails strict runs. Ordinary `-validate-report` still accepts historical
+reports and smoke reports with unavailable live control.
+
+Storage compares retained segment and manifest bytes, matched cold scan
+p95, peak decode working bytes, and rewrite amplification across the v1
+component and experimental layouts. Read the candidate's live compaction
+write ratio alongside those results. It uses the same committed WAL
+denominator and measures a separate server I/O window. Compare both
+profiles and architectures under the recorded cache and filesystem
+conditions. [Storage decision record](../../docs/adr/0051-live-checkpoint-layout-evidence.md)
 
 ## Successive publications
 
@@ -397,8 +422,8 @@ physical media writes. The component exercises the production WAL capture
 and pinned publisher. The runner reopens the durable checkpoint and checks
 its timestamps, append ordinals and complete contents against the oracle.
 
-To add live results, supply a clean native Linux `bog/cmd/bog` binary
-built at the full #53 revision. The runner copies it privately and records
+To add optional live results to a historical comparison, supply a clean
+native Linux `bog/cmd/bog` binary with the loopback control. The runner copies it privately and records
 the revision and file SHA-256. It starts the binary on IPv4 loopback with
 `BOG_CAPACITY_CONTROL=1` against an independently seeded copy of the same
 fixture, then gets a 204 for the backfill, waits for a newer generation

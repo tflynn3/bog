@@ -20,6 +20,7 @@ func TestAdvanceChecksLivePublication(t *testing.T) {
 		{"wrong cutoff", `{"state":"complete","generation":2,"covered_rows":11,"committed_rows":12}`, true},
 		{"unexpected commit", `{"state":"complete","generation":2,"covered_rows":12,"committed_rows":13}`, true},
 		{"missing committed count", `{"state":"complete","generation":2,"covered_rows":12}`, true},
+		{"duplicate generation", `{"state":"complete","generation":1,"generation":2,"covered_rows":12,"committed_rows":12}`, true},
 		{"malformed", "{}{}", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,7 +48,10 @@ func TestAdvanceChecksLivePublication(t *testing.T) {
 			}))
 			defer srv.Close()
 			s := liveService{client: srv.Client(), base: srv.URL}
-			if err := s.advance(t.Context(), 12, 1); (err != nil) != tc.wantErr {
+			s.strict = true
+			previous := controlReply{"complete", new(uint64(1)), new(8), new(8)}
+			if reply, err := s.advance(t.Context(), 12, previous); (err != nil) != tc.wantErr ||
+				(err == nil && (!reply.atCutoff("complete", 12) || *reply.Generation != 2)) {
 				t.Fatalf("advance: %v", err)
 			}
 		})
@@ -56,7 +60,7 @@ func TestAdvanceChecksLivePublication(t *testing.T) {
 
 func TestControlHTTPFailures(t *testing.T) {
 	t.Parallel()
-	for _, status := range []int{http.StatusNotFound, http.StatusServiceUnavailable, http.StatusOK} {
+	for _, status := range []int{http.StatusNotFound, http.StatusNotImplemented, http.StatusServiceUnavailable, http.StatusOK} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(status)
@@ -69,7 +73,7 @@ func TestControlHTTPFailures(t *testing.T) {
 			defer srv.Close()
 			client := srv.Client()
 			client.Timeout = time.Second
-			s := liveService{client: client, base: srv.URL}
+			s := liveService{client: client, base: srv.URL, strict: true}
 			_, code, err := s.control(t.Context(), http.MethodGet, "status", 0)
 			if code != status || (status == http.StatusOK) != (err != nil) {
 				t.Fatalf("control: HTTP %d, %v", code, err)

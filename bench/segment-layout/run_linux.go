@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"bog/internal/checkpoint"
+	"bog/verify/capacityevidence"
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sys/unix"
 )
@@ -206,12 +207,18 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 		if err != nil {
 			return err
 		}
+		if cfg.requireLive {
+			return errors.Join(readBenchmarkReport(f, &cfg.candidate), f.Close())
+		}
 		return errors.Join(validateBenchmarkReport(f), f.Close())
 	}
 	if cfg.cold {
 		result, err := collectCold(ctx, cfg)
 		if err != nil {
 			return err
+		}
+		if cfg.reportPath != "" {
+			return (capacityevidence.ReportPublisher{}).WriteReport(cfg.reportPath, result)
 		}
 		return json.NewEncoder(out).Encode(result)
 	}

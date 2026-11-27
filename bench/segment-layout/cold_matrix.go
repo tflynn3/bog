@@ -132,7 +132,7 @@ func measureColdSelectivity(rows []checkpoint.BlockRow, q query, matches int) co
 	return coldSelectivity{len(rows), windows, matches}
 }
 
-func validateColdMatrixJSON(raw json.RawMessage) error {
+func validateColdMatrixJSON(raw json.RawMessage, candidate *candidateIdentity) error {
 	var report coldMatrixReport
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -161,6 +161,9 @@ func validateColdMatrixJSON(raw json.RawMessage) error {
 		if err := validateColdEncoding(wire.Profiles[i], profile, "cold profile"); err != nil {
 			return fmt.Errorf("%s: %w", profile.Fixture.Profile, err)
 		}
+	}
+	if candidate != nil {
+		return report.requireCandidate(*candidate)
 	}
 	return nil
 }

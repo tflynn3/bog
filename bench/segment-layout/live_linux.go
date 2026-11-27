@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"bog/verify/listener"
+	"golang.org/x/sys/unix"
 )
 
 func pinBinary(source, target, revision string) (digest string, err error) {
@@ -62,19 +63,36 @@ func pinBinary(source, target, revision string) (digest string, err error) {
 }
 
 func measureLive(ctx context.Context, cfg config, dir string, input fixtureInput, denominators map[string]uint64) (liveReport, error) {
-	binary := filepath.Join(dir, "candidate")
-	digest, err := pinBinary(cfg.binary, binary, cfg.binaryRevision)
+	candidate, err := pinLiveCandidate(cfg, dir)
 	if err != nil {
 		return liveReport{}, err
 	}
-	result := liveReport{Status: "measured", Revision: cfg.binaryRevision, BinarySHA256: digest}
+	return candidate.measure(ctx, cfg, dir, input, denominators)
+}
+
+type pinnedCandidate struct {
+	path     string
+	identity candidateIdentity
+}
+
+func pinLiveCandidate(cfg config, dir string) (pinnedCandidate, error) {
+	path := filepath.Join(dir, "candidate")
+	digest, err := pinBinary(cfg.binary, path, cfg.binaryRevision)
+	if err != nil {
+		return pinnedCandidate{}, err
+	}
+	return pinnedCandidate{path, candidateIdentity{cfg.binaryRevision, digest, runtime.GOARCH}}, nil
+}
+
+func (c pinnedCandidate) measure(ctx context.Context, cfg config, dir string, input fixtureInput, denominators map[string]uint64) (liveReport, error) {
+	result := liveReport{Status: "measured", Revision: c.identity.Revision, BinarySHA256: c.identity.SHA256}
 	for _, burst := range input.backfills() {
 		data := filepath.Join(dir, "server-"+burst.name)
 		if err := os.Mkdir(data, 0700); err != nil {
 			return liveReport{}, err
 		}
 		trialCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
-		sample, unavailable, err := liveTrial(trialCtx, binary, data, input, burst, denominators[burst.name], cfg.cold)
+		sample, unavailable, err := liveTrial(trialCtx, c.path, data, input, burst, denominators[burst.name], cfg.cold, cfg.requireLive)
 		cancel()
 		if err != nil {
 			return liveReport{}, fmt.Errorf("%s live compaction: %w", burst.name, err)
@@ -83,6 +101,9 @@ func measureLive(ctx context.Context, cfg config, dir string, input fixtureInput
 			return liveReport{}, err
 		}
 		if unavailable != "" {
+			if cfg.requireLive {
+				return liveReport{}, fmt.Errorf("live candidate control unavailable: %s", unavailable)
+			}
 			if len(result.Measurements) != 0 {
 				return liveReport{}, errors.New("candidate control disappeared between trials")
 			}
@@ -94,7 +115,7 @@ func measureLive(ctx context.Context, cfg config, dir string, input fixtureInput
 	return result, nil
 }
 
-func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burst backfill, denominator uint64, queryParity bool) (publicationMeasurement, string, error) {
+func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burst backfill, denominator uint64, queryParity, strict bool) (publicationMeasurement, string, error) {
 	if err := withSeededPublication(ctx, dir, input, nil); err != nil {
 		return publicationMeasurement{}, "", err
 	}
@@ -107,6 +128,7 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 	var sample publicationMeasurement
 	var unavailable string
 	err = withCandidate(ctx, binary, dir, func(s liveService) (err error) {
+		s.strict = strict
 		initial, status, err := s.control(ctx, http.MethodGet, "status", len(input.rows))
 		if err != nil {
 			return err
@@ -143,7 +165,8 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 			return err
 		}
 		start := time.Now()
-		if err := s.advance(ctx, count, *initial.Generation); err != nil {
+		completed, err := s.advance(ctx, count, initial)
+		if err != nil {
 			return err
 		}
 		elapsed := time.Since(start)
@@ -153,6 +176,9 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 		}
 		if after < before {
 			return errors.New("server write_bytes counter decreased")
+		}
+		if strict && after == before {
+			return errors.New("live compaction charged no Linux write_bytes; choose a disk-backed work directory")
 		}
 		if queryParity {
 			if err := s.checkPublishedQueries(ctx, rows); err != nil {
@@ -166,12 +192,21 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 			Scenario: burst.name, CoveredRows: count, ElapsedNS: elapsed.Nanoseconds(), HTTPQueryParity: queryParity,
 			WriteAmplification: writeAmplification(after-before, denominator, liveBoundary),
 		}
+		if strict {
+			sample.Publication = &livePublication{Before: initial, After: completed}
+		}
 		return nil
 	})
 	if err != nil || unavailable != "" {
 		return sample, unavailable, err
 	}
-	return sample, "", verifyPublished(dir, rows)
+	if err := verifyPublished(dir, rows); err != nil {
+		return sample, "", err
+	}
+	if sample.Publication != nil {
+		sample.Publication.PersistedParity = true
+	}
+	return sample, "", ctx.Err()
 }
 
 func withCandidate(ctx context.Context, binary, dir string, run func(liveService) error) (err error) {
@@ -183,29 +218,34 @@ func withCandidate(ctx context.Context, binary, dir string, run func(liveService
 	if err := reserved.Close(); err != nil {
 		return err
 	}
-	childCtx, stop := context.WithCancel(ctx)
-	defer stop()
-	cmd := exec.CommandContext(childCtx, binary, "-addr", addr.String(), "-data-dir", dir)
-	cmd.Env = append(cmd.Environ(), "BOG_CAPACITY_CONTROL=1")
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Cancel = func() error {
-		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-			return err
-		}
-		// A clean exit after our shutdown request is successful.
-		return os.ErrProcessDone
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	cmd := exec.Command(binary, "-addr", addr.String(), "-data-dir", dir)
+	cmd.Env = append(cmd.Environ(), "BOG_CAPACITY_CONTROL=1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 5 * time.Second
 	var log childLog
 	cmd.Stderr, cmd.Stdout = &log, &log
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	exited := make(chan struct{})
+	var observeErr error
+	go func() {
+		// Leave the leader unreaped so the group ID remains reserved through cleanup.
+		var info unix.Siginfo
+		for {
+			observeErr = unix.Waitid(unix.P_PID, cmd.Process.Pid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+			if !errors.Is(observeErr, unix.EINTR) {
+				break
+			}
+		}
+		close(exited)
+	}()
 	defer func() {
-		stop()
-		waitErr := <-done
-		if failure := errors.Join(err, waitErr, ctx.Err()); failure != nil {
+		stopErr := stopCandidate(cmd, exited)
+		if failure := errors.Join(err, stopErr, observeErr, ctx.Err()); failure != nil {
 			err = fmt.Errorf("candidate: %w %.8192s", failure, string(log))
 		}
 	}()
@@ -223,7 +263,7 @@ func withCandidate(ctx context.Context, binary, dir string, run func(liveService
 	startup, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		owned, err := listener.Owns(s.pid, s.port)
+		owned, err := listener.OwnsBind(s.pid, s.port, listener.BindLoopback)
 		if err != nil {
 			return err
 		}
@@ -241,8 +281,7 @@ func withCandidate(ctx context.Context, binary, dir string, run func(liveService
 			return run(s)
 		}
 		select {
-		case waitErr := <-done:
-			done <- waitErr // The deferred cleanup owns the final result.
+		case <-exited:
 			return errors.New("candidate exited before startup")
 		case <-startup.Done():
 			return fmt.Errorf("candidate startup: %w", startup.Err())
@@ -251,8 +290,33 @@ func withCandidate(ctx context.Context, binary, dir string, run func(liveService
 	}
 }
 
+func stopCandidate(cmd *exec.Cmd, exited <-chan struct{}) error {
+	var stopErr error
+	select {
+	case <-exited:
+		stopErr = errors.New("candidate exited before shutdown")
+	default:
+		stopErr = cmd.Process.Signal(syscall.SIGTERM)
+		if stopErr == nil {
+			timer := time.NewTimer(5 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-exited:
+			case <-timer.C:
+				stopErr = errors.New("candidate did not shut down after SIGTERM")
+			}
+		}
+	}
+	groupErr := unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
+	if errors.Is(groupErr, unix.ESRCH) {
+		groupErr = nil
+	}
+	<-exited
+	return errors.Join(stopErr, groupErr, cmd.Wait())
+}
+
 func (s liveService) requireListener() error {
-	owned, err := listener.Owns(s.pid, s.port)
+	owned, err := listener.OwnsBind(s.pid, s.port, listener.BindLoopback)
 	if err != nil {
 		return err
 	}

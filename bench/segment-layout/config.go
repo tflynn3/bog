@@ -23,12 +23,15 @@ var scaleBatches = map[string]int{
 type config struct {
 	dir, revision, profile, scale string
 	validateReport                string
+	reportPath                    string
 	batches, runs                 int
 	fixtureSeed                   uint64
 	binary, binaryRevision        string
 	timeout                       time.Duration
 	incremental                   bool
 	cold                          bool
+	requireLive                   bool
+	candidate                     candidateIdentity
 }
 
 func parseConfig(args []string, revision string, output io.Writer) (config, error) {
@@ -47,7 +50,11 @@ func parseConfig(args []string, revision string, output io.Writer) (config, erro
 	flags.StringVar(&cfg.revision, "revision", revision, "source revision to record")
 	flags.BoolVar(&cfg.incremental, "incremental", false, "compare successive segment publications against production v1")
 	flags.BoolVar(&cfg.cold, "cold", false, "pair cold incremental codec samples and measure production v1")
+	flags.BoolVar(&cfg.requireLive, "require-live", false, "require live candidate evidence for both cold profiles")
 	flags.StringVar(&cfg.validateReport, "validate-report", "", "validate an incremental or cold benchmark report and exit")
+	flags.StringVar(&cfg.reportPath, "report", "", "atomically publish a strict cold candidate report at this path")
+	flags.StringVar(&cfg.candidate.SHA256, "bog-sha256", "", "expected candidate binary SHA-256 for strict report validation")
+	flags.StringVar(&cfg.candidate.Arch, "bog-arch", "", "expected native candidate architecture for strict report validation")
 	smoke := flags.Bool("smoke", false, "use the fixed small fixture and one sample per query")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
@@ -64,10 +71,27 @@ func parseConfig(args []string, revision string, output io.Writer) (config, erro
 		}
 	})
 	if validate {
-		if cfg.validateReport == "" || flags.NFlag() != 1 || flags.NArg() != 0 {
-			return config{}, fmt.Errorf("-validate-report requires a path and must be used alone")
+		if cfg.validateReport == "" || flags.NArg() != 0 {
+			return config{}, fmt.Errorf("-validate-report requires a path and no positional arguments")
+		}
+		if cfg.requireLive {
+			cfg.candidate.Revision = cfg.binaryRevision
+			if flags.NFlag() != 5 || !cfg.candidate.valid() {
+				return config{}, fmt.Errorf("strict validation requires -validate-report, -require-live, -bog-revision, -bog-sha256 and -bog-arch")
+			}
+		} else if flags.NFlag() != 1 {
+			return config{}, fmt.Errorf("-validate-report must be used alone or with strict candidate validation")
 		}
 		return cfg, nil
+	}
+	if cfg.candidate.SHA256 != "" || cfg.candidate.Arch != "" {
+		return config{}, fmt.Errorf("-bog-sha256 and -bog-arch require strict report validation")
+	}
+	if cfg.requireLive && (!cfg.cold || *smoke || cfg.binary == "" || !lowerHex(cfg.binaryRevision, 40)) {
+		return config{}, fmt.Errorf("-require-live requires -cold, -bog-bin and a full lowercase -bog-revision without -smoke")
+	}
+	if cfg.reportPath != "" && !cfg.requireLive {
+		return config{}, fmt.Errorf("-report requires -require-live")
 	}
 	if explicitBatches && explicitScale {
 		return config{}, fmt.Errorf("choose either -batches or -scale")

@@ -189,6 +189,7 @@ jobs:
             done
           }
           {
+            python3 -B gate/verify/release/check_gate_evidence_test.py || exit
             release_help=$(cd gate && timeout --kill-after=5s 1m go run ./verify/release validate -help 2>&1) ||
               { printf 'gate report validator help failed\n%s\n' "$release_help" >&2; exit 1; }
             require_flags "gate report validator" "$release_help" binary revision fixture admission durability capacity parity require-cutover query-model-events query-handler-events
@@ -303,30 +304,8 @@ jobs:
             export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
             timeout --kill-after=5s 3m go test -json -count=1 -run "^${test}\$" ./verify/release |
               tee "$events" || exit
-            python3 - "$events" "$test" "$@" <<'PY'
-          import json
-          import sys
-          from collections import Counter
-
-          path, test, *children = sys.argv[1:]
-          required = ["", test, *(f"{test}/{child}" for child in children)]
-          passes = Counter()
-          with open(path, encoding="utf-8") as events:
-              for line in events:
-                  event = json.loads(line)
-                  if event.get("Package") != "bog/verify/release":
-                      continue
-                  name = event.get("Test", "")
-                  action = event.get("Action")
-                  if name == "" or name == test or name.startswith(test + "/"):
-                      if action in ("fail", "skip"):
-                          sys.exit(f"{name or 'bog/verify/release'} reported {action}")
-                      if action == "pass":
-                          passes[name] += 1
-          for name in required:
-              if passes[name] != 1:
-                  sys.exit(f"{name or 'bog/verify/release'} reported {passes[name]} passes, expected 1")
-          PY
+            python3 "$GITHUB_WORKSPACE/gate/verify/release/check_gate_evidence.py" test-events \
+              "$events" bog/verify/release "$test" "$@"
           )
           parity() (
             export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
@@ -479,46 +458,10 @@ jobs:
         env:
           BOG_RELEASE_REQUIRE_RETARGET: '1'
         run: |
-          validate_producers() {
-            python3 - "$EVIDENCE/producers.txt" "$REVISION" "$EXPECTED_ARCH" "$GITHUB_WORKFLOW_SHA" "$RELEASE_PRODUCERS" <<'PY'
-          import sys
-
-          path, revision, arch, gate_sha, definitions = sys.argv[1:]
-          checkout_shas = {"gate": gate_sha, "candidate": revision}
-          expected = {}
-          for definition in definitions.splitlines():
-              name, checkout = definition.split()
-              expected[name] = (
-                  f"{name} revision={revision} arch={arch} exit=0 "
-                  f"checkout={checkout} checkout_sha={checkout_shas[checkout]}"
-              )
-
-          seen = set()
-          try:
-              with open(path, encoding="utf-8") as manifest:
-                  for number, raw in enumerate(manifest, 1):
-                      record = raw.rstrip("\n")
-                      name = record.partition(" ")[0]
-                      location = f"{path}:{number}"
-                      if name not in expected:
-                          sys.exit(f"{location}: unexpected producer {name!r}")
-                      if name in seen:
-                          sys.exit(f"{location}: duplicate producer {name!r}")
-                      if record != expected[name]:
-                          sys.exit(f"{location}: expected {expected[name]!r}, got {record!r}")
-                      seen.add(name)
-          except (OSError, UnicodeError) as error:
-              sys.exit(f"{path}: cannot read producer manifest: {error}")
-
-          missing = expected.keys() - seen
-          if missing:
-              sys.exit(f"{path}: missing producers: {', '.join(sorted(missing))}")
-          print(f"Validated {len(seen)} producer records for {revision} on {arch}")
-          PY
-          }
           {
             failed=0
-            validate_producers || failed=1
+            python3 verify/release/check_gate_evidence.py producers \
+              "$EVIDENCE/producers.txt" "$REVISION" "$EXPECTED_ARCH" "$GITHUB_WORKFLOW_SHA" "$RELEASE_PRODUCERS" || failed=1
             sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
             checkout_sha=$(git rev-parse HEAD)
             printf 'release validator checkout=gate checkout_sha=%s\n' "$checkout_sha"

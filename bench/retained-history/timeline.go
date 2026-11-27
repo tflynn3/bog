@@ -7,14 +7,16 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"bog/verify/capacityevidence"
 )
 
 const (
 	compactionPollInterval = 30 * time.Millisecond
 	timelineSampleInterval = 100 * time.Millisecond
 	timelineSampleLimit    = 64
-	liveMemorySampleLimit  = 16 // per timeline, including attempted reads
-	drainBudget            = 2 * time.Second
+	liveMemorySampleLimit  = capacityevidence.MemorySampleLimit // per timeline, including attempted reads
+	drainBudget            = capacityevidence.DrainBudget
 	diagnosticRequestLimit = 250 * time.Millisecond
 )
 

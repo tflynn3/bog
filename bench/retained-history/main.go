@@ -17,9 +17,11 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+
+	"bog/verify/capacityevidence"
 )
 
-const capacityCase = "retained_history_capacity"
+const capacityCase = capacityevidence.Case
 
 type fixture struct {
 	SeedRows      int    `json:"seed_rows"`
@@ -33,11 +35,11 @@ type fixture struct {
 func fixtures(mode string) []fixture {
 	sizes := []int{8192, 32768}
 	if mode == "live" {
-		sizes = []int{196608, 393216}
+		sizes = []int{capacityevidence.SmallScale, capacityevidence.LargeScale}
 	}
 	var result []fixture
 	for _, size := range sizes {
-		result = append(result, fixture{size, 2048, 1024, 64, 128 << 20, mode == "live"})
+		result = append(result, fixture{size, capacityevidence.TailRows, capacityevidence.LineBytes, capacityevidence.BatchRows, capacityevidence.MemoryLimit, mode == "live"})
 	}
 	return result
 }
@@ -200,7 +202,7 @@ func run(ctx context.Context, args []string) (err error) {
 		return validateCutoverFile(cutoverReport)
 	}
 	if f.NArg() != 0 || !filepath.IsAbs(o.binary) || !regexp.MustCompile("^[0-9a-f]{40}$").MatchString(o.revision) ||
-		o.fixture != "linux-release-v1" || o.report == "" || o.timeout <= 0 || (o.mode != "live" && o.mode != "legacy") {
+		o.fixture != capacityevidence.FixtureID || o.report == "" || o.timeout <= 0 || (o.mode != "live" && o.mode != "legacy") {
 		return errors.New("require absolute -binary, full lowercase -revision, -fixture linux-release-v1, and -report; see -help")
 	}
 	source, sourceErr := os.Stat(o.binary)

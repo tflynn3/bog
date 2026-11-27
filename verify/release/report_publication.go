@@ -1,13 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 type reportPublicationState string
@@ -34,37 +34,38 @@ func (e *reportPublicationError) Error() string {
 func (e *reportPublicationError) Unwrap() error { return e.Err }
 
 type reportDirectory interface {
+	OpenExclusive(name string) (reportStagingFile, error)
+	Rename(from, to string) error
+	Remove(name string) error
 	Sync() error
 	Close() error
 }
 
 type reportStagingFile interface {
 	io.Writer
-	reportDirectory
-	Name() string
+	Sync() error
+	Close() error
 }
 
 // Operations are scoped to a publisher, so tests can inject filesystem
 // failures without sharing mutable hooks with another writer.
 type reportPublisher struct {
-	openDir    func(string) (reportDirectory, error)
-	createTemp func(string, string) (reportStagingFile, error)
-	rename     func(string, string) error
-	remove     func(string) error
+	openDir func(string) (reportDirectory, error)
 }
 
 func localReportPublisher() reportPublisher {
-	return reportPublisher{
-		openDir: func(path string) (reportDirectory, error) {
-			// Reject non-directories without opening a FIFO or device.
-			return os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY, 0)
-		},
-		createTemp: func(dir, pattern string) (reportStagingFile, error) {
-			return os.CreateTemp(dir, pattern)
-		},
-		rename: os.Rename,
-		remove: os.Remove,
+	return reportPublisher{openDir: openReportDirectory}
+}
+
+func createStagingReport(dir reportDirectory) (reportStagingFile, string, error) {
+	for range 16 {
+		name := ".release-report-" + rand.Text()
+		file, err := dir.OpenExclusive(name)
+		if !errors.Is(err, os.ErrExist) {
+			return file, name, err
+		}
 	}
+	return nil, "", errors.New("could not allocate a unique staging report")
 }
 
 func (p reportPublisher) writeReport(path string, results report) (err error) {
@@ -81,7 +82,13 @@ func (p reportPublisher) writeReport(path string, results report) (err error) {
 	}
 	data = append(data, '\n')
 
-	dirPath := filepath.Dir(path)
+	dirPath, name := filepath.Split(path)
+	if name == "" || name == "." || name == ".." {
+		return errors.New("report path must name a file")
+	}
+	if dirPath == "" {
+		dirPath = "."
+	}
 	dir, err := p.openDir(dirPath)
 	if err != nil {
 		return fmt.Errorf("open report directory: %w", err)
@@ -92,15 +99,14 @@ func (p reportPublisher) writeReport(path string, results report) (err error) {
 		}
 	}()
 
-	staged, err := p.createTemp(dirPath, ".release-report-*")
+	staged, stagedName, err := createStagingReport(dir)
 	if err != nil {
 		return fmt.Errorf("create staging report: %w", err)
 	}
-	stagedPath := staged.Name()
 	defer func() {
 		if state == reportUnpublished {
-			if removeErr := p.remove(stagedPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-				err = errors.Join(err, fmt.Errorf("remove staging report %q: %w", stagedPath, removeErr))
+			if removeErr := dir.Remove(stagedName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				err = errors.Join(err, fmt.Errorf("remove staging report %q: %w", stagedName, removeErr))
 			}
 		}
 	}()
@@ -120,7 +126,7 @@ func (p reportPublisher) writeReport(path string, results report) (err error) {
 	if err != nil {
 		return err
 	}
-	if err := p.rename(stagedPath, path); err != nil {
+	if err := dir.Rename(stagedName, name); err != nil {
 		return fmt.Errorf("rename staging report: %w", err)
 	}
 	state = reportDurabilityUncertain

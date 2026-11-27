@@ -1,4 +1,4 @@
-package main
+package capacityevidence
 
 import (
 	"context"
@@ -7,8 +7,11 @@ import (
 	"time"
 )
 
-// Cutover consumes the producer's additive timelines. The base capacity
-// verdict continues to cover archived reports with the original schema.
+const (
+	DrainBudget       = 2 * time.Second
+	MemorySampleLimit = 16
+)
+
 type backfillEvidence struct {
 	Pattern      string `json:"pattern"`
 	Status       string `json:"status"`
@@ -77,73 +80,6 @@ type backfillCutoffs struct {
 	held, publish, final int
 }
 
-func (r capacityEvidence) validateCutover() error {
-	var timelines []backfillEvidence
-	var memoryEvents map[string]uint64
-	var candidates []struct {
-		Lifetime            string `json:"lifetime"`
-		Ready               int64  `json:"start_to_ready_ns"`
-		Reaped              bool   `json:"reaped"`
-		ExitedBeforeCleanup bool   `json:"exited_before_cleanup"`
-		ExitCode            *int   `json:"exit_code"`
-		Signal              string `json:"exit_signal"`
-		WaitError           string `json:"wait_error"`
-		StartupError        string `json:"startup_error"`
-		LogDrainError       string `json:"log_drain_error"`
-	}
-	if _, err := decodeFields(r.Diagnostics, map[string]any{
-		"backfill_timelines": &timelines, "cgroup_memory_events": &memoryEvents, "candidates": &candidates,
-	}); err != nil {
-		return fmt.Errorf("cutover diagnostics: %w", err)
-	}
-	if r.CgroupLimit == nil || *r.CgroupLimit != r.Fixture.MemoryBytes || r.CgroupSwap == nil || *r.CgroupSwap != 0 {
-		return errors.New("missing cgroup limit readback or disabled swap readback")
-	}
-	if !r.Cleanup.StoreRemoved {
-		return errors.New("missing fixture store cleanup")
-	}
-	if oom, observed := memoryEvents["oom_kill"]; !observed || oom != 0 || r.CgroupOOM == nil || *r.CgroupOOM != 0 {
-		return errors.New("require an observed zero cgroup OOM-kill count")
-	}
-	if len(candidates) != 2 {
-		return errors.New("missing startup and restart lifecycle evidence")
-	}
-	for i, lifetime := range []string{"startup", "restart"} {
-		p := candidates[i]
-		if p.Lifetime != lifetime || p.Ready <= 0 || !p.Reaped || p.ExitedBeforeCleanup ||
-			p.ExitCode == nil || *p.ExitCode != 0 || p.Signal != "" || p.WaitError != "" ||
-			p.StartupError != "" || p.LogDrainError != "" {
-			return fmt.Errorf("missing clean %s lifecycle", lifetime)
-		}
-	}
-	if len(timelines) != 2 {
-		return errors.New("cutover requires exactly one clustered and one scattered backfill timeline")
-	}
-	seed := r.Fixture.SeedRows
-	cutoffs := map[string]backfillCutoffs{
-		"clustered": {seed - 2*capacityBatch, seed - capacityBatch, seed},
-		"scattered": {seed, seed + capacityBatch, seed + capacityTail},
-	}
-	generations := make(map[string]uint64, len(cutoffs))
-	for _, timeline := range timelines {
-		expected, ok := cutoffs[timeline.Pattern]
-		if !ok || generations[timeline.Pattern] != 0 {
-			return fmt.Errorf("unexpected or duplicate cutover backfill pattern %q", timeline.Pattern)
-		}
-		if err := timeline.validate(expected); err != nil {
-			return fmt.Errorf("%s cutover backfill: %w", timeline.Pattern, err)
-		}
-		if err := timeline.validateLiveMemory(r.CgroupPeak); err != nil {
-			return fmt.Errorf("%s cutover backfill: %w", timeline.Pattern, err)
-		}
-		generations[timeline.Pattern] = timeline.Publication.Generation
-	}
-	if generations["clustered"] >= generations["scattered"] || generations["scattered"] != r.Compaction.Generation {
-		return errors.New("cutover expected advancing generations with scattered publication matching completed compaction")
-	}
-	return nil
-}
-
 func (b backfillEvidence) validate(want backfillCutoffs) error {
 	if b.Status != "pass" || b.Failure != "" {
 		return fmt.Errorf("timeline did not pass: status %q, failure %q", b.Status, b.Failure)
@@ -162,12 +98,12 @@ func (b backfillEvidence) validate(want backfillCutoffs) error {
 		return errors.New("require terminal page replay and explicit capture retirement")
 	}
 	ack := b.Acknowledged
-	if ack.Rows != want.final-want.held || ack.Batches != ack.Rows/capacityBatch ||
+	if ack.Rows != want.final-want.held || ack.Batches != ack.Rows/BatchRows ||
 		ack.First <= 0 || ack.Last < ack.First || ack.Earliest.IsZero() || ack.Latest.Before(ack.Earliest) {
 		return errors.New("missing or invalid acknowledged backfill evidence")
 	}
 	pub := b.Publication
-	if pub.Generation == 0 || pub.LowerNS <= 0 || pub.UpperNS < pub.LowerNS {
+	if pub.Generation == 0 || pub.LowerNS <= 0 || pub.UpperNS <= pub.LowerNS {
 		return errors.New("missing or invalid publication generation or observation bounds")
 	}
 	pins := b.PinDrain
@@ -178,7 +114,6 @@ func (b backfillEvidence) validate(want backfillCutoffs) error {
 }
 
 func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
-	const drainBudget = int64(2 * time.Second) // Match the capacity producer's drain budget.
 	var elapsed, startSent, overlapSent, lastRunningSent, exhaustedAt, retriedAt, retiredAt, drainStarted int64
 	var published, finalObserved, held, drained, fresh bool
 	var predecessor uint64
@@ -244,7 +179,7 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 			if drainStarted == 0 {
 				drainStarted = *sample.SentNS
 			}
-			if elapsed-drainStarted > drainBudget {
+			if elapsed-drainStarted > int64(DrainBudget) {
 				return errors.New("pin drain sample exceeded the drain budget")
 			}
 			if retry {
@@ -266,7 +201,7 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 		case "overlap":
 			if startSent == 0 || overlapSent != 0 || *sample.SentNS <= startSent ||
 				c.State != "running" || c.Generation != predecessor || c.CoveredRows != want.held ||
-				c.CommittedRows < want.publish+capacityBatch || c.CommittedRows > want.final {
+				c.CommittedRows < want.publish+BatchRows || c.CommittedRows > want.final {
 				return errors.New("overlap did not observe backfill on the predecessor generation")
 			}
 			overlapSent = *sample.SentNS
@@ -373,7 +308,7 @@ func (t backfillEvidence) validateLiveMemory(peak uint64) error {
 			overlap = true
 		}
 		if m != nil {
-			if summary.Samples == 16 || m.ReadStart < lastRunning ||
+			if summary.Samples == MemorySampleLimit || m.ReadStart < lastRunning ||
 				m.ReadEnd <= m.ReadStart || m.ReadEnd > *s.SentNS {
 				return errors.New("mis-timed or excessive memory.current samples")
 			}

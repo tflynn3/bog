@@ -84,6 +84,10 @@ func openRestored(ctx context.Context, directory string, verify func(context.Con
 
 func (r *Reader) Point() Point { return r.image.Point }
 
+// RecoveryPoint returns the verified logical bounds, suffix digest, and
+// recovered first free ordinal, including for a v1 image.
+func (r *Reader) RecoveryPoint() RecoveryPoint { return r.image.recoveryPoint() }
+
 // Close releases the directory. Complete active operations before calling Close.
 func (r *Reader) Close() error { return r.root.Close() }
 

@@ -1,11 +1,11 @@
 package checkpoint
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 
@@ -35,14 +35,16 @@ type Segment struct {
 	SHA256 string `json:"sha256"`
 }
 
-// Manifest identifies an immutable collection of sorted blocks and the WAL prefix
-// they represent. SourceSHA256 is the identity of that exact prefix, including magic.
+// Manifest identifies immutable sorted blocks and their logical WAL boundary.
+// SourceSHA256 binds the exact full prefix, including magic, in version 1.
+// Advance binds the consumed suffix range in version 2.
 type Manifest struct {
 	Version       int       `json:"version"`
-	SourceSHA256  string    `json:"source_sha256"`
+	SourceSHA256  string    `json:"source_sha256,omitempty"`
 	CoveredOffset int64     `json:"covered_offset"`
 	NextOrdinal   uint64    `json:"next_ordinal"`
 	Segments      []Segment `json:"segments"`
+	Advance       *Advance  `json:"advance,omitempty"`
 }
 type segmentMeta = Segment
 
@@ -154,65 +156,13 @@ func (l *Legacy) readPublished(keepRows bool) (p *Published, err error) {
 	if keepRows {
 		p.blocks = make([][]BlockRow, 0, len(m.Segments))
 	}
-	seen := map[string]bool{}
-	// Bound the bitmap by validated declared segment sizes before allocating it.
-	var maxRows uint64
-	for _, s := range m.Segments {
-		if s.Size < blockHeaderSize || s.Size > MaxBlockSize {
-			return nil, errors.New("invalid segment size")
-		}
-		maxRows += uint64((s.Size - blockHeaderSize) / blockRowSize)
-	}
-	if m.NextOrdinal > maxRows {
-		return nil, errors.New("invalid segment row count")
-	}
-	ordinals := make([]byte, (m.NextOrdinal+7)/8)
-	var count uint64
-	for _, s := range m.Segments {
-		if !validSegmentName(s.Name) || seen[s.Name] || s.Size < blockHeaderSize || s.Size > MaxBlockSize {
-			return nil, errors.New("invalid segment metadata")
-		}
-		seen[s.Name] = true
-		f, e := l.openFile(s.Name)
-		if e != nil {
-			return nil, fmt.Errorf("%w: referenced segment %s: %v", ErrIntegrity, s.Name, e)
-		}
-		st, e := f.Stat()
-		if e != nil {
-			return nil, errors.Join(e, f.Close())
-		}
-		if st.Size() != s.Size {
-			return nil, errors.Join(errors.New("invalid segment size"), f.Close())
-		}
-		b, e := io.ReadAll(io.LimitReader(f, s.Size+1))
-		e = errors.Join(e, f.Close())
-		if e != nil {
-			return nil, e
-		}
-		if int64(len(b)) != s.Size || digest(b) != s.SHA256 {
-			return nil, errors.New("invalid segment checksum")
-		}
-		rows, e := DecodeBlock(b)
-		if e != nil {
-			return nil, e
-		}
-		for i, r := range rows {
-			if r.Ordinal >= m.NextOrdinal || (i > 0 && lessRow(r, rows[i-1])) {
-				return nil, errors.New("invalid segment order")
-			}
-			mask := byte(1 << (r.Ordinal % 8))
-			if ordinals[r.Ordinal/8]&mask != 0 {
-				return nil, errors.New("duplicate segment ordinal")
-			}
-			ordinals[r.Ordinal/8] |= mask
-		}
-		count += uint64(len(rows))
+	err = validateManifestBlocks(context.Background(), m, func(name string) (io.ReadCloser, error) { return l.openFile(name) }, func(rows []BlockRow) {
 		if keepRows {
 			p.blocks = append(p.blocks, rows)
 		}
-	}
-	if count != m.NextOrdinal {
-		return nil, errors.New("invalid segment row count")
+	})
+	if err != nil {
+		return nil, err
 	}
 	return p, nil
 }

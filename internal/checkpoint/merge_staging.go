@@ -30,12 +30,15 @@ func (s stagedBlock) reusableRoom() int {
 
 func (a *publicationAttempt) ownedFiles() []ownedSegment {
 	// Keep the empty intent's v1 encoding.
-	if len(a.files) == 0 {
+	if len(a.files) == 0 && a.manifest == nil {
 		return nil
 	}
 	files := make([]ownedSegment, len(a.files))
 	for i, s := range a.files {
 		files[i] = s.ownedSegment
+	}
+	if a.manifest != nil {
+		files = append(files, *a.manifest)
 	}
 	return files
 }

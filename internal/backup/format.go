@@ -19,18 +19,20 @@ import (
 )
 
 const (
-	metadataName  = "bog.backup"
-	manifestName  = "bog.checkpoint"
-	tailName      = "bog.wal.tail"
-	bundleMagic   = "BOGBAK01"
-	walMagic      = "BOGWAL01"
-	metadataSize  = 128
-	manifestLimit = 256 << 10
-	segmentLimit  = 1024
-	blockHeader   = 44
-	rowHeader     = 24
-	blockLimit    = store.MaxBatch + blockHeader + rowHeader
-	segmentPrefix = "bog-segment-"
+	metadataName   = "bog.backup"
+	manifestName   = "bog.checkpoint"
+	tailName       = "bog.wal.tail"
+	bundleMagic    = "BOGBAK01"
+	bundleMagicV2  = "BOGBAK02"
+	walMagic       = "BOGWAL01"
+	metadataSize   = 128
+	metadataSizeV2 = 136
+	manifestLimit  = 256 << 10
+	segmentLimit   = 1024
+	blockHeader    = 44
+	rowHeader      = 24
+	blockLimit     = store.MaxBatch + blockHeader + rowHeader
+	segmentPrefix  = "bog-segment-"
 )
 
 var (
@@ -56,33 +58,62 @@ type Point struct {
 
 type metadata struct {
 	Point
-	tailSum [sha256.Size]byte
+	tailSum          [sha256.Size]byte
+	v2               bool
+	committedOrdinal uint64
 }
 
 func (m metadata) tailSize() int64 { return m.CommittedEnd - m.CoveredOffset }
 
 func (m metadata) encode() []byte {
-	b := make([]byte, metadataSize)
-	copy(b, bundleMagic)
+	size, magic := metadataSize, bundleMagic
+	if m.v2 {
+		size, magic = metadataSizeV2, bundleMagicV2
+	}
+	b := make([]byte, size)
+	copy(b, magic)
 	copy(b[8:40], m.Generation[:])
 	little.PutUint64(b[40:48], uint64(m.CoveredOffset))
 	little.PutUint64(b[48:56], m.NextOrdinal)
 	little.PutUint64(b[56:64], uint64(m.CommittedEnd))
-	copy(b[64:96], m.tailSum[:])
-	sum := sha256.Sum256(b[:96])
-	copy(b[96:], sum[:])
+	tailOffset := 64
+	if m.v2 {
+		little.PutUint64(b[64:72], m.committedOrdinal)
+		tailOffset = 72
+	}
+	copy(b[tailOffset:], m.tailSum[:])
+	sum := sha256.Sum256(b[:size-sha256.Size])
+	copy(b[size-sha256.Size:], sum[:])
 	return b
 }
 
 func decodeMetadata(b []byte) (metadata, error) {
-	if len(b) != metadataSize || string(b[:8]) != bundleMagic || sha256.Sum256(b[:96]) != [32]byte(b[96:]) {
-		return metadata{}, corrupt("invalid bundle metadata")
+	var m metadata
+	switch {
+	case len(b) == metadataSize && string(b[:8]) == bundleMagic:
+	case len(b) == metadataSizeV2 && string(b[:8]) == bundleMagicV2:
+		m.v2 = true
+		m.committedOrdinal = little.Uint64(b[64:72])
+	default:
+		return metadata{}, corrupt("invalid bundle metadata version or size")
 	}
-	return metadata{
-		Point: Point{Generation: [32]byte(b[8:40]), CoveredOffset: int64(little.Uint64(b[40:48])),
-			NextOrdinal: little.Uint64(b[48:56]), CommittedEnd: int64(little.Uint64(b[56:64]))},
-		tailSum: [32]byte(b[64:96]),
-	}, nil
+	sumOffset := len(b) - sha256.Size
+	if sha256.Sum256(b[:sumOffset]) != [32]byte(b[sumOffset:]) {
+		return metadata{}, corrupt("invalid bundle metadata checksum")
+	}
+	m.Point = Point{Generation: [32]byte(b[8:40]), CoveredOffset: int64(little.Uint64(b[40:48])),
+		NextOrdinal: little.Uint64(b[48:56]), CommittedEnd: int64(little.Uint64(b[56:64]))}
+	m.tailSum = [32]byte(b[sumOffset-sha256.Size : sumOffset])
+	if m.CoveredOffset < int64(len(walMagic)) || m.CommittedEnd < m.CoveredOffset ||
+		m.v2 && !validSuffixBounds(m.Point, m.committedOrdinal) {
+		return metadata{}, corrupt("invalid bundle metadata bounds")
+	}
+	return m, nil
+}
+
+func validSuffixBounds(p Point, committedOrdinal uint64) bool {
+	return p.CoveredOffset >= int64(len(walMagic)) && p.CommittedEnd >= p.CoveredOffset &&
+		committedOrdinal >= p.NextOrdinal && (p.CommittedEnd == p.CoveredOffset) == (committedOrdinal == p.NextOrdinal)
 }
 
 type segment struct {
@@ -92,14 +123,22 @@ type segment struct {
 }
 
 type manifest struct {
-	Version       int       `json:"version"`
-	SourceSHA256  string    `json:"source_sha256"`
-	CoveredOffset int64     `json:"covered_offset"`
-	NextOrdinal   uint64    `json:"next_ordinal"`
-	Segments      []segment `json:"segments"`
+	Version       int              `json:"version"`
+	SourceSHA256  string           `json:"source_sha256,omitempty"`
+	CoveredOffset int64            `json:"covered_offset"`
+	NextOrdinal   uint64           `json:"next_ordinal"`
+	Segments      []segment        `json:"segments"`
+	Advance       *manifestAdvance `json:"advance,omitempty"`
 }
 
-func readManifest(b []byte, p Point) (manifest, error) {
+type manifestAdvance struct {
+	Generation     string  `json:"generation"`
+	CoveredOffset  int64   `json:"covered_offset"`
+	NextOrdinal    *uint64 `json:"next_ordinal"`
+	ConsumedSHA256 string  `json:"consumed_sha256"`
+}
+
+func readManifest(b []byte, p Point, allowV2 bool) (manifest, error) {
 	var env struct {
 		Payload json.RawMessage `json:"payload"`
 		SHA256  string          `json:"sha256"`
@@ -115,18 +154,38 @@ func readManifest(b []byte, p Point) (manifest, error) {
 	if err := json.Unmarshal(env.Payload, &m); err != nil {
 		return m, corrupt("manifest payload: %v", err)
 	}
-	empty := m.NextOrdinal == 0 && m.CoveredOffset == int64(len(walMagic))
-	populated := m.NextOrdinal != 0 && m.CoveredOffset >= int64(len(walMagic))+17
-	if m.Version != 1 || len(m.Segments) > segmentLimit || !(empty || populated) ||
-		m.CoveredOffset != p.CoveredOffset || m.NextOrdinal != p.NextOrdinal || p.CommittedEnd < p.CoveredOffset ||
-		!lowerHex(m.SourceSHA256, 64) {
-		return m, corrupt("invalid manifest boundary, version or size")
+	if len(m.Segments) > segmentLimit || m.CoveredOffset != p.CoveredOffset ||
+		m.NextOrdinal != p.NextOrdinal || p.CommittedEnd < p.CoveredOffset ||
+		!validCheckpointBoundary(m.CoveredOffset, m.NextOrdinal) {
+		return m, corrupt("invalid manifest boundary or size")
 	}
-	if empty {
-		sum := sha256.Sum256([]byte(walMagic))
-		if m.SourceSHA256 != hex.EncodeToString(sum[:]) {
-			return m, corrupt("empty checkpoint WAL identity mismatch")
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(env.Payload, &fields); err != nil {
+		return m, corrupt("manifest fields: %v", err)
+	}
+	switch m.Version {
+	case 1:
+		if _, mixed := fields["advance"]; mixed || !lowerHex(m.SourceSHA256, 64) {
+			return m, corrupt("invalid v1 checkpoint digest")
 		}
+		if m.NextOrdinal == 0 {
+			sum := sha256.Sum256([]byte(walMagic))
+			if m.SourceSHA256 != hex.EncodeToString(sum[:]) {
+				return m, corrupt("empty checkpoint WAL identity mismatch")
+			}
+		}
+	case 2:
+		a := m.Advance
+		_, mixed := fields["source_sha256"]
+		if !allowV2 || mixed || m.SourceSHA256 != "" || a == nil || a.NextOrdinal == nil || m.Segments == nil ||
+			!lowerHex(a.Generation, 64) || !lowerHex(a.ConsumedSHA256, 64) ||
+			!validCheckpointBoundary(a.CoveredOffset, *a.NextOrdinal) ||
+			m.CoveredOffset <= a.CoveredOffset || m.CoveredOffset-a.CoveredOffset < 17 ||
+			m.NextOrdinal <= *a.NextOrdinal {
+			return m, corrupt("invalid v2 checkpoint transition")
+		}
+	default:
+		return m, corrupt("unsupported checkpoint version %d", m.Version)
 	}
 	seen := make(map[string]bool, len(m.Segments))
 	var maxRows uint64
@@ -143,6 +202,11 @@ func readManifest(b []byte, p Point) (manifest, error) {
 		return m, corrupt("impossible checkpoint row count")
 	}
 	return m, nil
+}
+
+func validCheckpointBoundary(offset int64, ordinal uint64) bool {
+	return offset == int64(len(walMagic)) && ordinal == 0 ||
+		offset >= int64(len(walMagic))+17 && ordinal > 0
 }
 
 func lowerHex(s string, n int) bool {

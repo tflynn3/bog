@@ -37,3 +37,64 @@ by the minimum row size (at most 1024 times (MaxBlockSize - 44) / 24 bits).
 These are fixed limits, but may be large.
 Checkpoints exceeding the segment limit fail; external merge/compaction and live
 recovery remain future work.
+
+# Retained checkpoint version 2
+
+A v2 generation uses the same envelope, immutable blocks, and
+`covered_offset`, `next_ordinal`, and `segments` fields as v1. The
+payload sets `version` to 2 and carries an `advance` object in place of
+`source_sha256`:
+
+| Field | Binding |
+| --- | --- |
+| `generation` | SHA-256 of the exact predecessor manifest payload |
+| `covered_offset` | Predecessor's logical covered byte offset |
+| `next_ordinal` | Predecessor's first uncovered append ordinal |
+| `consumed_sha256` | SHA-256 of the exact whole frames consumed by this advance |
+
+Digests in the JSON records are lowercase hexadecimal. The covered offset
+and next ordinal strictly advance. Logical offsets always include the
+original eight-byte WAL magic. The manifest digest covers the exact encoded
+payload and gives the installed file its name,
+`bog-checkpoint-<64 lowercase hex digits>`. A backup carries the same
+envelope under `bog.checkpoint`. Verification of a selected generation
+uses its own manifest and blocks. The predecessor and consumed frames can
+be reclaimed after the corresponding pins drain.
+
+## Owner handoff
+
+`Publisher.PublishRecoveryView` borrows the caller's pin and consumes a
+sequential reader starting at the predecessor's covered offset. The
+publisher checks the entire bounded captured suffix, including the
+uncovered remainder, before offering the successor to the selector. The
+publisher uses the configured `ReplayTailBytes` ceiling for the captured
+range and charges new output through `StagingBytes`. The owner continues
+accounting for the captured backing data.
+
+The new blocks and manifest are synced and installed under the existing
+publication lock. The intent records the candidate manifest's identity
+alongside the identities of new blocks. The selector callback receives
+the generation and the captured committed bounds and suffix digest at
+the new cutoff. The owner checks that the predecessor remains selected,
+reconciles commits since capture under append synchronization, and
+durably selects the manifest and matching writable tail together. The
+owner keeps required files and pins through that decision. A selector
+error leaves the attempt pending and requires recovery before dependent
+operations resume.
+
+`Publisher.RecoverRecoveryView` uses the owner's selected view under
+the publication lock. The owner validates the durable selector and tail
+identity, syncs the selected record and tail as needed, and supplies
+their pinned readers. Checkpoint validates the selected manifest, segment
+coverage, and committed suffix before syncing the directory and cleaning
+up attempt-owned files. Only a durably selected generation can be activated
+or supplied to new captures. The owner manages retirement of previously
+selected generations and tails after their pins drain.
+
+Release Verification can reproduce the two fixture cycles with
+`go test ./internal/backup -run TestPinnedTailRecoveryTwoCycles` and
+exercise both selection outcomes and interrupted cleanup with
+`go test ./internal/checkpoint -run TestRecoveryViewInterruptedCleanup`.
+The fixtures supply the owner-side selector and synced appends. See
+[ADR 0035](../../docs/adr/0035-tail-only-retained-recovery-contract.md)
+for the composed runtime acceptance criteria.

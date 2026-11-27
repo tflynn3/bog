@@ -6,7 +6,6 @@ import (
 	"cmp"
 	"context"
 	"encoding/hex"
-	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -443,27 +442,14 @@ func remainingTailParityArtifact(ctx context.Context, root *os.Root, pid int, re
 }
 
 func observeTailParityPins(ctx context.Context, client *http.Client, base string, want backfillCompaction) (uint64, error) {
-	res, err := request(ctx, client, http.MethodGet, fmt.Sprintf("%s/_capacity/compaction?action=status&cutoff=%d", base, want.covered), nil)
+	got, err := readCompactionObservation(ctx, client, base, http.MethodGet, "status", want.covered, true)
 	if err != nil {
 		return 0, err
 	}
-	if res.status != http.StatusOK {
-		return 0, fmt.Errorf("pin status returned HTTP %d, want 200", res.status)
+	if got.backfillCompaction != want || got.state != "complete" {
+		return 0, fmt.Errorf("published compaction changed during pin observation: got %+v, want %+v", got.backfillCompaction, want)
 	}
-	var got backfillCompaction
-	var metrics jsontext.Value
-	if _, err := decodeFields(res.body, map[string]any{
-		"state": &got.state, "generation": &got.generation, "covered_rows": &got.covered,
-		"committed_rows": &got.committed, "metrics": &metrics,
-	}); err != nil {
-		return 0, err
-	}
-	if got != want || got.state != "complete" {
-		return 0, fmt.Errorf("published compaction changed during pin observation: got %+v, want %+v", got, want)
-	}
-	var pins uint64
-	_, err = decodeFields(metrics, map[string]any{"retired_generation_pins": &pins})
-	return pins, err
+	return got.retiredGenerationPins, nil
 }
 
 func retireTailParityCapture(ctx context.Context, client *http.Client, base string, pager *releasePager, terminal querymodel.WireRequest,
@@ -660,14 +646,17 @@ func TestTailParityRetirementAndReclamation(t *testing.T) {
 	for _, tc := range []struct {
 		name, held, drained, retired, resume, keep, want string
 		early, stageTail, leakTail                       bool
+		wantCalls                                        int
 	}{
 		{name: "positive then pending then zero", held: one, drained: zero, retired: backfillTestAck, resume: "query capture expired\n"},
-		{name: "missing held metric", held: "{}", want: "observe held predecessor pins"},
-		{name: "duplicate held metric", held: `{"retired_generation_pins":0,"retired_generation_pins":1}`, want: "observe held predecessor pins"},
+		{name: "missing held metric", held: "{}", want: `missing or null "retired_generation_pins"`, wantCalls: 1},
+		{name: "duplicate held metric", held: `{"retired_generation_pins":0,"retired_generation_pins":1}`, want: "duplicate", wantCalls: 1},
 		{name: "zero before retirement", held: zero, want: "expected a positive retired generation pin count"},
 		{name: "reclaimed before retirement", early: true, want: "while capture is held"},
 		{name: "retirement refused", held: one, retired: lengthResponse(404, "", "hidden"), want: "expected empty HTTP 204"},
-		{name: "missing final metric", held: one, retired: backfillTestAck, drained: "{}", want: "observe retired generation pin drain"},
+		{name: "missing final metric", held: one, retired: backfillTestAck, drained: "{}", want: `missing or null "retired_generation_pins"`, wantCalls: 4},
+		{name: "null final metric", held: one, retired: backfillTestAck, drained: `{"retired_generation_pins":null}`, want: `missing or null "retired_generation_pins"`, wantCalls: 4},
+		{name: "mis-cased final metric", held: one, retired: backfillTestAck, drained: `{"Retired_Generation_Pins":0}`, want: `missing or null "retired_generation_pins"`, wantCalls: 4},
 		{name: "pin never drains", held: one, retired: backfillTestAck, drained: one, want: "wait for retired generation pin drain"},
 		{name: "tail left behind", held: one, retired: backfillTestAck, drained: zero, keep: "old-tail", want: "wait for retired artifact reclamation"},
 		{name: "segment left behind", held: one, retired: backfillTestAck, drained: zero, keep: "old-block", want: "wait for retired artifact reclamation"},
@@ -775,6 +764,9 @@ func TestTailParityRetirementAndReclamation(t *testing.T) {
 				}
 			} else if err != nil || calls != 5 {
 				t.Fatalf("retirement = %v, made %d requests, want 5", err, calls)
+			}
+			if tc.wantCalls != 0 && calls != tc.wantCalls {
+				t.Fatalf("retirement = %v, made %d requests, want %d", err, calls, tc.wantCalls)
 			}
 			if tc.stageTail || tc.leakTail {
 				if !errors.Is(err, context.DeadlineExceeded) || calls != 4 {

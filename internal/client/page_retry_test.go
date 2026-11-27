@@ -187,3 +187,39 @@ func retryResponse(status int, body string, length int64, closeErr error, closeC
 		}},
 	}
 }
+
+func TestInvalidCursorRequiresCompleteContinuationResponse(t *testing.T) {
+	const body = "invalid cursor\n"
+	for _, tc := range []struct {
+		name, cursor, body string
+		status             int
+		length             int64
+		closeErr           error
+		want               bool
+	}{
+		{name: "canonical rejection", cursor: fixtureCursor, body: body, status: 400, want: true},
+		{name: "different bad request", cursor: fixtureCursor, body: "invalid filter\n", status: 400},
+		{name: "wrong status", cursor: fixtureCursor, body: body, status: 410},
+		{name: "opening request", body: body, status: 400},
+		{name: "close delimited", cursor: fixtureCursor, body: body, status: 400, length: -1},
+		{name: "truncated", cursor: fixtureCursor, body: body, status: 400, length: int64(len(body) + 1)},
+		{name: "close failure", cursor: fixtureCursor, body: body, status: 400, closeErr: io.ErrClosedPipe},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var closes int
+			resp := retryResponse(tc.status, tc.body, tc.length, tc.closeErr, &closes)
+			page, err := acceptQueryResponse(t.Context(), resp, 0, 0, tc.cursor, nil)
+			var status *HTTPError
+			if !errors.As(err, &status) || status.StatusCode != tc.status || status.Body != tc.body ||
+				status.CursorRejected != tc.want || errors.Is(err, ErrInvalidCursor) != tc.want ||
+				errors.Is(err, ErrCaptureExpired) || status.Retryable() ||
+				page.Rows != nil || page.NextCursor != "" || closes != 1 {
+				t.Fatalf("page %+v, error %v, closes %d, want invalid cursor=%t", page, err, closes, tc.want)
+			}
+			if tc.closeErr != nil && !errors.Is(err, tc.closeErr) {
+				t.Fatalf("response close error lost: %v", err)
+			}
+		})
+	}
+}

@@ -68,7 +68,7 @@ func coordinateScanMemoryWorkers(parent context.Context, joinTimeout time.Durati
 			case r := <-results:
 				finished++
 				if r.err != context.Canceled {
-					err = errors.Join(err, fmt.Errorf("scan %d returned %v after shutdown, want context.Canceled", r.index, r.err))
+					err = errors.Join(err, fmt.Errorf("scan %d returned %v after shutdown, want context.Canceled", r.index, r.err), r.err)
 				}
 			case <-drain.Done():
 				err = errors.Join(err, fmt.Errorf("joined %d/%d scans: %w", finished, count, drain.Err()))
@@ -86,7 +86,10 @@ func coordinateScanMemoryWorkers(parent context.Context, joinTimeout time.Durati
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return fmt.Errorf("scan %d exited before cancellation: %v", r.index, r.err)
+			if r.err == nil {
+				return fmt.Errorf("scan %d exited before cancellation", r.index)
+			}
+			return fmt.Errorf("scan %d exited before cancellation: %w", r.index, r.err)
 		case <-ticks:
 			sample()
 		case <-ctx.Done():

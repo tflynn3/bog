@@ -153,48 +153,56 @@ fixture runs alongside the separate 128 MiB capacity verifier fixtures.
 
 ## Peak memory for concurrent retained scans
 
-Run on native Linux amd64 and arm64 and retain the two
-`retained_scan_memory` JSON records from the verbose test output.
+Run on native Linux amd64 and arm64 and retain the
+`retained_scan_worker` and `retained_scan_memory` JSON records from
+each run.
 
 ```sh
 BOG_TEST_CGROUP_PARENT=/sys/fs/cgroup/path/to/delegation \
   go test -race -count=1 -v -timeout=2m -run '^TestRetainedScanMemory$' ./verify/fuzz
 ```
 
-The parent must have the cgroup v2 memory controller enabled for its
-children and permit creating and entering a child cgroup. If the variable
-is omitted, the harness tries the current cgroup as the parent. On hosts
-without delegation or `memory.peak`, the report records a null cgroup peak
-and a reason. An explicitly requested cgroup must work. Each of the two
-fresh workers enters its own cgroup before loading the catalog. The
-parent seeds the shared fixture outside those cgroups, so filesystem
-cache charged during seeding can remain outside the measured groups.
-The harness removes each group after its worker exits.
+Each race run starts three fresh processes: one with one reader and two
+with eight readers. The worker sends a bounded readiness record before
+loading the fixture. The parent verifies its PID, architecture, Go version,
+race mode and concurrency, then admits the worker and releases it through
+a start pipe. The parent enforces separate startup and process deadlines
+and waits for the process to exit on every path. Startup, sanitizer mapping,
+reader budget and other reader failures have distinct outcomes.
 
-The fixture uses 1,024 overlapping segments within a 10 MiB disk budget.
-Its first ordered row contains the largest unescaped line that fits a
-single WAL batch. It spans the scan read page and forces overflow on each
-worker. The other segments contain late appends and identical tied
-backfills. Each concurrency case uses the same on-disk generation,
-measuring once with a single scan and once with the server's configured
-default concurrency. All visitors hold the maximum-size line together.
+The cgroup v2 parent must have the memory controller enabled for its
+children and permit process migration. If the variable is omitted, the
+harness attempts to use its current cgroup and reports why an isolated peak
+is unavailable when delegation or `memory.peak` is missing. An explicit
+parent is required to work. Each child cgroup contains only the worker from
+reader admission through exit. The parent reads its peak after reaping the
+worker and checking that the group is empty. Fixture pages charged during
+seeding can remain outside the group.
 
-Process peak RSS comes from `VmHWM` and the isolated cgroup peak comes
-from `memory.peak`, both read after cancellation and before the exact
-retry. These high-water marks include catalog load. The heap baseline is
-the loaded catalog after a forced GC. The harness samples Go's
-`HeapAlloc` during scan startup and at the overflow barrier and reports
-the largest observed increment above baseline. In between collections,
-`HeapAlloc` can include objects awaiting collection. The separate
-post-GC heap samples at the barrier and after cancellation show retained
-heap with and without active scan state.
+The fixture caps disk at 10 MiB and uses 1,024 overlapping segments. The
+first ordered row forces every worker to materialize an overflow line.
+Other segments contain late appends and identical tied backfills. Each scan
+has a query-work budget, the catalog bounds live captures and generation
+pins, and the report checks the sampled heap increment against 16 MiB per
+admitted reader. The catalog baseline and the retained-heap samples use
+forced collections. The sampled heap peak can include garbage awaiting GC.
 
-The barrier closes reader handles while scan reservations are still
-charged. Cancellation joins the scans under one deadline and checks that
-capture reservations and fixture descriptors return to their catalog
-baseline. A fresh reader verifies every timestamp, line and append
-ordinal in order. Closing the catalog releases the generation pin and
-its reservations and descriptors.
+The race scan worker allows sanitizer mappings to grow during the workload.
+Its startup record captures process virtual size and RSS before cgroup
+migration, and the workload report captures both again after scan
+cancellation, alongside the process-wide `VmHWM`. The isolated cgroup
+peak measures charges to the child cgroup, including any instrumentation
+allocated there. The composed service has its separate 128 MiB,
+swap-disabled release qualification. Ordinary scan workers and the other
+corpus workers retain their address-space and file-size limits.
+
+The scan barrier closes reader handles while the active scans still hold
+their reservations. Cancellation joins the scans under a deadline. The
+worker checks capture and descriptor baselines, retries the query in exact
+timestamp and append-ordinal order, then probes capture exhaustion, query
+work exhaustion and cancellation partway through reader acquisition.
+Closing the catalog must drain the generation and return pin and fixture
+descriptor counts to their initial values.
 
 ## Bounded replay oracle
 

@@ -3,6 +3,7 @@ package fuzz
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,30 +13,68 @@ import (
 	"testing"
 )
 
-func scanMemoryPeakRSS() (uint64, error) {
-	status, err := os.ReadFile("/proc/self/status")
+const scanProcStatusLimit = 64 << 10
+
+func readScanStatus() (string, error) {
+	f, err := os.Open("/proc/self/status")
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	return parseScanMemoryPeakRSS(string(status))
+	data, err := io.ReadAll(io.LimitReader(f, scanProcStatusLimit+1))
+	if err := errors.Join(err, f.Close()); err != nil {
+		return "", err
+	}
+	if len(data) > scanProcStatusLimit {
+		return "", errors.New("worker /proc/self/status exceeds size limit")
+	}
+	return string(data), nil
+}
+
+func readScanProcessMemory() scanProcessMemory {
+	status, err := readScanStatus()
+	if err != nil {
+		return scanProcessMemory{Unavailable: err.Error()}
+	}
+	return parseScanProcessMemory(status)
+}
+
+func parseScanProcessMemory(status string) scanProcessMemory {
+	virtual, virtualErr := parseScanStatusBytes(status, "VmSize")
+	rss, rssErr := parseScanStatusBytes(status, "VmRSS")
+	if err := errors.Join(virtualErr, rssErr); err != nil {
+		return scanProcessMemory{Unavailable: err.Error()}
+	}
+	if virtual < rss {
+		return scanProcessMemory{Unavailable: "VmSize smaller than VmRSS"}
+	}
+	return scanProcessMemory{VirtualBytes: virtual, RSSBytes: rss}
 }
 
 func parseScanMemoryPeakRSS(status string) (uint64, error) {
+	return parseScanStatusBytes(status, "VmHWM")
+}
+
+func parseScanStatusBytes(status, field string) (uint64, error) {
+	var result uint64
 	for line := range strings.SplitSeq(status, "\n") {
-		value, ok := strings.CutPrefix(line, "VmHWM:")
+		value, ok := strings.CutPrefix(line, field+":")
 		if !ok {
 			continue
 		}
 		fields := strings.Fields(value)
-		if len(fields) == 2 && fields[1] == "kB" {
-			kib, err := strconv.ParseUint(fields[0], 10, 54)
-			if err == nil && kib > 0 {
-				return kib * 1024, nil
-			}
+		if result != 0 || len(fields) != 2 || fields[1] != "kB" {
+			return 0, fmt.Errorf("invalid or duplicate %s field", field)
 		}
-		return 0, fmt.Errorf("invalid worker peak RSS: %q", line)
+		kib, err := strconv.ParseUint(fields[0], 10, 54)
+		if err != nil || kib == 0 {
+			return 0, fmt.Errorf("invalid %s size", field)
+		}
+		result = kib * 1024
 	}
-	return 0, errors.New("missing VmHWM in worker /proc/self/status")
+	if result == 0 {
+		return 0, fmt.Errorf("missing %s in worker /proc/self/status", field)
+	}
+	return result, nil
 }
 
 func scanMemoryFixtureFDs(procFD, fixture string) ([]string, error) {
@@ -66,7 +105,7 @@ func makeScanMemoryCgroup(parent string) (group, unavailable string, err error) 
 	if !explicit {
 		data, err := os.ReadFile("/proc/self/cgroup")
 		if err != nil {
-			return "", "", err
+			return "", fmt.Sprintf("read worker cgroup membership: %v", err), nil
 		}
 		parent, err = scanMemoryCgroupParent(string(data))
 		if err != nil {
@@ -123,13 +162,13 @@ func openScanMemoryCgroup(parent string) (string, error) {
 	return group, err
 }
 
-func enterScanMemoryCgroup(group string) error {
+func enterScanMemoryCgroup(group string, pid int) error {
 	path := filepath.Join(group, "cgroup.procs")
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
-	_, err = f.WriteString("0")
+	_, err = f.WriteString(strconv.Itoa(pid))
 	if err := errors.Join(err, f.Close()); err != nil {
 		return err
 	}
@@ -137,8 +176,8 @@ func enterScanMemoryCgroup(group string) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(string(data)) != strconv.Itoa(os.Getpid()) {
-		return fmt.Errorf("expected only worker %d in %s, got %q", os.Getpid(), group, data)
+	if strings.TrimSpace(string(data)) != strconv.Itoa(pid) {
+		return fmt.Errorf("expected only worker %d in %s, got %q", pid, group, data)
 	}
 	return nil
 }
@@ -166,6 +205,8 @@ func TestScanMemoryLinuxMetrics(t *testing.T) {
 		{"wrong unit", "VmHWM: 5 MB", 0},
 		{"negative", "VmHWM: -1 kB", 0},
 		{"overflow", "VmHWM: 18014398509481984 kB", 0},
+		{"zero", "VmHWM: 0 kB", 0},
+		{"duplicate", "VmHWM: 1 kB\nVmHWM: 2 kB", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseScanMemoryPeakRSS(tc.status)
@@ -173,6 +214,21 @@ func TestScanMemoryLinuxMetrics(t *testing.T) {
 				t.Fatalf("peak RSS = %d, %v, want %d", got, err, tc.want)
 			}
 		})
+	}
+
+	for _, tc := range []struct {
+		status string
+		want   scanProcessMemory
+	}{
+		{"VmSize: 4398046511104 kB\nVmRSS: 16384 kB", scanProcessMemory{VirtualBytes: 4 << 50, RSSBytes: 16 << 20}},
+		{"VmSize: 16384 kB", scanProcessMemory{}},
+		{"VmSize: 10 kB\nVmRSS: 11 kB", scanProcessMemory{}},
+	} {
+		got := parseScanProcessMemory(tc.status)
+		if !got.valid() || (got.Unavailable == "") != (tc.want.RSSBytes > 0) ||
+			got.VirtualBytes != tc.want.VirtualBytes || got.RSSBytes != tc.want.RSSBytes {
+			t.Errorf("process memory from %q = %+v, want %+v", tc.status, got, tc.want)
+		}
 	}
 
 	for _, tc := range []struct{ membership, want string }{
@@ -209,6 +265,21 @@ func TestScanMemoryLinuxMetrics(t *testing.T) {
 				t.Fatalf("cgroup peak = %d, %v, want %d (valid=%t)", got, err, tc.want, tc.valid)
 			}
 		})
+	}
+}
+
+func TestScanMemoryCgroupAfterReap(t *testing.T) {
+	dir := t.TempDir()
+	procs := filepath.Join(dir, "cgroup.procs")
+	must(t, os.WriteFile(filepath.Join(dir, "memory.peak"), []byte("4096\n"), 0600))
+	must(t, os.WriteFile(procs, []byte("1024\n"), 0600))
+	if _, err := readReapedScanCgroup(dir); err == nil {
+		t.Fatal("accepted an occupied cgroup after worker exit")
+	}
+	must(t, os.WriteFile(procs, nil, 0600))
+	peak, err := readReapedScanCgroup(dir)
+	if err != nil || peak != 4096 {
+		t.Fatalf("peak after reaping = %d, %v", peak, err)
 	}
 }
 

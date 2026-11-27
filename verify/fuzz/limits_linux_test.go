@@ -132,14 +132,19 @@ func setWorkerLimits(t *testing.T) {
 
 func setHardLimit(t *testing.T, resource int, maximum uint64) {
 	t.Helper()
+	must(t, applyHardLimit(resource, maximum))
+}
+
+func applyHardLimit(resource int, maximum uint64) error {
 	var current syscall.Rlimit
 	if err := syscall.Getrlimit(resource, &current); err != nil {
-		t.Fatal(fmt.Errorf("get resource limit %d: %w", resource, err))
+		return fmt.Errorf("get resource limit %d: %w", resource, err)
 	}
 	maximum = min(current.Cur, current.Max, maximum)
 	if err := syscall.Setrlimit(resource, &syscall.Rlimit{Cur: maximum, Max: maximum}); err != nil {
-		t.Fatal(fmt.Errorf("set resource limit %d: %w", resource, err))
+		return fmt.Errorf("set resource limit %d: %w", resource, err)
 	}
+	return nil
 }
 
 func setRetainedWorkerLimits(t *testing.T) { setWorkerLimits(t) }

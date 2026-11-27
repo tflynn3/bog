@@ -9,7 +9,14 @@ import (
 	"testing"
 )
 
-const scanMemorySeed = "retained-scan-memory-v2"
+const (
+	scanMemorySeed = "retained-scan-memory-v3"
+	// Per reader, allow segment pages, overflow scratch and the copied
+	// line (about 12 MiB together), plus cursor and allocation headroom.
+	scanReaderHeapBytes = 16 << 20
+)
+
+func scanHeapLimit(count int) uint64 { return uint64(count) * scanReaderHeapBytes }
 
 type scanMemoryFixture struct {
 	Generation      string `json:"generation"`
@@ -31,9 +38,12 @@ type scanMemoryReport struct {
 	Fixture               scanMemoryFixture `json:"fixture"`
 	Concurrency           int               `json:"concurrency"`
 	ConfiguredConcurrency int               `json:"configured_query_concurrency"`
+	ProcessMemory         scanProcessMemory `json:"workload_process_memory"`
+	PeakRSSUnavailable    string            `json:"peak_rss_unavailable,omitempty"`
 	PeakRSS               uint64            `json:"peak_rss_bytes"`
 	CgroupPeak            *uint64           `json:"cgroup_peak_memory_bytes"`
 	CgroupUnavailable     string            `json:"cgroup_peak_unavailable,omitempty"`
+	ReaderHeapLimit       uint64            `json:"reader_heap_limit_bytes"`
 	CatalogHeap           uint64            `json:"catalog_heap_bytes"`
 	PeakHeap              uint64            `json:"peak_sampled_heap_bytes"`
 	PeakIncrementalHeap   uint64            `json:"peak_incremental_live_heap_bytes"`
@@ -48,6 +58,7 @@ type scanMemoryReport struct {
 	PostCancelCaptures    uint64            `json:"post_cancel_capture_reservations"`
 	FinalPins             uint64            `json:"final_generation_pin_reservations"`
 	CanceledScans         int               `json:"canceled_scans"`
+	RejectionChecks       int               `json:"rejection_checks"`
 	RetryRows             int               `json:"exact_retry_rows"`
 	GenerationDrained     bool              `json:"generation_drained"`
 }
@@ -57,9 +68,15 @@ func (r scanMemoryReport) validate(isolatedCgroup bool) error {
 		(r.Concurrency != 1 && r.Concurrency != r.ConfiguredConcurrency) {
 		return errors.New("invalid scan memory report identity")
 	}
-	if r.PeakRSS == 0 || r.CatalogHeap == 0 || r.PausedHeap == 0 || r.PostCancelHeap == 0 || r.HeapSamples < 2 ||
+	if !r.ProcessMemory.valid() || (r.PeakRSS == 0) == (r.PeakRSSUnavailable == "") {
+		return errors.New("invalid process memory evidence")
+	}
+	if r.CatalogHeap == 0 || r.PausedHeap == 0 || r.PostCancelHeap == 0 || r.HeapSamples < 2 ||
 		r.PeakHeap < max(r.CatalogHeap, r.PausedHeap) || r.PeakHeap-r.CatalogHeap != r.PeakIncrementalHeap {
 		return errors.New("invalid scan memory samples")
+	}
+	if r.ReaderHeapLimit != scanHeapLimit(r.Concurrency) || r.PeakIncrementalHeap > r.ReaderHeapLimit {
+		return fmt.Errorf("%w: incremental heap %d, limit %d", errScanReaderBudget, r.PeakIncrementalHeap, r.ReaderHeapLimit)
 	}
 	if isolatedCgroup {
 		if r.CgroupPeak == nil || *r.CgroupPeak == 0 || r.CgroupUnavailable != "" {
@@ -70,7 +87,7 @@ func (r scanMemoryReport) validate(isolatedCgroup bool) error {
 	}
 	if r.CatalogFDs != 2 || r.PausedFDs != r.CatalogFDs || r.PostCancelFDs != r.CatalogFDs || r.FinalFDs != 0 ||
 		r.PausedCaptures != uint64(r.Concurrency) || r.PostCancelCaptures != 0 || r.FinalPins != 0 || r.CanceledScans != r.Concurrency ||
-		r.RetryRows != r.Fixture.Rows || !r.GenerationDrained {
+		r.RetryRows != r.Fixture.Rows || r.RejectionChecks != 3 || !r.GenerationDrained {
 		return errors.New("incomplete scan cleanup or retry evidence")
 	}
 	return nil
@@ -108,10 +125,11 @@ func TestScanMemoryReport(t *testing.T) {
 	base := scanMemoryReport{
 		Seed: scanMemorySeed, Arch: "arm64", GoVersion: "go1.27.0",
 		Concurrency: 8, ConfiguredConcurrency: 8, Fixture: scanMemoryFixture{Rows: 3070},
-		PeakRSS: 62 << 20, CgroupPeak: &cgroupPeak, CatalogHeap: 5 << 20, PeakHeap: 52 << 20,
+		PeakRSS: 62 << 20, ProcessMemory: scanProcessMemory{VirtualBytes: 4 << 40, RSSBytes: 60 << 20},
+		ReaderHeapLimit: scanHeapLimit(8), CgroupPeak: &cgroupPeak, CatalogHeap: 5 << 20, PeakHeap: 52 << 20,
 		PeakIncrementalHeap: 47 << 20, PausedHeap: 50 << 20, PostCancelHeap: 5 << 20, HeapSamples: 9,
 		CatalogFDs: 2, PausedFDs: 2, PostCancelFDs: 2, PausedCaptures: 8, CanceledScans: 8,
-		RetryRows: 3070, GenerationDrained: true,
+		RetryRows: 3070, RejectionChecks: 3, GenerationDrained: true,
 	}
 	for _, tc := range []struct {
 		name     string
@@ -123,6 +141,16 @@ func TestScanMemoryReport(t *testing.T) {
 		{name: "unavailable", valid: true, change: func(r *scanMemoryReport) {
 			r.CgroupPeak = nil
 			r.CgroupUnavailable = "read-only cgroup mount"
+		}},
+		{name: "unavailable process", isolated: true, valid: true, change: func(r *scanMemoryReport) {
+			r.ProcessMemory = scanProcessMemory{Unavailable: "proc status unavailable"}
+			r.PeakRSS = 0
+			r.PeakRSSUnavailable = "missing VmHWM"
+		}},
+		{name: "unexplained RSS", isolated: true, change: func(r *scanMemoryReport) { r.PeakRSS = 0 }},
+		{name: "heap budget exceeded", isolated: true, change: func(r *scanMemoryReport) {
+			r.PeakIncrementalHeap = r.ReaderHeapLimit + 1
+			r.PeakHeap = r.CatalogHeap + r.PeakIncrementalHeap
 		}},
 		{name: "shared peak", isolated: false},
 		{name: "missing peak", isolated: true, change: func(r *scanMemoryReport) { r.CgroupPeak = nil }},

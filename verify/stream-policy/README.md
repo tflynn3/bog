@@ -3,48 +3,56 @@
 Security Verification within Core Engineering owns the stream policy
 conformance runner and its fixture coverage.
 
-`streampolicy.Run` checks the proposed shared-deployment contract on one
-disposable target. Provision the canonical scopes, grants, and redactors from
-`ReferenceFixture()`, then supply query, ingest, restart/replay, and export
-observers backed by that same target. Give the run a context with a deadline.
-The caller owns startup and cleanup. The unit tests use a deterministic
-in-memory target with serialized committed frames.
+Provision a fresh disposable target with the scopes, grants, and redactors
+from `ReferenceFixture()`. Pass query, ingest, restart/replay, and export
+observers backed by that target to `streampolicy.Run`. The caller owns startup
+and cleanup and supplies a context with a deadline.
+
+The runner derives one matrix from the fixture grants. It pairs every
+principal with every configured selector and an unknown selector, then
+runs those cells concurrently against the same target. Setup, replay, and
+export inventories run after requests drain.
 
 | Check | Required observation |
 | --- | --- |
-| Authorization | A uniform 403 across missing grants and unknown selectors, including valid or invalid continuation tokens, keyed requests, and known or unknown artifact IDs. Compare error bodies and application headers and require an absence of page, cursor, or artifact evidence. |
-| Cursor scope | Exact first and final pages for the issuer. After authorization, a changed tenant, stream, or principal yields the same 400 as a modified token. |
-| Retry namespaces | The same key commits independently when any one scope component changes. An identical request returns the recorded response before and after reopening. A conflicting request returns 409, and exact query and committed-record comparisons catch duplicate or suppressed appends. |
-| Pre-append redaction | Committed bytes, exact replayed rows, query results, and export bytes and rows preserve the expected retained line and replacement. The plain and JSON-escaped Unicode markers must be absent. A two-row batch with an unavailable redactor leaves neither row committed. |
-| Scoped export | Authorized create and download have exact scoped records, including a positive control for a principal with only export permission. The observer verifies the artifact and authenticated manifest, then reports the source scope and policy versions. |
+| Query authorization | Every ungranted initial query and continuation returns 403, including requests with valid or modified tokens. Authorized queries return exactly the stream's redacted rows in both NDJSON and decoded evidence. Filters for foreign rows yield empty pages. |
+| Cursor scope | Every query grant issues a cursor with exact first and terminal pages. A different authorized principal or scope yields the same 400 as a modified token. The issuer successfully resumes after the denial probes. |
+| Keyed retries | Each independent namespace commits and replays its own outcome, including after reopening. Changed retries return 409. Ungranted targets return 403 for exact retries, changed bodies, and a fresh key. |
+| Pre-append redaction | Committed bytes, replayed rows, query results, and exports preserve the replacement and permitted text. Plain and JSON-escaped Unicode secrets stay absent. An unavailable redactor causes a whole two-row batch to fail. |
+| Exports | An authorized creator in each scope produces a verified artifact, including an export-only control. Every same-scope export grant can download the original bytes. Missing grants and cross-scope downloads return 403. Each denied download of an existing ID is paired with an absent ID. |
+| State | The complete committed bytes and replayed rows match before and after the matrix. The export state matches the authorized artifact IDs and fingerprints, with no new pending or published exports after the matrix. |
 
-The runner creates and verifies an artifact in each canonical scope with an
-authorized same-scope download. For each verified artifact, it checks every
-fixture principal against each known selector and an unknown selector. A probe
-is denied if the target lacks an export grant or resolves to a different
-canonical scope. This covers missing grants on the source stream, both
-directions across streams in a tenant, and both directions across tenants,
-including streams that share a stream ID.
+Denial comparisons require identical application response bodies and headers
+within each operation. They check decoded observations and raw response bytes
+for protected rows, cursors, retry outcomes, and artifact metadata. The runner
+recognizes structured metadata and scans for observed artifact IDs and their
+SHA-256 fingerprints in hexadecimal or standard base64 as whole tokens.
+Ordinary prose with an ID's characters inside a word still passes.
 
-Each denied download of an existing artifact ID is paired with a download of
-an absent ID under the same principal and selector. All denied downloads must
-return the same 403 with identical bodies and application headers and disclose
-no artifact IDs, bytes, records, manifest, or verification evidence. Denied
-creates have their own uniform 403 and yield no artifact ID.
+Observers preserve the original application response and exclude transport
+metadata such as Date. The query observer captures the original NDJSON.
+The replay observer reads all committed bytes, independently replays them,
+and routes subsequent observations to the reopened target. The export
+observer validates artifact integrity and the authenticated manifest, then
+reports the original bytes, decoded records, scope, and policy versions.
 
-Observers preserve the complete observed application response for each call and
-exclude transport-only metadata such as Date. The replay observer reads the
-complete committed fixture bytes and independently replays those bytes, then
-routes subsequent observations to the reopened target. The export observer
-validates the complete artifact and returns its original bytes and decoded
-records. Supply raw, inspectable fixture byte surfaces with positive retained
-witnesses. An opaque encoding that cannot be inspected by this runner leaves
-evidence incomplete. Each byte observation is bounded by `MaxEvidenceBytes`.
+The export adapter also implements `ExportStateObserver`. It independently
+enumerates all published artifacts and hashes their original bytes, including
+authenticated metadata, and counts pending or staged exports. The runner
+attests an empty inventory before authorized creation, checks the inventory
+against the authorized downloads, and compares it again after the matrix.
+Inventory evidence includes artifacts and pending work regardless of public
+visibility. Adapters honor context, support concurrent requests, and keep
+returned evidence stable through the run. Each raw byte observation is bounded
+by `MaxEvidenceBytes`.
 
-Ordinary application rejections are observations. Adapter errors, cancellation,
-missing observations, and unsupported evidence fail with `ErrIncomplete`.
-Mismatches fail with `ErrViolation`. The runner stops at the first failed check
-and reports its phase without including fixture secrets, raw adapter errors,
-cursor tokens, or artifact IDs. This milestone qualifies the fixture and evidence
-checks. Live policy changes, restore, and release-binary qualification require
-separate scenarios.
+Application rejections are observations. Adapter errors, cancellation, missing
+observations, and unsupported evidence fail with `ErrIncomplete`. Policy or
+state mismatches fail with `ErrViolation`. Diagnostics identify the probe
+phase and omit fixture secrets, raw adapter errors, cursor tokens, and artifact
+IDs.
+
+The Go unit and race tests qualify the fixture and its evidence checks against
+a deterministic in-memory target. Live shared-deployment qualification requires
+observers backed by that deployment and separate scenarios for policy changes,
+restore, and release qualification.

@@ -5,6 +5,7 @@ package streampolicy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -120,8 +121,27 @@ type ExportObserver interface {
 	FetchExport(context.Context, Target, string) (Artifact, error)
 }
 
+// ExportState is the complete inventory of published fixture artifacts and the
+// number of in-flight or staged exports. Each value is the SHA-256 of the
+// original artifact bytes, including its authenticated manifest.
+type ExportState struct {
+	Complete  bool
+	Artifacts map[string][sha256.Size]byte
+	Pending   int
+}
+
+// ExportStateObserver independently inventories the target's export state.
+// The Export adapter must also implement this interface. The runner calls it
+// only when no requests are in flight.
+type ExportStateObserver interface {
+	ObserveExportState(context.Context) (ExportState, error)
+}
+
 // Adapters must share one fresh, exclusively owned ReferenceFixture target.
-// Calls are serial. Adapters honor context through I/O and cleanup, return
+// Query, Ingest and FetchExport or CreateExport may run concurrently on that
+// target, including concurrent calls to the same observer. Restarts and export
+// inventories run after requests drain. Adapters honor context through I/O and
+// cleanup, return
 // errors for unsupported observations, and bound observations before reading
 // them into memory. Returned observations must remain stable through Run.
 // The caller owns the target lifecycle.

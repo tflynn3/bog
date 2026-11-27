@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // syntheticTarget models a disposable target over serialized committed frames.
 // Query state is rebuilt on restart instead of preserving its in-memory index.
 type syntheticTarget struct {
+	mu        sync.Mutex
 	fixture   Fixture
 	committed []byte
 	frames    []syntheticFrame
@@ -68,6 +70,8 @@ func response(status int, body string) Response {
 func forbiddenResponse() Response { return response(http.StatusForbidden, "forbidden\n") }
 
 func (s *syntheticTarget) Ingest(_ context.Context, request IngestRequest) (Response, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	stream, ok := s.authorize(request.Target, func(g Grant) bool { return g.Ingest })
 	if !ok {
 		return forbiddenResponse(), nil
@@ -141,6 +145,8 @@ func (s *syntheticTarget) records() []Record {
 }
 
 func (s *syntheticTarget) Query(_ context.Context, request QueryRequest) (Page, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	stream, ok := s.authorize(request.Target, func(g Grant) bool { return g.Query })
 	if !ok {
 		return Page{Response: forbiddenResponse()}, nil
@@ -181,6 +187,8 @@ func (s *syntheticTarget) Query(_ context.Context, request QueryRequest) (Page, 
 }
 
 func (s *syntheticTarget) RestartAndReplay(context.Context) (Committed, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var recovered []syntheticFrame
 	err := decodeFixture(bytes.NewReader(s.committed), func(frame syntheticFrame) error {
 		recovered = append(recovered, frame)
@@ -200,6 +208,8 @@ type syntheticImage struct {
 }
 
 func (s *syntheticTarget) CreateExport(_ context.Context, target Target) (ExportStart, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	stream, ok := s.authorize(target, func(g Grant) bool { return g.Export })
 	if !ok {
 		return ExportStart{Response: forbiddenResponse()}, nil
@@ -225,6 +235,8 @@ func (s *syntheticTarget) CreateExport(_ context.Context, target Target) (Export
 }
 
 func (s *syntheticTarget) FetchExport(_ context.Context, target Target, id string) (Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	stream, ok := s.authorize(target, func(g Grant) bool { return g.Export })
 	data, found := s.artifacts[id]
 	if !ok || !found {
@@ -252,6 +264,16 @@ func (s *syntheticTarget) FetchExport(_ context.Context, target Target, id strin
 		Response: response(http.StatusOK, ""), Verified: true, Bytes: bytes.Clone(data),
 		Records: image.Records, Manifest: image.Manifest,
 	}, nil
+}
+
+func (s *syntheticTarget) ObserveExportState(context.Context) (ExportState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := ExportState{Complete: true, Artifacts: make(map[string][sha256.Size]byte, len(s.artifacts))}
+	for id, data := range s.artifacts {
+		state.Artifacts[id] = sha256.Sum256(data)
+	}
+	return state, nil
 }
 
 func fixtureTag(data []byte) ([]byte, error) {

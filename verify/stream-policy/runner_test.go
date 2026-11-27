@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -42,11 +43,15 @@ type observedTarget struct {
 	query  func(QueryRequest, *Page) error
 	ingest func(IngestRequest, *Response)
 	replay func(*Committed)
+	state  func(*ExportState)
+	mu     sync.Mutex
 	create func(Target, *ExportStart)
 	fetch  func(Target, string, *Artifact)
 }
 
 func (o *observedTarget) Query(ctx context.Context, request QueryRequest) (Page, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	got, err := o.syntheticTarget.Query(ctx, request)
 	if err == nil && o.query != nil {
 		err = o.query(request, &got)
@@ -55,6 +60,8 @@ func (o *observedTarget) Query(ctx context.Context, request QueryRequest) (Page,
 }
 
 func (o *observedTarget) Ingest(ctx context.Context, request IngestRequest) (Response, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	got, err := o.syntheticTarget.Ingest(ctx, request)
 	if err == nil && o.ingest != nil {
 		o.ingest(request, &got)
@@ -63,6 +70,8 @@ func (o *observedTarget) Ingest(ctx context.Context, request IngestRequest) (Res
 }
 
 func (o *observedTarget) RestartAndReplay(ctx context.Context) (Committed, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	got, err := o.syntheticTarget.RestartAndReplay(ctx)
 	if err == nil && o.replay != nil {
 		o.replay(&got)
@@ -71,6 +80,8 @@ func (o *observedTarget) RestartAndReplay(ctx context.Context) (Committed, error
 }
 
 func (o *observedTarget) CreateExport(ctx context.Context, target Target) (ExportStart, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	got, err := o.syntheticTarget.CreateExport(ctx, target)
 	if err == nil && o.create != nil {
 		o.create(target, &got)
@@ -79,11 +90,23 @@ func (o *observedTarget) CreateExport(ctx context.Context, target Target) (Expor
 }
 
 func (o *observedTarget) FetchExport(ctx context.Context, target Target, id string) (Artifact, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	got, err := o.syntheticTarget.FetchExport(ctx, target, id)
 	if err == nil && o.fetch != nil {
 		o.fetch(target, id, &got)
 	}
 	return got, err
+}
+
+func (o *observedTarget) ObserveExportState(ctx context.Context) (ExportState, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	state, err := o.syntheticTarget.ObserveExportState(ctx)
+	if err == nil && o.state != nil {
+		o.state(&state)
+	}
+	return state, err
 }
 
 func TestRejectionAndPositiveControls(t *testing.T) {

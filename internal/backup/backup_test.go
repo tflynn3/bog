@@ -322,7 +322,7 @@ func TestBadBundlesAndRestoreRetry(t *testing.T) {
 			little.PutUint32(block[36:40], crc32.Checksum(block[44:], crcTable))
 			little.PutUint32(block[40:44], crc32.Checksum(block[:40], crcTable))
 			must(t, os.WriteFile(p, block, 0600))
-			m, err := readManifest(f.manifest, f.point)
+			m, err := readManifest(f.manifest, f.point, false)
 			must(t, err)
 			m.Segments[1].SHA256 = digest(block)
 			manifest, id := manifestEnvelope(t, m)

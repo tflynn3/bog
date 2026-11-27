@@ -94,3 +94,36 @@ recently decoded frame. Both passes use bounded single-frame decoding. The
 result holds at most `limit` row bodies, and tail lookahead uses the matching
 key alone. The tail scan and cursor walk repeat for each continuation.
 Whole-frame replay can also be used independently of queries.
+
+# Backup bundle version 2
+
+`ExportRecoveryView` consumes a caller-pinned recovery view and publishes
+the same directory layout using v2 metadata. The bundle carries the exact
+captured manifest envelope, which can encode either a v1 or a v2
+generation. The tail file is still the exact suffix at physical offset
+zero. The exporter checks the declared suffix byte ceiling before opening
+readers and verifies that the suffix ends at the captured byte and ordinal
+bounds.
+
+| Byte range | Field |
+| --- | --- |
+| `[0,8)` | ASCII `BOGBAK02` |
+| `[8,40)` | Manifest payload SHA-256 |
+| `[40,48)` | Checkpoint covered logical offset |
+| `[48,56)` | Checkpoint next append ordinal |
+| `[56,64)` | Committed logical end |
+| `[64,72)` | Committed first free ordinal |
+| `[72,104)` | SHA-256 of the entire bundled suffix |
+| `[104,136)` | SHA-256 of the preceding 104 metadata bytes |
+
+The integer encoding and logical coordinates are unchanged from v1.
+Verification matches the manifest boundary and digest to metadata and
+checks the committed ordinal against frame replay. An empty suffix has
+equal covered and committed bounds and the SHA-256 of the empty string.
+The bundle carries no writable tail identity or epoch.
+
+Verify, Restore, and the offline query readers accept both versions.
+`VerifyPinnedRecovery` returns the complete point and a verified logical
+offset reader for either version. For v1 it derives the committed ordinal
+by replay. Its admission hook runs before any suffix reads. Both versions
+share the destination-scoped staging protocol and its recovery semantics.

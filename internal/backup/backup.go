@@ -54,33 +54,18 @@ func exportBackup(ctx context.Context, snapshot Snapshot, destination string, pu
 		if err != nil {
 			return fmt.Errorf("read captured manifest: %w", err)
 		}
-		m, err := readManifest(b, p)
+		m, err := readManifest(b, p, false)
 		if err != nil {
 			return err
 		}
-		if err := writeBytes(stage, manifestName, b); err != nil {
-			return err
-		}
-		for _, s := range m.Segments {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			r, err := snapshot.OpenSegment(s.Name)
-			if err != nil {
-				return fmt.Errorf("open captured segment %s: %w", s.Name, err)
-			}
-			if err := copyFile(ctx, stage, s.Name, r, s.Size); err != nil {
-				return err
-			}
-		}
-		if _, err := validateSegments(ctx, stage, m); err != nil {
+		if err := stageGeneration(ctx, stage, snapshot, b, m); err != nil {
 			return err
 		}
 		tailSum, err := exportWAL(ctx, snapshot, stage, p, m.SourceSHA256)
 		if err != nil {
 			return err
 		}
-		return writeBytes(stage, metadataName, (metadata{p, tailSum}).encode())
+		return writeBytes(stage, metadataName, (metadata{Point: p, tailSum: tailSum}).encode())
 	})
 }
 
@@ -118,6 +103,7 @@ func exportWAL(ctx context.Context, snapshot Snapshot, stage *os.Root, p Point, 
 type image struct {
 	metadata
 	manifest
+	recoveredOrdinal uint64
 }
 
 func inspect(root *os.Root) (image, error) {
@@ -126,7 +112,7 @@ func inspect(root *os.Root) (image, error) {
 	if err != nil {
 		return img, err
 	}
-	b, err := readLimited(f, metadataSize)
+	b, err := readLimited(f, metadataSizeV2)
 	if err != nil {
 		return img, err
 	}
@@ -142,7 +128,7 @@ func inspect(root *os.Root) (image, error) {
 	if err != nil {
 		return img, err
 	}
-	img.manifest, err = readManifest(b, img.Point)
+	img.manifest, err = readManifest(b, img.Point, img.v2)
 	if err != nil {
 		return img, err
 	}
@@ -200,11 +186,12 @@ func restoreBackup(ctx context.Context, bundle, destination string, publish publ
 		if err != nil {
 			return err
 		}
+		metadataBytes := int64(len(img.metadata.encode()))
 		files := []struct {
 			name     string
 			min, max int64
 		}{
-			{metadataName, metadataSize, metadataSize},
+			{metadataName, metadataBytes, metadataBytes},
 			{manifestName, 1, manifestLimit},
 			{tailName, img.tailSize(), img.tailSize()},
 		}
@@ -264,7 +251,8 @@ func verifyPinnedImage(ctx context.Context, root *os.Root, checkReplay func(star
 	if err != nil {
 		return image{}, nil, nil, err
 	}
-	if err := scanTail(ctx, tail, img.metadata, nil); err != nil {
+	img.recoveredOrdinal, err = verifySuffix(ctx, tail, img.metadata, nil)
+	if err != nil {
 		return image{}, nil, nil, errors.Join(err, tail.Close())
 	}
 	return img, bounds, tail, nil
@@ -329,12 +317,23 @@ func readTail(ctx context.Context, root *os.Root, m metadata, visit walFrameVisi
 }
 
 func scanTail(ctx context.Context, f *os.File, m metadata, visit walFrameVisitor) error {
-	hash := sha256.New()
-	_, err := walkWAL(ctx, io.TeeReader(f, hash), m.Point.CoveredOffset, m.CommittedEnd, m.Point.NextOrdinal, visit)
-	if err == nil && [32]byte(hash.Sum(nil)) != m.tailSum {
-		return corrupt("WAL tail digest mismatch")
-	}
+	_, err := verifySuffix(ctx, f, m, visit)
 	return err
+}
+
+func verifySuffix(ctx context.Context, r io.Reader, m metadata, visit walFrameVisitor) (uint64, error) {
+	hash := sha256.New()
+	next, err := walkWAL(ctx, io.TeeReader(r, hash), m.CoveredOffset, m.CommittedEnd, m.NextOrdinal, visit)
+	if err != nil {
+		return 0, err
+	}
+	if [32]byte(hash.Sum(nil)) != m.tailSum {
+		return 0, corrupt("WAL tail digest mismatch")
+	}
+	if m.v2 && next != m.committedOrdinal {
+		return 0, corrupt("WAL tail committed ordinal mismatch")
+	}
+	return next, nil
 }
 
 func openRegular(root *os.Root, name string) (*os.File, int64, error) {
@@ -407,7 +406,11 @@ func (r contextReader) Read(b []byte) (int, error) {
 	if err := r.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return r.Reader.Read(b)
+	n, err := r.Reader.Read(b)
+	if len(b) > 0 && n == 0 && err == nil {
+		return 0, io.ErrNoProgress
+	}
+	return n, err
 }
 
 func writeBytes(root *os.Root, name string, b []byte) error {

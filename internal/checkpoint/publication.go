@@ -55,6 +55,7 @@ type publicationAttempt struct {
 	files      []stagedBlock
 	scratch    []byte
 	installing bool
+	manifest   *ownedSegment
 }
 
 type publication struct {
@@ -65,6 +66,7 @@ type publication struct {
 	segmentDirSync  func() error
 	manifestRename  func(string, string) error
 	manifestDirSync func() error
+	cleanupContext  context.Context
 }
 
 // PublishCaptured extends a validated checkpoint with whole committed frames.
@@ -254,7 +256,12 @@ func newManifest(end int64, sum string) *Manifest {
 	return &Manifest{Version: 1, CoveredOffset: end, SourceSHA256: sum, Segments: []segmentMeta{}}
 }
 
-func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, scan func(func(uint64, []store.Row) error) error) (published *Manifest, err error) {
+func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, scan func(func(uint64, []store.Row) error) error) (*Manifest, error) {
+	return p.publishGeneration(ctx, m, next, scan, nil)
+}
+
+func (p *publication) publishGeneration(ctx context.Context, m *Manifest, next *uint64, scan func(func(uint64, []store.Row) error) error, selectGeneration func([32]byte) error) (published *Manifest, err error) {
+	p.cleanupContext = ctx
 	if err := p.root.Mkdir(stageDir, 0700); err != nil {
 		return nil, err
 	}
@@ -300,7 +307,12 @@ func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, sc
 	if len(b) > maxManifestSize {
 		return nil, errors.New("manifest too large")
 	}
-	if err := a.writeNew(stagedManifest, b); err != nil {
+	id := sha256.Sum256(payload)
+	if selectGeneration == nil {
+		if err := a.writeNew(stagedManifest, b); err != nil {
+			return nil, err
+		}
+	} else if err := a.stageGeneration(id, b); err != nil {
 		return nil, err
 	}
 	if err := a.install(); err != nil {
@@ -308,6 +320,17 @@ func (p *publication) publish(ctx context.Context, m *Manifest, next *uint64, sc
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if selectGeneration != nil {
+		if err := p.validateInstalledGeneration(ctx, id); err != nil {
+			return nil, err
+		}
+		manifestPending = true
+		if err := selectGeneration(id); err != nil {
+			return nil, fmt.Errorf("%w: select checkpoint generation: %w", ErrPublicationUncertain, err)
+		}
+		manifestPending = false
+		return m, nil
 	}
 	rename := p.root.Rename
 	if p.manifestRename != nil {

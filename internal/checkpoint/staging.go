@@ -13,14 +13,16 @@ import (
 type stagingStep string
 
 const (
-	writeSuccessor  stagingStep = "write staged successor"
-	syncSuccessor   stagingStep = "sync staged successor"
-	closeSuccessor  stagingStep = "close staged successor"
-	syncOverlap     stagingStep = "sync staged overlap"
-	unlinkPrior     stagingStep = "unlink staged predecessor"
-	syncRetirement  stagingStep = "sync staged retirement"
-	linkFinal       stagingStep = "link final segment"
-	unlinkStageLink stagingStep = "unlink installed staging link"
+	writeSuccessor   stagingStep = "write staged successor"
+	syncSuccessor    stagingStep = "sync staged successor"
+	closeSuccessor   stagingStep = "close staged successor"
+	syncOverlap      stagingStep = "sync staged overlap"
+	unlinkPrior      stagingStep = "unlink staged predecessor"
+	syncRetirement   stagingStep = "sync staged retirement"
+	linkFinal        stagingStep = "link final segment"
+	unlinkStageLink  stagingStep = "unlink installed staging link"
+	removeFinal      stagingStep = "remove losing final file"
+	removeStageEntry stagingStep = "remove staging file"
 )
 
 // Fault injection is scoped to a single attempt. Production contexts carry
@@ -177,16 +179,20 @@ func (p *publication) stagingNames(dir *os.File, intent publicationIntent) ([]st
 		return nil, fmt.Errorf("%w: conflicting staging intent names", ErrIntegrity)
 	}
 	installed := make(map[string]ownedSegment, len(intent.Segments))
-	for _, file := range intent.Segments {
+	for _, file := range intent.files() {
 		installed[file.Name] = file
 	}
-	segments := 0
+	segments, generations := 0, 0
 	for _, name := range names {
 		segment := validSegmentName(name)
+		generation := validGenerationName(name)
 		if segment {
 			segments++
 		}
-		if !segment && name != intentBase && name != "intent" && name != "manifest" {
+		if generation {
+			generations++
+		}
+		if !segment && !generation && name != intentBase && name != "intent" && name != "manifest" {
 			return nil, fmt.Errorf("%w: unexpected staging file %q", ErrIntegrity, name)
 		}
 		info, err := p.root.Lstat(stageDir + "/" + name)
@@ -198,7 +204,7 @@ func (p *publication) stagingNames(dir *os.File, intent publicationIntent) ([]st
 		}
 		st := info.Sys().(*syscall.Stat_t)
 		file, recorded := installed[name]
-		if hasIntent && segment && (!recorded || file.Inode != st.Ino || file.Size != info.Size()) {
+		if hasIntent && (segment || generation) && (!recorded || file.Inode != st.Ino || file.Size != info.Size()) {
 			return nil, fmt.Errorf("%w: unrecorded staged segment %q", ErrIntegrity, name)
 		}
 		if st.Nlink == 1 {
@@ -216,6 +222,9 @@ func (p *publication) stagingNames(dir *os.File, intent publicationIntent) ([]st
 		if !os.SameFile(info, final) {
 			return nil, fmt.Errorf("%w: unowned staging link %q", ErrIntegrity, name)
 		}
+	}
+	if generations > 1 || generations == 1 && slices.Contains(names, "manifest") {
+		return nil, fmt.Errorf("%w: conflicting staged manifests", ErrIntegrity)
 	}
 	if segments > MaxSegments && (segments != MaxSegments+1 || segments != len(names)) {
 		return nil, fmt.Errorf("%w: staged segment limit exceeded outside replacement", ErrIntegrity)
@@ -258,6 +267,9 @@ func (p *publication) clearStaging() error {
 func (p *publication) removeStaging(names []string) error {
 	for _, name := range names {
 		if name != intentBase {
+			if err := p.cleanupFault(removeStageEntry); err != nil {
+				return err
+			}
 			if err := p.root.Remove(stageDir + "/" + name); err != nil {
 				return err
 			}
@@ -268,8 +280,18 @@ func (p *publication) removeStaging(names []string) error {
 	if err := p.syncStaging(); err != nil {
 		return err
 	}
+	if err := p.cleanupFault(removeStageEntry); err != nil {
+		return err
+	}
 	if err := p.root.Remove(intentName); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return p.removeEmptyStaging()
+}
+
+func (p *publication) cleanupFault(step stagingStep) error {
+	if p.cleanupContext == nil {
+		return nil
+	}
+	return stagingFault(p.cleanupContext, step)
 }

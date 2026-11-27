@@ -59,6 +59,11 @@ func (b *Budget) ReplayCapturedTail(ctx context.Context, input io.ReaderAt, star
 // scanCapturedFrames reads an owner-pinned suffix at absolute WAL offsets.
 // It never reads the omitted prefix of a restored WAL.
 func scanCapturedFrames(ctx context.Context, input io.ReaderAt, pos, end int64, ordinal uint64, visit func(int64, int64, uint64, []store.Row) error) error {
+	return scanFrames(ctx, io.NewSectionReader(input, pos, end-pos), pos, end, ordinal, visit)
+}
+
+// scanFrames reads sequentially from the start of the declared logical range.
+func scanFrames(ctx context.Context, input io.Reader, pos, end int64, ordinal uint64, visit func(int64, int64, uint64, []store.Row) error) error {
 	var header [16]byte
 	var payload []byte
 	for pos < end {
@@ -68,8 +73,7 @@ func scanCapturedFrames(ctx context.Context, input io.ReaderAt, pos, end int64, 
 		if end-pos < int64(len(header)) {
 			return fmt.Errorf("%w: incomplete committed frame at %d", ErrIntegrity, pos)
 		}
-		frame := io.NewSectionReader(input, pos, end-pos)
-		if _, err := io.ReadFull(frame, header[:]); err != nil {
+		if _, err := io.ReadFull(input, header[:]); err != nil {
 			return fmt.Errorf("read committed frame header at %d: %w", pos, err)
 		}
 		n := binary.LittleEndian.Uint32(header[:4])
@@ -84,7 +88,7 @@ func scanCapturedFrames(ctx context.Context, input io.ReaderAt, pos, end int64, 
 			payload = make([]byte, n)
 		}
 		payload = payload[:n]
-		if _, err := io.ReadFull(frame, payload); err != nil {
+		if _, err := io.ReadFull(input, payload); err != nil {
 			return fmt.Errorf("read committed frame at %d: %w", pos, err)
 		}
 		if crc32.Checksum(payload, castagnoli) != binary.LittleEndian.Uint32(header[8:12]) {

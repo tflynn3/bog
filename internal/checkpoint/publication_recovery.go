@@ -29,6 +29,7 @@ type ownedSegment struct {
 type publicationIntent struct {
 	HadManifest bool
 	Segments    []ownedSegment
+	Generation  *ownedSegment `json:",omitempty"`
 }
 
 func (a *publicationAttempt) recordIntent() error {
@@ -37,7 +38,8 @@ func (a *publicationAttempt) recordIntent() error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	intent := publicationIntent{Segments: a.ownedFiles()}
+	files := a.ownedFiles()
+	intent := publicationIntent{Segments: files[:len(a.files)], Generation: a.manifest}
 	if previous != nil {
 		intent.HadManifest = previous.Mode().IsRegular()
 	}
@@ -71,7 +73,7 @@ func (a *publicationAttempt) install() error {
 		return err
 	}
 	a.installing = true
-	for _, file := range a.files {
+	for _, file := range a.ownedFiles() {
 		path := stageDir + "/" + file.Name
 		if err := stagingFault(a.ctx, linkFinal); err != nil {
 			return err
@@ -168,7 +170,7 @@ func (p *publication) resolve(load func() (*Manifest, error)) error {
 		return fmt.Errorf("sync checkpoint directory: %w", err)
 	}
 	if info != nil {
-		if err := p.recoverStaging(info, m); err != nil {
+		if err := p.recoverStaging(info, m, ""); err != nil {
 			return err
 		}
 	}
@@ -178,13 +180,29 @@ func (p *publication) resolve(load func() (*Manifest, error)) error {
 	return nil
 }
 
-func (p *publication) recoverStaging(info os.FileInfo, m *Manifest) error {
+func (p *publication) recoverStaging(info os.FileInfo, m *Manifest, generationName string) error {
 	if info.Mode().Perm() != 0700 {
 		return p.removeEmptyStaging()
 	}
 	names, intent, err := p.inspectStaging()
 	if err != nil {
 		return err
+	}
+	if intent.Generation != nil && generationName == "" {
+		return fmt.Errorf("%w: recovery view required for pending generation", ErrPublicationUncertain)
+	}
+	if intent.Generation != nil && intent.Generation.Name == generationName {
+		b, err := readPublicationFile(p.dir, generationName, maxManifestSize)
+		if err != nil {
+			return err
+		}
+		_, id, err := DecodeManifest(b)
+		if err != nil {
+			return err
+		}
+		if GenerationManifestName(id) != generationName || digest(b) != intent.Generation.SHA256 {
+			return fmt.Errorf("%w: selected manifest does not match publication intent", ErrIntegrity)
+		}
 	}
 	if m == nil && intent.HadManifest {
 		return fmt.Errorf("%w: previous authoritative manifest is missing", ErrIntegrity)
@@ -195,7 +213,8 @@ func (p *publication) recoverStaging(info os.FileInfo, m *Manifest) error {
 			reachable[s.Name] = true
 		}
 	}
-	if err := p.removeOwned(intent.Segments, reachable); err != nil {
+	reachable[generationName] = true
+	if err := p.removeOwned(intent.files(), reachable); err != nil {
 		return err
 	}
 	return p.removeStaging(names)
@@ -257,7 +276,19 @@ func readIntent(stage *os.File) (publicationIntent, error) {
 		}
 		seen[file.Name] = true
 	}
+	if file := intent.Generation; file != nil &&
+		(!validGenerationName(file.Name) || file.Inode == 0 || file.Size <= 0 ||
+			file.Size > maxManifestSize || !lowercaseDigest(file.SHA256)) {
+		return publicationIntent{}, fmt.Errorf("%w: invalid publication generation entry", ErrIntegrity)
+	}
 	return intent, nil
+}
+
+func (i publicationIntent) files() []ownedSegment {
+	if i.Generation == nil {
+		return i.Segments
+	}
+	return append(i.Segments, *i.Generation)
 }
 
 func (p *publication) removeOwned(files []ownedSegment, reachable map[string]bool) error {
@@ -274,14 +305,18 @@ func (p *publication) removeOwned(files []ownedSegment, reachable map[string]boo
 			abandoned = append(abandoned, file.Name)
 		}
 	}
-	var err error
 	for _, name := range abandoned {
-		err = errors.Join(err, p.root.Remove(name))
+		if err := p.cleanupFault(removeFinal); err != nil {
+			return err
+		}
+		if err := p.root.Remove(name); err != nil {
+			return err
+		}
 	}
 	if len(files) > 0 {
-		err = errors.Join(err, p.dir.Sync())
+		return p.dir.Sync()
 	}
-	return err
+	return nil
 }
 
 // Match the recorded inode and content in the pinned directory. A crash

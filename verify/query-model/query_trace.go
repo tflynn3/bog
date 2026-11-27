@@ -12,17 +12,18 @@ import (
 // trace. Acknowledge and Fetch use the existing wire contracts. A retained
 // fixture supplies Publish, which must observe activation at the exact
 // acknowledged cutoff before returning. VerifyQueryCosts publishes the seed
-// once. VerifyQueryTrace also publishes after the first backfill while the
-// opening cursor is held.
+// in each trial. Both verifiers can publish after the first backfill while
+// the opening cursor is held.
 type QueryTraceAdapter struct {
 	Acknowledge AcknowledgeBatch
 	Fetch       FetchWirePage
 	Publish     func(ctx context.Context, cutoff int) error
 
-	// ObserveScanBytes optionally reports a trial-local scan measurement for
-	// VerifyQueryCosts. The trial samples it after the accepted walk and
-	// before replay. Count only query scan input from the walk's requests.
-	ObserveScanBytes func(context.Context) (QueryScanBytes, error)
+	// FetchObserved optionally replaces Fetch for cost-walk pages. It must
+	// fetch the same wire page and return counters from that exact request.
+	// Fetch still supplies the terminal replay. Missing counters are reported
+	// as unavailable; the budget and wire byte count cannot stand in for them.
+	FetchObserved func(context.Context, WireRequest) (WirePage, QueryScanObservation, error)
 
 	// Lifecycle is optional. If supplied, the runner exercises the complete
 	// lifecycle at the configured maximum work budget.
@@ -224,16 +225,8 @@ func runQueryTrace(ctx context.Context, cfg QueryTraceConfig, walk WireWalk, dat
 		}
 		return page, err
 	}, func(ctx context.Context, _ string) error {
-		if err := acknowledgeTraceBatches(ctx, &log, adapter.Acknowledge, data.later[:1]); err != nil {
-			return fmt.Errorf("first backfill: %w", err)
-		}
-		if err := publishTraceCutoff(ctx, adapter.Publish, log.HighWater()); err != nil {
-			return fmt.Errorf("replacement: %w", err)
-		}
-		if err := acknowledgeTraceBatches(ctx, &log, adapter.Acknowledge, data.later[1:]); err != nil {
-			return fmt.Errorf("tail backfill: %w", err)
-		}
-		return nil
+		_, err := backfillQueryCapture(ctx, &log, data.later, adapter)
+		return err
 	})
 	if openingRejection != nil && errors.Is(err, openingRejection) && ctx.Err() == nil {
 		return true, held, nil
@@ -290,6 +283,23 @@ func runQueryTrace(ctx context.Context, cfg QueryTraceConfig, walk WireWalk, dat
 		return false, held, fmt.Errorf("restarted walk: %w", err)
 	}
 	return false, held, nil
+}
+
+func backfillQueryCapture(ctx context.Context, log *Log, later [][]Row, adapter QueryTraceAdapter) (int, error) {
+	if err := acknowledgeTraceBatches(ctx, log, adapter.Acknowledge, later[:1]); err != nil {
+		return 0, fmt.Errorf("first backfill: %w", err)
+	}
+	cutoff := log.HighWater()
+	if err := publishTraceCutoff(ctx, adapter.Publish, cutoff); err != nil {
+		return 0, fmt.Errorf("replacement: %w", err)
+	}
+	if err := acknowledgeTraceBatches(ctx, log, adapter.Acknowledge, later[1:]); err != nil {
+		return 0, fmt.Errorf("tail backfill: %w", err)
+	}
+	if adapter.Publish == nil {
+		return 0, nil
+	}
+	return cutoff, nil
 }
 
 func acknowledgeTraceBatches(ctx context.Context, log *Log, acknowledge AcknowledgeBatch, batches [][]Row) error {

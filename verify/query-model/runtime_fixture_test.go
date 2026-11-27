@@ -56,13 +56,15 @@ func TestSeededQueryTraceBothPageSources(t *testing.T) {
 }
 
 type fixtureGeneration struct {
-	store  *store.Store
-	serial int
+	store     *store.Store
+	serial    int
+	scanIndex []store.PositionedRow
 }
 
 type fixtureCapture struct {
 	generation int
 	view       *store.PositionedSnapshot
+	scanIndex  []store.PositionedRow
 }
 
 // runtimeQueryFixture owns acknowledgement, activation and acquisition under
@@ -75,6 +77,7 @@ type runtimeQueryFixture struct {
 	budget      int
 	concurrency int
 	demand      *queryDemandMeter
+	meterScans  bool
 	journal     [][]byte
 	checkpoint  []store.Row // decoded prefix for the tail-only replacement fixture
 	covered     int
@@ -101,6 +104,9 @@ func (f *runtimeQueryFixture) Append(body []byte, rows []store.Row) error {
 	}
 	f.journal = append(f.journal, append([]byte(nil), body...))
 	f.active.store.Publish(rows)
+	if f.meterScans {
+		f.active.scanIndex = indexFixtureScanRows(f.active.scanIndex, rows)
+	}
 	return nil
 }
 
@@ -108,13 +114,15 @@ func (f *runtimeQueryFixture) Page(ctx context.Context, req httpapi.PageRequest,
 	if !req.Snapshot {
 		return httpapi.PageResult{}, errors.New("fixture expects a snapshot request")
 	}
-	if err := work.Charge(1); err != nil {
-		return httpapi.PageResult{}, err
+	if !f.meterScans {
+		if err := work.Charge(1); err != nil {
+			return httpapi.PageResult{}, err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return httpapi.PageResult{}, err
 	}
-	rows, more, id, err := f.scanPage(req, work)
+	rows, more, id, err := f.scanPage(ctx, req, work)
 	if err != nil {
 		return httpapi.PageResult{}, err
 	}
@@ -136,7 +144,7 @@ func (f *runtimeQueryFixture) Page(ctx context.Context, req httpapi.PageRequest,
 	return result, nil
 }
 
-func (f *runtimeQueryFixture) scanPage(req httpapi.PageRequest, work *store.QueryWork) ([]store.PositionedRow, bool, string, error) {
+func (f *runtimeQueryFixture) scanPage(ctx context.Context, req httpapi.PageRequest, work *store.QueryWork) ([]store.PositionedRow, bool, string, error) {
 	id := req.Capture
 	capture, err := f.captureView(id)
 	if err != nil {
@@ -152,11 +160,21 @@ func (f *runtimeQueryFixture) scanPage(req httpapi.PageRequest, work *store.Quer
 		}
 		after = &store.TailPosition{Time: t, Ordinal: i}
 	}
-	rows, more, err := capture.view.Page(req.Filter.Start, req.Filter.End, req.Filter.Contains, req.Limit, 0, after, work)
-	if err != nil {
-		return nil, false, "", err
+	var rows []store.PositionedRow
+	var more bool
+	if f.meterScans {
+		meter, ok := ctx.Value(fixtureScanMeterKey{}).(*fixtureScanMeter)
+		if !ok {
+			return nil, false, "", errors.New("missing fixture scan meter")
+		}
+		rows, more, err = meter.page(capture.scanIndex, req, after, work)
+	} else {
+		rows, more, err = capture.view.Page(req.Filter.Start, req.Filter.End, req.Filter.Contains, req.Limit, 0, after, work)
+		if err == nil {
+			err = work.Charge(uint64(len(rows)))
+		}
 	}
-	if err := work.Charge(uint64(len(rows))); err != nil {
+	if err != nil {
 		return nil, false, "", err
 	}
 	if id == "" {
@@ -176,7 +194,11 @@ func (f *runtimeQueryFixture) captureView(id string) (fixtureCapture, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if id == "" {
-		return fixtureCapture{f.active.serial, f.active.store.CapturePositionedSnapshot()}, nil
+		capture := fixtureCapture{generation: f.active.serial, scanIndex: f.active.scanIndex}
+		if !f.meterScans {
+			capture.view = f.active.store.CapturePositionedSnapshot()
+		}
+		return capture, nil
 	}
 	capture, ok := f.captures[id]
 	if !ok {
@@ -210,9 +232,17 @@ func (f *runtimeQueryFixture) startIssuer() {
 
 func (f *runtimeQueryFixture) start() error {
 	f.startIssuer()
-	f.server = httptest.NewServer(f.handler)
+	handler := f.handler
+	if f.meterScans {
+		handler = instrumentFixtureScans(handler, uint64(f.budget))
+	}
+	f.server = httptest.NewServer(handler)
+	var transport http.RoundTripper = f.server.Client().Transport
+	if f.meterScans {
+		transport = fixtureScanTransport{transport}
+	}
 	var err error
-	f.client, f.fetch, err = newWitnessClient(f.server.URL, f.server.Client().Transport, 256)
+	f.client, f.fetch, err = newWitnessClient(f.server.URL, transport, 256)
 	return err
 }
 
@@ -242,13 +272,27 @@ func (f *runtimeQueryFixture) closeIssuer() error {
 	return err
 }
 
-func (f *runtimeQueryFixture) replay(ctx context.Context) (*store.Store, model.QueryRecovery, error) {
-	return replayFixtureJournal(ctx, f.checkpoint, f.journal)
+func (f *runtimeQueryFixture) replay(ctx context.Context, checkpoint []store.Row, journal [][]byte) (fixtureGeneration, model.QueryRecovery, error) {
+	var generation fixtureGeneration
+	var input []store.Row
+	var collect func([]store.Row)
+	if f.meterScans {
+		collect = func(rows []store.Row) { input = append(input, rows...) }
+	}
+	s, stats, err := replayFixtureJournal(ctx, checkpoint, journal, collect)
+	if err == nil {
+		generation.store = s
+		generation.scanIndex = indexFixtureScanRows(nil, input)
+	}
+	return generation, stats, err
 }
 
-func replayFixtureJournal(ctx context.Context, checkpoint []store.Row, journal [][]byte) (*store.Store, model.QueryRecovery, error) {
+func replayFixtureJournal(ctx context.Context, checkpoint []store.Row, journal [][]byte, collect func([]store.Row)) (*store.Store, model.QueryRecovery, error) {
 	s := new(store.Store)
 	s.Publish(checkpoint)
+	if collect != nil {
+		collect(checkpoint)
+	}
 	stats := model.QueryRecovery{CommittedRows: len(checkpoint)}
 	for i, body := range journal {
 		if err := ctx.Err(); err != nil {
@@ -264,6 +308,9 @@ func replayFixtureJournal(ctx context.Context, checkpoint []store.Row, journal [
 		stats.PeakBytes = max(stats.PeakBytes, uint64(len(body)))
 		stats.CommittedRows += len(rows)
 		s.Publish(rows)
+		if collect != nil {
+			collect(rows)
+		}
 	}
 	return s, stats, ctx.Err()
 }
@@ -295,7 +342,7 @@ func (f *runtimeQueryFixture) activateTail(ctx context.Context, cutoff int) (mod
 		return model.ReplacementGeneration{}, fmt.Errorf("tail cutoff %d does not match a whole frame boundary", cutoff)
 	}
 	tail := slices.Clone(f.journal[consumed:])
-	s, stats, err := replayFixtureJournal(ctx, checkpoint, tail)
+	next, stats, err := f.replay(ctx, checkpoint, tail)
 	if err != nil {
 		return model.ReplacementGeneration{}, err
 	}
@@ -303,7 +350,8 @@ func (f *runtimeQueryFixture) activateTail(ctx context.Context, cutoff int) (mod
 		return model.ReplacementGeneration{}, fmt.Errorf("tail activation recovered %d committed rows, want %d", stats.CommittedRows, committed)
 	}
 	f.checkpoint, f.journal, f.covered = checkpoint, tail, cutoff
-	f.active = fixtureGeneration{s, f.active.serial + 1}
+	next.serial = f.active.serial + 1
+	f.active = next
 	return f.replacementPointLocked(), nil
 }
 
@@ -335,14 +383,15 @@ func (f *runtimeQueryFixture) publish(ctx context.Context, cutoff int) error {
 	if f.covered > 0 && len(f.captures) != 1 {
 		return fmt.Errorf("replacement needs one held capture, got %d", len(f.captures))
 	}
-	s, stats, err := f.replay(ctx)
+	next, stats, err := f.replay(ctx, f.checkpoint, f.journal)
 	if err != nil {
 		return err
 	}
 	if stats.CommittedRows != cutoff {
 		return fmt.Errorf("publication replay covered %d rows, want %d", stats.CommittedRows, cutoff)
 	}
-	f.active = fixtureGeneration{s, f.active.serial + 1}
+	next.serial = f.active.serial + 1
+	f.active = next
 	f.covered = cutoff
 	return nil
 }
@@ -371,11 +420,12 @@ func (f *runtimeQueryFixture) restart(ctx context.Context) (model.QueryRecovery,
 	if err := f.stop(); err != nil {
 		return model.QueryRecovery{}, err
 	}
-	s, stats, err := f.replay(ctx)
+	next, stats, err := f.replay(ctx, f.checkpoint, f.journal)
 	if err != nil {
 		return stats, err
 	}
-	f.active.store = s
+	next.serial = f.active.serial
+	f.active = next
 	return stats, f.start()
 }
 
@@ -403,6 +453,9 @@ func (f *runtimeQueryFixture) adapter() model.QueryTraceAdapter {
 	}
 	if f.retained {
 		adapter.Publish, adapter.Lifecycle.Retire = f.publish, f.retire
+	}
+	if f.meterScans {
+		adapter.FetchObserved = f.fetchObserved
 	}
 	return adapter
 }

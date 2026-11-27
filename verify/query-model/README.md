@@ -21,65 +21,91 @@ memory and retirement against the pinned Linux runtime.
 
 ## Comparable query costs
 
-`VerifyQueryCosts` uses the same launcher, adapter, and wire oracle as the
-seeded replay trace. Every budget probe starts with an empty issuer and
-acknowledges the same 112 rows in the same batches and order, including
-timestamp ties and exact duplicates. Retained trials publish at that exact
-cutoff before querying. The empty (absent literal), sparse (five matches), and
-broad (unfiltered) queries share the time range, row limit sequence of 4, 1,
-and 7, and the 256-byte response cap. Only the literal changes.
+`VerifyQueryCosts` uses the seeded trace launcher, production Go HTTP
+client in the fixtures and pinned checks, and the independent append-log
+oracle. Every budget probe starts with an empty issuer and acknowledges the
+same 112 rows in the same batches and order, including timestamp ties and
+exact duplicates. Retained trials publish at that exact cutoff before querying.
+The `empty` (absent literal), `sparse` (five matches for `needle [wire]`), and
+`broad` (110 matches for the dense `[all]` prefix) queries share the time range,
+the row limit sequence of 4, 1, and 7, and the 256-byte response cap.
 
-The search assumes monotonic opening refusal for an identical request on
+The search assumes monotonic opening refusal for the same request on
 equivalently seeded issuers. It requires a complete, framed HTTP 503 with
 the exact work-budget refusal body and no rows or cursor at the adjacent
-lower positive budget. At the issuing budget every page must match the
-ordered ledger through exhaustion. The terminal request must replay
-byte for byte at that same budget. For the empty walk the terminal request
-is the opening itself, so replay repeats the same opening and checks the
-explicitly framed empty body again.
+lower positive budget. At the issuing budget the ledger checks every page
+through exhaustion. The runner replays the terminal request and compares
+exact encoded bytes. The absent query ends on its opening page and the
+replay repeats the explicitly framed empty body. The two adjacent budgets
+are per-request configuration settings.
 
-The report gives the adjacent budget settings in work units, the number
-of rows returned, and the encoded NDJSON response bytes as separate values.
-Rows, pages, and bytes count the verified walk once and exclude the refusal
-and replay. The minimum issuing budget is a per-request configuration
-threshold for this workload. The query wire has no counter for actual
-charged work. An adapter with a direct scan meter can supply a byte count
-and its source just before replay. The report divides those bytes by
-returned rows for nonempty results and omits the ratio for an empty result.
-Candidate output marks both charged work and scanned bytes unavailable.
+Separate sparse and broad trials at the work ceiling keep the opening
+cursor while acknowledging a two-row backfill. The retained adapter waits
+for a successor at exactly 114 covered and committed rows. Both paths then
+acknowledge one more in-range row beyond that cutoff. The ledger checks
+the held walk against the original prefix and the fresh walk against all
+115 acknowledged rows. Both walks require byte-identical terminal replay.
 
-The portable race run for seed 2709 on macOS arm64 observed:
+Each `page_observations` entry records its ordinal, row limit, returned
+rows, and validated NDJSON body bytes, including the final newline. An
+optional `FetchObserved` adapter supplies scan input bytes and successful
+scan-work charges from that same request, with a source for each counter.
+The walk totals sum accepted pages through exhaustion. Refusal probes and
+terminal replay are outside these totals. Missing counters carry an
+`unavailable` reason at both page and walk scope. A measured zero remains
+a counter value. The scan-bytes-per-returned-row ratio requires complete
+byte observations and at least one returned row.
 
-| Query | Legacy refused / issuing work units | Retained fixture refused / issuing work units | Returned rows | Response bytes |
-| --- | ---: | ---: | ---: | ---: |
-| Empty | 1487 / 1488 | 1495 / 1496 | 0 | 0 |
-| Sparse | 1713 / 1714 | 3022 / 3023 | 5 | 413 |
-| Broad | 1492 / 1493 | 3776 / 3777 | 110 | 6173 |
+The instrumented retained fixture uses an immutable, timestamp- and
+append-ordinal-ordered input rebuilt from acknowledged rows on replacement.
+It counts the UTF-8 byte length of each line handed to literal matching,
+including nonmatches and lookahead. It counts repeated scan input again
+when the handler certifies the opening or re-scans on continuations.
+The bounded request-local meter counts successful charges for scan setup,
+seek, candidate visits, line matching, and rows collected. It passes each
+charge to the handler's work meter and observes only the PageSource side
+of that budget. The report's response bytes come from the bounded client
+read. Cursor work, response encoding and delivery charges, disk traffic,
+and on-disk encoded bytes fall outside the scan counters. These counters
+characterize the fixture's scanner and the HTTP serving pattern at that
+boundary. The legacy handler and pinned candidate expose wire evidence
+and budget thresholds, with both scan counters marked unavailable.
 
-The separate scripted HTTP fixture measured 6,487 bytes of encoded JSON
-row payload decoded during each capture. That yields 1,297.4 scanned bytes
-per sparse result row and about 58.97 per broad result row. Its work
-thresholds are scripted to test the verifier. The in-process handler trials
-and the pinned candidate trials report their own budget thresholds, and
-the scripted byte counts apply only to the scripted fixture.
+The Darwin arm64 race run for seed 2709 produced these seed-walk results.
+The retained held walks produced the same totals across replacement.
+
+| Query | Legacy refused / issuing units | Retained fixture refused / issuing units | Pages | Rows | NDJSON bytes | Fixture opening scan bytes / charged units | Fixture walk scan bytes / charged units |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Absent | 2147 / 2148 | 2140 / 2141 | 1 | 0 | 0 | 2,022 / 2,141 | 2,022 / 2,141 |
+| Rare | 2404 / 2405 | 3930 / 3931 | 3 | 5 | 443 | 3,423 / 3,637 | 6,871 / 7,309 |
+| Dense | 4191 / 4192 | 5142 / 5143 | 40 | 110 | 6,833 | 2,063 / 2,301 | 77,489 / 86,346 |
+
+At the 16,384-unit ceiling the retained fresh rare walk returned eight rows
+in four pages, with 665 NDJSON bytes, 8,237 scan bytes and 8,751 charged
+scan units. The fresh dense walk returned 113 rows in 42 pages, with 7,055
+NDJSON bytes, 85,305 scan bytes and 94,856 charged scan units.
 
 ```sh
 go test -race -count=1 -v ./verify/query-model -run '^TestQueryCosts'
 ```
 
-After #108, run the cost check on each native Linux release runner with
-`BOG_RELEASE_BINARY` and `BOG_RELEASE_REVISION` set to the clean pinned
-candidate and its full revision.
+After #108, use the same reviewed revision as the segment layout run. On
+both native Linux architectures, set `BOG_RELEASE_BINARY` and
+`BOG_RELEASE_REVISION` to the clean pinned candidate and its full revision.
 
 ```sh
 go test -json -race -count=1 ./verify/query-model -run '^TestPinnedQueryModelCosts$'
 ```
 
-Collect the `pinned_query_cost` records together with the logged candidate
-revision, binary SHA-256 and architecture. Require passing events for both
-`TestPinnedQueryModelCosts/ordinary` (before seed publication) and
-`TestPinnedQueryModelCosts/retained` (after exact-cutoff seed publication).
-The retained check requires the candidate's compaction control.
+Require passing events for both `TestPinnedQueryModelCosts/ordinary` and
+`TestPinnedQueryModelCosts/retained`. The retained check requires the
+candidate's compaction control. Hand Storage the `pinned_query_cost`
+records with their revision, binary SHA-256 and architecture, alongside the
+fixture results and the segment-layout matrix for both profiles and
+architectures. Compare threshold and wire evidence at the same workload
+settings. Keep fixture scan observations attributed to their measuring
+boundary and host when reviewing them with the layout results.
+[Segment layout candidate handoff](../../bench/segment-layout/README.md#retained-release-candidate-handoff)
 
 ## Release handoff
 

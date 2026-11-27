@@ -34,6 +34,18 @@ func TestPinnedQueryModelCosts(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkQueryCostReport(t, report)
+			for _, sample := range report.Samples {
+				checkQueryCostAvailability(t, sample, false)
+				if sample.Replacement != nil {
+					wantCutoff := 0
+					if mode.retained {
+						wantCutoff = 114
+					}
+					if sample.Replacement.PublishedReplacementCutoff != wantCutoff {
+						t.Fatalf("incorrect replacement cutoff: %+v", sample.Replacement)
+					}
+				}
+			}
 			logQueryReport(t, "pinned_query_cost", report)
 		})
 	}

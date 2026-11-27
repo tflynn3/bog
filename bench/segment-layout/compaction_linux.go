@@ -25,14 +25,6 @@ type compactionReport struct {
 	Live      liveReport               `json:"live_server"`
 }
 
-type publicationMeasurement struct {
-	Scenario           string        `json:"scenario"`
-	CoveredRows        int           `json:"covered_rows"`
-	ElapsedNS          int64         `json:"elapsed_ns"`
-	PeakRSSBytes       uint64        `json:"peak_rss_bytes,omitempty"`
-	WriteAmplification amplification `json:"write_amplification"`
-}
-
 type componentRequest struct {
 	Dir, Profile, Scenario string
 	Batches                int

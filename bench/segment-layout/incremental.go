@@ -23,7 +23,10 @@ type segmentRef struct {
 	Name      string `json:"name"`
 	FileBytes int64  `json:"file_bytes"`
 	RawBytes  int    `json:"raw_bytes"`
+	Bloom     bool   `json:"bloom,omitempty"`
 }
+
+func (ref segmentRef) indexWidth() int { return (layout{prune: ref.Bloom}).indexWidth() }
 
 type snapshot struct {
 	Segments []segmentRef `json:"segments"`
@@ -70,7 +73,7 @@ func validSegmentRef(ref segmentRef) bool {
 	return filepath.IsLocal(ref.Name) && filepath.Base(ref.Name) == ref.Name &&
 		strings.HasSuffix(ref.Name, ".segment") &&
 		ref.RawBytes >= blockHeader+blockRowWidth && ref.RawBytes <= maxBlock &&
-		ref.FileBytes > headerSize+entrySize && ref.FileBytes <= int64(headerSize+entrySize+ref.RawBytes)
+		ref.FileBytes > int64(headerSize+ref.indexWidth()) && ref.FileBytes <= int64(headerSize+ref.indexWidth()+ref.RawBytes)
 }
 
 const blockRowWidth = 24
@@ -119,7 +122,7 @@ func publishSegments(ctx context.Context, dir, id string, previous snapshot, app
 		if err != nil {
 			return "", fmt.Errorf("write %s: %w", name, err)
 		}
-		next.Segments = append(next.Segments, segmentRef{name, size, rawBlockBytes(block)})
+		next.Segments = append(next.Segments, segmentRef{name, size, rawBlockBytes(block), l.prune})
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -178,22 +181,12 @@ type decodeWorkingSet struct {
 }
 
 func decodeSegment(dir string, ref segmentRef, target int, decoder *blockDecoder, visit func([]checkpoint.BlockRow)) (peak int, err error) {
-	if !validSegmentRef(ref) {
-		return 0, errLayout
-	}
-	f, err := os.Open(filepath.Join(dir, ref.Name))
+	f, err := openSegment(dir, ref)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
-	info, err := f.Stat()
-	if err != nil {
-		return 0, err
-	}
-	if info.Size() != ref.FileBytes || !info.Mode().IsRegular() {
-		return 0, errLayout
-	}
-	reads, err := decoder.scan(f, ref.FileBytes, ref.RawBytes, true, query{start: firstTime, end: endTime}, func(raw []byte, buffers int) error {
+	reads, err := decoder.scan(f, ref.FileBytes, ref.RawBytes, ref.indexWidth(), query{start: firstTime, end: endTime}, func(raw []byte, buffers int) error {
 		if len(raw) != ref.RawBytes {
 			return errLayout
 		}
@@ -224,6 +217,24 @@ func decodeSegment(dir string, ref segmentRef, target int, decoder *blockDecoder
 		return 0, errLayout
 	}
 	return peak, nil
+}
+
+func openSegment(dir string, ref segmentRef) (*os.File, error) {
+	if !validSegmentRef(ref) {
+		return nil, errLayout
+	}
+	f, err := os.Open(filepath.Join(dir, ref.Name))
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err == nil && (info.Size() != ref.FileBytes || !info.Mode().IsRegular()) {
+		err = errLayout
+	}
+	if err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+	return f, nil
 }
 
 func scanSnapshot(ctx context.Context, dir string, current snapshot, target int, visit func([]checkpoint.BlockRow)) (decodeWorkingSet, error) {

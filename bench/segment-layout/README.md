@@ -32,6 +32,80 @@ query. Use `-seed` to select the PCG seed (default 44) and `-timeout`
 to bound each query sample or compaction scenario (default 5m). Fixture rows, block counts and file byte counts are reproducible for
 the same profile, size and dependency versions. Timings vary.
 
+## Cold incremental comparison
+
+Storage owns this nested module. Run the schema v5 comparison on native
+Linux with a disk-backed work directory.
+
+```sh
+cd bench/segment-layout
+go run . -cold -smoke -dir /path/to/data
+go run . -cold -dir /path/to/data -fixture mixed -scale medium -seed 44 \
+  -runs 21 -revision "$(git rev-parse HEAD)" > cold-mixed-medium.json
+go run . -validate-report cold-mixed-medium.json
+```
+
+Run both `mixed` and `entropy` with the same seed, scale, run count, and
+filesystem. The report has three sections for the experiment, the production
+v1 storage component, and live server compaction. Each experiment uses a
+64 KiB target and one immutable file per segment. Raw, LZ4, and Zstd each
+run with Bloom disabled and enabled. Late clustered and scattered
+backfills independently extend the same initial fixture. The v1 baseline
+publishes each fixture with the production checkpoint publisher and scans it
+with the production retained-history reader.
+
+Each sample starts a fresh Linux worker, opens the same published generation
+for that layout and phase, loads the manifest, and initializes the reader.
+For v1 this includes production manifest and segment validation and seek
+index construction. Immediately before sampling, the worker requests
+`FADV_DONTNEED` over every referenced segment, including reused segments.
+The kernel may retain pages after this advice. The run leaves filesystem
+metadata, the manifest cache, default readahead, and host and device caches
+in place. The timer covers the ordered scan and result construction. It
+excludes worker startup, generation validation, cache advice, metric
+collection, and transfer to the oracle. This measures cold segment reads
+against an initialized reader.
+
+The runner rotates layout order across matched samples. `-runs` applies
+to full-range and bounded sparse queries. Each phase and layout also
+runs one absent, one-byte, two-byte, three-byte, and all-rows probe.
+The parent verifies every returned timestamp, append ordinal, and line byte
+against the independent append-log oracle before accepting the sample.
+The all-rows probe verifies the complete generation. The short-literal
+probes require exact byte matching and check that enabling Bloom leaves
+their payload counts unchanged.
+
+| Report field | Measurement |
+| --- | --- |
+| `cold_p95_ns` | Nearest-rank p95 of the query timer. Single-sample probes are parity controls. |
+| `process_read_bytes_p95` | Linux `rchar` delta, less the observer's own first counter read, including index and payload reads served from cache. |
+| `storage_read_bytes_p95` | Linux `read_bytes` delta charged to the worker, including readahead. A cache hit can yield zero. |
+| `experimental_payload` | Logical compressed or raw payload blocks and bytes, excluding index and Bloom metadata. Compare the matched on/off samples for each codec. |
+| `peak_decode_bytes` | Experimental maximum live single-block payload buffers, decoded rows, and line bytes. Codec internals and accumulated results are outside this count. |
+| `peak_decode_go_heap_upper_bound_bytes` | Maximum query-window Go allocation delta, an upper bound on Go heap allocated for decoding in that window. It also covers other query allocations, such as results, and observer overhead. The v1 reader exposes this bound and worker RSS for memory comparison. |
+| `peak_worker_rss_bytes` | Worker high-water RSS through the scan, including startup and reader initialization. |
+| `rewrite_amplification` | For experiments, new synced segment and snapshot manifest bytes. For the v1 component, the publisher's Linux `wchar` delta including transient staging writes. The denominator in both is the same actual committed WAL suffix, including the frame header. |
+
+After #53 ships loopback compaction, rerun with a clean pinned native Linux
+binary from the same shipped revision on each target architecture.
+
+```sh
+go run . -cold -dir /path/to/data -fixture mixed -scale medium -seed 44 \
+  -runs 21 -revision "$(git rev-parse HEAD)" \
+  -bog-bin /path/to/pinned/bog -bog-revision "$candidate_revision" > cold-live-mixed-medium.json
+go run . -validate-report cold-live-mixed-medium.json
+```
+
+The live section measures process-attributed filesystem writes around
+the compaction request and completion. It checks the published cutoff,
+ordered loopback query results for a bounded sparse query and all three
+short literals, and the full persisted checkpoint after shutdown. A
+missing candidate or unavailable control endpoint is recorded in the live
+section. The live comparison is pending #53. The historical measurements
+below describe the earlier full-rewrite experiment. Use schema v5 evidence
+to assess the incremental format, including compressed size, Bloom metadata
+cost, cold query latency and I/O, and backfill amplification.
+
 ## Successive publications
 
 Run the incremental experiment on native Linux.
@@ -313,6 +387,11 @@ moved in both directions across codec pairs. The dense query matched
 135,168 rows in each profile and pruned just one block with the filter
 enabled. Across the six layouts, dense p95 ranged from 24.69 to 63.97 ms
 in mixed and from 52.22 to 370.56 ms in entropy on this shared runner.
+The historical sparse samples also show why it matters which blocks the
+filter prunes. The unfiltered layouts reached roughly 8 MiB in peak
+decode working bytes. The filtered layouts skipped the oversized singleton
+and peaked at 147,320–153,053 bytes in mixed and 140,300–169,616 bytes in
+entropy, even though the entropy filter pruned only three blocks.
 
 ### Publication and rewrites
 

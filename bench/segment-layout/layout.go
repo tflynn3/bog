@@ -186,7 +186,7 @@ type payloadReads struct {
 func scanBlocks(r io.ReaderAt, size int64, q query, visit func(raw []byte, bufferBytes int) error) (read payloadReads, err error) {
 	var decoder blockDecoder
 	defer decoder.close()
-	return decoder.scan(r, size, maxBlock, false, q, visit)
+	return decoder.scan(r, size, maxBlock, 0, q, visit)
 }
 
 type blockDecoder struct {
@@ -199,7 +199,7 @@ func (d *blockDecoder) close() {
 	}
 }
 
-func (d *blockDecoder) scan(r io.ReaderAt, size int64, rawLimit int, singleSegment bool, q query, visit func(raw []byte, bufferBytes int) error) (read payloadReads, err error) {
+func (d *blockDecoder) scan(r io.ReaderAt, size int64, rawLimit, singleIndexWidth int, q query, visit func(raw []byte, bufferBytes int) error) (read payloadReads, err error) {
 	var header [headerSize]byte
 	if size < headerSize {
 		return payloadReads{}, errLayout
@@ -214,7 +214,7 @@ func (d *blockDecoder) scan(r io.ReaderAt, size int64, rawLimit int, singleSegme
 	if string(header[:8]) != magic || l.codec > zstdCodec || header[9] > 1 || offset > size {
 		return payloadReads{}, errLayout
 	}
-	if singleSegment && (count != 1 || l.prune) {
+	if singleIndexWidth != 0 && (count != 1 || width != int64(singleIndexWidth)) {
 		return payloadReads{}, errLayout
 	}
 	entry := make([]byte, width)

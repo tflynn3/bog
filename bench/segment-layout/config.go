@@ -28,6 +28,7 @@ type config struct {
 	binary, binaryRevision        string
 	timeout                       time.Duration
 	incremental                   bool
+	cold                          bool
 }
 
 func parseConfig(args []string, revision string, output io.Writer) (config, error) {
@@ -45,7 +46,8 @@ func parseConfig(args []string, revision string, output io.Writer) (config, erro
 	flags.StringVar(&cfg.dir, "dir", "", "parent for temporary benchmark files (defaults to OS temp directory)")
 	flags.StringVar(&cfg.revision, "revision", revision, "source revision to record")
 	flags.BoolVar(&cfg.incremental, "incremental", false, "compare successive segment publications against production v1")
-	flags.StringVar(&cfg.validateReport, "validate-report", "", "validate a schema v4 qualification report and exit")
+	flags.BoolVar(&cfg.cold, "cold", false, "compare cold incremental snapshots with production v1")
+	flags.StringVar(&cfg.validateReport, "validate-report", "", "validate an incremental or cold benchmark report and exit")
 	smoke := flags.Bool("smoke", false, "use the fixed small fixture and one sample per query")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
@@ -95,7 +97,10 @@ func parseConfig(args []string, revision string, output io.Writer) (config, erro
 		return config{}, fmt.Errorf("-timeout exceeds the incremental worker limit")
 	}
 	if cfg.incremental && cfg.binary != "" {
-		return config{}, fmt.Errorf("-bog-bin is only supported by the full-rewrite benchmark")
+		return config{}, fmt.Errorf("-bog-bin requires the default or -cold benchmark")
+	}
+	if cfg.incremental && cfg.cold {
+		return config{}, fmt.Errorf("choose either -cold or -incremental")
 	}
 	return cfg, nil
 }

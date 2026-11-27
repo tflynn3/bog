@@ -51,10 +51,10 @@ func TestSuccessiveFixture(t *testing.T) {
 
 func TestSegmentAccounting(t *testing.T) {
 	t.Parallel()
-	a := segmentRef{"a.segment", 120, 200}
-	b := segmentRef{"b.segment", 140, 220}
-	c := segmentRef{"c.segment", 170, 250}
-	changed := segmentRef{"b.segment", 141, 220}
+	a := segmentRef{"a.segment", 120, 200, false}
+	b := segmentRef{"b.segment", 140, 220, false}
+	c := segmentRef{"c.segment", 170, 250, false}
+	changed := segmentRef{"b.segment", 141, 220, false}
 	for _, tc := range []struct {
 		name          string
 		before, after []segmentRef
@@ -68,8 +68,8 @@ func TestSegmentAccounting(t *testing.T) {
 		{"duplicate old", []segmentRef{a, a}, []segmentRef{a}, segmentBytes{}, true},
 		{"duplicate new", []segmentRef{a}, []segmentRef{a, a}, segmentBytes{}, true},
 		{"mutated identity", []segmentRef{b}, []segmentRef{changed}, segmentBytes{}, true},
-		{"invalid sizes", nil, []segmentRef{{"a.segment", 500, 100}}, segmentBytes{}, true},
-		{"escaping manifest", nil, []segmentRef{{"../a.segment", 120, 100}}, segmentBytes{}, true},
+		{"invalid sizes", nil, []segmentRef{{"a.segment", 500, 100, false}}, segmentBytes{}, true},
+		{"escaping manifest", nil, []segmentRef{{"../a.segment", 120, 100, false}}, segmentBytes{}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := accountSegments(snapshot{tc.before}, snapshot{tc.after})
@@ -213,7 +213,7 @@ func TestDecodeRejectsInvalidSegmentBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			current := snapshot{[]segmentRef{{name, size, tc.rawBytes}}}
+			current := snapshot{[]segmentRef{{name, size, tc.rawBytes, false}}}
 			_, err = scanSnapshot(t.Context(), dir, current, 1024, func([]checkpoint.BlockRow) {
 				t.Error("invalid segment reached consumer")
 			})

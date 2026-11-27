@@ -23,6 +23,8 @@ type workerRequest struct {
 	Component     *componentRequest
 	Decode        *decodeRequest
 	Qualification *qualificationRequest
+	Cold          *coldRequest
+	ColdPrepare   *componentRequest
 }
 
 type querySample struct {
@@ -54,6 +56,12 @@ func worker(ctx context.Context, arg string, out io.Writer) error {
 	if req.Decode != nil {
 		return decodeWorker(ctx, *req.Decode, out)
 	}
+	if req.Cold != nil {
+		return coldWorker(ctx, *req.Cold, out)
+	}
+	if req.ColdPrepare != nil {
+		return prepareColdProduction(ctx, *req.ColdPrepare, out)
+	}
 	return queryWorker(req, out)
 }
 
@@ -83,8 +91,12 @@ func queryWorker(req workerRequest, out io.Writer) (err error) {
 	if err != nil {
 		return err
 	}
+	return writeQuerySample(out, querySample{reads, elapsed.Nanoseconds(), peak, rss}, rows)
+}
+
+func writeQuerySample(out io.Writer, metrics any, rows []checkpoint.BlockRow) error {
 	w := bufio.NewWriter(out)
-	if err := json.NewEncoder(w).Encode(querySample{reads, elapsed.Nanoseconds(), peak, rss}); err != nil {
+	if err := json.NewEncoder(w).Encode(metrics); err != nil {
 		return err
 	}
 	for _, row := range rows {
@@ -108,7 +120,7 @@ func rowHeader(row checkpoint.BlockRow) [24]byte {
 	return h
 }
 
-func readQuerySample(r io.Reader, want []checkpoint.BlockRow, sample *querySample) error {
+func readQuerySample(r io.Reader, want []checkpoint.BlockRow, sample any) error {
 	input := bufio.NewReader(r)
 	header, err := input.ReadSlice('\n')
 	if err != nil {
@@ -195,23 +207,27 @@ func measureIsolated(ctx context.Context, cfg config, path string, q query, want
 
 func queryFile(r io.ReaderAt, size int64, q query) (matches []checkpoint.BlockRow, reads payloadReads, peak int, err error) {
 	reads, err = scanBlocks(r, size, q, func(raw []byte, buffers int) error {
-		rows, err := checkpoint.DecodeBlock(raw)
-		if err != nil {
-			return err
-		}
-		working := buffers + len(rows)*decodedRowBytes
-		for _, row := range rows {
-			working += len(row.Row.Line)
-			if !row.Row.TS.Before(q.start) && row.Row.TS.Before(q.end) && strings.Contains(row.Row.Line, q.literal) {
-				matches = append(matches, row)
-			}
-		}
-		peak = max(peak, working)
-		return nil
+		return matchBlock(raw, buffers, q, &matches, &peak)
 	})
 	if err != nil {
 		return nil, payloadReads{}, 0, err
 	}
 	slices.SortFunc(matches, ordered)
 	return matches, reads, peak, nil
+}
+
+func matchBlock(raw []byte, buffers int, q query, matches *[]checkpoint.BlockRow, peak *int) error {
+	rows, err := checkpoint.DecodeBlock(raw)
+	if err != nil {
+		return err
+	}
+	working := buffers + len(rows)*decodedRowBytes
+	for _, row := range rows {
+		working += len(row.Row.Line)
+		if !row.Row.TS.Before(q.start) && row.Row.TS.Before(q.end) && strings.Contains(row.Row.Line, q.literal) {
+			*matches = append(*matches, row)
+		}
+	}
+	*peak = max(*peak, working)
+	return nil
 }

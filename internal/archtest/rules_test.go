@@ -209,6 +209,24 @@ func TestComposedCutoverRules(t *testing.T) {
 			},
 		},
 		{
+			name: "one Linux inventory lacks the command's backup wiring",
+			change: func(pkgs map[string]listedPackage, _ map[string]rule) {
+				pkgs[server] = productionPackage("main", history, httpapi, readiness, store, wal)
+			},
+			want: []string{
+				backup + " is registered as runtime library but reachability from " + server + " is false",
+				"stale production import registration: " + server + " -> " + backup,
+			},
+		},
+		{
+			name: "registered retained dependencies form a cycle",
+			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
+				pkgs[checkpoint] = productionPackage("checkpoint", store, history)
+				rules[checkpoint] = rule{runtimeLibrary, []string{store, history}}
+			},
+			want: []string{"production import cycle: " + history + " -> " + checkpoint + " -> " + history},
+		},
+		{
 			name: "registered checkpoint import still violates storage direction",
 			change: func(pkgs map[string]listedPackage, rules map[string]rule) {
 				pkgs[checkpoint] = productionPackage("checkpoint", store, httpapi)
@@ -253,7 +271,10 @@ func TestComposedCutoverRules(t *testing.T) {
 				pkgs[httpapi] = productionPackage("httpapi", store, wal, history)
 				rules[httpapi] = rule{runtimeLibrary, []string{store, wal, history}}
 			},
-			want: []string{"HTTP must use the page source seam: " + httpapi + " -> " + history},
+			want: []string{
+				"HTTP must use the page source seam: " + httpapi + " reaches " + checkpoint,
+				"HTTP must use the page source seam: " + httpapi + " reaches " + history,
+			},
 		},
 		{
 			name: "registered readiness import still cannot reach backup",

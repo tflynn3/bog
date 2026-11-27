@@ -98,7 +98,7 @@ func listVerifierTestPackages(t *testing.T, arch string) map[string]verifierTest
 func verifierConsumerProblems(rules map[string]rule, consumers map[string]verifierTestConsumer, packages map[string]verifierTestPackage) []string {
 	reached := make(map[string]bool)
 	for path, entry := range rules {
-		if entry.role == verifier && path != operatorCommand {
+		if entry.role == verifier && path != operatorCommand && path != exportCommand {
 			maps.Copy(reached, registeredReachability(rules, path))
 		}
 	}

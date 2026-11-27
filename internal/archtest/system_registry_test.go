@@ -130,7 +130,7 @@ func systemRoleLabel(path string, registeredRole role) string {
 	case testOnly:
 		return "Test-only"
 	case verifier:
-		if path == operatorCommand {
+		if path == operatorCommand || path == exportCommand {
 			return "Operator command"
 		}
 		return "Verifier command"

@@ -15,10 +15,13 @@ func TestStorageAuthorityBoundary(t *testing.T) {
 	}
 }
 
-// The Linux architecture test checks the registry against the production graph.
-// Enforce ownership independently so registering a bypass cannot permit it.
+// Check ownership against both the registry and the measured Linux graphs.
+// Registering an import cannot permit a bypass.
 func storageAuthorityProblems(rules map[string]rule) []string {
 	const (
+		backup      = "bog/internal/backup"
+		checkpoint  = "bog/internal/checkpoint"
+		history     = "bog/internal/history"
 		idempotency = "bog/internal/idempotency"
 		wal         = "bog/internal/wal"
 	)
@@ -27,16 +30,27 @@ func storageAuthorityProblems(rules map[string]rule) []string {
 		packages[path] = listedPackage{Imports: entry.imports}
 	}
 
-	retained := []string{
-		"bog/internal/backup",
-		"bog/internal/checkpoint",
-		"bog/internal/history",
-	}
+	retained := []string{backup, checkpoint, history}
 	walPeers := append(retained, idempotency)
 	var problems []string
 	for _, from := range walPeers {
-		if reachableImports(packages, from)[wal] {
+		reached := reachableImports(packages, from)
+		if reached[wal] {
 			problems = append(problems, fmt.Sprintf("forbidden storage authority dependency: %s reaches %s", from, wal))
+		}
+		// Backup validates its own recovery view. History may use checkpoint
+		// validation, and both consume the view independently of backup.
+		switch from {
+		case backup:
+			for _, to := range []string{checkpoint, history} {
+				if reached[to] {
+					problems = append(problems, fmt.Sprintf("forbidden recovery view dependency: %s reaches %s", from, to))
+				}
+			}
+		case checkpoint, history:
+			if reached[backup] {
+				problems = append(problems, fmt.Sprintf("forbidden recovery view dependency: %s reaches %s", from, backup))
+			}
 		}
 	}
 	walReachable := reachableImports(packages, wal)

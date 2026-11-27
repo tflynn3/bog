@@ -144,9 +144,16 @@ reclamation. Store owns decoded rows and their order. The command uses
 the WAL owner's synchronization to supply checkpoint and backup with a
 pinned recovery view of the generation and its exact committed suffix.
 The command and WAL owner coordinate append publication and activation.
+Command-local adapters implement the separate backup and checkpoint
+`RecoveryView` contracts. Backup validates its own view for export and
+offline verification. History may reuse checkpoint validation. The caller
+holds the operation pin through cleanup, and the consumers close their
+independent readers. Reclamation waits for durable selection and final
+reference drain.
 [Runtime storage composition](../adr/0007-runtime-storage-composition.md),
 [Pinned writable recovery](../adr/0005-pinned-writable-recovery-authority.md),
-[Tail-only recovery view](../adr/0035-tail-only-retained-recovery-contract.md)
+[Tail-only recovery view](../adr/0035-tail-only-retained-recovery-contract.md),
+[Independent recovery-view consumers](../adr/0037-independent-recovery-view-consumers.md)
 
 The cutover's opt-in loopback capacity control uses the same publication path.
 Charge replay and whole-batch append reservations before reading or
@@ -266,9 +273,23 @@ is pending.
 | `verify/release` | `admission.json` | Query slot saturation, concurrent ingest, cursor replay, and clean work-budget rejection. Issuing budgets complete tied and sparse, byte-trimmed walks, including a smaller resume limit. |
 | `verify/linux` | `durability.json` | SIGKILL recovery, committed-prefix checks, and real ENOSPC on a disposable local filesystem. Retarget the configured path in both directions and check readiness and ingest against the active WAL filesystem. |
 | `bench/retained-history` | `capacity.json` | Both live scales (196,608 and 393,216 seed rows), each under a 128 MiB cgroup cap with swap disabled. Verify durable replacement at the exact cutoff, a held cursor across acknowledged backfill, exact fresh and restarted walks, and process and cgroup cleanup. Capture publication and retired pin drain evidence at the runtime observation points. |
-| `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Start the pinned binary on a verified restore, compare exact walks with the independent append-log oracle, observe 204 for new backfill, and check the held capture and exact augmented history after restart. Exercise immediate post-ack crash recovery on a separate restored fixture. |
+| `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Record ordinary WAL reopen, restored parity, immediate post-ack crash, and two-cycle tail-only parity as four outcomes in the existing candidate-bound report. |
 | `verify/release` / `TestReleaseFixedBudgetBackfill` and `TestReleaseCapacityControlScope` | Passing test events | Exercise fixed-budget paging through backfill and replacement. Check that capacity routes are available only with explicit opt-in on the loopback listener. |
 | `verify/query-model` / `TestPinnedQueryModelReplay` | `query-model-events.jsonl` | Require passing seeded ordinary and retained walks, exact terminal replay, and a candidate identity matching the revision and binary checksum on each runner. |
+
+Strict cutover validation requires all four `parity.json` outcomes on each
+native runner. Every recovery walk compares exact order and multiplicity
+through exhaustion with the independent append-log oracle.
+
+| Outcome | Required evidence |
+| --- | --- |
+| `ordinary_wal_reopen` | Reopen a seeded ordinary WAL, require HTTP 204 for a backfill batch, and verify the exact augmented walk before shutdown and after restart. |
+| `restored_parity` | Start on a verified restore, require HTTP 204 for backfill, and verify both the held capture and fresh augmented walks. After crash and restart, check the exact augmented history and rejection of the pre-crash cursor. |
+| `post_restore_ack_crash` | On a separate verified restore, send SIGKILL immediately on HTTP 204, before reading or closing the response body. Verify the signal, exact restart replay, both processes reaped, and fixture removal. |
+| `tail_only_two_cycle_parity` | Start from a verified v1 restore with a nonempty tail and carry a nonempty suffix through each exact cutoff. Check held, fresh, restarted, and separately restored walks, v2 export and restore, generation and suffix digests, logical bounds, and physical tail rebasing. Verify the recovered next ordinal and use the first export as the second cycle's input. |
+
+[Recovery parity contract](../../verify/release/README.md),
+[Immediate post-restore crash evidence](../adr/0027-immediate-post-restore-crash-evidence.md)
 
 The baseline includes the native query replay startup checks for verified
 bind collisions. Native qualification for this baseline is pending.
@@ -302,9 +323,9 @@ use one strict schema-v1 capacity validator. The proof requires a numeric
 zero in the raw cgroup OOM kill counter and validates the observed
 backfill timeline in execution order. Standard release validation still
 accepts historical schema-v1 live reports. Release validation matches
-the pinned candidate identity and requires affirmative writable-restore
-parity in strict mode. Release report publication anchors staging,
-replacement, cleanup, and directory sync to the same opened parent.
+the pinned candidate identity across evidence reports. Release report
+publication anchors staging, replacement, cleanup, and directory sync to
+the same opened parent.
 [Capacity evidence validation](../adr/0018-capacity-evidence-validation.md),
 [Shared capacity evidence boundary](../adr/0020-shared-capacity-evidence.md)
 
@@ -339,14 +360,6 @@ Architecture in the bog AgentSet owns the architecture record and
 fitness registry, including this diagram check. `bog-storage` owns #108
 recovery, publication, and command composition. `bog-query` owns the
 HTTP paging contract. Release Verification owns the two native verdicts.
-Cycle 158 advances #108 to a reviewed Storage handoff and wires the bounded
-retained runtime when the command lease clears. #81 can start against the
-frozen recovery-view contract. #104 remains reserved behind the reviewed
-HTTP paging handoff. The backlog shows two running tracks and PM reports
-three. Preserve capacity for the reported third track until dispatch
-reconciles the counts. Keep the listener work, #106, and the exclusive
-eval and council leases with their current owners. Recheck read and
-write leases at dispatch and at the reviewed Storage SHA.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification),
 [Tail-only recovery contract](../adr/0035-tail-only-retained-recovery-contract.md)
@@ -380,6 +393,10 @@ imports and nested modules are outside the root-module production registry.
   relay. The Linux inventory checks the paging and storage authority
   boundaries through external dependencies as well.
   [Storage authority](../../internal/archtest/storage_authority_test.go)
+- Backup and checkpoint/history have no production import paths to each
+  other in either Linux inventory, including through relays. History can
+  import checkpoint, and the offline operator can import backup.
+  [Recovery-view fitness fixtures](../../internal/archtest/recovery_view_boundary_test.go)
 - Command roots enforce server, operator verification, and operator export
   exclusions. The measured Linux graph checks those exclusions and the
   oracle and three release producer boundaries through external production

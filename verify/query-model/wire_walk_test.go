@@ -20,6 +20,39 @@ func wireConfig() model.WireWalk {
 	}
 }
 
+func TestWireWalkChecksExactNDJSONBeforeAcceptingPage(t *testing.T) {
+	t.Parallel()
+	const canonical = "{\"ts\":\"2025-01-02T00:00:00.000000123Z\",\"line\":\"row\"}\n"
+	rows := []model.Row{{Time: epoch, Line: "row"}, {Time: epoch, Line: "row"}}
+	for _, tc := range []struct {
+		name, body, want string
+		cap              int64
+		reported         int64
+	}{
+		{"differently formatted", strings.Replace(canonical, ":\"", ": \"", 1), "NDJSON differs", 128, 0},
+		{"length metadata", canonical, "captured", 128, int64(len(canonical) + 1)},
+		{"prefix underfilled", canonical, "fits within the byte cap", int64(2 * len(canonical)), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var log model.Log
+			log.Append(rows)
+			walk := wireConfig()
+			walk.ExactNDJSON = true
+			walk.Limits.MaxPageBytes = tc.cap
+			reported := tc.reported
+			if reported == 0 {
+				reported = int64(len(tc.body))
+			}
+			stats, err := model.VerifyWireWalk(t.Context(), &log, walk, func(context.Context, model.WireRequest) (model.WirePage, error) {
+				return model.WirePage{Rows: rows[:1], NextCursor: "cursor", BodyBytes: reported, NDJSON: []byte(tc.body)}, nil
+			}, nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) || stats != (model.WireStats{}) {
+				t.Fatalf("walk = %+v, %v, want %q", stats, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestWireWalkInterleavesAcknowledgedAppend(t *testing.T) {
 	t.Parallel()
 	first := model.Row{Time: epoch, Line: "early"}

@@ -140,3 +140,38 @@ func TestStagedPackageDeclarationFixtures(t *testing.T) {
 		})
 	}
 }
+
+func TestRetainedPromotionKeepsKeyedIngestStaged(t *testing.T) {
+	t.Parallel()
+	const (
+		backup      = "bog/internal/backup"
+		checkpoint  = "bog/internal/checkpoint"
+		history     = "bog/internal/history"
+		idempotency = "bog/internal/idempotency"
+		store       = "bog/internal/store"
+		wal         = "bog/internal/wal"
+	)
+	rules := map[string]rule{
+		server:          {serverCommand, []string{backup, history, wal}},
+		operatorCommand: {verifier, []string{backup, goClient, store}},
+		backup:          {runtimeLibrary, []string{store}},
+		checkpoint:      {runtimeLibrary, []string{store}},
+		history:         {runtimeLibrary, []string{checkpoint, store}},
+		idempotency:     {staged, nil},
+		store:           {runtimeLibrary, nil},
+		wal:             {runtimeLibrary, []string{store}},
+		goClient:        {standalone, []string{store}},
+	}
+	requireValidCommandFixture(t, rules)
+	declarations := map[string]stagingDeclaration{
+		idempotency: {owner: "bog-storage", activation: "Recover durable retry records atomically with their batches."},
+	}
+	if got := stagedPackageProblems(rules, declarations); len(got) != 0 {
+		t.Errorf("retained promotion with keyed ingest staged: %v", got)
+	}
+	delete(declarations, idempotency)
+	want := []string{"staged package " + idempotency + " has no staging declaration"}
+	if got := stagedPackageProblems(rules, declarations); !slices.Equal(got, want) {
+		t.Errorf("stagedPackageProblems() = %q, want %q", got, want)
+	}
+}

@@ -17,19 +17,14 @@ access layer. [Single-writer decision](../adr/0001-single-writer-retained-histor
 
 ## Declared Linux production import graph
 
-The Mermaid graph declares the production packages and direct root-module
-imports in the executable fitness registry. Arrows point from importer to
-direct dependency. Nodes with no outgoing arrows have zero direct
-root-module production imports. Test-only packages appear in the package
-table below. The architecture suite checks the diagram against the registry
-and checks the registry against both Linux production inventories.
-
-The declaration includes the fixture-backed stream policy verifier support
-added in #86 and both #87 capacity evidence imports. The shared validator
-and directory-anchored publisher are present in the repository. #87
-qualification still requires running the strict evidence gate against the
-composed #53 runtime on both native Linux runners.
-[Shared capacity evidence boundary](../adr/0020-shared-capacity-evidence.md)
+Linux amd64 and arm64 inventories at
+`d87ad247b8015bb7e5f5e292b1564c7d0c421a1d` agree on 18 production
+packages and 22 direct root-module imports. The five server nodes are
+`cmd/bog` and its four reachable libraries. Arrows point from importer
+to direct dependency. The package table includes three test-only packages.
+The architecture suite checks the diagram against the registry and the
+registry against both inventories. The #53 command composition awaits an
+immutable Storage revision for measurement.
 
 ```mermaid
 flowchart TD
@@ -103,38 +98,46 @@ flowchart TD
   wires the existing descriptor sampler to an independently owned handle
   to the active WAL directory. [Readiness descriptor handoff](../adr/0005-pinned-writable-recovery-authority.md#readiness-descriptor-handoff-60)
 
-## Retained-history handoff
+## Retained-history cutover contract
 
-#53 composes the retained `PageSource` in `cmd/bog` and injects it through
-`httpapi.NewWithPageSource`. HTTP owns admission, cursor authentication and
-expiry, fixed-budget certification through exhaustion, and NDJSON framing.
-The adapter pins the validated generation and the matching durable,
-query-visible tail together under WAL owner synchronization. A held cursor
-keeps its original view across replacement while fresh walks see later
-commits. The earlier of the source expiry and HTTP deadline governs new
-resumes. Admitted paging and export operations keep their references to
-completion. [Runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
-[Fixed-budget continuations](../adr/0006-fixed-budget-query-continuations.md)
-
-The cutover validates ordinary WAL, retained checkpoint plus committed
-suffix, and verified restore under the same pinned directory. A restored
-image establishes writable authority before the listener opens. Checkpoint
-validates and durably publishes immutable generations. History owns
-generation scans, pins, and reclamation. Store owns decoded rows and
-their order. Backup consumes pinned readers and bounds. The WAL owner
-coordinates append publication, capture, and generation activation.
-Checkpoint, history, and backup receive authority through composition.
-[Runtime storage composition](../adr/0007-runtime-storage-composition.md),
+The #53 command composes ordinary WAL recovery, retained checkpoint and
+committed suffix recovery, and verified writable restore under the same
+pinned directory lock. The Storage interface handoff supplies
+`backup.VerifyPinnedRestore`, which borrows the locked root and allows
+replay admission before opening the suffix. The command owns the returned
+absolute-offset tail reader and establishes durable writable authority
+before opening the listener. Restart follows the committed end selected by
+that authority, while backup metadata identifies the original restore point.
+Checkpoint owns immutable generation validation and durable publication.
+History owns generation scans, pins, and reclamation. The WAL owner
+coordinates append visibility, capture, and generation activation.
+[Runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
 [Pinned writable recovery](../adr/0005-pinned-writable-recovery-authority.md)
 
-The opt-in loopback capacity control uses the same publication path.
-Charge replay and whole-batch append reservations before reading or
-writing the tail. Charge capture, pin, and staging capacity before doing
-work. Credit reclaimed capacity after durable publication and activation
-and once references to the covered data drain. Stop admitting new work
-during shutdown, drain HTTP and storage work, then close storage and the
-pinned directory. [Resource admission](../adr/0010-retained-resource-admission.md),
-[Storage budget interfaces](../../internal/history/LIMITS.md)
+`cmd/bog` injects a command-local `PageSource` through
+`httpapi.NewWithPageSource`. The adapter captures the generation and its
+matching durable, query-visible WAL tail together. It merges rows by UTC
+timestamp and append ordinal and shares HTTP's request meter with
+`history.Reader.ScanWithWork` and tail paging. HTTP owns admission,
+fixed-budget certification through exhaustion, cursor authentication and
+expiry, and NDJSON framing. A held cursor keeps its original view across
+replacement while fresh walks see later commits. The earlier of source
+expiry and the HTTP deadline governs new resumes. Admitted work retains
+its references through response delivery.
+[Fixed-budget continuations](../adr/0006-fixed-budget-query-continuations.md),
+[Storage interface handoff](https://github.com/tflynn3/bog/issues/53#issuecomment-7203853989)
+
+The opt-in loopback capacity control uses the same publication path. A
+terminal input cursor stays replayable until retirement or expiry. The
+control retires it through the issuing API, which stops new resumes and
+releases the source capture after admitted users drain. Charge replay,
+whole-batch append, capture, pin, and staging reservations before the work
+they cover. Credit reclaimed capacity after durable activation and after
+the covered references drain. During shutdown, stop admission and
+maintenance scheduling, drain HTTP, and close the API before closing the
+storage owner. The directory remains locked until admitted storage work
+has drained. [Cursor retirement](../adr/0031-retained-cursor-retirement.md),
+[Resource admission](../adr/0010-retained-resource-admission.md)
 
 ## Package registry
 
@@ -150,7 +153,7 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 
 | Package or entry point | Role | Responsibility |
 | --- | --- | --- |
-| `cmd/bog` | Server command | Recovery, listener, and lifecycle |
+| `cmd/bog` | Server command | Owns startup recovery, listener, and shutdown. #53 adds retained storage composition. |
 | `internal/httpapi` | Wired | HTTP validation, admission, cursors, and response framing |
 | `internal/readiness` | Wired | Disk headroom and write outcome observation |
 | `internal/wal` | Wired | Directory locking, commit, replay, and WAL capture |
@@ -187,9 +190,9 @@ bodies, and retries after an ambiguous response and process restart.
 | Rank | Property | Design choice and cost |
 | --- | --- | --- |
 | 1 | Durability | Acknowledge only durable whole batches and activate only durably published generations. Fence on uncertainty and fail startup on invalid committed authority, even when availability suffers. |
-| 2 | Exact queries | Preserve timestamp and ordinal order through restart, restore, and replacement. Certification spends work before cursor issuance, and pinned generations and tails delay reclamation. |
+| 2 | Exact queries | Preserve timestamp and ordinal order through restart, restore, and replacement. Certification spends work before cursor issuance. Pins delay reclamation until the capture expires or retires and admitted users drain. |
 | 3 | Bounded resources | Bound query work, response bytes, and concurrency. The retained path also bounds replay, append reservations, live captures, pinned generations, and staging. At capacity it can defer maintenance and refuse whole batches. |
-| 4 | Recovery time | Legacy startup replays the full committed WAL. Retained startup validates generation and writable authority, then replays a bounded committed suffix. Validation adds I/O before the listener opens. |
+| 4 | Recovery time | Ordinary startup replays the full committed WAL. Retained startup validates generation and writable authority, then replays a bounded committed suffix. Restore validation reads immutable storage before the listener opens, and replay admission can refuse an oversized suffix before its I/O. |
 | 5 | Throughput | Group syncs across admitted commits and prune provably irrelevant scan work. Retaining and hashing the readable v1 WAL prefix costs disk space and bandwidth. Tail-only v1 restores keep the verified checkpoint boundary and have finite writable tail capacity. |
 
 ## Operator verification boundary
@@ -271,6 +274,11 @@ expiry with admitted operations still draining.
 [Capacity evidence contract](../../bench/retained-history/README.md#publication-and-pin-drain-sample-contract),
 [Resource qualification](../adr/0010-retained-resource-admission.md#qualification)
 
+#99 qualifies incremental segment layouts against production v1 in the
+nested `bench/segment-layout` module. Its results measure layout performance
+independently of the #53 runtime qualification.
+[Incremental layout qualification](https://github.com/tflynn3/bog/issues/99)
+
 ## Stream policy conformance
 
 Security Verification owns the fixture-backed runner for the proposed
@@ -286,22 +294,22 @@ qualification requires adapters that observe a shared-deployment implementation.
 ## Fitness and registry ownership
 
 Architecture within Core Engineering owns the architecture record and
-fitness registry.
-`bog-storage` owns #53 recovery, publication, and command composition.
-`bog-query` owns the #59 HTTP paging contract. Recheck write leases at
-dispatch and at the Storage draft handoff. #60 follows the #53 command
-lease. Review the measured edges and roles together with the runtime
-wiring in one PR.
+fitness registry. `bog-storage` owns #53 recovery, publication, and command
+composition. `bog-query` owns HTTP paging and cursor retirement. #60 owns
+the readiness descriptor integration after the #53 command lease clears.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification)
 
-Architecture coordinates the SYSTEM.md handoff with Release Verification
-for #87 and with Storage for #53. Run the full architecture suite on the
-composed #87 tree. In the separate #53 runtime wiring PR, update the diagram
-and promote staged roles once both Linux inventories show server reachability
-and the activation criteria are met. Rebase the later registry edit onto the
-first landed PR, then rerun both Linux inventories.
-[#53 package promotion handoff](../adr/0019-package-role-governance.md#53-promotion-handoff)
+At handoff, recheck the write leases and measure the immutable Storage
+revision on both Linux targets. Update exact imports, the diagram, the
+package table, and staging declarations in the same reviewed merge as the
+#53 runtime wiring. Promote each retained library when both inventories
+show server reachability and its activation criteria are met. #98 export
+registration uses the tree that contains `cmd/bog-export`. Sequence those
+registry edits after the #53 architecture lease and remeasure both
+inventories on the resulting tree.
+[#53 package promotion handoff](../adr/0019-package-role-governance.md#53-promotion-handoff),
+[Operator export boundary](../adr/0032-operator-export-boundary.md)
 
 The Architecture workflow runs `go test -count=1 ./internal/archtest`.
 The suite lists packages with `GOOS=linux`, `GOAMD64=v1`, `GOARM64=v8.0`,

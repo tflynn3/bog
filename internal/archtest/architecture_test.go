@@ -40,7 +40,8 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// Every staged role also has a declaration in stagedPackages, removed on promotion.
+// Promote a retained library and remove its staging declaration once the
+// composed command reaches it on both Linux targets and its criteria are met.
 var registry = map[string]rule{
 	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
 	server:                       {serverCommand, []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
@@ -255,13 +256,10 @@ func storageDirectionProblems(packages map[string]listedPackage, production map[
 			}
 		}
 	}
-	// Readiness observes the active owner and its filesystem. The command
-	// supplies the probe handle and owns retained storage composition.
+	// The command supplies the page source and the readiness directory handle.
+	problems = append(problems, pagingBoundaryProblems(packages)...)
 	readyReachable := reachableImports(packages, readiness)
 	for _, to := range []string{"bog/internal/backup", "bog/internal/checkpoint", "bog/internal/history"} {
-		if slices.Contains(production[httpapi], to) {
-			problems = append(problems, fmt.Sprintf("HTTP must use the page source seam: %s -> %s", httpapi, to))
-		}
 		if readyReachable[to] {
 			problems = append(problems, fmt.Sprintf("forbidden readiness dependency: %s reaches %s", readiness, to))
 		}

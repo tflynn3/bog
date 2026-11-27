@@ -209,9 +209,6 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 			if problems := architectureProblems(packages, rules); len(problems) != 0 {
 				t.Fatalf("fixture violates the existing architecture rules: %v", problems)
 			}
-			if problems := pagingBoundaryProblems(rules); len(problems) != 0 {
-				t.Fatalf("fixture violates the HTTP paging boundary: %v", problems)
-			}
 			if got := storageAuthorityProblems(rules); !slices.Equal(got, tt.want) {
 				t.Errorf("storageAuthorityProblems() = %q, want %q", got, tt.want)
 			}
@@ -326,9 +323,6 @@ func TestStorageCompositionFixtures(t *testing.T) {
 				rules[relay] = rule{runtimeLibrary, tt.relayImports}
 			}
 			requireValidCommandFixture(t, rules)
-			if problems := pagingBoundaryProblems(rules); len(problems) > 0 {
-				t.Fatalf("fixture violates the HTTP paging boundary: %v", problems)
-			}
 			if problems := operatorBoundaryProblems(rules); len(problems) > 0 {
 				t.Fatalf("fixture violates the operator boundary: %v", problems)
 			}

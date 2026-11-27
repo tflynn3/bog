@@ -6,22 +6,10 @@ import (
 	"testing"
 )
 
-func TestHTTPPagingBoundary(t *testing.T) {
-	t.Parallel()
-	for _, problem := range pagingBoundaryProblems(registry) {
-		t.Error(problem)
-	}
-}
-
-// TestLinuxArchitecture checks that the registry exactly matches the Linux
-// production graph within the root module. Check the paging seam independently
-// so registering every edge of a bypass still fails the suite.
-func pagingBoundaryProblems(rules map[string]rule) []string {
+// Follow the measured production graph so even a dependency outside the
+// root-module registry cannot bring retained storage into the HTTP adapter.
+func pagingBoundaryProblems(packages map[string]listedPackage) []string {
 	const httpapi = "bog/internal/httpapi"
-	packages := make(map[string]listedPackage, len(rules))
-	for path, entry := range rules {
-		packages[path] = listedPackage{Imports: entry.imports}
-	}
 	reached := reachableImports(packages, httpapi)
 
 	var problems []string
@@ -41,6 +29,7 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 		history    = "bog/internal/history"
 		httpapi    = "bog/internal/httpapi"
 		relay      = "bog/internal/relay"
+		external   = "bog/bridge"
 		store      = "bog/internal/store"
 		wal        = "bog/internal/wal"
 	)
@@ -52,11 +41,13 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 	tests := []struct {
 		name       string
 		bypassFrom string
+		bypassVia  string
 		want       []string
 	}{
 		{name: "command injects its own page source"},
-		{name: "HTTP reaches retained storage through a relay", bypassFrom: httpapi, want: wantBypass},
-		{name: "HTTP reaches retained storage through WAL", bypassFrom: wal, want: wantBypass},
+		{name: "HTTP reaches retained storage through a relay", bypassFrom: httpapi, bypassVia: relay, want: wantBypass},
+		{name: "HTTP reaches retained storage through WAL", bypassFrom: wal, bypassVia: relay, want: wantBypass},
+		{name: "HTTP reaches retained storage outside the registry", bypassFrom: httpapi, bypassVia: external, want: wantBypass},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -70,7 +61,7 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 				store:      {runtimeLibrary, nil},
 				wal:        {runtimeLibrary, []string{store}},
 			}
-			if tt.bypassFrom != "" {
+			if tt.bypassVia == relay {
 				rules[relay] = rule{runtimeLibrary, []string{backup, history}}
 				entry := rules[tt.bypassFrom]
 				entry.imports = append(entry.imports, relay)
@@ -84,11 +75,17 @@ func TestHTTPPagingBoundaryFixtures(t *testing.T) {
 				}
 				packages[path] = productionPackage(name, entry.imports...)
 			}
-			if problems := architectureProblems(packages, rules); len(problems) != 0 {
-				t.Fatalf("fixture violates the existing architecture rules: %v", problems)
+			if tt.bypassVia == external {
+				pkg := packages[tt.bypassFrom]
+				pkg.Imports = append(pkg.Imports, external)
+				packages[tt.bypassFrom] = pkg
+				packages[external] = listedPackage{
+					GoFiles: []string{"bridge.go"},
+					Imports: []string{backup, history},
+				}
 			}
-			if got := pagingBoundaryProblems(rules); !slices.Equal(got, tt.want) {
-				t.Errorf("pagingBoundaryProblems() = %q, want %q", got, tt.want)
+			if got := architectureProblems(packages, rules); !slices.Equal(got, tt.want) {
+				t.Errorf("architectureProblems() = %q, want %q", got, tt.want)
 			}
 		})
 	}

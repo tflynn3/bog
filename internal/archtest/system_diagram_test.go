@@ -9,7 +9,11 @@ import (
 	"testing"
 )
 
-const systemDiagramHeading = "## Declared Linux production import graph"
+const (
+	systemDiagramHeading = "## Declared Linux production import graph"
+	runtimeSubgraph      = "Runtime"
+	stagedSubgraph       = "Staged"
+)
 
 func TestSystemImportDiagram(t *testing.T) {
 	t.Parallel()
@@ -28,7 +32,7 @@ type diagramEdge struct {
 }
 
 type systemImportGraph struct {
-	nodes map[string]bool
+	nodes map[string]string // Package path to subgraph ID, or empty at top level.
 	edges map[diagramEdge]bool
 }
 
@@ -39,13 +43,29 @@ func systemDiagramProblems(doc string, rules map[string]rule) []string {
 	}
 
 	var problems []string
+	serverClosure := registeredReachability(rules, server)
 	expectedEdges := make(map[diagramEdge]bool)
 	for path, entry := range rules {
 		if entry.role == testOnly {
 			continue
 		}
-		if !graph.nodes[path] {
+		if group, ok := graph.nodes[path]; !ok {
 			problems = append(problems, "missing production node "+path)
+		} else {
+			for _, membership := range []struct {
+				group string
+				want  bool
+			}{
+				{runtimeSubgraph, serverClosure[path]},
+				{stagedSubgraph, entry.role == staged},
+			} {
+				switch {
+				case membership.want && group != membership.group:
+					problems = append(problems, fmt.Sprintf("missing %s subgraph member %s", membership.group, path))
+				case !membership.want && group == membership.group:
+					problems = append(problems, fmt.Sprintf("unexpected %s subgraph member %s", membership.group, path))
+				}
+			}
 		}
 		for _, dependency := range entry.imports {
 			edge := diagramEdge{path, dependency}
@@ -71,13 +91,14 @@ func systemDiagramProblems(doc string, rules map[string]rule) []string {
 
 var (
 	diagramDirection = regexp.MustCompile(`^flowchart\s+(TD|TB|BT|LR|RL)$`)
-	diagramSubgraph  = regexp.MustCompile(`^subgraph\s+[A-Za-z][A-Za-z0-9_]*\s*\["[^"]+"\]$`)
+	diagramSubgraph  = regexp.MustCompile(`^subgraph\s+([A-Za-z][A-Za-z0-9_]*)\s*\["[^"]+"\]$`)
 	diagramNode      = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_]*)\s*\["([A-Za-z0-9_./-]+)( \([^"]+\))?"\]$`)
 	diagramArrow     = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_]*)\s*-->\s*([A-Za-z][A-Za-z0-9_]*)$`)
 )
 
 // Read the Mermaid block in the declared graph section. Accept the small
-// flowchart subset used by SYSTEM.md so unsupported statements cannot hide edges.
+// flowchart subset used by SYSTEM.md. Edges inside a subgraph must have
+// both endpoints declared there so they cannot introduce implicit members.
 func parseSystemImportGraph(doc string) (systemImportGraph, error) {
 	lines := strings.Split(doc, "\n")
 	section := slices.IndexFunc(lines, func(line string) bool {
@@ -110,41 +131,48 @@ func parseSystemImportGraph(doc string) (systemImportGraph, error) {
 		return systemImportGraph{}, fmt.Errorf("expected Mermaid flowchart direction at line %d", start+1)
 	}
 
-	graph := systemImportGraph{nodes: make(map[string]bool), edges: make(map[diagramEdge]bool)}
+	graph := systemImportGraph{nodes: make(map[string]string), edges: make(map[diagramEdge]bool)}
 	aliases := make(map[string]string)
+	subgraphs := make(map[string]bool)
 	type diagramArrowLine struct {
 		diagramEdge
-		line int
+		line  int
+		group string
 	}
 	var arrows []diagramArrowLine
-	inSubgraph := false
+	group := ""
 	for i := start + 1; i < end; i++ {
 		line := strings.TrimSpace(lines[i])
+		subgraph := diagramSubgraph.FindStringSubmatch(line)
 		switch {
 		case line == "":
-		case diagramSubgraph.MatchString(line) && !inSubgraph:
-			inSubgraph = true
-		case line == "end" && inSubgraph:
-			inSubgraph = false
+		case subgraph != nil && group == "":
+			group = subgraph[1]
+			if _, isNode := aliases[group]; subgraphs[group] || isNode {
+				return systemImportGraph{}, fmt.Errorf("duplicate diagram alias %s at line %d", group, i+1)
+			}
+			subgraphs[group] = true
+		case line == "end" && group != "":
+			group = ""
 		default:
 			if node := diagramNode.FindStringSubmatch(line); node != nil {
 				alias, path := node[1], "bog/"+node[2]
-				if _, exists := aliases[alias]; exists {
+				if _, exists := aliases[alias]; exists || subgraphs[alias] {
 					return systemImportGraph{}, fmt.Errorf("duplicate diagram alias %s at line %d", alias, i+1)
 				}
-				if graph.nodes[path] {
+				if _, exists := graph.nodes[path]; exists {
 					return systemImportGraph{}, fmt.Errorf("duplicate production node %s at line %d", path, i+1)
 				}
 				aliases[alias] = path
-				graph.nodes[path] = true
+				graph.nodes[path] = group
 			} else if arrow := diagramArrow.FindStringSubmatch(line); arrow != nil {
-				arrows = append(arrows, diagramArrowLine{diagramEdge{arrow[1], arrow[2]}, i + 1})
+				arrows = append(arrows, diagramArrowLine{diagramEdge{arrow[1], arrow[2]}, i + 1, group})
 			} else {
 				return systemImportGraph{}, fmt.Errorf("unsupported Mermaid statement at line %d: %q", i+1, line)
 			}
 		}
 	}
-	if inSubgraph {
+	if group != "" {
 		return systemImportGraph{}, fmt.Errorf("unclosed diagram subgraph before line %d", end+1)
 	}
 
@@ -152,6 +180,9 @@ func parseSystemImportGraph(doc string) (systemImportGraph, error) {
 		from, to := aliases[arrow.from], aliases[arrow.to]
 		if from == "" || to == "" {
 			return systemImportGraph{}, fmt.Errorf("undeclared diagram endpoint at line %d: %s -> %s", arrow.line, arrow.from, arrow.to)
+		}
+		if arrow.group != "" && (graph.nodes[from] != arrow.group || graph.nodes[to] != arrow.group) {
+			return systemImportGraph{}, fmt.Errorf("edge inside %s subgraph at line %d has an endpoint declared outside it: %s -> %s", arrow.group, arrow.line, from, to)
 		}
 		edge := diagramEdge{from, to}
 		if graph.edges[edge] {
@@ -165,26 +196,35 @@ func parseSystemImportGraph(doc string) (systemImportGraph, error) {
 func TestSystemImportDiagramFixtures(t *testing.T) {
 	t.Parallel()
 	const (
-		client = "bog/internal/client"
-		store  = "bog/internal/store"
-		leaf   = "bog/verify/query-model"
-		arrow  = "    Cmd --> Client"
+		httpapi    = "bog/internal/httpapi"
+		store      = "bog/internal/store"
+		backup     = "bog/internal/backup"
+		leaf       = "bog/verify/query-model"
+		arrow      = "    Cmd --> HTTP"
+		storeNode  = `        Store["internal/store"]`
+		backupNode = `        Backup["internal/backup"]`
+		stagedOpen = `    subgraph Staged["Awaiting activation"]`
 	)
 	rules := map[string]rule{
-		server:            {serverCommand, []string{client}},
-		client:            {standalone, []string{store}},
+		server:            {serverCommand, []string{httpapi}},
+		httpapi:           {runtimeLibrary, []string{store}},
 		store:             {runtimeLibrary, nil},
+		backup:            {staged, []string{store}},
+		operatorCommand:   {verifier, []string{backup}},
 		leaf:              {verifierModel, nil},
 		"bog/verify/fuzz": {testOnly, nil},
 	}
 	const body = `flowchart TD
     subgraph Runtime["Server"]
         Cmd["cmd/bog"]
+        HTTP["internal/httpapi"]
+` + storeNode + "\n    end\n" + stagedOpen + "\n" + backupNode + `
     end
-    Cmd --> Client
-    Client["internal/client (standalone)"]
-    Store["internal/store"]
-    Client --> Store
+    Cmd --> HTTP
+    HTTP --> Store
+    Backup --> Store
+    Operator --> Backup
+    Operator["cmd/bog-verify"]
     Model["verify/query-model (independent oracle)"]
 `
 	const open = "```mermaid\n"
@@ -196,20 +236,48 @@ func TestSystemImportDiagramFixtures(t *testing.T) {
 		name, old, replacement string
 		want                   []string
 	}{
-		{name: "exact graph with isolated node and forward reference"},
+		{name: "exact graph with operator-only backup, isolated node, and forward reference"},
+		{
+			name:        "staged backup drawn inside server closure",
+			old:         "    end\n" + stagedOpen + "\n" + backupNode,
+			replacement: backupNode + "\n    end\n" + stagedOpen,
+			want:        []string{"missing Staged subgraph member " + backup, "unexpected Runtime subgraph member " + backup},
+		},
+		{
+			name:        "transitively wired store left outside server closure",
+			old:         storeNode + "\n    end",
+			replacement: "    end\n" + storeNode,
+			want:        []string{"missing Runtime subgraph member " + store},
+		},
+		{
+			name:        "wired store drawn as staged",
+			old:         storeNode + "\n    end\n" + stagedOpen,
+			replacement: "    end\n" + stagedOpen + "\n" + storeNode,
+			want:        []string{"missing Runtime subgraph member " + store, "unexpected Staged subgraph member " + store},
+		},
+		{
+			name: "renamed staged subgraph", old: stagedOpen,
+			replacement: `    subgraph Pending["Awaiting activation"]`,
+			want:        []string{"missing Staged subgraph member " + backup},
+		},
+		{
+			name: "edge inside Runtime cannot pull in staged backup", old: storeNode,
+			replacement: storeNode + "\n        Backup --> Store",
+			want:        []string{"edge inside Runtime subgraph at line 13 has an endpoint declared outside it: " + backup + " -> " + store},
+		},
 		{
 			name: "missing edge", old: arrow,
-			want: []string{"missing production edge " + server + " -> " + client},
+			want: []string{"missing production edge " + server + " -> " + httpapi},
 		},
 		{
 			name: "extra transitive edge", old: arrow, replacement: arrow + "\n    Cmd --> Store",
 			want: []string{"unexpected production edge " + server + " -> " + store},
 		},
 		{
-			name: "reversed edge", old: arrow, replacement: "    Client --> Cmd",
+			name: "reversed edge", old: arrow, replacement: "    HTTP --> Cmd",
 			want: []string{
-				"missing production edge " + server + " -> " + client,
-				"unexpected production edge " + client + " -> " + server,
+				"missing production edge " + server + " -> " + httpapi,
+				"unexpected production edge " + httpapi + " -> " + server,
 			},
 		},
 		{
@@ -223,23 +291,28 @@ func TestSystemImportDiagramFixtures(t *testing.T) {
 		},
 		{
 			name: "undeclared endpoint", old: arrow, replacement: "    Cmd --> Missing",
-			want: []string{"undeclared diagram endpoint at line 12: Cmd -> Missing"},
+			want: []string{"undeclared diagram endpoint at line 17: Cmd -> Missing"},
 		},
 		{
 			name: "duplicate alias", old: arrow, replacement: arrow + "\n    Cmd[\"cmd/other\"]",
-			want: []string{"duplicate diagram alias Cmd at line 13"},
+			want: []string{"duplicate diagram alias Cmd at line 18"},
+		},
+		{
+			name: "duplicate subgraph alias", old: stagedOpen,
+			replacement: `    subgraph Runtime["Awaiting activation"]`,
+			want:        []string{"duplicate diagram alias Runtime at line 14"},
 		},
 		{
 			name: "duplicate package", old: arrow, replacement: arrow + "\n    Other[\"cmd/bog\"]",
-			want: []string{"duplicate production node bog/cmd/bog at line 13"},
+			want: []string{"duplicate production node bog/cmd/bog at line 18"},
 		},
 		{
 			name: "duplicate edge", old: arrow, replacement: arrow + "\n" + arrow,
-			want: []string{"duplicate production edge " + server + " -> " + client + " at line 13"},
+			want: []string{"duplicate production edge " + server + " -> " + httpapi + " at line 18"},
 		},
 		{
 			name: "unsupported edge syntax", old: arrow, replacement: arrow + " --> Store",
-			want: []string{`unsupported Mermaid statement at line 12: "Cmd --> Client --> Store"`},
+			want: []string{`unsupported Mermaid statement at line 17: "Cmd --> HTTP --> Store"`},
 		},
 		{
 			name: "missing heading", old: systemDiagramHeading, replacement: "## Elsewhere",

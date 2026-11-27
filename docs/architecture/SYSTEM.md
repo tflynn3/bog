@@ -16,7 +16,7 @@ authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
 The Linux amd64 and arm64 production inventories at
-`ddc0496f00812f17ab913ddb284587f7f216a231` agree on the 19 root-module
+`a720df0d818b19ba3359aa4226b8b844c8f5e063` agree on the 19 root-module
 production packages and 23 direct imports between them shown below.
 `cmd/bog` reaches HTTP, readiness, store, and WAL and recovers an ordinary
 WAL into an in-memory store. The command still uses path-based readiness
@@ -32,8 +32,11 @@ The Mermaid graph declares the production packages and direct root-module
 imports in the executable fitness registry. Arrows point from importer to
 direct dependency. Nodes with no outgoing arrows have zero direct
 root-module production imports. Test-only packages appear in the package
-table below. The architecture suite checks the diagram against the registry
-and checks the registry against both Linux production inventories.
+table below. Runtime contains the registered production closure rooted at
+`cmd/bog`. Staged contains all libraries with the staged role, including
+backup, which the operator command imports. The architecture suite checks
+both memberships and the exact graph against the registry and checks the
+registry against both Linux production inventories.
 
 The declaration includes the fixture-backed stream policy verifier support
 added in #86 and both #87 capacity evidence imports. The shared validator
@@ -62,13 +65,13 @@ flowchart TD
     end
     Operator["cmd/bog-verify"]
     Export["cmd/bog-export"]
-    subgraph Staged["Retained libraries awaiting server activation"]
+    subgraph Staged["Libraries awaiting server activation"]
         Checkpoint["internal/checkpoint"]
         History["internal/history"]
         Backup["internal/backup"]
+        Idempotency["internal/idempotency (staged keyed ingest)"]
         History --> Checkpoint
     end
-    Idempotency["internal/idempotency (staged keyed ingest)"]
     Client["internal/client (standalone)"]
     Checkpoint --> Store
     History --> Store
@@ -195,10 +198,9 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
 `bog-storage` owns #108 activation for checkpoint, history, and backup.
-The table and diagram describe the measured revision. At the reviewed
-Storage handoff, promote each package whose server reachability and
-activation evidence are confirmed. Update the exact imports, roles, and
-diagram and remove each promoted staging declaration in the wiring PR.
+The table and diagram describe the measured revision. Promote each
+library in the command wiring PR once both Linux inventories confirm
+server reachability and its activation criteria are met.
 Idempotency remains staged under its own criteria. Keyed retries require
 the production WAL to commit and recover retry records atomically with
 their batches. Exercise concurrent same-key submissions, conflicting
@@ -251,10 +253,12 @@ Qualify the same clean composed revision on native Linux amd64
 (`ubuntu-24.04`, `GOAMD64=v1`) and arm64 (`ubuntu-24.04-arm`,
 `GOARM64=v8.0`). Each job verifies its runner and kernel architecture,
 builds once with Go 1.27.0 and cgo disabled, and uses that job's pinned
-binary for every producer. Reports bind to the full revision, the native
-binary's SHA-256, and the `linux-release-v1` fixture. Both matrix jobs
-must pass report validation and cleanup. The matrix is configured and
-qualification of the composed #108 revision is pending.
+binary for every producer. The workflow checks out the candidate and
+the release gate at their respective pinned revisions. Reports bind to
+the full candidate revision, the native binary's SHA-256, and the
+`linux-release-v1` fixture. Both matrix jobs must pass strict report
+validation and cleanup. Qualification of the composed #108 revision
+is pending.
 [Linux release workflow](../../.github/workflows/linux-release.yml)
 
 | Producer | Report | Required evidence |
@@ -266,9 +270,9 @@ qualification of the composed #108 revision is pending.
 | `verify/release` / `TestReleaseFixedBudgetBackfill` and `TestReleaseCapacityControlScope` | Passing test events | Exercise fixed-budget paging through backfill and replacement. Check that capacity routes are available only with explicit opt-in on the loopback listener. |
 | `verify/query-model` / `TestPinnedQueryModelReplay` | `query-model-events.jsonl` | Require passing seeded ordinary and retained walks, exact terminal replay, and a candidate identity matching the revision and binary checksum on each runner. |
 
-The supplied QA artifact at `79f0fe8adf1a3642c56990ad8791534fde1c426a`
-records a harness failure. Native qualification for the measured revision
-is pending. The two Linux inventories measure build topology and the cross-build
+The baseline includes the native query replay startup checks for verified
+bind collisions. Native qualification for this baseline is pending.
+The two Linux inventories measure build topology, and the cross-build
 checks compilation. Native verdicts require the pinned-binary producers.
 
 The three producers exercise a separate pinned server process through HTTP,
@@ -332,21 +336,27 @@ qualification requires adapters that observe a shared-deployment implementation.
 ## Fitness and registry ownership
 
 Architecture in the bog AgentSet owns the architecture record and
-fitness registry. Storage owns #108 recovery, publication, and command
-composition. Release Verification owns the two native verdicts.
-`bog-query` owns the HTTP paging contract. Cycle 157 reserves one track for
-the ordered Storage handoff and one for pinned-binary query replay. Preserve
-the existing assignments while rechecking the live read and write leases
-at dispatch and at the reviewed Storage SHA. Keep #104 behind the HTTP
-read lease and retained paging handoff, and #81 behind #108's writable
-recovery contract. Review the measured edges and roles together with the
-runtime wiring in the #108 PR.
+fitness registry, including this diagram check. `bog-storage` owns #108
+recovery, publication, and command composition. `bog-query` owns the
+HTTP paging contract. Release Verification owns the two native verdicts.
+Cycle 158 advances #108 to a reviewed Storage handoff and wires the bounded
+retained runtime when the command lease clears. #81 can start against the
+frozen recovery-view contract. #104 remains reserved behind the reviewed
+HTTP paging handoff. The backlog shows two running tracks and PM reports
+three. Preserve capacity for the reported third track until dispatch
+reconciles the counts. Keep the listener work, #106, and the exclusive
+eval and council leases with their current owners. Recheck read and
+write leases at dispatch and at the reviewed Storage SHA.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
-[Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification)
+[Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification),
+[Tail-only recovery contract](../adr/0035-tail-only-retained-recovery-contract.md)
 
-Keep the existing exporter and release evidence registrations when
-updating the diagram and registry for #108. Rerun both Linux inventories
-on the composed tree.
+At the reviewed Storage SHA, compare both Linux inventories. The command
+wiring PR updates `internal/archtest/architecture_test.go` with the exact
+imports and roles, `internal/archtest/staged_packages_test.go` with the
+remaining staging declarations, and `docs/architecture/SYSTEM.md` with the
+measured revision, diagram, and role table. Preserve the operator backup
+edge and the exporter and release evidence registrations.
 [Package role governance](../adr/0019-package-role-governance.md),
 [Exporter integration handoff](../adr/0032-operator-export-boundary.md#integration-and-qualification)
 
@@ -355,9 +365,9 @@ The suite lists packages with `GOOS=linux`, `GOAMD64=v1`, `GOARM64=v8.0`,
 `CGO_ENABLED=0`, `GOENV=off`, empty `GOFLAGS`, `GO111MODULE=on`, and
 `GOWORK=off`, once for each target. Exact imports, cycles, package kinds,
 and server reachability are checked against both inventories. The diagram
-fitness test checks every declared production node and directed edge
-against the same registry. Test imports and nested modules are outside the
-root-module production registry.
+fitness test checks every declared production node and directed edge, the
+Runtime closure, and Staged membership against the same registry. Test
+imports and nested modules are outside the root-module production registry.
 [Diagram fitness test](../../internal/archtest/system_diagram_test.go)
 
 - HTTP owns the paging seam. It cannot reach checkpoint, history, or

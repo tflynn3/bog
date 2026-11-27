@@ -1,14 +1,16 @@
 # ADR 0019 — Package role parity
 
-**Status** — Proposed for Cycle 103 review.
+**Status** — Enforced by the architecture fitness suite. Cycle 158 extends
+the check to Mermaid subgraph membership.
 
 ## Context
 
 The Go fitness registry records package roles and exact production imports.
 SYSTEM.md documents those roles for reviewers. A check limited to staged
 rows can miss an incorrect wired role, a missing verifier, or duplicate
-rows elsewhere in the table. During #53, a stale role can hide whether a
-retained library has entered the server's production dependency tree.
+rows elsewhere in the table. A diagram with exact nodes and imports can
+still misstate whether a retained library has entered the server's
+production dependency tree.
 [Package registry](../architecture/SYSTEM.md#package-registry),
 [Retained-history runtime cutover](0015-retained-history-runtime-cutover.md)
 
@@ -25,7 +27,7 @@ SYSTEM.md labels below.
 | Staged | Staged |
 | Standalone | Standalone |
 | Test-only | Test-only |
-| Verifier command for `cmd/bog-verify` | Operator command |
+| Verifier command for `cmd/bog-verify` or `cmd/bog-export` | Operator command |
 | Verifier command for an evidence producer | Verifier command |
 | Verifier support | Verifier support |
 
@@ -40,14 +42,32 @@ staged package still requires an owner and activation criteria.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Staging declarations](../../internal/archtest/staged_packages_test.go)
 
-## #53 promotion handoff
+Require the Mermaid Runtime subgraph to contain exactly `cmd/bog` and its
+transitive root-module production dependencies in the registry. Require
+Staged to contain exactly the packages registered as staged. Check
+membership alongside every production node and direct import edge. Declare
+edges between groups at the top level so each grouped edge has both
+endpoints declared in that group.
+[Diagram fitness check](../../internal/archtest/system_diagram_test.go)
 
-Architecture owns the fitness registry and SYSTEM.md. `bog-storage` owns
-#53 composition and hands off the composed revision to Architecture for
-review. Recheck the applicable write leases at dispatch and handoff.
+## #108 promotion handoff
 
-On the composed revision, measure direct root-module production imports
-and transitive reachability from `cmd/bog` on Linux amd64 (`GOAMD64=v1`)
+Architecture in the bog AgentSet owns the fitness registry and SYSTEM.md.
+`bog-storage` owns #108 recovery and publication and supplies the reviewed
+Storage SHA. Storage owns runtime composition after the command lease
+clears. `bog-query` owns the retained HTTP paging contract, and Release
+Verification owns the native release gate. Recheck the applicable read
+and write leases at dispatch and handoff.
+
+At baseline `a720df0d818b19ba3359aa4226b8b844c8f5e063`, the Linux server
+closure is `cmd/bog`, `internal/httpapi`, `internal/readiness`,
+`internal/store`, and `internal/wal`. Checkpoint, history, backup, and
+idempotency remain staged. Preserve the `cmd/bog-verify` import of backup
+for read-only image verification.
+
+Compare the Storage handoff and composed revision by measuring direct
+root-module production imports and transitive reachability from
+`cmd/bog` on Linux amd64 (`GOAMD64=v1`)
 and arm64 (`GOARM64=v8.0`). Use the architecture suite's `go list -deps`
 settings with `CGO_ENABLED=0`, `GOENV=off`, empty `GOFLAGS`,
 `GO111MODULE=on`, and `GOWORK=off`. Review both inventories against the
@@ -58,12 +78,16 @@ server graph reaches each library on both targets and its activation
 criteria are met. Operator or release verifier use alone leaves a library
 staged. Keep idempotency staged until keyed-ingest activation passes,
 including atomic WAL commit and recovery of retry records with their batches.
-In the wiring PR, update the registered edges and roles, update the measured
-revision, diagram, and package roles in SYSTEM.md, and remove the staging
-declaration for each promoted library. Review those edits with the runtime
-wiring, then run `go test -count=1 ./internal/archtest` and
-`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on the composed tree.
-Native release qualification still requires both Linux jobs to pass on the
-same clean composed revision.
+In the command wiring PR, update the exact imports and roles in
+`internal/archtest/architecture_test.go`, remove each promoted library's
+declaration from `internal/archtest/staged_packages_test.go`, and update the
+measured revision, diagram, and role table in `docs/architecture/SYSTEM.md`.
+Review those edits with the runtime wiring and preserve the operator and
+evidence registrations. On the composed tree, run
+`go vet ./internal/archtest`, `go test -race -count=1 ./internal/archtest`,
+and `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...`.
+Native qualification remains pending. Both native Linux jobs must qualify
+the same clean composed revision, using one SHA-256-pinned binary per
+architecture for the evidence producers and strict validation.
 [Fitness ownership](../architecture/SYSTEM.md#fitness-and-registry-ownership),
 [Cutover integration and qualification](0015-retained-history-runtime-cutover.md#integration-and-qualification)

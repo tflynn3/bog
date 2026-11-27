@@ -26,7 +26,9 @@ const usage = `Usage:
 
 Export query rows as NDJSON to stdout. Times are RFC3339 and the range is
 half-open. The filter is a case-sensitive substring. The page budget includes
-the terminal page. The timeout covers the entire walk, retries, and output.
+the terminal page. The timeout covers the walk, retries, and output.
+An incomplete export can leave a partial final record. Earlier newline-
+terminated records remain valid and in query order.
 
 Exit statuses:
   0  complete export or help

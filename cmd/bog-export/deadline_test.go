@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -58,15 +59,21 @@ func TestExportSharesDeadlineAcrossOutputAndRetries(t *testing.T) {
 
 type slowOutput struct {
 	bytes.Buffer
+	mu       sync.Mutex
 	deadline time.Time
 }
 
 func (w *slowOutput) SetWriteDeadline(deadline time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.deadline = deadline
 	return nil
 }
 
 func (w *slowOutput) Write(p []byte) (int, error) {
-	time.Sleep(time.Until(w.deadline.Add(-450 * time.Millisecond)))
+	w.mu.Lock()
+	deadline := w.deadline
+	w.mu.Unlock()
+	time.Sleep(time.Until(deadline.Add(-450 * time.Millisecond)))
 	return w.Buffer.Write(p)
 }

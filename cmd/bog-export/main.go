@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"bog/internal/client"
 )
@@ -18,10 +19,17 @@ const (
 	exitOK         = 0
 	exitIncomplete = 1
 	exitUsage      = 2
+
+	// Help, usage errors, and a last diagnostic after an export has
+	// already been canceled get a short best-effort reporting window.
+	diagnosticWindow = 200 * time.Millisecond
 )
 
 func main() {
-	// Report a closed pipeline as a stdout write failure.
+	if len(os.Args) == 2 && os.Args[1] == outputWorkerArg {
+		os.Exit(runOutputWorker())
+	}
+	// Report closed pipelines (including worker channels) as write errors.
 	signal.Ignore(syscall.SIGPIPE)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	status := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
@@ -31,31 +39,45 @@ func main() {
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	opts, err := parseOptions(args)
-	if errors.Is(err, flag.ErrHelp) {
-		if err := writeOnce(stderr, []byte(usage)); err != nil {
-			return exitIncomplete
+	if err != nil {
+		reportCtx, cancel := context.WithTimeout(ctx, diagnosticWindow)
+		defer cancel()
+		if errors.Is(err, flag.ErrHelp) {
+			return writeDiagnostic(reportCtx, stderr, exitOK, []byte(usage))
 		}
+		return writeDiagnostic(reportCtx, stderr, exitUsage, fmt.Appendf(nil, "bog-export: %v (see bog-export -h)\n", err))
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, opts.timeout)
+	defer cancel()
+	err = outputCancellation(ctx, export(ctx, opts, stdout))
+	if err == nil {
 		return exitOK
 	}
-	if err != nil {
-		return reportError(stderr, exitUsage, fmt.Errorf("%w (see bog-export -h)", err))
+	reportCtx := ctx
+	if outputCancellation(ctx, nil) != nil {
+		// The export has stopped. Allow one brief diagnostic attempt even
+		// after cancellation so an available stderr can explain the exit.
+		var stop context.CancelFunc
+		reportCtx, stop = context.WithTimeout(context.WithoutCancel(ctx), diagnosticWindow)
+		defer stop()
 	}
-	if err := export(ctx, opts, stdout); err != nil {
-		return reportError(stderr, exitIncomplete, fmt.Errorf("export incomplete: %w", err))
-	}
-	return exitOK
+	return writeDiagnostic(reportCtx, stderr, exitIncomplete, fmt.Appendf(nil, "bog-export: export incomplete: %v\n", err))
 }
 
-func reportError(stderr io.Writer, status int, err error) int {
-	if err := writeOnce(stderr, fmt.Appendf(nil, "bog-export: %v\n", err)); err != nil {
+func writeDiagnostic(ctx context.Context, stderr io.Writer, status int, message []byte) int {
+	output, err := openOutput(ctx, stderr)
+	if err != nil {
+		return exitIncomplete
+	}
+	writeErr := output.WriteRecord(message)
+	if err := errors.Join(writeErr, output.Close()); err != nil {
 		return exitIncomplete
 	}
 	return status
 }
 
 func export(ctx context.Context, opts options, out io.Writer) error {
-	ctx, cancel := context.WithTimeout(ctx, opts.timeout)
-	defer cancel()
 	server, err := client.New(opts.baseURL, nil)
 	if err != nil {
 		return fmt.Errorf("configure query client: %w", err)
@@ -70,62 +92,41 @@ func export(ctx context.Context, opts options, out io.Writer) error {
 }
 
 func exportPages(ctx context.Context, walk *client.ContextBoundedWalk, retry client.PageRetry, out io.Writer) (resultErr error) {
-	var readyToWrite bool
+	var output *recordOutput
 	for pageNumber := 1; ; pageNumber++ {
 		page, err := walk.NextPageWithRetry(retry)
 		if err == io.EOF {
-			return ctx.Err()
+			return outputCancellation(ctx, nil)
 		}
 		if err != nil {
 			return fmt.Errorf("get query page %d: %w", pageNumber, err)
 		}
-		if len(page.Rows) > 0 && !readyToWrite {
-			writer, finish, err := prepareOutput(ctx, out)
+		if len(page.Rows) > 0 && output == nil {
+			output, err = openOutput(ctx, out)
 			if err != nil {
-				return err
+				return fmt.Errorf("prepare stdout: %w", err)
 			}
-			out, readyToWrite = writer, true
-			if finish != nil {
-				defer func() {
-					if err := finish(); err != nil {
-						resultErr = errors.Join(resultErr, err)
-					}
-				}()
-			}
+			defer func() {
+				if err := output.Close(); err != nil {
+					resultErr = errors.Join(resultErr, fmt.Errorf("close stdout output: %w", err))
+				}
+			}()
 		}
 		for i, row := range page.Rows {
-			if err := writeRow(ctx, out, row); err != nil {
+			if err := writeRow(output, row); err != nil {
 				return fmt.Errorf("write stdout (page %d, row %d): %w", pageNumber, i+1, err)
 			}
 		}
 	}
 }
 
-func writeRow(ctx context.Context, out io.Writer, row client.Row) error {
-	if err := ctx.Err(); err != nil {
+func writeRow(out *recordOutput, row client.Row) error {
+	if err := outputCancellation(out.ctx, nil); err != nil {
 		return err
 	}
 	record, err := json.Marshal(row)
 	if err != nil {
 		return fmt.Errorf("encode NDJSON record: %w", err)
 	}
-	record = append(record, '\n')
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := writeOnce(out, record); err != nil {
-		return errors.Join(err, ctx.Err())
-	}
-	return ctx.Err()
-}
-
-func writeOnce(out io.Writer, data []byte) error {
-	n, err := out.Write(data)
-	if err != nil {
-		return err
-	}
-	if n != len(data) {
-		return io.ErrShortWrite
-	}
-	return nil
+	return out.WriteRecord(append(record, '\n'))
 }

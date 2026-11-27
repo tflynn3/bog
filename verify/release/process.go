@@ -19,9 +19,8 @@ const (
 	candidateStartupTimeout = 5 * time.Second
 	candidateStopTimeout    = 3 * time.Second
 	candidatePollInterval   = 20 * time.Millisecond
-	// Bog handles SIGTERM for graceful shutdown. Use a distinct fatal
-	// signal for this fixture so normal exit and SIGKILL can never pass
-	// as the result of the verifier's stop request.
+	// Bog handles SIGTERM for graceful shutdown. Use SIGHUP for routine
+	// teardown so an escalation to SIGKILL remains distinguishable.
 	candidateStopSignal = syscall.SIGHUP
 )
 
@@ -29,12 +28,12 @@ const (
 // serializes group signals with observation and prevents signaling a reused
 // PID once the observer proceeds to reap the leader.
 type candidateProcess struct {
-	process  *os.Process
-	done     chan struct{}
-	mu       sync.Mutex
-	observed bool
-	stopSent bool
-	result   error
+	process    *os.Process
+	done       chan struct{}
+	mu         sync.Mutex
+	observed   bool
+	stopSignal syscall.Signal
+	result     error
 }
 
 func startCandidate(ctx context.Context, binary string, args []string, cancelProbes context.CancelCauseFunc) (*candidateProcess, error) {
@@ -59,21 +58,28 @@ func (p *candidateProcess) observe(cmd *exec.Cmd, cancelProbes context.CancelCau
 	_, observeErr := candidateExited(p.process.Pid, false)
 	p.mu.Lock()
 	p.observed = true
-	stopSent := p.stopSent
+	stopSignal := p.stopSignal
 	// Kill any descendants even when the leader exited on its own.
 	groupErr := killCandidateGroup(p.process.Pid)
 	p.mu.Unlock()
 
 	waitErr := cmd.Wait()
-	p.result = errors.Join(candidateExitError(stopSent, waitErr), observeErr, groupErr)
+	p.result = errors.Join(candidateSignalExitError(stopSignal, waitErr), observeErr, groupErr)
 	cancelProbes(p.result)
 	close(p.done)
 }
 
 func candidateExitError(stopSent bool, waitErr error) error {
+	if stopSent {
+		return candidateSignalExitError(candidateStopSignal, waitErr)
+	}
+	return candidateSignalExitError(0, waitErr)
+}
+
+func candidateSignalExitError(stopSignal syscall.Signal, waitErr error) error {
 	var exit *exec.ExitError
 	if errors.As(waitErr, &exit) {
-		if status, ok := exit.Sys().(syscall.WaitStatus); ok && stopSent && status.Signaled() && status.Signal() == candidateStopSignal {
+		if status, ok := exit.Sys().(syscall.WaitStatus); ok && stopSignal != 0 && status.Signaled() && status.Signal() == stopSignal {
 			return nil
 		}
 	}
@@ -83,9 +89,12 @@ func candidateExitError(stopSent bool, waitErr error) error {
 	return fmt.Errorf("candidate exited unexpectedly: %w", waitErr)
 }
 
-func (p *candidateProcess) requestStop() error {
+func (p *candidateProcess) requestStop(signal syscall.Signal) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.stopSignal != 0 && p.stopSignal != signal {
+		return fmt.Errorf("candidate stop already requested with %s", p.stopSignal)
+	}
 	if p.observed {
 		return nil
 	}
@@ -95,13 +104,13 @@ func (p *candidateProcess) requestStop() error {
 	if err != nil || exited {
 		return err
 	}
-	if err := p.process.Signal(candidateStopSignal); err != nil {
+	if err := p.process.Signal(signal); err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
 			return nil // The observer classifies the actual wait status.
 		}
-		return fmt.Errorf("signal candidate for teardown: %w", err)
+		return fmt.Errorf("signal candidate for teardown with %s: %w", signal, err)
 	}
-	p.stopSent = true
+	p.stopSignal = signal
 	return nil
 }
 
@@ -122,7 +131,16 @@ func (p *candidateProcess) forceStop() error {
 }
 
 func (p *candidateProcess) stop(timeout time.Duration) error {
-	stopErr := p.requestStop()
+	return p.stopWithSignal(candidateStopSignal, timeout)
+}
+
+// crashStop requires the leader to exit from the requested SIGKILL.
+func (p *candidateProcess) crashStop(timeout time.Duration) error {
+	return p.stopWithSignal(syscall.SIGKILL, timeout)
+}
+
+func (p *candidateProcess) stopWithSignal(signal syscall.Signal, timeout time.Duration) error {
+	stopErr := p.requestStop(signal)
 	if stopErr != nil {
 		stopErr = errors.Join(stopErr, p.forceStop())
 	}
@@ -228,7 +246,11 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
 	})
 }
 
-func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(context.Context, string) error) (err error) {
+func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(context.Context, string) error) error {
+	return serveDirectoryWithStop(ctx, binary, dir, client, flags, (*candidateProcess).stop, check)
+}
+
+func serveDirectoryWithStop(ctx context.Context, binary, dir string, client *http.Client, flags []string, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string) error) (err error) {
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		return fmt.Errorf("reserve release listener: %w", err)
@@ -243,8 +265,13 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 	if err != nil {
 		return err
 	}
+	probeComplete := false
 	defer func() {
-		stopErr := p.stop(candidateStopTimeout)
+		stop := (*candidateProcess).stop
+		if probeComplete && ctx.Err() == nil {
+			stop = stopAfterProbe
+		}
+		stopErr := stop(p, candidateStopTimeout)
 		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
 			err = errors.Join(err, ctxErr)
 		}
@@ -261,5 +288,7 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 	probeErr := check(probes, base)
 	// Keep the probe diagnostic first even when the listener or process
 	// disappeared during the last request.
-	return errors.Join(probeErr, p.requireListener(addr.Port))
+	err = errors.Join(probeErr, p.requireListener(addr.Port))
+	probeComplete = err == nil
+	return err
 }

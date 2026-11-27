@@ -164,7 +164,7 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 	// the first page, where a resume against a fresh snapshot would see it.
 	added := querymodel.Row{Time: rows[1].Time, Line: "after restore [match]"}
 	var staleCursor string
-	err = serveDirectory(ctx, binary, dir, client, flags, func(ctx context.Context, base string) error {
+	err = serveDirectoryWithStop(ctx, binary, dir, client, flags, (*candidateProcess).crashStop, func(ctx context.Context, base string) error {
 		pager, err := newReleasePager(base, client, restoredPageCap)
 		if err != nil {
 			return err
@@ -202,11 +202,12 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 		return nil
 	})
 	if err != nil {
-		return proof, fmt.Errorf("serve restored image: %w", err)
+		return proof, fmt.Errorf("serve and crash-stop restored image: %w", err)
 	}
+	client.CloseIdleConnections()
 	err = serveDirectory(ctx, binary, dir, client, flags, func(ctx context.Context, base string) error {
 		if err := requireStaleCursorRejection(ctx, client, base, staleCursor); err != nil {
-			return fmt.Errorf("resume cursor from before restart: %w", err)
+			return fmt.Errorf("resume cursor from before crash: %w", err)
 		}
 		pager, err := newReleasePager(base, client, restoredPageCap)
 		if err != nil {
@@ -219,7 +220,7 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 		return nil
 	})
 	if err != nil {
-		err = fmt.Errorf("restart with acknowledged post-restore write: %w", err)
+		err = fmt.Errorf("restart after SIGKILL with acknowledged post-restore write: %w", err)
 	}
 	return proof, err
 }

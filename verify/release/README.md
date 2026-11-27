@@ -47,9 +47,9 @@ loopback address and port to listening sockets in the candidate's own file
 descriptors. Any matching foreign listener fails the fixture. The verifier
 checks ownership again after health and after the workload. It observes
 exit independently of probing and reserves the leader PID through
-process-group teardown. The verifier requests its stop with SIGHUP and
-requires a matching exit. Normal exits and SIGKILL, including escalation
-after a teardown timeout, fail the fixture.
+process-group teardown. Routine teardown requests SIGHUP and requires a
+matching wait status. Unexpected exits and teardown timeouts fail the
+fixture, even if escalation to SIGKILL succeeds.
 
 The durability report validator requires these fields in the `enospc` case's
 `evidence` object.
@@ -175,12 +175,16 @@ The Linux test `TestReleaseRestoredParity` publishes a checkpoint and appends
 a WAL tail with overlapping times, ties, duplicates, and backfill. It exports,
 verifies, and restores that capture before starting the pinned candidate.
 Fresh walks use `FetchPage` and must reproduce the exact append-order model
-across page sizes and literal filters with a 256-byte response cap. After the candidate
-acknowledges an ingest on the restored image, a fresh walk must return the
-augmented model before shutdown, and another must return it after restart.
-On restart, a raw request using a cursor from the old process must receive
-a framed HTTP 400 with the exact `invalid cursor\n` body and no continuation
-header or trailer.
+across page sizes and literal filters with a 256-byte response cap. After the
+candidate returns HTTP 204 for a backfill on the restored image, the held
+cursor must finish at the original capture and fresh walks must match the
+augmented ledger. The verifier then checks listener ownership, intentionally
+sends SIGKILL, and requires a matching wait status, process-group cleanup,
+and reaping within the teardown deadline before restarting the same pinned
+binary on the same directory. Fresh walks after restart must match the
+augmented ledger in exact order through exhaustion. A raw request using the
+pre-crash cursor must receive a framed HTTP 400 with the exact
+`invalid cursor\n` body and no continuation header or trailer.
 The `restored_parity` evidence records their row counts in `post_append_rows`
 and `restart_rows`. The report is bound to the same candidate identity.
 
@@ -191,9 +195,10 @@ restart. The `ordinary_wal_reopen` case records the row counts and append
 status.
 
 The native workflow uses `-require-cutover -parity parity.json` and runs the
-verifier tests with the race detector on Linux. Strict validation requires
-both recovery cases to pass and checks these exact evidence fields for
-`linux-release-v1`.
+verifier tests with the race detector on Linux. Qualify the crash fixture
+against the composed #53 candidate on both native Linux runners. Strict
+validation requires both recovery cases to pass and checks these exact
+evidence fields for `linux-release-v1`.
 
 | Case | Required evidence |
 | --- | --- |

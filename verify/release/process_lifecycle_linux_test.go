@@ -103,13 +103,19 @@ func TestServeCandidateLifecycle(t *testing.T) {
 	for _, tc := range []struct {
 		name, mode, want string
 		kill, cancel     bool
+		crash            bool
 		probeErr         error
 	}{
 		{name: "intentional stop"},
+		{name: "intentional crash", mode: "ignore-stop", crash: true},
 		{name: "kill before first HTTP", mode: "kill-before-listen", want: "signal: killed"},
+		{name: "kill before crash fixture listens", mode: "kill-before-listen", crash: true, want: "signal: killed"},
 		{name: "outside kill after final HTTP", kill: true, want: "signal: killed"},
+		{name: "outside kill before requested crash", kill: true, crash: true, want: "signal: killed"},
 		{name: "outside kill keeps probe error first", kill: true, probeErr: probeErr, want: "signal: killed"},
+		{name: "failed probe uses routine teardown", crash: true, probeErr: probeErr, want: probeErr.Error()},
 		{name: "probe cancellation with intentional stop", cancel: true, want: "context canceled"},
+		{name: "canceled crash fixture uses routine teardown", crash: true, cancel: true, want: "context canceled"},
 		{name: "foreign listener in candidate group", mode: "foreign", want: "foreign listener"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -122,8 +128,15 @@ func TestServeCandidateLifecycle(t *testing.T) {
 			raw := &http.Transport{DisableKeepAlives: true}
 			defer raw.CloseIdleConnections()
 			client := &http.Client{Transport: raw}
-			called := false
-			err := serveDirectory(ctx, binary, root, client, []string{"-fixture-mode=" + tc.mode}, func(probes context.Context, base string) error {
+			called, crashRequested := false, false
+			stopAfterProbe := (*candidateProcess).stop
+			if tc.crash {
+				stopAfterProbe = func(p *candidateProcess, timeout time.Duration) error {
+					crashRequested = true
+					return p.crashStop(timeout)
+				}
+			}
+			err := serveDirectoryWithStop(ctx, binary, root, client, []string{"-fixture-mode=" + tc.mode}, stopAfterProbe, func(probes context.Context, base string) error {
 				called = true
 				res, err := request(probes, client, http.MethodGet, base+"/last-probe", nil)
 				if err != nil {
@@ -141,7 +154,11 @@ func TestServeCandidateLifecycle(t *testing.T) {
 						return err
 					}
 					// Independent exit cancels probes even before teardown is requested.
-					<-probes.Done()
+					select {
+					case <-probes.Done():
+					case <-time.After(time.Second):
+						return errors.New("candidate exit did not cancel probes")
+					}
 					if cause := context.Cause(probes); cause == nil || !strings.Contains(cause.Error(), "signal: killed") {
 						return fmt.Errorf("candidate exit cause: %w", cause)
 					}
@@ -151,8 +168,12 @@ func TestServeCandidateLifecycle(t *testing.T) {
 				}
 				return tc.probeErr
 			})
-			if wantCalled := tc.mode == ""; called != wantCalled {
+			wantCalled := tc.mode == "" || tc.mode == "ignore-stop"
+			if called != wantCalled {
 				t.Errorf("probe invoked = %t, want %t", called, wantCalled)
+			}
+			if wantCrash := tc.crash && tc.want == ""; crashRequested != wantCrash {
+				t.Errorf("crash requested = %t, want %t", crashRequested, wantCrash)
 			}
 			if tc.want == "" {
 				if err != nil {
@@ -172,7 +193,7 @@ func TestServeCandidateLifecycle(t *testing.T) {
 			if tc.probeErr != nil && (!errors.Is(err, tc.probeErr) || !strings.HasPrefix(err.Error(), tc.probeErr.Error())) {
 				t.Errorf("probe failure lost precedence: %v", err)
 			}
-			if tc.mode == "" {
+			if wantCalled {
 				pid, err := fixturePID(root)
 				if err != nil {
 					t.Fatal(err)
@@ -205,7 +226,7 @@ func TestStopCandidateEscalatesAndReportsTimeout(t *testing.T) {
 		}
 	})
 	for {
-		if _, err := fixturePID(root); err == nil {
+		if _, err := os.Stat(filepath.Join(root, "pid")); err == nil {
 			break
 		} else if !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
@@ -221,18 +242,30 @@ func TestStopCandidateEscalatesAndReportsTimeout(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "did not exit within teardown deadline") {
 		t.Fatalf("teardown hang was accepted: %v", err)
 	}
+	if !strings.Contains(err.Error(), "candidate exited unexpectedly: signal: killed") {
+		t.Errorf("escalation lost the unexpected SIGKILL status: %v", err)
+	}
 	select {
 	case <-p.done:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
+	if _, err := candidateExited(p.process.Pid, true); !errors.Is(err, syscall.ECHILD) {
+		t.Errorf("escalated leader was not reaped: %v", err)
+	}
 }
 
 func TestStopDoesNotClaimAnUnreapedExit(t *testing.T) {
 	t.Parallel()
-	for _, tc := range []struct{ name, script, diagnostic string }{
-		{"successful exit", "exit 0", "status 0"},
-		{"external SIGKILL", "kill -KILL $$", "signal: killed"},
+	for _, tc := range []struct {
+		name, script, diagnostic string
+		request                  syscall.Signal
+	}{
+		{"successful exit before stop", "exit 0", "status 0", candidateStopSignal},
+		{"successful exit before crash", "exit 0", "status 0", syscall.SIGKILL},
+		{"external SIGHUP before stop", "kill -HUP $$", "signal: hangup", candidateStopSignal},
+		{"external SIGKILL before stop", "kill -KILL $$", "signal: killed", candidateStopSignal},
+		{"external SIGKILL before crash", "kill -KILL $$", "signal: killed", syscall.SIGKILL},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -245,17 +278,40 @@ func TestStopDoesNotClaimAnUnreapedExit(t *testing.T) {
 			// Arrange for the kernel to have the exit status while the
 			// lifecycle observer has yet to publish it.
 			_, observeErr := candidateExited(cmd.Process.Pid, false)
-			stopErr := p.requestStop()
+			stopErr := p.requestStop(tc.request)
 			waitErr := cmd.Wait()
 			if err := errors.Join(observeErr, stopErr); err != nil {
 				t.Fatal(err)
 			}
-			if p.stopSent {
-				t.Error("stop request claimed a process that had already exited")
+			if p.stopSignal != 0 {
+				t.Errorf("stop request claimed a process that had already exited with %s", p.stopSignal)
 			}
-			got := candidateExitError(p.stopSent, waitErr)
+			got := candidateSignalExitError(p.stopSignal, waitErr)
 			if got == nil || !strings.Contains(got.Error(), tc.diagnostic) {
 				t.Errorf("exit diagnosis = %v, want %q", got, tc.diagnostic)
+			}
+		})
+	}
+}
+
+func TestCrashStopRequiresSIGKILLWaitStatus(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, script, diagnostic string }{
+		{"matching crash", "kill -KILL $$", ""},
+		{"hangup", "kill -HUP $$", "signal: hangup"},
+		{"successful exit", "exit 0", "status 0"},
+		{"failed exit", "exit 19", "exit status 19"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			waitErr := exec.CommandContext(t.Context(), "/bin/sh", "-c", tc.script).Run()
+			err := candidateSignalExitError(syscall.SIGKILL, waitErr)
+			if tc.diagnostic == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.diagnostic) {
+				t.Errorf("exit diagnosis = %v, want %q", err, tc.diagnostic)
 			}
 		})
 	}

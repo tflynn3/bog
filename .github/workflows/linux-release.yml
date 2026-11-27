@@ -47,6 +47,13 @@ jobs:
       EXPECTED_MACHINE: ${{ matrix.machine }}
       TUNING_KEY: ${{ matrix.tuning_key }}
       EXPECTED_TUNING: ${{ matrix.tuning }}
+      RELEASE_PRODUCERS: |-
+        admission gate
+        durability candidate
+        capacity candidate
+        parity gate
+        fixed_budget_backfill gate
+        capacity_control_scope gate
     defaults:
       run:
         shell: bash
@@ -301,17 +308,13 @@ jobs:
             run_candidate_test TestReleaseCapacityControlScope "$EVIDENCE/capacity-control-scope-events.jsonl"
           )
           failed=0
-          for name in admission durability capacity parity fixed_budget_backfill capacity_control_scope; do
-            case "$name" in
-              admission|parity|fixed_budget_backfill|capacity_control_scope) checkout=gate ;;
-              durability|capacity) checkout=candidate ;;
-            esac
+          while read -r -u 3 name checkout; do
             checkout_sha=$(git -C "$checkout" rev-parse HEAD) || { failed=1; continue; }
             statuses=(0 0)
             (cd "$checkout" && "$name") 2>&1 | tee "$EVIDENCE/$name.log" || statuses=("${PIPESTATUS[@]}")
             record "$name" "${statuses[0]}" "$checkout" "$checkout_sha" || failed=1
             if (( statuses[0] != 0 || statuses[1] != 0 )); then failed=1; fi
-          done
+          done 3<<< "$RELEASE_PRODUCERS"
           exit "$failed"
 
       - name: Validate reports and candidate identity
@@ -321,8 +324,46 @@ jobs:
         env:
           BOG_RELEASE_REQUIRE_RETARGET: '1'
         run: |
+          validate_producers() {
+            python3 - "$EVIDENCE/producers.txt" "$REVISION" "$EXPECTED_ARCH" "$GITHUB_WORKFLOW_SHA" "$RELEASE_PRODUCERS" <<'PY'
+          import sys
+
+          path, revision, arch, gate_sha, definitions = sys.argv[1:]
+          checkout_shas = {"gate": gate_sha, "candidate": revision}
+          expected = {}
+          for definition in definitions.splitlines():
+              name, checkout = definition.split()
+              expected[name] = (
+                  f"{name} revision={revision} arch={arch} exit=0 "
+                  f"checkout={checkout} checkout_sha={checkout_shas[checkout]}"
+              )
+
+          seen = set()
+          try:
+              with open(path, encoding="utf-8") as manifest:
+                  for number, raw in enumerate(manifest, 1):
+                      record = raw.rstrip("\n")
+                      name = record.partition(" ")[0]
+                      location = f"{path}:{number}"
+                      if name not in expected:
+                          sys.exit(f"{location}: unexpected producer {name!r}")
+                      if name in seen:
+                          sys.exit(f"{location}: duplicate producer {name!r}")
+                      if record != expected[name]:
+                          sys.exit(f"{location}: expected {expected[name]!r}, got {record!r}")
+                      seen.add(name)
+          except (OSError, UnicodeError) as error:
+              sys.exit(f"{path}: cannot read producer manifest: {error}")
+
+          missing = expected.keys() - seen
+          if missing:
+              sys.exit(f"{path}: missing producers: {', '.join(sorted(missing))}")
+          print(f"Validated {len(seen)} producer records for {revision} on {arch}")
+          PY
+          }
           {
             failed=0
+            validate_producers || failed=1
             sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
             checkout_sha=$(git rev-parse HEAD)
             printf 'release validator checkout=gate checkout_sha=%s\n' "$checkout_sha"

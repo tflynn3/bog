@@ -12,6 +12,10 @@ import (
 	"time"
 )
 
+type readinessMismatch struct{ error }
+
+func (e readinessMismatch) Unwrap() error { return e.error }
+
 func (s *server) observeDiskReadiness(ctx context.Context, phase string, want, transient diskReadiness, stableFor time.Duration) (last readinessObservation, err error) {
 	var evidence *readinessEvidence
 	if d := s.diagnostics; d != nil {
@@ -23,17 +27,26 @@ func (s *server) observeDiskReadiness(ctx context.Context, phase string, want, t
 			}
 		}()
 	}
-	return pollDiskReadiness(ctx, want, transient, stableFor, func(ctx context.Context) (readinessObservation, error) {
+	var probeErr error
+	var mismatch bool
+	last, err = pollDiskReadiness(ctx, want, transient, stableFor, func(ctx context.Context) (readinessObservation, error) {
 		obs, err := readDiskReadiness(ctx, s.client, s.addr)
 		if d := s.diagnostics; d != nil {
 			obs.Lifetime = len(d.Candidates)
 		}
-		return obs, err
+		probeErr = errors.Join(err, ctx.Err())
+		return obs, probeErr
 	}, func(obs readinessObservation, err error) {
+		// The poller only records an assertion failure after a clean probe.
+		mismatch = err != nil && probeErr == nil
 		if evidence != nil {
 			s.diagnostics.observeReadiness(evidence, obs, err)
 		}
 	})
+	if mismatch {
+		err = readinessMismatch{err}
+	}
+	return last, err
 }
 
 func diskCase(ctx context.Context, binary, root string, diag *caseDiagnostics) (diskEvidence, error) {
@@ -59,7 +72,7 @@ func diskCase(ctx context.Context, binary, root string, diag *caseDiagnostics) (
 	})
 }
 
-func checkFullToHealthy(ctx context.Context, s *server, fixture *diskFixture, proof *diskEvidence) (err error) {
+func checkFullToHealthy(ctx context.Context, s *server, fixture *diskFixture, proof *diskEvidence) error {
 	if err := s.start(ctx); err != nil {
 		return err
 	}
@@ -84,31 +97,8 @@ func checkFullToHealthy(ctx context.Context, s *server, fixture *diskFixture, pr
 	if err := retargetDirectory(fixture.link, fixture.healthy); err != nil {
 		return err
 	}
-	afterRetarget, err := s.observeDiskReadiness(ctx, "after_retarget", diskLow, diskReadiness{}, retargetObservation)
+	l, err = s.checkRetarget(ctx, fixture.full, l, cursor, proof)
 	if err != nil {
-		return fmt.Errorf("readiness after retarget: %w", err)
-	}
-	proof.FullToHealthy.ReadinessStatus = *afterRetarget.Status
-	proof.FullToHealthy.ReadinessReason = afterRetarget.Reason
-	rows := fixtureRows("disk-rejected", 2, 1, strings.Repeat("x", 32<<10))
-	if err := s.checkFullRetargetIngest(ctx, rows, proof.FullToHealthy); err != nil {
-		return err
-	}
-	l = append(l, batch{rows, rejected})
-	if _, err := s.reconcile(ctx, l, "", nil); err != nil {
-		return fmt.Errorf("queries on full filesystem: %w", err)
-	}
-	if err := s.process.stop(syscall.SIGTERM); err != nil {
-		return err
-	}
-	if err := retargetDirectory(fixture.link, fixture.full); err != nil {
-		return err
-	}
-	if err := s.resume(ctx, cursor); err != nil {
-		return fmt.Errorf("restart on full filesystem: %w", err)
-	}
-	proof.StaleCursorsRejected++
-	if _, err := s.reconcile(ctx, l, "", nil); err != nil {
 		return err
 	}
 	cursor, err = s.capture(ctx)
@@ -118,7 +108,7 @@ func checkFullToHealthy(ctx context.Context, s *server, fixture *diskFixture, pr
 	if err := os.Remove(fixture.filler); err != nil {
 		return err
 	}
-	rows = fixtureRows("space-freed", 3, 1, "")
+	rows := fixtureRows("space-freed", 3, 1, "")
 	if err := s.submit(ctx, "space_freed", rows, "", http.StatusNoContent); err != nil {
 		return err
 	}
@@ -147,7 +137,7 @@ func (s *server) checkFullRetargetIngest(ctx context.Context, rows []row, proof 
 	// A failed response can still leave an observable WAL state while the
 	// same candidate is serving. Keep the original ingest error.
 	post, probeErr := s.observeDiskReadiness(ctx, "after_ingest", diskRollback, diskReadiness{}, 0)
-	if post.state() == diskRollback && s.diagnostics != nil {
+	if submitErr == nil && probeErr == nil && s.diagnostics != nil {
 		s.diagnostics.confirmRollback(s.observationKey(phase), post)
 	}
 	if probeErr != nil {
@@ -175,36 +165,83 @@ func checkHealthyToFull(ctx context.Context, s *server, fixture *diskFixture, pr
 	if err := retargetDirectory(fixture.link, fixture.full); err != nil {
 		return err
 	}
-	afterRetarget, err := s.observeDiskReadiness(ctx, "after_retarget", diskReady, diskReadiness{}, retargetObservation)
-	if err != nil {
+	if _, err := s.checkRetarget(ctx, fixture.healthy, nil, "", proof); err != nil {
 		return err
 	}
-	proof.HealthyToFull.ReadinessStatus = *afterRetarget.Status
-	proof.HealthyToFull.ReadinessReason = afterRetarget.Reason
-	rows := fixtureRows("healthy-retarget", 2, 1, "")
-	if err := s.submit(ctx, "retarget_ingest", rows, "", http.StatusNoContent); err != nil {
-		return err
+	return s.process.stop(syscall.SIGTERM)
+}
+
+// Check the live and restarted ledger against the original filesystem's
+// expected ingest outcome, even when readiness reported a different state.
+func (s *server) checkRetarget(ctx context.Context, launchDir string, l ledger, cursor string, proof *diskEvidence) (_ ledger, err error) {
+	want, evidence := diskReady, proof.HealthyToFull
+	full := s.direction == fullToHealthy
+	if full {
+		want, evidence = diskLow, proof.FullToHealthy
 	}
-	proof.HealthyToFull.IngestStatus = http.StatusNoContent
-	if _, err := s.reconcile(ctx, ledger{{rows, acknowledged}}, "", nil); err != nil {
-		return err
+	after, readyErr := s.observeDiskReadiness(ctx, "after_retarget", want, diskReadiness{}, retargetObservation)
+	var liveErr error
+	if readyErr != nil {
+		assertion := fmt.Errorf("readiness after retarget: %w", readyErr)
+		if _, mismatch := errors.AsType[readinessMismatch](readyErr); !mismatch {
+			return nil, assertion
+		}
+		defer func() { err = errors.Join(assertion, liveErr, err) }()
+	}
+	evidence.ReadinessStatus, evidence.ReadinessReason = *after.Status, after.Reason
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-s.process.done:
+		return nil, errors.New("candidate exited before retarget ingest")
+	default:
+	}
+	if full {
+		rows := fixtureRows("disk-rejected", 2, 1, strings.Repeat("x", 32<<10))
+		if err := s.checkFullRetargetIngest(ctx, rows, evidence); err != nil {
+			return nil, err
+		}
+		l = append(l, batch{rows, rejected})
+	} else {
+		rows := fixtureRows("healthy-retarget", 2, 1, "")
+		if err := s.submit(ctx, "retarget_ingest", rows, "", http.StatusNoContent); err != nil {
+			return nil, err
+		}
+		evidence.IngestStatus = http.StatusNoContent
+		l = append(l, batch{rows, acknowledged})
+	}
+	if _, liveErr = s.reconcile(ctx, l, "", nil); liveErr != nil {
+		// A failed live walk still permits an independent replay check after
+		// a readiness assertion, provided the candidate stops cleanly.
+		liveErr = fmt.Errorf("queries after retarget ingest: %w", liveErr)
+		if readyErr == nil {
+			return nil, liveErr
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := s.process.stop(syscall.SIGTERM); err != nil {
-		return err
+		return nil, err
 	}
-	// Restore the launch path and restart to confirm where the acknowledged
-	// batch was committed.
-	if err := retargetDirectory(fixture.link, fixture.healthy); err != nil {
-		return err
+	if err := retargetDirectory(s.dir, launchDir); err != nil {
+		return nil, err
 	}
 	if err := s.start(ctx); err != nil {
-		return err
+		return nil, fmt.Errorf("restart on original directory: %w", err)
 	}
-	if _, err := s.reconcile(ctx, ledger{{rows, acknowledged}}, "", nil); err != nil {
-		return fmt.Errorf("replay on original healthy directory: %w", err)
+	if full {
+		if err := s.rejectCursor(ctx, cursor); err != nil {
+			return nil, err
+		}
+		proof.StaleCursorsRejected++
 	}
-	proof.HealthyToFull.ReplayedAfterRestart = true
-	return s.process.stop(syscall.SIGTERM)
+	if _, err := s.reconcile(ctx, l, "", nil); err != nil {
+		return nil, fmt.Errorf("replay on original directory: %w", err)
+	}
+	evidence.ReplayedAfterRestart = true
+	return l, nil
 }
 
 func fillFilesystem(path string) (err error) {

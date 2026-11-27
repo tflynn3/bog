@@ -40,7 +40,7 @@ jobs:
             tuning_key: GOARM64
             tuning: v8.0
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 72
+    timeout-minutes: 80
     env:
       EXPECTED_ARCH: ${{ matrix.arch }}
       EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
@@ -53,12 +53,14 @@ jobs:
     steps:
       - name: Record fixture and check revision input
         run: |
-          EVIDENCE="$RUNNER_TEMP/bog-release-evidence"
-          mkdir -p "$EVIDENCE"
-          printf 'EVIDENCE=%s\nBINARY=%s\n' "$EVIDENCE" "$RUNNER_TEMP/bog-release-candidate" >> "$GITHUB_ENV"
+          attempt_dir=$(mktemp -d "$RUNNER_TEMP/bog-release-${GITHUB_RUN_ATTEMPT}.XXXXXXXX")
+          EVIDENCE="$attempt_dir/evidence"
+          mkdir "$EVIDENCE"
+          printf 'EVIDENCE=%s\nBINARY=%s\n' "$EVIDENCE" "$attempt_dir/bog-release-candidate" >> "$GITHUB_ENV"
           {
             printf 'revision=%q\ngate_revision=%s\nfixture=%s\nexpected_arch=%s\n' \
               "$REVISION" "$GITHUB_WORKFLOW_SHA" "$FIXTURE" "$EXPECTED_ARCH"
+            printf 'run_attempt=%s\nevidence_dir=%s\n' "$GITHUB_RUN_ATTEMPT" "$EVIDENCE"
             uname -a
             printf 'runner_os=%s\nrunner_arch=%s\nimage_os=%s\nimage_version=%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
             cat /etc/os-release
@@ -191,7 +193,8 @@ jobs:
             timeout --kill-after=5s 2m go run ./verify/release "${common[@]}" -report "$EVIDENCE/admission.json"
           )
           durability() (
-            timeout --kill-after=5s 2m go build -trimpath -o "$RUNNER_TEMP/bog-durability-verifier" ./verify/linux || exit
+            verifier="${BINARY%/*}/bog-durability-verifier"
+            timeout --kill-after=5s 2m go build -trimpath -o "$verifier" ./verify/linux || exit
             fixture_parent=$(mktemp -d "$RUNNER_TEMP/bog-durability.XXXXXXXX") || exit
             cleanup() {
               local status=$?
@@ -208,7 +211,7 @@ jobs:
             sudo -n systemd-run --quiet --wait --pipe --collect --expand-environment=no \
               --uid="$runner_uid" --gid="$runner_gid" -p PrivateMounts=yes \
               -p RuntimeMaxSec=15min -p TimeoutStopSec=30s \
-              --setenv="TMPDIR=$fixture_parent" "$RUNNER_TEMP/bog-durability-verifier" \
+              --setenv="TMPDIR=$fixture_parent" "$verifier" \
               "${common[@]}" -report "$EVIDENCE/durability.json"
           )
           capacity() (
@@ -259,7 +262,6 @@ jobs:
           parity() (
             export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
             export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
-            rm -f -- "$BOG_RELEASE_PARITY_REPORT" || exit
             events="$EVIDENCE/parity-events.jsonl"
             timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release |
               tee "$events" || exit
@@ -318,20 +320,38 @@ jobs:
 
       - name: Race-test release verifier lifecycle
         if: always() && steps.build.outcome == 'success'
-        working-directory: candidate
-        timeout-minutes: 5
+        timeout-minutes: 10
         env:
           CGO_ENABLED: '1'
         run: |
-          go test -race -count=1 ./internal/archtest ./verify/linux ./verify/listener ./verify/release ./bench/retained-history ./verify/fuzz \
-            2>&1 | tee "$EVIDENCE/verifier-race.log"
+          race_checkout() (
+            local checkout=$1 expected_sha=$2 status=0
+            shift 2
+            cd "$checkout" || exit
+            checkout_sha=$(git rev-parse HEAD) || exit
+            printf 'race checkout=%s checkout_sha=%s\n' "$checkout" "$checkout_sha" || exit
+            [[ "$checkout_sha" == "$expected_sha" ]] || exit 1
+            timeout --kill-after=5s 285s go test -race -count=1 "$@" || status=$?
+            printf 'race checkout=%s checkout_sha=%s exit=%d\n' "$checkout" "$checkout_sha" "$status" || exit
+            exit "$status"
+          )
+          {
+            failed=0
+            race_checkout candidate "$REVISION" ./internal/archtest ./verify/linux ./verify/listener \
+              ./verify/release ./bench/retained-history ./verify/fuzz || failed=1
+            if [[ "$GITHUB_WORKFLOW_SHA" != "$REVISION" ]]; then
+              race_checkout gate "$GITHUB_WORKFLOW_SHA" ./verify/listener ./verify/release \
+                ./bench/retained-history || failed=1
+            fi
+            exit "$failed"
+          } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 
       - name: Publish release evidence
-        if: always()
+        if: always() && env.EVIDENCE != ''
         uses: actions/upload-artifact@v4
         with:
-          name: linux-release-evidence-${{ matrix.arch }}
-          path: ${{ runner.temp }}/bog-release-evidence
+          name: linux-release-evidence-${{ matrix.arch }}${{ github.run_attempt != '1' && format('-attempt-{0}', github.run_attempt) || '' }}
+          path: ${{ env.EVIDENCE }}
           if-no-files-found: error
 
   qualification:

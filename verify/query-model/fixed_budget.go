@@ -122,7 +122,19 @@ func (c FixedBudgetCase) fixture() (seed []Row, backfill [2]Row, filter Filter, 
 // must honor ctx. A clean opening rejection returns a distinct outcome and
 // nil error. Failures after a verified issuing page retain its progress
 // evidence, including when a continuation or replay returns a clean 503.
+// When either terminal response supplies EncodedBody, both must supply it
+// and the bodies must match byte for byte.
 func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge AcknowledgeBatch, fetch FetchWirePage, afterCapture ...AfterCapture) (FixedBudgetResult, error) {
+	return runFixedBudgetCase(ctx, c, acknowledge, fetch, false, afterCapture)
+}
+
+// RunStrictFixedBudgetCase additionally requires exact encoded-body witnesses
+// on the terminal response and its replay.
+func RunStrictFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge AcknowledgeBatch, fetch FetchWirePage, afterCapture ...AfterCapture) (FixedBudgetResult, error) {
+	return runFixedBudgetCase(ctx, c, acknowledge, fetch, true, afterCapture)
+}
+
+func runFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge AcknowledgeBatch, fetch FetchWirePage, strict bool, afterCapture []AfterCapture) (FixedBudgetResult, error) {
 	result := FixedBudgetResult{Outcome: FixedBudgetIndeterminate, Phase: "setup"}
 	fail := func(err error) (FixedBudgetResult, error) {
 		stage := "before opening page"
@@ -192,18 +204,14 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 			var observed *FixedBudgetHTTPError
 			if errors.As(err, &observed) && observed != nil {
 				result.HTTPStatus = observed.StatusCode
-				if result.Phase == "opening" && err == observed && observed.CleanBudgetRejection &&
-					observed.StatusCode == http.StatusServiceUnavailable &&
-					len(page.Rows) == 0 && page.NextCursor == "" && page.BodyBytes == 0 {
+				if result.Phase == "opening" && isCleanOpeningRejection(page, err) {
 					openingRejection = observed
 				}
 			}
 		}
 		return page, err
 	}
-	var terminalRequest WireRequest
-	var terminalRows int
-	var terminalBytes int64
+	var terminal terminalReplay
 	result.WireStats, err = VerifyWireWalk(ctx, &log, walk, func(ctx context.Context, req WireRequest) (WirePage, error) {
 		switch result.Page {
 		case 1:
@@ -220,8 +228,8 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 		}
 		result.Page++
 		page, err := fetchObserved(ctx, req)
-		if result.Page == walk.Limits.MaxPages {
-			terminalRequest, terminalRows, terminalBytes = req, len(page.Rows), page.BodyBytes
+		if err == nil && result.Page == walk.Limits.MaxPages && page.NextCursor == "" {
+			terminal.record(req, page)
 		}
 		return page, err
 	}, func(ctx context.Context, cursor string) error {
@@ -263,21 +271,7 @@ func RunFixedBudgetCase(ctx context.Context, c FixedBudgetCase, acknowledge Ackn
 	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
-	page, err := fetchObserved(ctx, terminalRequest)
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return fail(ctxErr)
-	}
-	if err != nil {
-		return fail(redactWireFailure(fmt.Errorf("fetch page: %w", err), terminalRequest.Cursor, page.NextCursor))
-	}
-	offset := result.Rows - terminalRows
-	if err := checkWirePage(terminalRequest, page, matches[offset:], offset, nil); err != nil {
-		return fail(err)
-	}
-	if page.BodyBytes != terminalBytes {
-		return fail(fmt.Errorf("replayed terminal body has %d bytes, want %d", page.BodyBytes, terminalBytes))
-	}
-	if err := ctx.Err(); err != nil {
+	if err := terminal.verify(ctx, fetchObserved, matches, result.Rows, strict); err != nil {
 		return fail(err)
 	}
 	result.Outcome = FixedBudgetExhausted

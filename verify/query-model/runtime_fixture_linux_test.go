@@ -1,0 +1,300 @@
+package querymodel_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"bog/internal/client"
+	"bog/internal/httpapi"
+	"bog/internal/store"
+	model "bog/verify/query-model"
+)
+
+func TestSeededQueryTraceBothPageSources(t *testing.T) {
+	t.Parallel()
+	for _, seed := range []int64{-17, 0, 2709} {
+		for _, retained := range []bool{false, true} {
+			name := "legacy"
+			if retained {
+				name = "retained"
+			}
+			t.Run(fmt.Sprintf("%s/%d", name, seed), func(t *testing.T) {
+				t.Parallel()
+				cfg := seededTraceConfig(seed)
+				cfg.MaxRecoveryWork, cfg.MaxRecoveryBytes = 1<<16, 1<<16
+				result, err := model.VerifyQueryTrace(t.Context(), cfg, func(ctx context.Context, budget int, run func(model.QueryTraceAdapter) error) (err error) {
+					fixture := &runtimeQueryFixture{retained: retained, budget: budget}
+					if err := fixture.start(); err != nil {
+						return errors.Join(err, fixture.stop())
+					}
+					defer func() { err = errors.Join(err, fixture.stop()) }()
+					return run(fixture.adapter())
+				})
+				if err != nil {
+					t.Fatalf("result=%+v: %v", result, err)
+				}
+				if result.MinimumWorkBudget != result.RejectedBudget+1 ||
+					result.BoundaryHeld.Rows != 5 || result.BoundaryHeld.ByteTrimmedPages == 0 ||
+					result.Held.Rows != 5 || result.Fresh.Rows != 8 || result.Restarted.Rows <= result.Fresh.Rows || result.Recovery == nil {
+					t.Fatalf("incomplete query trace: %+v", result)
+				}
+				t.Logf("boundary=%d/%d held=%+v fresh=%+v restart=%+v recovery=%+v",
+					result.RejectedBudget, result.MinimumWorkBudget, result.Held, result.Fresh, result.Restarted, *result.Recovery)
+			})
+		}
+	}
+}
+
+type fixtureGeneration struct {
+	store  *store.Store
+	serial int
+}
+
+type fixtureCapture struct {
+	generation int
+	view       *store.PositionedSnapshot
+}
+
+// runtimeQueryFixture owns acknowledgement, activation and acquisition under
+// one mutex. It exercises the real HTTP PageSource seam with owned immutable
+// snapshot views. The journal here is a fixture WAL, retained across issuer
+// replacement, with encoded batches preserved to exercise decode on restart.
+type runtimeQueryFixture struct {
+	mu          sync.Mutex
+	retained    bool
+	budget      int
+	journal     [][]byte
+	covered     int
+	active      fixtureGeneration
+	captures    map[string]fixtureCapture
+	nextCapture int
+	failAppend  bool
+	rejections  int
+
+	api     *httpapi.API
+	handler http.Handler
+	server  *httptest.Server
+	client  *client.Client
+	fetch   model.FetchWirePage
+}
+
+func (f *runtimeQueryFixture) Append(body []byte, rows []store.Row) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failAppend {
+		f.failAppend = false
+		f.rejections++
+		return errors.New("injected whole-batch append failure")
+	}
+	f.journal = append(f.journal, append([]byte(nil), body...))
+	f.active.store.Publish(rows)
+	return nil
+}
+
+func (f *runtimeQueryFixture) Page(ctx context.Context, req httpapi.PageRequest, work *store.QueryWork) (httpapi.PageResult, error) {
+	if !req.Snapshot {
+		return httpapi.PageResult{}, errors.New("fixture expects a snapshot request")
+	}
+	if err := work.Charge(1); err != nil {
+		return httpapi.PageResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return httpapi.PageResult{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	id := req.Capture
+	var capture fixtureCapture
+	var after *store.TailPosition
+	if id == "" {
+		capture = fixtureCapture{f.active.serial, f.active.store.CapturePositionedSnapshot()}
+	} else {
+		var ok bool
+		capture, ok = f.captures[id]
+		if !ok {
+			return httpapi.PageResult{}, httpapi.ErrCaptureExpired
+		}
+		stamp, ordinal, found := strings.Cut(string(req.After), "/")
+		t, timeErr := time.Parse(time.RFC3339Nano, stamp)
+		i, ordinalErr := strconv.ParseUint(ordinal, 10, 64)
+		if !found || timeErr != nil || ordinalErr != nil {
+			return httpapi.PageResult{}, fmt.Errorf("invalid fixture position: %w", errors.Join(timeErr, ordinalErr))
+		}
+		after = &store.TailPosition{Time: t, Ordinal: i}
+	}
+	rows, more, err := capture.view.Page(req.Filter.Start, req.Filter.End, req.Filter.Contains, req.Limit, 0, after, work)
+	if err != nil {
+		return httpapi.PageResult{}, err
+	}
+	if err := work.Charge(uint64(len(rows))); err != nil {
+		return httpapi.PageResult{}, err
+	}
+	result := httpapi.PageResult{Rows: make([]httpapi.PageRow, 0, len(rows)), More: more}
+	for _, row := range rows {
+		pos := row.Position.Time.UTC().Format(time.RFC3339Nano) + "/" + strconv.FormatUint(row.Position.Ordinal, 10)
+		result.Rows = append(result.Rows, httpapi.PageRow{Row: row.Row, Position: httpapi.PagePosition(pos)})
+	}
+	if id == "" {
+		f.nextCapture++
+		id = strconv.Itoa(f.nextCapture)
+		f.captures[id] = capture
+	}
+	result.Capture = id
+	return result, nil
+}
+
+func (f *runtimeQueryFixture) Release(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.captures, id)
+	return nil
+}
+
+func (f *runtimeQueryFixture) start() error {
+	if f.active.store == nil {
+		f.active.store = new(store.Store)
+	}
+	f.captures = make(map[string]fixtureCapture)
+	if f.retained {
+		f.api = httpapi.NewWithPageSource(f, f, 256, 1, uint64(f.budget))
+		f.handler = f.api
+	} else {
+		f.handler = httpapi.NewWithQueryLimits(f.active.store, f, 256, 1, uint64(f.budget))
+	}
+	f.server = httptest.NewServer(f.handler)
+	var err error
+	f.client, f.fetch, err = newWitnessClient(f.server.URL, f.server.Client().Transport, 256)
+	return err
+}
+
+func (f *runtimeQueryFixture) stop() error {
+	if f.server == nil {
+		return nil
+	}
+	f.server.Close()
+	f.server = nil
+	if f.api == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := f.api.Close(ctx)
+	f.api = nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.captures) != 0 {
+		err = errors.Join(err, fmt.Errorf("%d captures remained after HTTP drain", len(f.captures)))
+	}
+	return err
+}
+
+func (f *runtimeQueryFixture) replay(ctx context.Context) (*store.Store, model.QueryRecovery, error) {
+	s := new(store.Store)
+	var stats model.QueryRecovery
+	for i, body := range f.journal {
+		if err := ctx.Err(); err != nil {
+			return nil, stats, err
+		}
+		rows, err := store.DecodeIngest(body)
+		if err != nil {
+			return nil, stats, fmt.Errorf("recover batch %d: %w", i+1, err)
+		}
+		// Work counts encoded bytes decoded. Memory is peak encoded replay
+		// input per batch, the scratch working set of this fixture meter.
+		stats.Work += uint64(len(body))
+		stats.PeakBytes = max(stats.PeakBytes, uint64(len(body)))
+		stats.CommittedRows += len(rows)
+		s.Publish(rows)
+	}
+	return s, stats, ctx.Err()
+}
+
+func (f *runtimeQueryFixture) publish(ctx context.Context, cutoff int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cutoff <= f.covered || cutoff != f.active.store.PublishedCount() {
+		return fmt.Errorf("invalid publication cutoff %d after %d", cutoff, f.covered)
+	}
+	if f.covered > 0 && len(f.captures) != 1 {
+		return fmt.Errorf("replacement needs one held capture, got %d", len(f.captures))
+	}
+	s, stats, err := f.replay(ctx)
+	if err != nil {
+		return err
+	}
+	if stats.CommittedRows != cutoff {
+		return fmt.Errorf("publication replay covered %d rows, want %d", stats.CommittedRows, cutoff)
+	}
+	f.active = fixtureGeneration{s, f.active.serial + 1}
+	f.covered = cutoff
+	return nil
+}
+
+func (f *runtimeQueryFixture) retire(ctx context.Context, cursor string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := f.api.RetireQueryCapture(cursor); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, capture := range f.captures {
+		if capture.generation < f.active.serial {
+			return errors.New("retired generation retained its capture after the retirement response")
+		}
+	}
+	if len(f.captures) != 1 {
+		return fmt.Errorf("expected only the fresh capture to remain, got %d", len(f.captures))
+	}
+	return ctx.Err()
+}
+
+func (f *runtimeQueryFixture) restart(ctx context.Context) (model.QueryRecovery, error) {
+	if err := f.stop(); err != nil {
+		return model.QueryRecovery{}, err
+	}
+	s, stats, err := f.replay(ctx)
+	if err != nil {
+		return stats, err
+	}
+	f.active.store = s
+	return stats, f.start()
+}
+
+func (f *runtimeQueryFixture) reject(ctx context.Context, rows []model.Row) error {
+	f.mu.Lock()
+	f.failAppend = true
+	rejections := f.rejections
+	f.mu.Unlock()
+	outcome, err := sendFixtureBatch(ctx, f.client, rows)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	status, ok := err.(*client.HTTPError)
+	if outcome != client.IngestUncommitted || !ok || status.StatusCode != http.StatusServiceUnavailable ||
+		status.Body != "WAL unavailable\n" || status.Cause != nil || f.rejections != rejections+1 {
+		return fmt.Errorf("expected injected uncommitted WAL refusal, outcome=%d error=%v", outcome, err)
+	}
+	return ctx.Err()
+}
+
+func (f *runtimeQueryFixture) adapter() model.QueryTraceAdapter {
+	adapter := model.QueryTraceAdapter{
+		Acknowledge: func(ctx context.Context, rows []model.Row) error { return acknowledgeFixtureBatch(ctx, f.client, rows) },
+		Fetch:       func(ctx context.Context, req model.WireRequest) (model.WirePage, error) { return f.fetch(ctx, req) },
+		Lifecycle:   &model.QueryTraceLifecycle{RejectAppend: f.reject, Restart: f.restart},
+	}
+	if f.retained {
+		adapter.Publish, adapter.Lifecycle.Retire = f.publish, f.retire
+	}
+	return adapter
+}

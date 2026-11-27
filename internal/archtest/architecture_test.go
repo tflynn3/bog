@@ -40,9 +40,9 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// At 54347c836018, cmd/bog reaches HTTP, readiness, store, and WAL on
-// both Linux targets. The retained roles still reflect the pre-cutover tree.
-// Promote each library with the measured #108 wiring and activation evidence.
+// At 791e510a3afd, cmd/bog reaches HTTP, readiness, store, and WAL on both
+// Linux targets. Promote retained libraries with measured #108 wiring and
+// activation evidence. The offline backup consumer is already registered.
 var registry = map[string]rule{
 	exportCommand:                {verifier, []string{goClient}},
 	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
@@ -140,21 +140,26 @@ func checkLinuxArchitecture(t *testing.T, arch string) {
 	for _, problem := range architectureProblems(packages, registry) {
 		t.Error(problem)
 	}
-	for _, problem := range measuredCutoverBoundaryProblems(packages) {
+	for _, problem := range measuredCutoverBoundaryProblems(packages, registry) {
 		t.Error(problem)
 	}
 }
 
 // Check the cutover seams against the full production graph. The root-module
 // edge registry cannot describe a path that traverses an external dependency.
-func measuredCutoverBoundaryProblems(packages map[string]listedPackage) []string {
+func measuredCutoverBoundaryProblems(packages map[string]listedPackage, rules map[string]rule) []string {
 	measured := make(map[string]rule, len(packages))
 	for path, pkg := range packages {
 		if pkg.production() {
-			measured[path] = rule{imports: pkg.Imports}
+			measured[path] = rule{role: rules[path].role, imports: pkg.Imports}
 		}
 	}
-	return append(pagingBoundaryProblems(measured), storageAuthorityProblems(measured)...)
+	problems := pagingBoundaryProblems(measured)
+	problems = append(problems, storageAuthorityProblems(measured)...)
+	problems = append(problems, serverCommandBoundaryProblems(measured)...)
+	problems = append(problems, operatorBoundaryProblems(measured)...)
+	problems = append(problems, releaseEvidenceBoundaryProblems(measured)...)
+	return append(problems, queryOracleProblems(measured)...)
 }
 
 func TestMeasuredCutoverBoundaries(t *testing.T) {
@@ -164,6 +169,8 @@ func TestMeasuredCutoverBoundaries(t *testing.T) {
 		checkpoint = "bog/internal/checkpoint"
 		history    = "bog/internal/history"
 		httpapi    = "bog/internal/httpapi"
+		readiness  = "bog/internal/readiness"
+		store      = "bog/internal/store"
 		wal        = "bog/internal/wal"
 		relay      = "example.com/relay"
 	)
@@ -172,7 +179,7 @@ func TestMeasuredCutoverBoundaries(t *testing.T) {
 		testOnly               bool
 		want                   []string
 	}{
-		{name: "command composes retained paging and WAL", consumer: server},
+		{name: "command composes retained paging and WAL while the operator reads backup", consumer: server},
 		{
 			name:     "HTTP reaches history and checkpoint through an external relay",
 			consumer: httpapi, target: history,
@@ -185,7 +192,11 @@ func TestMeasuredCutoverBoundaries(t *testing.T) {
 		{
 			name:     "backup reaches WAL through an external relay",
 			consumer: backup, target: wal,
-			want: []string{"forbidden storage authority dependency: " + backup + " reaches " + wal},
+			want: []string{
+				"forbidden storage authority dependency: " + backup + " reaches " + wal,
+				"forbidden retained storage composition: " + operatorCommand + " reaches " + wal + " and " + backup + ". Compose in " + server,
+				"forbidden operator verification dependency: " + operatorCommand + " reaches " + wal,
+			},
 		},
 		{
 			name:     "WAL reaches backup through an external relay",
@@ -194,38 +205,95 @@ func TestMeasuredCutoverBoundaries(t *testing.T) {
 				"HTTP must use the page source seam: " + httpapi + " reaches " + backup,
 				"forbidden storage authority dependency: " + wal + " reaches " + backup,
 				"forbidden retained storage composition: " + httpapi + " reaches " + wal + " and " + backup + ". Compose in " + server,
+				"forbidden retained storage composition: " + readiness + " reaches " + wal + " and " + backup + ". Compose in " + server,
 			},
+		},
+		{
+			name:     "release admission reaches history through an external relay",
+			consumer: releaseVerifier, target: history,
+			want: []string{
+				"forbidden release evidence dependency: " + releaseVerifier + " reaches " + checkpoint,
+				"forbidden release evidence dependency: " + releaseVerifier + " reaches " + history,
+			},
+		},
+		{
+			name:     "Linux durability producer reaches backup through an external relay",
+			consumer: linuxVerifier, target: backup,
+			want: []string{"forbidden release evidence dependency: " + linuxVerifier + " reaches " + backup},
+		},
+		{
+			name:     "capacity producer reaches WAL through an external relay",
+			consumer: retainedBench, target: wal,
+			want: []string{"forbidden release evidence dependency: " + retainedBench + " reaches " + wal},
+		},
+		{
+			name:     "operator reaches WAL through an external relay",
+			consumer: operatorCommand, target: wal,
+			want: []string{
+				"forbidden retained storage composition: " + operatorCommand + " reaches " + wal + " and " + backup + ". Compose in " + server,
+				"forbidden operator verification dependency: " + operatorCommand + " reaches " + wal,
+			},
+		},
+		{
+			name:     "server reaches the oracle through an external relay",
+			consumer: server, target: queryModel,
+			want: []string{"forbidden server command dependency: " + server + " reaches " + queryModel},
+		},
+		{
+			name:     "oracle reaches shared runtime rows through an external relay",
+			consumer: queryModel, target: store,
+			want: []string{"forbidden query oracle dependency: " + queryModel + " reaches " + store},
+		},
+		{
+			name:     "release can use HTTP client and shared row types through an external relay",
+			consumer: releaseVerifier, target: goClient,
 		},
 		{
 			name:     "test-only relay supplies no production edge",
 			consumer: httpapi, target: history, testOnly: true,
 		},
+		{
+			name:     "release fixtures supply no production edge",
+			consumer: releaseVerifier, target: backup, testOnly: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			packages := map[string]listedPackage{
-				server:     productionPackage("main", backup, history, httpapi, wal),
-				backup:     productionPackage("backup"),
-				checkpoint: productionPackage("checkpoint"),
-				history:    productionPackage("history", checkpoint),
-				httpapi:    productionPackage("httpapi", wal),
-				wal:        productionPackage("wal"),
-				relay:      {GoFiles: []string{"relay.go"}},
+			rules := map[string]rule{
+				server:          {serverCommand, []string{backup, history, httpapi, readiness, wal}},
+				operatorCommand: {verifier, []string{backup, goClient, store}},
+				releaseVerifier: {verifier, []string{goClient}},
+				linuxVerifier:   {role: verifier},
+				retainedBench:   {role: verifier},
+				queryModel:      {role: verifierModel},
+				backup:          {runtimeLibrary, []string{store}},
+				checkpoint:      {runtimeLibrary, []string{store}},
+				history:         {runtimeLibrary, []string{checkpoint, store}},
+				httpapi:         {runtimeLibrary, []string{store, wal}},
+				readiness:       {runtimeLibrary, []string{store, wal}},
+				wal:             {runtimeLibrary, []string{store}},
+				store:           {role: runtimeLibrary},
+				goClient:        {standalone, []string{store}},
+			}
+
+			packages := make(map[string]listedPackage, len(rules)+1)
+			for path, entry := range rules {
+				packages[path] = listedPackage{GoFiles: []string{"package.go"}, Imports: entry.imports}
 			}
 			consumer := packages[tt.consumer]
 			consumer.Imports = append(consumer.Imports, relay)
 			packages[tt.consumer] = consumer
+			pkg := listedPackage{GoFiles: []string{"relay.go"}}
 			if tt.target != "" {
-				pkg := packages[relay]
 				pkg.Imports = []string{tt.target}
-				if tt.testOnly {
-					pkg.GoFiles = nil
-					pkg.TestGoFiles = []string{"relay_test.go"}
-				}
-				packages[relay] = pkg
 			}
-			if got := measuredCutoverBoundaryProblems(packages); !slices.Equal(got, tt.want) {
+			if tt.testOnly {
+				pkg.GoFiles = nil
+				pkg.TestGoFiles = []string{"relay_test.go"}
+			}
+			packages[relay] = pkg
+			if got := measuredCutoverBoundaryProblems(packages, rules); !slices.Equal(got, tt.want) {
 				t.Errorf("measuredCutoverBoundaryProblems() = %q, want %q", got, tt.want)
 			}
 		})

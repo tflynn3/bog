@@ -1,10 +1,11 @@
 # ADR 0015 — Retained-history runtime cutover
 
-**Status** — Cycle 150 baseline measured at
-`54347c836018789e0e3a95f7d76a02293169dfc5`. #108 carries the activation
-contract developed under #53. On both Linux targets the server uses
-ordinary WAL recovery and the in-memory query view. The immutable
-Storage handoff, package promotion, and native qualification are pending.
+**Status** — Cycle 153 baseline measured at
+`791e510a3afd11de6de8b4b2e05ac0eb3ce7ccb8`. #108 carries the activation
+contract developed under #53. The supplied revision uses ordinary WAL
+recovery and the in-memory query view on both Linux targets. The reviewed
+Storage SHA, retained package promotion, and native qualification of the
+composed revision are pending.
 [#108](https://github.com/tflynn3/bog/issues/108),
 [#53](https://github.com/tflynn3/bog/issues/53)
 
@@ -76,36 +77,40 @@ Promote each retained package when both Linux production inventories
 show that `cmd/bog` reaches it and review confirms its activation criteria.
 Remove the corresponding staging declaration in the same change.
 
-At the Cycle 150 base, `go list -deps` under the architecture suite settings
-reported the same direct root-module production edges and transitive
-server reachability for Linux amd64 and arm64 with cgo disabled.
+The Cycle 153 baseline inventories agree on these direct root-module
+production edges and transitive server reachability. Both use
+`go list -deps` under the architecture suite settings.
 
-| Package | Direct root-module production imports | Reachable from `cmd/bog` |
+| Package | Direct root-module production imports | Measured role |
 | --- | --- | --- |
-| `cmd/bog` | HTTP, readiness, store, WAL | Server root |
-| `internal/checkpoint` | Store | No |
-| `internal/history` | Checkpoint, store | No |
-| `internal/backup` | Store | No |
-| `internal/idempotency` | None | No |
+| `cmd/bog` | `internal/httpapi`, `internal/readiness`, `internal/store`, `internal/wal` | Server root |
+| `internal/httpapi` | `internal/store`, `internal/wal` | Wired |
+| `internal/readiness` | `internal/store`, `internal/wal` | Wired |
+| `internal/wal` | `internal/store` | Wired |
+| `internal/store` | None | Wired |
+| `internal/checkpoint` | `internal/store` | Staged |
+| `internal/history` | `internal/checkpoint`, `internal/store` | Staged |
+| `internal/backup` | `internal/store` | Staged |
+| `internal/idempotency` | None | Staged |
+| `cmd/bog-verify` | `internal/backup`, `internal/client`, `internal/store` | Operator command |
 
-The server closure contains only the command and its four direct
-root-module dependencies. `cmd/bog-verify` directly imports backup,
-client, and store. That read-only consumer keeps backup in the
-production inventory while its server activation criteria remain open.
+The server closure contains the command and its four wired libraries.
+The operator's read-only backup edge is outside that closure.
 [Exact production graph](../architecture/SYSTEM.md#declared-linux-production-import-graph)
 
-| Staged package | Owner | Activation criteria |
-| --- | --- | --- |
-| `internal/checkpoint` | `bog-storage` | #108 validates and publishes generations through the pinned WAL owner and proves durable replacement at the requested cutoff. |
-| `internal/history` | `bog-storage` | #108 serves ordered checkpoint and tail rows through the command-owned page source and proves a held HTTP cursor survives replacement. |
-| `internal/backup` | `bog-storage` | #108 wires backup into command composition and proves verified writable restore, an acknowledged append, and exact HTTP parity after restart. Read-only operator use already exists. |
-| `internal/idempotency` | `bog-storage` | The production WAL atomically commits and recovers retry records with their batches. HTTP ingest covers concurrent same-key submissions, conflicting bodies, and retry after an ambiguous response and restart. |
+| Staged package | Owner | Activation criteria | Evidence required from the composed revision |
+| --- | --- | --- | --- |
+| `internal/checkpoint` | `bog-storage` | Validate and publish generations under the pinned WAL owner's synchronization. | Show durable publication of a newer generation at the exact whole-batch cutoff and recovery of later acknowledged commits. Use the live capacity and capacity-control scope probes. |
+| `internal/history` | `bog-storage` | Serve ordered checkpoint and tail rows through the injected command-owned page source. | Show an exact held walk across replacement and acknowledged backfill, exact fresh and restarted walks, and retirement and pin drain. Use fixed-budget backfill and live capacity evidence. |
+| `internal/backup` | `bog-storage` | Validate a restored image in command composition and establish writable authority before listening. | Use restored parity to observe HTTP 204, verify the exact augmented history after restart, and recover an acknowledged batch after an immediate crash. |
+| `internal/idempotency` | `bog-storage` | Atomically commit and recover retry records with their batches. | Exercise concurrent same-key submissions, conflicting bodies, and retry after an ambiguous response and restart. This activation remains staged beyond #108. |
 
 A staging declaration must name an owner and state activation criteria.
 The fitness check rejects missing or blank fields and declarations for
 removed or reclassified packages. Exact imports and reachability verify
-the role. The Linux inventory also checks the paging and storage authority
-seams through dependencies outside the root module.
+the role. The Linux inventory checks paging, storage authority, server
+and operator verification, and release evidence and oracle independence
+through production dependencies outside the root module as well.
 [Staging declaration check](../../internal/archtest/staged_packages_test.go),
 [Command root boundaries](0012-command-root-boundaries.md),
 [Standalone production consumers](0014-standalone-package-consumers.md)
@@ -126,12 +131,18 @@ append ledger and exercises the separate pinned server process.
 
 ## Integration and qualification
 
-Architecture in the bog AgentSet owns this ADR, SYSTEM.md,
+Architecture in the existing bog AgentSet owns this ADR, SYSTEM.md,
 `internal/archtest/architecture_test.go`, and
 `internal/archtest/staged_packages_test.go`. Storage owns the runtime
-draft and its write lease. At the immutable Storage handoff, check the
-four Architecture paths against the five held leases. Use the reviewed
-Storage SHA to measure the composed Linux amd64 and arm64 inventories.
+draft and its write lease. Release Verification owns the native gate.
+Keep #104 behind the HTTP read lease and retained paging handoff, and
+#81 behind #108's writable recovery contract.
+
+Recheck the four Architecture paths against the active leases at
+dispatch and again at the immutable Storage handoff. The supplied write
+scope covers the four governance files. The handoff lease check requires
+the current active leases and reviewed Storage SHA. Measure the composed
+Linux amd64 and arm64 inventories at that SHA.
 Record the direct edges, transitive server closure, and activation evidence
 for every promotion, and update the registry, staging declarations,
 diagram, and role table together.
@@ -142,9 +153,9 @@ Run `go vet ./internal/archtest`,
 tree and land runtime and governance in one reviewed PR.
 [System fitness settings](../architecture/SYSTEM.md#fitness-and-registry-ownership)
 
-The baseline governance update passed architecture vet and race checks,
-including both Linux inventory checks, and the Linux amd64 cross-build.
-The activation evidence must come from the composed revision.
+The Cycle 153 baseline architecture vet, race suite, dual Linux inventory
+checks, and Linux amd64 cross-build passed. The activation and native
+qualification evidence still requires the composed revision.
 
 The native matrix qualifies the same clean revision on amd64 and arm64.
 Each runner uses its own SHA-256-pinned binary for all producers. Require

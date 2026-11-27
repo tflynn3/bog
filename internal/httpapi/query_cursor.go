@@ -91,3 +91,15 @@ func (a *API) decodeCursor(token string) (cursorData, error) {
 	copy(c.After[:], b[45:cursorPayloadSize])
 	return c, nil
 }
+
+// RetireQueryCapture authenticates a continuation token and bars new resumes
+// of its capture. Admitted requests can finish before the source is released.
+// An authenticated token for an already retired capture succeeds. If the
+// capture is idle, RetireQueryCapture returns the result of releasing it.
+func (a *API) RetireQueryCapture(token string) error {
+	cursor, err := a.decodeCursor(token)
+	if err != nil {
+		return err
+	}
+	return a.captures.retireByID(cursor.Capture)
+}

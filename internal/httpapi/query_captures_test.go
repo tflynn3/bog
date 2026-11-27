@@ -100,8 +100,14 @@ func TestQueryCaptureUsesEarlierDeadline(t *testing.T) {
 				}
 				assertQueryRejection(t, requestCapturePage(a, path), 410, "query capture expired")
 				assertQueryRejection(t, requestCapturePage(a, path+"&contains=other"), 400, "invalid cursor")
+				if err := a.RetireQueryCapture(token); err != nil {
+					t.Fatalf("retire expired capture: %v", err)
+				}
 				if err := a.Close(t.Context()); err != nil {
 					t.Fatal(err)
+				}
+				if got := source.releases.Load(); got != 1 {
+					t.Fatalf("retiring expired capture left %d releases, want 1", got)
 				}
 			})
 		})

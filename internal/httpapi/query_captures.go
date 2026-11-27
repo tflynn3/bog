@@ -108,15 +108,23 @@ func (s *queryCaptures) retireLocked(c *queryCapture) bool {
 }
 
 func (s *queryCaptures) retire(c *queryCapture) {
-	s.mu.Lock()
-	release := s.retireLocked(c)
-	s.mu.Unlock()
-	if release {
-		s.release(c)
-	}
+	s.retireByID(c.id)
 }
 
-func (s *queryCaptures) release(c *queryCapture) {
+func (s *queryCaptures) retireByID(id uint64) error {
+	s.mu.Lock()
+	c := s.live[id]
+	release := c != nil && s.retireLocked(c)
+	s.mu.Unlock()
+	if release {
+		return s.release(c)
+	}
+	return nil
+}
+
+// release logs failures for callers without an error return and includes
+// failures during shutdown in the result of close.
+func (s *queryCaptures) release(c *queryCapture) error {
 	var err error
 	if c.sourceID != "" {
 		err = s.source.Release(c.sourceID)
@@ -133,6 +141,7 @@ func (s *queryCaptures) release(c *queryCapture) {
 			close(s.drained)
 		}
 	}
+	return err
 }
 
 func (s *queryCaptures) close(ctx context.Context) error {

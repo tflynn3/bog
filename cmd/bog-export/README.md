@@ -70,16 +70,57 @@ same lock.
 
 Resume starts at the last durably recorded acknowledgment. The opening page
 is journaled before delivery so it can replay without creating a new
-snapshot. If output is written ahead of a saved acknowledgment, a restart
-can append the unacknowledged page again. It can also follow an incomplete
-record from the previous run. Reconcile that suffix before resuming if you
-need a single copy of each page and complete NDJSON framing. The checkpoint
-tracks pages and cursors without storing output offsets.
+snapshot. The output can contain a complete unacknowledged page or part
+of a record when the checkpoint still points to that page. For exact
+resume, stop the exporter and establish the byte offset immediately after
+the last page acknowledged by the recovered checkpoint. Use an independently
+verified boundary, such as a recorded output size taken when that checkpoint
+and its output were known to agree. A newline can occur in an unacknowledged
+page, so counting complete records alone cannot establish the boundary.
+Truncate the output to the verified offset and sync it before using
+`-resume`. Keep the checkpoint as recovered. If you cannot establish the
+offset, keep both artifacts and use a separate output and checkpoint for
+a fresh export.
 
 A saved cursor belongs to the original Bog process and snapshot. If the
-process restarts, the snapshot expires or is retired, or routing sends the
-cursor to another instance, resume can fail. If the original snapshot is
-gone, use a new checkpoint and output file to start a fresh export.
+same issuer authenticates a cursor whose capture has expired or been
+retired, it returns HTTP 410 with `query capture expired`. A restarted
+issuer rejects the pre-restart cursor with HTTP 400 and `invalid cursor`.
+Both errors stop the export at the saved cursor and preserve the output
+and checkpoint. If the original snapshot is gone, use a new checkpoint
+and output file to start a fresh export.
+
+## Interruption qualification
+
+The process tests use the CLI entry point and real append-file output.
+The matrix covers interrupted page delivery, a partial output record,
+failed or interrupted output sync, and interruption of the next request
+after a durable acknowledgment.
+The client tests inject failures before checkpoint rename and before
+directory sync after rename. After reconciling any extra output against
+the recovered acknowledgment, the tests compare the entire resumed file
+with expected NDJSON bytes in order, including ties and duplicates.
+
+On Linux, run against the already built candidate issuer for that runner.
+The tests use the supplied binary for the live matrix and for the issuer
+restart on the same data directory. A separate test uses the real HTTP
+query API with a controlled source expiry to exercise authenticated 410
+without waiting for the server's 15-minute deadline.
+
+```sh
+BOG_RELEASE_BINARY=/absolute/path/to/bog go test -count=1 ./cmd/bog-export \
+  -run 'TestCheckpoint(NativeIssuerQualification|AuthenticatedCaptureExpiry)$'
+```
+
+The native test builds the checkout's issuer when `BOG_RELEASE_BINARY`
+is unset. This exporter qualification can run independently of the
+retained-history capacity gate.
+
+PM acceptance criteria still open
+
+- Successfully continue the original capture across issuer restart.
+- Automatically produce exactly-once output after an interruption that
+  leaves an unreconciled suffix.
 
 ## Architecture
 

@@ -136,10 +136,10 @@ func acceptQueryResponse(ctx context.Context, resp *http.Response, maxBytes int6
 		e := statusError(resp)
 		e.QueryRetryable = resp.StatusCode == http.StatusServiceUnavailable
 		closeErr := resp.Body.Close()
-		if cursor != "" && framed(resp) && e.Cause == nil {
+		if cursor != "" && framed(resp) && e.Cause == nil && closeErr == nil &&
+			(resp.ContentLength < 0 || resp.ContentLength == int64(len(e.Body))) {
 			e.CursorRejected = resp.StatusCode == http.StatusBadRequest && e.Body == "invalid cursor\n"
-			e.captureExpired = resp.StatusCode == http.StatusGone && e.Body == "query capture expired\n" &&
-				closeErr == nil && (resp.ContentLength < 0 || resp.ContentLength == int64(len(e.Body)))
+			e.captureExpired = resp.StatusCode == http.StatusGone && e.Body == "query capture expired\n"
 		}
 		if closeErr != nil {
 			return Page{}, withQueryCancellation(ctx, errors.Join(e, closeErr))

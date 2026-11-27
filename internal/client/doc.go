@@ -41,6 +41,16 @@
 // and will not replay it if output stops partway through. Cancellation
 // preserves previously accepted pages and prevents further requests.
 //
+// # Resumable exports
+//
+// Use Client.NewExportSession with an ExportProgressStore and a sink that
+// acknowledges complete pages. FileExportProgressStore keeps a versioned
+// checkpoint, including the complete opening page until it is acknowledged.
+// Reopen the same checkpoint with the same query and issuing endpoint to
+// resume after interruption. A sink may see the same page again if delivery
+// or progress persistence was interrupted. Use its export-scoped page number
+// to deduplicate when needed. An expired capture returns ErrCaptureExpired.
+//
 // # Routing and restarting a walk
 //
 // Route every continuation to the Bog process that issued the cursor. Bog uses

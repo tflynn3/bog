@@ -11,7 +11,7 @@ import (
 // It validates the complete body and the cursor metadata before returning a
 // candidate page. The response owner still has to close the body and check
 // cancellation before the candidate can be published.
-func decodeQueryPage(ctx context.Context, resp *http.Response, maxBytes int64, maxRows int, cursor string) (Page, error) {
+func decodeQueryPage(ctx context.Context, resp *http.Response, maxBytes int64, maxRows int, cursor string, opening *[]byte) (Page, error) {
 	if err := ctx.Err(); err != nil {
 		return Page{}, err
 	}
@@ -19,7 +19,7 @@ func decodeQueryPage(ctx context.Context, resp *http.Response, maxBytes int64, m
 	if err != nil {
 		return Page{}, fmt.Errorf("read query page: %w", err)
 	}
-	rows, err := decodeQueryFrame(ctx, &frame, maxRows)
+	rows, err := decodeQueryFrame(ctx, &frame, maxRows, opening)
 	if err != nil {
 		return Page{}, err
 	}
@@ -32,7 +32,7 @@ func decodeQueryPage(ctx context.Context, resp *http.Response, maxBytes int64, m
 	return Page{Rows: rows, NextCursor: next}, nil
 }
 
-func decodeQueryFrame(ctx context.Context, frame *queryFrame, maxRows int) ([]Row, error) {
+func decodeQueryFrame(ctx context.Context, frame *queryFrame, maxRows int, opening *[]byte) ([]Row, error) {
 	buffer := make([]byte, frame.blockSize())
 	records := queryRecords{maxBytes: frame.limit, maxRows: maxRows}
 	var recordErr error
@@ -51,6 +51,10 @@ func decodeQueryFrame(ctx context.Context, frame *queryFrame, maxRows int) ([]Ro
 			// records. Release rows and record scratch as soon as they can
 			// no longer contribute to an accepted page.
 			records = queryRecords{}
+			continue
+		}
+		if opening != nil {
+			*opening = appendQueryBytes(*opening, block, frame.limit)
 		}
 	}
 	if err := frame.result(ctx); err != nil {

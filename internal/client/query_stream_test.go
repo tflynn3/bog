@@ -340,7 +340,7 @@ func TestQueryStreamReaderProgress(t *testing.T) {
 					return body.Read(p)
 				})),
 			}
-			page, err := acceptQueryResponse(ctx, resp, int64(len(row)), 1, "")
+			page, err := acceptQueryResponse(ctx, resp, int64(len(row)), 1, "", nil)
 			if tc.want != nil {
 				assertQueryStreamFailure(t, page, err, ErrPageInterrupted, tc.want)
 				if calls != tc.count {

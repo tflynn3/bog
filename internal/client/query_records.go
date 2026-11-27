@@ -54,18 +54,22 @@ func (r *queryRecords) add(ctx context.Context, block []byte) error {
 // of in-budget payload, so their sum is already within maxBytes. Clamp spare
 // capacity to that bound and to the largest representable slice size.
 func (r *queryRecords) extend(fragment []byte) {
-	if len(fragment) > cap(r.pending)-len(r.pending) {
-		needed := len(r.pending) + len(fragment)
-		ceiling := min(r.maxBytes, int64(int(^uint(0)>>1)))
-		capacity := int64(cap(r.pending))
+	r.pending = appendQueryBytes(r.pending, fragment, r.maxBytes)
+}
+
+func appendQueryBytes(dst, fragment []byte, maxBytes int64) []byte {
+	if len(fragment) > cap(dst)-len(dst) {
+		needed := len(dst) + len(fragment)
+		ceiling := min(maxBytes, int64(int(^uint(0)>>1)))
+		capacity := int64(cap(dst))
 		// Add at most 50% spare capacity, without overflowing at a large limit.
 		capacity += min(capacity/2, ceiling-capacity)
 		capacity = max(capacity, int64(needed))
-		grown := make([]byte, len(r.pending), int(capacity))
-		copy(grown, r.pending)
-		r.pending = grown
+		grown := make([]byte, len(dst), int(capacity))
+		copy(grown, dst)
+		dst = grown
 	}
-	r.pending = append(r.pending, fragment...)
+	return append(dst, fragment...)
 }
 
 func (r *queryRecords) resetPending() {

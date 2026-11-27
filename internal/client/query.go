@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -91,6 +92,22 @@ func joinQueryErrors(err, additional error) error {
 // otherwise. It returns the zero Page if the response fails validation or the
 // context is canceled before acceptance.
 func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (Page, error) {
+	return c.fetchPage(ctx, q, cursor, nil)
+}
+
+func queryValues(q Query) url.Values {
+	v := make(url.Values)
+	v.Set("start", q.Start.UTC().Format(time.RFC3339Nano))
+	v.Set("end", q.End.UTC().Format(time.RFC3339Nano))
+	v.Set("contains", q.Contains)
+	if q.Limit != 0 {
+		v.Set("limit", strconv.Itoa(q.Limit))
+	}
+	return v
+}
+
+// When opening is supplied, capture the exact accepted NDJSON payload.
+func (c *Client) fetchPage(ctx context.Context, q Query, cursor string, opening *[]byte) (Page, error) {
 	if err := withQueryCancellation(ctx, nil); err != nil {
 		return Page{}, err
 	}
@@ -98,13 +115,7 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (Page, e
 	if err != nil {
 		return Page{}, err
 	}
-	v := req.URL.Query()
-	v.Set("start", q.Start.UTC().Format(time.RFC3339Nano))
-	v.Set("end", q.End.UTC().Format(time.RFC3339Nano))
-	v.Set("contains", q.Contains)
-	if q.Limit != 0 {
-		v.Set("limit", strconv.Itoa(q.Limit))
-	}
+	v := queryValues(q)
 	if cursor == "" {
 		v.Set("page", "1")
 	} else {
@@ -115,10 +126,10 @@ func (c *Client) FetchPage(ctx context.Context, q Query, cursor string) (Page, e
 	if err != nil {
 		return Page{}, withQueryCancellation(ctx, err)
 	}
-	return acceptQueryResponse(ctx, resp, c.MaxPageBytes, q.Limit, cursor)
+	return acceptQueryResponse(ctx, resp, c.MaxPageBytes, q.Limit, cursor, opening)
 }
 
-func acceptQueryResponse(ctx context.Context, resp *http.Response, maxBytes int64, maxRows int, cursor string) (Page, error) {
+func acceptQueryResponse(ctx context.Context, resp *http.Response, maxBytes int64, maxRows int, cursor string, opening *[]byte) (Page, error) {
 	// Acceptance happens only after the entire response has been read, validated
 	// and closed. Keep the page local until then.
 	if resp.StatusCode != http.StatusOK {
@@ -139,7 +150,7 @@ func acceptQueryResponse(ctx context.Context, resp *http.Response, maxBytes int6
 		maxBytes = DefaultMaxPage
 	}
 
-	page, err := decodeQueryPage(ctx, resp, maxBytes, maxRows, cursor)
+	page, err := decodeQueryPage(ctx, resp, maxBytes, maxRows, cursor, opening)
 	if closeErr := resp.Body.Close(); closeErr != nil {
 		err = joinQueryErrors(err, fmt.Errorf("close query page: %w", interruptedPage(ctx, closeErr)))
 	}
@@ -166,22 +177,34 @@ func readNextCursor(resp *http.Response, cursor string) (string, error) {
 	if len(values) == 0 {
 		return "", nil
 	}
-	const maxCursorBytes = 2048
 	next := values[0]
-	if len(values) != 1 || len(next) > base64.RawURLEncoding.EncodedLen(maxCursorBytes) {
+	if len(values) != 1 {
 		return "", errors.New("invalid next cursor header")
 	}
-	decoded, err := base64.RawURLEncoding.Strict().DecodeString(next)
-	if err != nil {
-		return "", fmt.Errorf("invalid next cursor header: %w", err)
-	}
-	if len(decoded) <= sha256.Size || len(decoded) > maxCursorBytes || base64.RawURLEncoding.EncodeToString(decoded) != next {
-		return "", errors.New("invalid next cursor header")
+	if err := validateCursor(next); err != nil {
+		return "", err
 	}
 	if next == cursor {
 		return "", errors.New("next cursor does not advance pagination")
 	}
 	return next, nil
+}
+
+// Validate only the transport representation. The issuing server owns the
+// payload, authenticity, and lifetime of the opaque token.
+func validateCursor(next string) error {
+	const maxCursorBytes = 2048
+	if len(next) > base64.RawURLEncoding.EncodedLen(maxCursorBytes) {
+		return errors.New("invalid next cursor header")
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(next)
+	if err != nil {
+		return fmt.Errorf("invalid next cursor header: %w", err)
+	}
+	if len(decoded) <= sha256.Size || len(decoded) > maxCursorBytes || base64.RawURLEncoding.EncodeToString(decoded) != next {
+		return errors.New("invalid next cursor header")
+	}
+	return nil
 }
 
 // Walk delivers validated pages in order. It advances only after consume succeeds;

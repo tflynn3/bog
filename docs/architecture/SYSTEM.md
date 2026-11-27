@@ -50,6 +50,7 @@ flowchart TD
         WAL --> Store
     end
     Operator["cmd/bog-verify"]
+    Export["cmd/bog-export"]
     subgraph Staged["Staged for server activation"]
         Checkpoint["internal/checkpoint"]
         History["internal/history"]
@@ -64,6 +65,7 @@ flowchart TD
     Operator --> Backup
     Operator --> Client
     Operator --> Store
+    Export --> Client
     Client --> Store
     subgraph Evidence["Release evidence"]
         Admission["verify/release"]
@@ -143,8 +145,9 @@ production graph. Staged libraries have a named owner and activation
 criteria and await server wiring. Operator or evidence use alone leaves
 that role unchanged. Standalone libraries sit outside the server tree and
 must be reachable through production imports from a registered command.
-The operator and evidence commands are verifier roots in the fitness
-registry. Test-only packages have Linux test files and no Linux
+Operator and evidence commands share the verifier role in the fitness
+registry. Evidence commands establish production ownership of verifier
+support packages. Test-only packages have Linux test files and no Linux
 production files. [Command root boundaries](../adr/0012-command-root-boundaries.md),
 [Standalone package consumers](../adr/0014-standalone-package-consumers.md)
 
@@ -160,7 +163,8 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `internal/backup` | Staged | Pinned export, verification, restore, offline reads, and staging recovery. The operator command uses the read-only APIs. |
 | `internal/idempotency` | Staged | Keyed-ingest coordination and durable backend contract |
 | `cmd/bog-verify` | Operator command | Read-only image verification and complete HTTP query parity |
-| `internal/client` | Standalone | Production HTTP client for `cmd/bog-verify` and `verify/release`, including complete-page framing, opaque cursors, and ingest outcomes |
+| `cmd/bog-export` | Operator command | Stream ordered NDJSON from the server's HTTP query API |
+| `internal/client` | Standalone | Production HTTP client for `cmd/bog-verify`, `cmd/bog-export`, and `verify/release`, including complete-page framing, opaque cursors, and ingest outcomes |
 | `internal/ingest` | Test-only | Reference decoder and fuzz tests |
 | `internal/archtest` | Test-only | Linux dependency fitness suite |
 | `verify/fuzz` | Test-only | Bounded backup and history corruption harness |
@@ -205,6 +209,21 @@ path to `internal/wal`, `internal/httpapi`, or `internal/readiness`.
 The server has no production path to the Go HTTP client or independent
 query oracle. [Operator verification](../adr/0011-operator-verification-boundary.md),
 [Command root boundaries](../adr/0012-command-root-boundaries.md)
+
+## Operator export boundary
+
+`cmd/bog-export` streams NDJSON from a snapshot query against the issuing
+server. It follows opaque continuations with the original time range and
+literal filter, preserving server order, timestamp ties, and duplicates.
+Its only direct root-module production import is `internal/client`, which
+uses `internal/store` for shared row types. Direct and transitive imports
+to the server command, HTTP, readiness, WAL, backup, checkpoint, history,
+idempotency, and packages at or under `verify` and `bench` are forbidden.
+The walk uses one overall timeout and a finite page budget. The exporter
+returns success after writing the terminal page. A walk or write failure
+returns nonzero, and previously emitted complete rows form a partial export.
+Release qualification uses the pinned candidate and its own evidence
+producers. [Operator export boundary](../adr/0032-operator-export-boundary.md)
 
 ## Release evidence
 
@@ -303,6 +322,12 @@ and the activation criteria are met. Rebase the later registry edit onto the
 first landed PR, then rerun both Linux inventories.
 [#53 package promotion handoff](../adr/0019-package-role-governance.md#53-promotion-handoff)
 
+Architecture coordinates the exporter registry handoff with the #103 and
+#53 owners. Recheck leases at dispatch and handoff. If the pending #53
+cutover claims shared registry files, serialize the edits, rebase the later
+change, and rerun both Linux inventories on the composed tree.
+[Exporter integration handoff](../adr/0032-operator-export-boundary.md#integration-and-qualification)
+
 The Architecture workflow runs `go test -count=1 ./internal/archtest`.
 The suite lists packages with `GOOS=linux`, `GOAMD64=v1`, `GOARM64=v8.0`,
 `CGO_ENABLED=0`, `GOENV=off`, empty `GOFLAGS`, `GO111MODULE=on`, and
@@ -320,10 +345,12 @@ root-module production registry.
 - Checkpoint, history, and backup cannot reach the WAL. Storage cannot
   depend on HTTP, readiness, or the Go HTTP client.
   [Storage authority](../../internal/archtest/storage_authority_test.go)
-- Command roots enforce server and operator exclusions. The oracle and the
-  three release evidence roots enforce their independent dependency rules.
+- Command roots enforce server, operator verification, and operator export
+  exclusions. The oracle and the three release evidence roots enforce their
+  independent dependency rules.
   [Server boundary](../../internal/archtest/command_roots_test.go),
   [Operator boundary](../../internal/archtest/operator_boundary_test.go),
+  [Exporter boundary](../../internal/archtest/export_boundary_test.go),
   [Oracle boundary](../../internal/archtest/verifier_boundaries_test.go),
   [Release evidence boundary](../../internal/archtest/release_evidence_boundary_test.go)
 - Stream policy conformance runs outside every registered production command

@@ -42,6 +42,7 @@ type rule struct {
 // Update roles and edges in the same change as the wiring that requires them.
 // Every staged role also has a declaration in stagedPackages, removed on promotion.
 var registry = map[string]rule{
+	exportCommand:                {verifier, []string{goClient}},
 	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
 	server:                       {serverCommand, []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
 	"bog/internal/httpapi":       {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
@@ -63,6 +64,11 @@ var registry = map[string]rule{
 	listenerVerifier:             {verifierModel, nil},
 	"bog/verify/query-model":     {verifierModel, nil},
 	streamPolicyVerifier:         {verifierModel, nil},
+}
+
+// Operator roots use the verifier role for package kind and reachability.
+func isOperatorCommand(path string) bool {
+	return path == operatorCommand || path == exportCommand
 }
 
 type listedPackage struct {

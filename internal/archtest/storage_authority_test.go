@@ -22,15 +22,21 @@ func storageAuthorityProblems(rules map[string]rule) []string {
 		packages[path] = listedPackage{Imports: entry.imports}
 	}
 
-	var problems []string
-	for _, from := range []string{
+	retained := []string{
 		"bog/internal/backup",
 		"bog/internal/checkpoint",
 		"bog/internal/history",
-		"bog/internal/idempotency",
-	} {
+	}
+	var problems []string
+	for _, from := range append(retained, "bog/internal/idempotency") {
 		if reachableImports(packages, from)[wal] {
 			problems = append(problems, fmt.Sprintf("forbidden storage authority dependency: %s reaches %s", from, wal))
+		}
+	}
+	walReachable := reachableImports(packages, wal)
+	for _, to := range retained {
+		if walReachable[to] {
+			problems = append(problems, fmt.Sprintf("forbidden storage authority dependency: %s reaches %s", wal, to))
 		}
 	}
 	return problems
@@ -44,71 +50,108 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 		history     = "bog/internal/history"
 		httpapi     = "bog/internal/httpapi"
 		idempotency = "bog/internal/idempotency"
+		readiness   = "bog/internal/readiness"
 		relay       = "bog/internal/relay"
 		store       = "bog/internal/store"
 		wal         = "bog/internal/wal"
+		forbidden   = "forbidden storage authority dependency: "
 	)
 	tests := []struct {
-		name          string
-		from, through string
-		want          []string
+		name     string
+		from, to string
+		viaRelay bool
+		want     []string
 	}{
-		{name: "command-local composition supplies the keyed ingest backend"},
+		{name: "command-local composition supplies retained storage and the keyed ingest backend"},
+		{
+			name: "WAL imports backup directly",
+			from: wal, to: backup,
+			want: []string{forbidden + wal + " reaches " + backup},
+		},
+		{
+			name: "WAL reaches backup through a registered relay",
+			from: wal, to: backup, viaRelay: true,
+			want: []string{forbidden + wal + " reaches " + backup},
+		},
+		{
+			name: "WAL imports checkpoint directly",
+			from: wal, to: checkpoint,
+			want: []string{forbidden + wal + " reaches " + checkpoint},
+		},
+		{
+			name: "WAL reaches checkpoint through a registered relay",
+			from: wal, to: checkpoint, viaRelay: true,
+			want: []string{forbidden + wal + " reaches " + checkpoint},
+		},
+		{
+			name: "WAL imports history directly and reaches checkpoint",
+			from: wal, to: history,
+			want: []string{forbidden + wal + " reaches " + checkpoint, forbidden + wal + " reaches " + history},
+		},
+		{
+			name: "WAL reaches history and checkpoint through a registered relay",
+			from: wal, to: history, viaRelay: true,
+			want: []string{forbidden + wal + " reaches " + checkpoint, forbidden + wal + " reaches " + history},
+		},
 		{
 			name: "backup imports the owner directly",
-			from: backup, through: wal,
-			want: []string{"forbidden storage authority dependency: " + backup + " reaches " + wal},
+			from: backup, to: wal,
+			want: []string{forbidden + backup + " reaches " + wal},
 		},
 		{
 			name: "backup reaches the owner through a relay",
-			from: backup, through: relay,
-			want: []string{"forbidden storage authority dependency: " + backup + " reaches " + wal},
+			from: backup, to: wal, viaRelay: true,
+			want: []string{forbidden + backup + " reaches " + wal},
 		},
 		{
 			name: "checkpoint bypass also exposes the owner to history",
-			from: checkpoint, through: relay,
+			from: checkpoint, to: wal, viaRelay: true,
 			want: []string{
-				"forbidden storage authority dependency: " + checkpoint + " reaches " + wal,
-				"forbidden storage authority dependency: " + history + " reaches " + wal,
+				forbidden + checkpoint + " reaches " + wal,
+				forbidden + history + " reaches " + wal,
 			},
 		},
 		{
 			name: "history reaches the owner through a relay",
-			from: history, through: relay,
-			want: []string{"forbidden storage authority dependency: " + history + " reaches " + wal},
+			from: history, to: wal, viaRelay: true,
+			want: []string{forbidden + history + " reaches " + wal},
 		},
 		{
 			name: "idempotency imports the owner directly",
-			from: idempotency, through: wal,
-			want: []string{"forbidden storage authority dependency: " + idempotency + " reaches " + wal},
+			from: idempotency, to: wal,
+			want: []string{forbidden + idempotency + " reaches " + wal},
 		},
 		{
 			name: "idempotency reaches the owner through a registered relay",
-			from: idempotency, through: relay,
-			want: []string{"forbidden storage authority dependency: " + idempotency + " reaches " + wal},
+			from: idempotency, to: wal, viaRelay: true,
+			want: []string{forbidden + idempotency + " reaches " + wal},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			// The command can adapt its WAL owner to idempotency.Backend and
-			// inject it into the coordinator without a coordinator-to-WAL import.
+			// The command adapts the WAL owner for retained storage and keyed
+			// ingest. HTTP and readiness get their inputs from the command
+			// without importing WAL, so their rules cannot detect its bypasses.
 			rules := map[string]rule{
-				server:      {serverCommand, []string{backup, checkpoint, history, httpapi, idempotency, wal}},
+				server:      {serverCommand, []string{backup, checkpoint, history, httpapi, idempotency, readiness, wal}},
 				backup:      {runtimeLibrary, []string{store}},
 				checkpoint:  {runtimeLibrary, []string{store}},
 				history:     {runtimeLibrary, []string{checkpoint, store}},
-				httpapi:     {runtimeLibrary, []string{store, wal}},
+				httpapi:     {runtimeLibrary, []string{store}},
 				idempotency: {runtimeLibrary, nil},
+				readiness:   {runtimeLibrary, []string{store}},
 				store:       {runtimeLibrary, nil},
 				wal:         {runtimeLibrary, []string{store}},
 			}
-			if tt.through == relay {
-				rules[relay] = rule{runtimeLibrary, []string{wal}}
-			}
 			if tt.from != "" {
+				target := tt.to
+				if tt.viaRelay {
+					rules[relay] = rule{runtimeLibrary, []string{tt.to}}
+					target = relay
+				}
 				entry := rules[tt.from]
-				entry.imports = append(entry.imports, tt.through)
+				entry.imports = append(entry.imports, target)
 				rules[tt.from] = entry
 			}
 			packages := make(map[string]listedPackage, len(rules))
@@ -121,6 +164,9 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 			}
 			if problems := architectureProblems(packages, rules); len(problems) != 0 {
 				t.Fatalf("fixture violates the existing architecture rules: %v", problems)
+			}
+			if problems := pagingBoundaryProblems(rules); len(problems) != 0 {
+				t.Fatalf("fixture violates the HTTP paging boundary: %v", problems)
 			}
 			if got := storageAuthorityProblems(rules); !slices.Equal(got, tt.want) {
 				t.Errorf("storageAuthorityProblems() = %q, want %q", got, tt.want)

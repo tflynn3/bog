@@ -119,10 +119,24 @@ following evidence is available for that revision.
 | Keyed retry | Prove current authorization before retry lookup, scoped keys and conflicts, replay of the recorded outcome across policy revisions, and atomic batch and disposition recovery after ambiguous responses and crashes wherever keyed ingest is enabled. |
 | Export and restore | Prove scope and redaction in authentic artifacts, revocation at the publication barrier with no retrievable artifact, and uniform denial for revoked and absent-ID retrievals. For writable restore, prove target-policy compatibility or redaction before durable writes and exact scoped replay after restart. |
 
+Masking evidence requires a distinct, previously unused cursor for each
+assertion. Use separate successful baseline resumes under the original and
+changed rules. After an acknowledged change, require the standard 400 for an
+original-policy cursor. Require the standard 403 during revocation, then the
+standard 400 for a different original-policy cursor after regrant. A
+changed-policy cursor issued before revocation must resume after regrant.
+After restoration, require the standard 400 for unused cursors issued under
+both earlier policies. Hold separate unaffected-stream cursors for successful
+resumes after the change and after restoration. Compare exact scoped rows and
+NDJSON for successful resumes and for fresh queries and literal searches under
+both changed and restored rules. Reused witnesses leave the masking evidence
+incomplete because prior presentation can itself invalidate a cursor.
+
 Security Verification runs the independent candidate and revision
 scenarios with bounded adapters against the same clean serving revision
-on native Linux amd64 and arm64. Record the pinned revision, each
-binary checksum, the observed results, and cleanup. Synthetic fixtures
+on native Linux amd64 and arm64. Each runner uses its own SHA-256-pinned
+binary. Record the revision, both binary digests, the observed results,
+and cleanup. Synthetic fixtures
 qualify the verifier; missing observations leave activation evidence
 incomplete. Update the registry, staging declaration, SYSTEM.md diagram,
 and role table with the measured serving wiring. Review storage format

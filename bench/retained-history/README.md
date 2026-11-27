@@ -62,6 +62,51 @@ is removed. The peak must be positive and within the cap, and
 `memory.events` must contain an explicit zero `oom_kill` counter. Cleanup
 records reaping, subtree emptiness and removal, and fixture store removal.
 
+## Slow-response qualification
+
+Run the benchmark with the reviewed #108 binary on native Linux at both
+fixture sizes. Build the binary in its clean candidate checkout and run the
+benchmark from the checkout containing this workload. The invocation runs both
+live fixtures and writes one report. Retain that report with the candidate
+revision and binary SHA-256. Both the 196,608- and 393,216-row results must pass,
+including `diagnostics.slow_responses.status`, under the kernel-reported
+128 MiB memory limit with swap disabled.
+
+```sh
+go run ./bench/retained-history \
+  -mode live -require-slow-response-overlap \
+  -binary /absolute/path/to/bog -revision "$candidate_revision" \
+  -fixture linux-release-v1 -report /absolute/path/to/slow-response.json \
+  -cgroup-parent /sys/fs/cgroup/path/to/delegation \
+  -work-dir /absolute/path/on/local/disk
+```
+
+This mode uses two query slots. The scattered trial holds a full-range cursor
+and opens a selective cursor while a continuation is blocked on a loopback
+socket. The benchmark constrains the client receive window and uses the
+candidate's normal send buffer. It observes a nonempty candidate send queue
+with a TCP zero-window probe, then keeps the body unread across acknowledged
+ingest and publication.
+After publication, a second paused continuation and a clean query-capacity
+rejection confirm both slots are still occupied. Resetting the first socket
+must let that same continuation return the original NDJSON bytes and next
+cursor while the other write stays paused.
+
+After checking both held snapshots, the runner retires the selective capture
+and starts one more paused broad continuation. Explicit retirement bars new
+resumes with HTTP 410 while the admitted write still pins the predecessor.
+Cancellation must then allow the pin count to reach zero and the predecessor
+manifest to disappear while the successor manifest retains its identity.
+Full-range and selective walks compare ordered rows and duplicate multiplicity
+against the acknowledged fixture ledger before and after restart.
+
+The schema-v1 report adds `diagnostics.slow_responses` for this workload.
+It records ordered observations, sampled `memory.current` peaks at phase
+boundaries and every 20 ms during each phase, and the phase of any failure.
+The lifetime kernel `memory.peak` and zero-swap, zero-OOM, and cleanup
+requirements still apply. The query diagnostics record HTTP rejection reasons
+and distinguish received headers from completed bodies.
+
 ## Live qualification
 
 Live mode is the default used by the release gate. The legacy case records a

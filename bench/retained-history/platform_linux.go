@@ -58,7 +58,7 @@ const (
 	liveQueryWorkBudget = 2 << 30
 )
 
-func startChild(binary, dir, group, mode string) (*child, string, error) {
+func startChild(binary, dir, group, mode string, queryFlags ...string) (*child, string, error) {
 	reserved, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		return nil, "", err
@@ -80,6 +80,7 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 	if mode == "live" {
 		args = append(args, "-query-work-budget", strconv.FormatUint(liveQueryWorkBudget, 10))
 	}
+	args = append(args, queryFlags...)
 	cmd := exec.Command("/bin/sh", args...)
 	cmd.Dir = dir
 	env := cmd.Environ()
@@ -220,6 +221,9 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 	if o.mode == "live" {
 		r.Diagnostics.Backfills = newBackfillTimelines(f)
 		r.Diagnostics.Restart = newRestartEvidence()
+		if o.requireSlowOverlap {
+			r.Diagnostics.SlowResponses = newSlowResponseEvidence()
+		}
 	}
 	err := func() (err error) {
 		if err := ctx.Err(); err != nil {
@@ -325,6 +329,9 @@ func measure(ctx context.Context, o options, binary, dir string, f fixture) (r r
 		p, err = r.exercise(ctx, o, binary, dir, group, f, candidate, trial)
 		return err
 	}()
+	if e := r.Diagnostics.SlowResponses; e != nil && e.Status == "running" && err != nil {
+		e.fail(err)
+	}
 	r.Diagnostics.markMissing(o.mode)
 	for key, missing := range map[string]bool{
 		"cgroup_peak_memory": r.CgroupPeak == nil, "peak_rss": r.PeakRSS == nil, "peak_descriptors": r.PeakFDs == nil,
@@ -372,7 +379,11 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 		return nil, err
 	}
 	start := time.Now()
-	p, base, err := startChild(binary, dir, group, o.mode)
+	var queryFlags []string
+	if o.requireSlowOverlap {
+		queryFlags = []string{"-query-concurrency=2"}
+	}
+	p, base, err := startChild(binary, dir, group, o.mode, queryFlags...)
 	if err != nil {
 		candidate.StartupError = diagnosticError(err)
 		return p, err
@@ -434,11 +445,28 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 			return p, fmt.Errorf("%s candidate directory: %w", candidate.Lifetime, statErr)
 		}
 	}
+	if o.mode == "live" {
+		probe.readMemoryCurrent = func(ctx context.Context) (uint64, error) {
+			return readCandidateMemoryCurrent(ctx, p, group)
+		}
+		probe.readMemoryPeak = func(ctx context.Context) (uint64, error) {
+			return readCandidateMemory(ctx, p, group, "memory.peak")
+		}
+	}
+	if o.requireSlowOverlap {
+		probe.openPaused = func(ctx context.Context, path, phase string, framing pageFraming) (pausedResponse, error) {
+			return openLinuxPaused(ctx, probe, p.cmd.Process.Pid, path, phase, framing)
+		}
+	}
 	if candidate.Lifetime == "restart" {
 		r.RestartReady = &elapsed
 		r.Phase = "recovery_walk"
 		if trial != nil {
-			err = trial.verify(work, probe, o.control, f)
+			if e := r.Diagnostics.SlowResponses; e != nil {
+				err = e.verifyRestart(work, probe, o.control, f, trial)
+			} else {
+				err = trial.verify(work, probe, o.control, f)
+			}
 			r.RecoveredRows = trial.evidence.Ledger.Matched
 			if err == nil {
 				trial.evidence.Phase = "restart_completion"
@@ -451,14 +479,6 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
 	r.StartReady = &elapsed
 	if trial != nil {
 		probe.acknowledged = &trial.ledger
-	}
-	if o.mode == "live" {
-		probe.readMemoryCurrent = func(ctx context.Context) (uint64, error) {
-			return readCandidateMemoryCurrent(ctx, p, group)
-		}
-		probe.readMemoryPeak = func(ctx context.Context) (uint64, error) {
-			return readCandidateMemory(ctx, p, group, "memory.peak")
-		}
 	}
 	return p, f.load(work, probe, o, r, dir)
 }

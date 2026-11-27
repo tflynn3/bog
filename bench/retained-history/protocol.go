@@ -29,6 +29,7 @@ type service struct {
 	readMemoryCurrent func(context.Context) (uint64, error)
 	readMemoryPeak    func(context.Context) (uint64, error)
 	acknowledged      *acknowledgedRows
+	openPaused        func(context.Context, string, string, pageFraming) (pausedResponse, error)
 }
 
 func newService(base string) service {
@@ -185,9 +186,7 @@ func (w *walk) page(ctx context.Context, s service, f fixture) (time.Duration, e
 	return elapsed, err
 }
 
-func (w *walk) readPage(ctx context.Context, s service, f fixture) (_ time.Duration, terminalBody []byte, err error) {
-	var attempt queryAttempt
-	defer func() { recordQuery(s.queryPhases, w.phase, attempt, err) }()
+func (w *walk) limit() int {
 	limit := [...]int{1, 193, 509}[w.pages%3]
 	if w.pageLimit > 0 {
 		limit = w.pageLimit
@@ -195,6 +194,10 @@ func (w *walk) readPage(ctx context.Context, s service, f fixture) (_ time.Durat
 	if w.pages == 1 && w.firstResumeLimit > 0 {
 		limit = w.firstResumeLimit
 	}
+	return limit
+}
+
+func (w *walk) path(limit int) string {
 	q := url.Values{"start": {w.filter.start.Format(time.RFC3339Nano)}, "end": {w.filter.end.Format(time.RFC3339Nano)},
 		"contains": {w.filter.literal}, "limit": {strconv.Itoa(limit)}}
 	if w.pages == 0 {
@@ -202,13 +205,23 @@ func (w *walk) readPage(ctx context.Context, s service, f fixture) (_ time.Durat
 	} else {
 		q.Set("cursor", w.cursor)
 	}
+	return "/query?" + q.Encode()
+}
+
+func (w *walk) readPage(ctx context.Context, s service, f fixture) (_ time.Duration, pageBody []byte, err error) {
+	var attempt queryAttempt
+	defer func() { recordQuery(s.queryPhases, w.phase, attempt, err) }()
+	limit := w.limit()
 	start := time.Now()
-	res, data, err := s.requestObserved(ctx, http.MethodGet, "/query?"+q.Encode(), nil, &attempt)
+	res, data, err := s.requestObserved(ctx, http.MethodGet, w.path(limit), nil, &attempt)
 	elapsed := time.Since(start)
 	if err != nil {
 		return elapsed, nil, err
 	}
 	attempt.Phase = "validation"
+	if attempt.Admission == "capacity_rejection" && len(res.Trailer.Values("Bog-Next-Cursor")) == 0 {
+		return elapsed, nil, errQuerySlotsFull
+	}
 	if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "application/x-ndjson" {
 		return elapsed, nil, fmt.Errorf("query HTTP %d (%s)", res.StatusCode, attempt.Admission)
 	}
@@ -247,11 +260,9 @@ func (w *walk) readPage(ctx context.Context, s service, f fixture) (_ time.Durat
 	if len(cursors) == 1 {
 		w.cursor = cursors[0]
 		w.seen[w.cursor] = true
-	} else {
-		terminalBody = data
 	}
 	w.pages++
-	return elapsed, terminalBody, nil
+	return elapsed, data, nil
 }
 
 // terminalPage retains the request and bounded body of the terminal page.
@@ -349,8 +360,9 @@ func (s service) retireCapture(ctx context.Context, path, cursor string) error {
 	if err != nil {
 		return err
 	}
-	if res.StatusCode != http.StatusNoContent || len(data) != 0 {
-		return fmt.Errorf("retire capture: HTTP %d, body bytes %d", res.StatusCode, len(data))
+	if res.StatusCode != http.StatusNoContent || len(data) != 0 ||
+		len(res.Header.Values("Bog-Next-Cursor")) != 0 || len(res.Trailer.Values("Bog-Next-Cursor")) != 0 {
+		return fmt.Errorf("retire capture: expected empty 204 without a cursor, got HTTP %d with %d body bytes", res.StatusCode, len(data))
 	}
 	return nil
 }

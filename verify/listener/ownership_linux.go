@@ -9,6 +9,11 @@ import (
 )
 
 func owns(pid, port int, expected Bind) (bool, error) {
+	probeIPv6 := expected == BindIPv6Loopback
+	family := "IPv4"
+	if probeIPv6 {
+		family = "IPv6"
+	}
 	var sockets []listenerSocket
 	wildcards := make(map[uint64]bool)
 	for _, table := range []struct {
@@ -18,20 +23,23 @@ func owns(pid, port int, expected Bind) (bool, error) {
 		{"/proc/net/tcp", false},
 		{"/proc/net/tcp6", true},
 	} {
+		if probeIPv6 && !table.ipv6 {
+			continue
+		}
 		data, err := os.ReadFile(table.path)
-		if table.ipv6 && errors.Is(err, os.ErrNotExist) {
+		if !probeIPv6 && table.ipv6 && errors.Is(err, os.ErrNotExist) {
 			continue // IPv6 can be disabled in the runner kernel.
 		}
 		if err != nil {
 			return false, fmt.Errorf("read listener table: %w", err)
 		}
-		matching, err := listenerSockets(string(data), port, table.ipv6)
+		matching, err := listenerSockets(string(data), port, table.ipv6, probeIPv6)
 		if err != nil {
 			return false, fmt.Errorf("read listener table %s: %w", table.path, err)
 		}
 		sockets = append(sockets, matching...)
 		for _, socket := range matching {
-			if socket.ipv6Wildcard {
+			if !probeIPv6 && socket.ipv6Wildcard {
 				wildcards[socket.inode] = true
 			}
 		}
@@ -71,7 +79,7 @@ func owns(pid, port int, expected Bind) (bool, error) {
 	}
 	for _, socket := range sockets {
 		if !owned["socket:["+strconv.FormatUint(socket.inode, 10)+"]"] {
-			return false, fmt.Errorf("foreign listener on IPv4 loopback port %d (socket inode %d belongs outside candidate PID %d)", port, socket.inode, pid)
+			return false, fmt.Errorf("foreign listener on %s loopback port %d (socket inode %d belongs outside candidate PID %d)", family, port, socket.inode, pid)
 		}
 	}
 	if expected != "" {

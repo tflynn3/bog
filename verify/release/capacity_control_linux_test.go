@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -46,6 +45,7 @@ func TestReleaseCapacityControlScope(t *testing.T) {
 		{name: "loopback_with_opt_in_disabled", bind: listener.BindLoopback, optIn: "0"},
 		{name: "wildcard_with_opt_in", bind: listener.BindWildcard, optIn: "1"},
 		{name: "loopback_with_opt_in", bind: listener.BindLoopback, optIn: "1", visible: true},
+		{name: "ipv6_loopback_with_opt_in", bind: listener.BindIPv6Loopback, optIn: "1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setenv registers restoration and prevents parallel execution. The
@@ -68,23 +68,10 @@ func TestReleaseCapacityControlScope(t *testing.T) {
 				},
 			}
 			defer client.CloseIdleConnections()
-			bind := candidateBind{
-				ip: net.ParseIP(string(tc.bind)),
-				verify: func(pid, port int) error {
-					owned, err := listener.OwnsBind(pid, port, tc.bind)
-					if err != nil {
-						return err
-					}
-					if !owned {
-						return fmt.Errorf("candidate PID %d has no IPv4 loopback listener on port %d", pid, port)
-					}
-					t.Logf("confirmed candidate pid=%d bind=%s:%d", pid, tc.bind, port)
-					return nil
-				},
-			}
 			err := withFixtureRoot(func(dir string) error {
-				return serveDirectoryOn(ctx, binary, dir, client, nil, bind, (*candidateProcess).stop,
+				return serveDirectoryOn(ctx, binary, dir, client, nil, tc.bind, (*candidateProcess).stop,
 					func(ctx context.Context, base string) error {
+						t.Logf("confirmed candidate bind %s for probe %s", tc.bind, base)
 						return probeCapacityControl(ctx, t, client, base, tc.visible)
 					})
 			})
@@ -132,22 +119,12 @@ func checkCapacityControlPresent(ctx context.Context, t *testing.T, client *http
 
 func checkCapacityControlAbsent(ctx context.Context, t *testing.T, client *http.Client, base string) error {
 	t.Helper()
-	var probeErr error
-	for _, probe := range []struct {
-		method, path string
-		want         int
-	}{
-		{http.MethodGet, "/_capacity/compaction?action=status&cutoff=1", http.StatusNotFound},
-		{http.MethodPost, "/_capacity/compaction?action=start&cutoff=1", http.StatusNotFound},
-	} {
-		probeErr = errors.Join(probeErr, checkCapacityHTTPStatus(ctx, t, client, base, probe.method, probe.path, probe.want))
-	}
-	retirementErr := checkCapacityRetirementAbsent(ctx, t, client, base)
+	probeErr := checkCapacityRoutesAbsent(ctx, t, client, base)
 	healthErr := checkCapacityHTTPStatus(ctx, t, client, base, http.MethodGet, "/healthz", http.StatusOK)
-	return errors.Join(probeErr, retirementErr, healthErr)
+	return errors.Join(probeErr, healthErr)
 }
 
-func checkCapacityRetirementAbsent(ctx context.Context, t *testing.T, client *http.Client, base string) error {
+func checkCapacityRoutesAbsent(ctx context.Context, t *testing.T, client *http.Client, base string) error {
 	t.Helper()
 	const pageBytes = 4096
 	pager, err := newReleasePager(base, client, pageBytes)
@@ -163,18 +140,24 @@ func checkCapacityRetirementAbsent(ctx context.Context, t *testing.T, client *ht
 	}
 
 	params := url.Values{"action": {"retire"}, "cursor": {first.NextCursor}}
-	retireErr := checkCapacityHTTPStatus(ctx, t, client, base, http.MethodPost,
-		"/_capacity/compaction?"+params.Encode(), http.StatusNotFound)
+	var probeErr error
+	for _, probe := range []struct{ method, path string }{
+		{http.MethodGet, "/_capacity/compaction?action=status&cutoff=1"},
+		{http.MethodPost, "/_capacity/compaction?action=start&cutoff=1"},
+		{http.MethodPost, "/_capacity/compaction?" + params.Encode()},
+	} {
+		probeErr = errors.Join(probeErr, checkCapacityHTTPStatus(ctx, t, client, base, probe.method, probe.path, http.StatusNotFound))
+	}
 	last, _, resumeErr := pager.fetch(ctx, capacityScopeFilter, 1, first.NextCursor)
 	if resumeErr == nil {
 		resumeErr = checkBudgetPage(last, []row{{TS: fixtureStart, Line: capacityScopeTail}}, true, nil)
 	}
 	if resumeErr != nil {
 		resumeErr = fmt.Errorf("resume continuation after retirement probe: %w", resumeErr)
-	} else if retireErr == nil {
-		t.Log("continuation returned the exact terminal row after HTTP 404 for retirement")
+	} else if probeErr == nil {
+		t.Log("continuation returned the exact terminal row after all three control requests returned HTTP 404")
 	}
-	return errors.Join(retireErr, resumeErr)
+	return errors.Join(probeErr, resumeErr)
 }
 
 func checkCapacityHTTPStatus(ctx context.Context, t *testing.T, client *http.Client, base, method, path string, want int) error {
@@ -215,7 +198,7 @@ func TestProbeCapacityControlAbsent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var ingests atomic.Int32
-			var retirementAttempted atomic.Bool
+			var controls atomic.Int32
 			handler := http.NewServeMux()
 			handler.HandleFunc("POST /ingest", func(w http.ResponseWriter, r *http.Request) {
 				const rowFormat = "{\"ts\":%q,\"line\":%q}\n"
@@ -242,15 +225,22 @@ func TestProbeCapacityControlAbsent(t *testing.T) {
 				w.WriteHeader(tc.health)
 			})
 			handler.HandleFunc("/_capacity/compaction", func(w http.ResponseWriter, r *http.Request) {
+				step := controls.Add(1)
 				var status int
 				switch r.Method + " " + r.URL.RawQuery {
 				case "GET action=status&cutoff=1":
+					if step != 1 {
+						t.Error("status probe out of order")
+					}
 					status = tc.status
 				case "POST action=start&cutoff=1":
+					if step != 2 {
+						t.Error("start probe out of order")
+					}
 					status = tc.start
 				case "POST action=retire&cursor=" + token:
-					if retirementAttempted.Swap(true) {
-						t.Error("duplicate retirement request")
+					if step != 3 {
+						t.Error("retirement probe out of order")
 					}
 					status = tc.retire
 				default:
@@ -266,13 +256,16 @@ func TestProbeCapacityControlAbsent(t *testing.T) {
 				var line string
 				switch r.URL.RequestURI() {
 				case queryPath("", 1, capacityScopeFilter):
+					if controls.Load() != 0 {
+						t.Error("control request preceded cursor issuance")
+					}
 					if !tc.missingCursor {
 						w.Header().Set(nextCursor, token)
 					}
 					line = capacityScopeSeed
 				case queryPath(token, 1, capacityScopeFilter):
-					if !retirementAttempted.Load() {
-						t.Error("continuation resumed before retirement was attempted")
+					if controls.Load() != 3 {
+						t.Error("continuation resumed before all control requests")
 					}
 					if tc.resume != http.StatusOK {
 						http.Error(w, "query capture expired", tc.resume)
@@ -299,8 +292,12 @@ func TestProbeCapacityControlAbsent(t *testing.T) {
 			if got := ingests.Load(); got != 2 {
 				t.Errorf("ingests = %d, want 2", got)
 			}
-			if retirementAttempted.Load() == tc.missingCursor {
-				t.Errorf("retirement attempted = %t, want %t", retirementAttempted.Load(), !tc.missingCursor)
+			wantControls := int32(3)
+			if tc.missingCursor {
+				wantControls = 0
+			}
+			if got := controls.Load(); got != wantControls {
+				t.Errorf("control requests = %d, want %d", got, wantControls)
 			}
 			if tc.wantErr == "" {
 				if err != nil {

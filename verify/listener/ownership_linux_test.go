@@ -44,6 +44,35 @@ func TestIPv4ExpectedBind(t *testing.T) {
 	}
 }
 
+func TestIPv6LoopbackExpectedBind(t *testing.T) {
+	t.Parallel()
+	for _, host := range []string{"::1", "::"} {
+		t.Run(host, func(t *testing.T) {
+			t.Parallel()
+			sock, err := net.ListenTCP("tcp6", &net.TCPAddr{IP: net.ParseIP(host)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { closeTestListener(t, sock) })
+			pid, port := os.Getpid(), sock.Addr().(*net.TCPAddr).Port
+			childPID := startListenerHolder(t, sock)
+			if err := sock.Close(); err != nil {
+				t.Fatal(err)
+			}
+			want := host == "::1"
+			var why string
+			if !want {
+				why = "has bind ::, want ::1"
+			}
+			assertExpectedBind(t, childPID, port, BindIPv6Loopback, want, why)
+			assertExpectedBind(t, pid, port, BindIPv6Loopback, false, "foreign listener on IPv6 loopback")
+			if owned, err := Owns(childPID, port); owned || err != nil {
+				t.Fatalf("IPv6-only socket affected IPv4 probe: %t, %v", owned, err)
+			}
+		})
+	}
+}
+
 func closeTestListener(t *testing.T, sock *net.TCPListener) {
 	t.Helper()
 	if err := sock.Close(); err != nil && !errors.Is(err, net.ErrClosed) {

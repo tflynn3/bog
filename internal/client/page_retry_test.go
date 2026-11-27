@@ -29,6 +29,8 @@ func TestBoundedPageRetry(t *testing.T) {
 		{name: "same cursor after unavailable", status: 503, retries: 1, recoverAfter: 1, wantAttempts: 2},
 		{name: "same cursor after incomplete delivery", status: 200, body: row, length: int64(len(row) + 1),
 			retries: 1, recoverAfter: 1, wantAttempts: 2},
+		{name: "same cursor after truncated frame with malformed suffix", status: 200, body: row + "{\n", length: int64(len(row) + 3),
+			retries: 1, recoverAfter: 1, wantAttempts: 2},
 		{name: "same cursor after failed close", status: 200, body: row, closeErr: io.ErrClosedPipe,
 			retries: 1, recoverAfter: 1, wantAttempts: 2},
 		{name: "retry exhaustion retains last error", status: 200, body: row, length: int64(len(row) + 1),

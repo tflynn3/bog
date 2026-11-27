@@ -1,20 +1,15 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"bog/internal/store"
 )
@@ -62,45 +57,6 @@ var ErrCaptureExpired = errors.New("query capture expired")
 var ErrInvalidCursor = errors.New("invalid cursor")
 
 var errCursorCycle = fmt.Errorf("%w: next cursor does not advance pagination: cursor cycle", ErrMalformedPage)
-
-func readQueryBody(ctx context.Context, r *http.Response, limit int64) ([]byte, error) {
-	if limit < 0 || limit == math.MaxInt64 {
-		return nil, errors.New("invalid response size limit")
-	}
-	if !framed(r) {
-		return nil, fmt.Errorf("%w: query response has unverifiable framing", ErrMalformedPage)
-	}
-	encodings := r.Header.Values("Content-Encoding")
-	if r.Uncompressed || len(encodings) > 1 || (len(encodings) == 1 && !strings.EqualFold(encodings[0], "identity")) {
-		return nil, fmt.Errorf("%w: unsupported query content encoding", ErrMalformedPage)
-	}
-	if r.ContentLength > limit {
-		return nil, pageSizeError{}
-	}
-
-	// Read at most one extra byte to distinguish a complete page exactly at
-	// the limit from an oversized stream. ReadAll can return bytes and an error.
-	body, readErr := io.ReadAll(io.LimitReader(r.Body, limit+1))
-	size := int64(len(body))
-	if size > limit {
-		if readErr != nil {
-			return nil, errors.Join(pageSizeError{}, interruptedPage(ctx, readErr))
-		}
-		return nil, pageSizeError{}
-	}
-	if readErr != nil {
-		return nil, interruptedPage(ctx, readErr)
-	}
-	if r.ContentLength >= 0 && size != r.ContentLength {
-		if size < r.ContentLength {
-			return nil, fmt.Errorf("%w: received %d of %d declared bytes: %w",
-				ErrPageInterrupted, size, r.ContentLength, io.ErrUnexpectedEOF)
-		}
-		return nil, fmt.Errorf("%w: received %d bytes with Content-Length %d",
-			ErrMalformedPage, size, r.ContentLength)
-	}
-	return body, nil
-}
 
 func interruptedPage(ctx context.Context, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Cause(ctx)) {
@@ -192,61 +148,6 @@ func acceptQueryResponse(ctx context.Context, resp *http.Response, maxBytes int6
 		return Page{}, &HTTPError{StatusCode: resp.StatusCode, Cause: err}
 	}
 	return page, nil
-}
-
-func decodeQueryPage(ctx context.Context, resp *http.Response, maxBytes int64, maxRows int, cursor string) (Page, error) {
-	if err := ctx.Err(); err != nil {
-		return Page{}, err
-	}
-	body, err := readQueryBody(ctx, resp, maxBytes)
-	if err != nil {
-		return Page{}, fmt.Errorf("read query page: %w", err)
-	}
-	rows, err := decodeQueryRows(ctx, body, maxRows)
-	if err != nil {
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			err = fmt.Errorf("%w: %w", ErrMalformedPage, err)
-		}
-		return Page{}, err
-	}
-	next, err := readNextCursor(resp, cursor)
-	if err != nil {
-		return Page{}, fmt.Errorf("%w: %w", ErrMalformedPage, err)
-	}
-	return Page{Rows: rows, NextCursor: next}, nil
-}
-
-func decodeQueryRows(ctx context.Context, body []byte, limit int) ([]Row, error) {
-	var rows []Row
-	for len(body) > 0 {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		line, rest, found := bytes.Cut(body, []byte{'\n'})
-		if !found || len(line) == 0 || !utf8.Valid(line) {
-			return nil, errors.New("invalid query record framing or UTF-8")
-		}
-		body = rest
-		var record struct {
-			TS   *string `json:"ts"`
-			Line *string `json:"line"`
-		}
-		if err := jsonv2.Unmarshal(line, &record, jsonv2.RejectUnknownMembers(true)); err != nil {
-			return nil, fmt.Errorf("decode query record: %w", err)
-		}
-		if record.TS == nil || record.Line == nil {
-			return nil, errors.New("missing query record field")
-		}
-		ts, err := store.ParseTime(*record.TS)
-		if err != nil {
-			return nil, fmt.Errorf("decode query timestamp: %w", err)
-		}
-		if limit > 0 && len(rows) == limit {
-			return nil, fmt.Errorf("unexpected row %d: exceeds requested limit %d", len(rows)+1, limit)
-		}
-		rows = append(rows, Row{TS: ts, Line: *record.Line})
-	}
-	return rows, nil
 }
 
 func readNextCursor(resp *http.Response, cursor string) (string, error) {

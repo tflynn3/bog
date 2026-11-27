@@ -16,6 +16,8 @@ var (
 // PageSource is the storage side of HTTP paging. Page meters capture and scan
 // work using the supplied budget. Replaying a captured request must reproduce
 // its rows, positions and More decision within the original scan work.
+// This includes repeating the acquisition scan using its returned Capture
+// and an empty After. Acquisition includes the cost of opening the view.
 // A failed acquisition cleans up its own resources. After a successful
 // acquisition HTTP owns Release, including when response preparation fails.
 // Snapshot IDs and positions are nonempty UTF-8 strings of at most 1024 bytes.

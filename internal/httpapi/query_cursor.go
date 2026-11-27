@@ -17,14 +17,6 @@ const (
 
 var cursorTokenSize = base64.RawURLEncoding.EncodedLen(cursorSize)
 
-// Cursor encoding and authentication process bounded tokens and positions in
-// blocks. The base token charge covers fixed setup, including HMAC padding.
-var cursorTokenWork = 1 + cursorBlockWork(cursorTokenSize)
-
-func cursorBlockWork(size int) uint64 {
-	return (uint64(size) + sha256.BlockSize - 1) / sha256.BlockSize
-}
-
 type cursorData struct {
 	Capture uint64
 	Filter  [sha256.Size]byte

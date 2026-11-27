@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -15,10 +16,22 @@ type legacyPageSource struct {
 	store *store.Store
 	mu    sync.Mutex
 	next  uint64
-	views map[string]*store.PositionedSnapshot
+	views map[string]legacyQueryView
 }
 
-func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.QueryWork) (PageResult, error) {
+type legacyQueryView struct {
+	snapshot       *store.PositionedSnapshot
+	batchScan      bool
+	firstScanLimit int
+}
+
+const positionsPerUnit = 32
+
+func (s *legacyPageSource) Page(ctx context.Context, req PageRequest, work *store.QueryWork) (PageResult, error) {
+	return s.page(ctx, req, work, 0)
+}
+
+func (s *legacyPageSource) page(ctx context.Context, req PageRequest, work *store.QueryWork, firstPageLimit int) (PageResult, error) {
 	filter := req.Filter
 	if !req.Snapshot {
 		rows, err := s.store.QueryWithWork(filter.Start, filter.End, filter.Contains, req.Limit, work)
@@ -32,20 +45,32 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 		return result, nil
 	}
 	id := req.Capture
-	var view *store.PositionedSnapshot
+	var view legacyQueryView
 	var after *store.TailPosition
+	// One adapter unit covers capture or lookup and the fixed-size
+	// positions for the first block of rows.
+	if err := work.Charge(1); err != nil {
+		return PageResult{}, err
+	}
 	if id == "" {
-		if err := work.Charge(1); err != nil {
-			return PageResult{}, err
+		view.snapshot = s.store.CapturePositionedSnapshot()
+		// Use a bounded batch for compact literal searches, where the cost
+		// of checking many short nonmatches dominates. Keep the selection
+		// with the captured view so later appends cannot change replay cost.
+		count := s.store.PublishedCount()
+		view.batchScan = filter.Contains != "" && count > positionsPerUnit && count <= 8*positionsPerUnit
+		if view.batchScan {
+			view.firstScanLimit = firstPageLimit
 		}
-		view = s.store.CapturePositionedSnapshot()
 	} else {
 		s.mu.Lock()
 		view = s.views[id]
 		s.mu.Unlock()
-		if view == nil {
+		if view.snapshot == nil {
 			return PageResult{}, ErrCaptureExpired
 		}
+	}
+	if req.After != "" {
 		if err := work.Charge(1); err != nil {
 			return PageResult{}, err
 		}
@@ -56,11 +81,11 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 		after = &position
 	}
 
-	rows, more, err := view.Page(filter.Start, filter.End, filter.Contains, req.Limit, 0, after, work)
+	rows, more, err := view.page(ctx, filter, req.Limit, after, work)
 	if err != nil {
 		return PageResult{}, err
 	}
-	if err := work.Charge(uint64(len(rows))); err != nil {
+	if err := work.Charge(uint64(max(0, len(rows)-1) / positionsPerUnit)); err != nil {
 		return PageResult{}, err
 	}
 	result := PageResult{Rows: make([]PageRow, len(rows)), More: more}
@@ -72,13 +97,37 @@ func (s *legacyPageSource) Page(_ context.Context, req PageRequest, work *store.
 		s.next++
 		id = strconv.FormatUint(s.next, 10)
 		if s.views == nil {
-			s.views = make(map[string]*store.PositionedSnapshot)
+			s.views = make(map[string]legacyQueryView)
 		}
 		s.views[id] = view
 		s.mu.Unlock()
 	}
 	result.Capture = id
 	return result, nil
+}
+
+func (v legacyQueryView) page(ctx context.Context, filter PageFilter, limit int, after *store.TailPosition, work *store.QueryWork) ([]store.PositionedRow, bool, error) {
+	if after == nil && v.firstScanLimit > 0 {
+		// Keep the first page's lookahead on the regular meter. A compact
+		// scan can return fewer rows than requested and certify the rest
+		// in a separate scan. Replay uses the same limit on the pinned view.
+		limit = min(limit, v.firstScanLimit)
+	}
+	if v.batchScan && after != nil {
+		// Prepay the certification scan and bound the actual Store work, including
+		// seeks, candidate bytes, and trailing exhaustion. A heavier scan
+		// can use the regular meter after paying for the entire attempt.
+		const batches, unitsPerBatch = 8, 256
+		if err := work.Charge(batches); err != nil {
+			return nil, false, err
+		}
+		batchWork := store.NewQueryWork(ctx, batches*unitsPerBatch)
+		rows, more, err := v.snapshot.Page(filter.Start, filter.End, filter.Contains, limit, 0, after, batchWork)
+		if !errors.Is(err, store.ErrQueryWorkExhausted) {
+			return rows, more, err
+		}
+	}
+	return v.snapshot.Page(filter.Start, filter.End, filter.Contains, limit, 0, after, work)
 }
 
 func (s *legacyPageSource) Release(id string) error {

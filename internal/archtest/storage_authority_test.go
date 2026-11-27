@@ -2,7 +2,9 @@ package archtest
 
 import (
 	"fmt"
+	"maps"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -37,6 +39,27 @@ func storageAuthorityProblems(rules map[string]rule) []string {
 	for _, to := range retained {
 		if walReachable[to] {
 			problems = append(problems, fmt.Sprintf("forbidden storage authority dependency: %s reaches %s", wal, to))
+		}
+	}
+
+	for _, from := range slices.Sorted(maps.Keys(rules)) {
+		// The storage roots already have specific diagnostics above.
+		if from == server || from == wal || slices.Contains(retained, from) || rules[from].role == testOnly {
+			continue
+		}
+		reached := reachableImports(packages, from)
+		if !reached[wal] {
+			continue
+		}
+		var dependencies []string
+		for _, path := range retained {
+			if reached[path] {
+				dependencies = append(dependencies, path)
+			}
+		}
+		if len(dependencies) > 0 {
+			problems = append(problems, fmt.Sprintf("forbidden retained storage composition: %s reaches %s and %s. Compose in %s",
+				from, wal, strings.Join(dependencies, ", "), server))
 		}
 	}
 	return problems
@@ -167,6 +190,97 @@ func TestStorageAuthorityBoundaryFixtures(t *testing.T) {
 			}
 			if problems := pagingBoundaryProblems(rules); len(problems) != 0 {
 				t.Fatalf("fixture violates the HTTP paging boundary: %v", problems)
+			}
+			if got := storageAuthorityProblems(rules); !slices.Equal(got, tt.want) {
+				t.Errorf("storageAuthorityProblems() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRetainedStorageCompositionFixtures(t *testing.T) {
+	t.Parallel()
+	const (
+		adapter    = "bog/internal/retained"
+		backup     = "bog/internal/backup"
+		checkpoint = "bog/internal/checkpoint"
+		history    = "bog/internal/history"
+		httpapi    = "bog/internal/httpapi"
+		readiness  = "bog/internal/readiness"
+		relay      = "bog/internal/relay"
+		store      = "bog/internal/store"
+		wal        = "bog/internal/wal"
+		forbidden  = "forbidden retained storage composition: "
+		resolution = ". Compose in " + server
+	)
+	tests := []struct {
+		name           string
+		adapterImports []string
+		relayImports   []string
+		want           []string
+	}{
+		{name: "command composes retained storage for separate readiness and paging consumers and operator reads backup"},
+		{
+			name:           "command composes WAL with a retained-only helper",
+			adapterImports: []string{history, backup},
+		},
+		{
+			name:           "shared adapter combines WAL and backup directly",
+			adapterImports: []string{wal, backup},
+			want:           []string{forbidden + adapter + " reaches " + wal + " and " + backup + resolution},
+		},
+		{
+			name:           "shared adapter reaches checkpoint through a registered relay",
+			adapterImports: []string{wal, relay},
+			relayImports:   []string{checkpoint},
+			want:           []string{forbidden + adapter + " reaches " + wal + " and " + checkpoint + resolution},
+		},
+		{
+			name:           "shared adapter reaches WAL through a registered relay",
+			adapterImports: []string{history, relay},
+			relayImports:   []string{wal},
+			want:           []string{forbidden + adapter + " reaches " + wal + " and " + checkpoint + ", " + history + resolution},
+		},
+		{
+			name:           "registered relay and its shared importer both reach WAL and retained storage",
+			adapterImports: []string{relay},
+			relayImports:   []string{wal, history},
+			want: []string{
+				forbidden + relay + " reaches " + wal + " and " + checkpoint + ", " + history + resolution,
+				forbidden + adapter + " reaches " + wal + " and " + checkpoint + ", " + history + resolution,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rules := map[string]rule{
+				server:          {serverCommand, []string{backup, history, httpapi, readiness, wal}},
+				operatorCommand: {verifier, []string{backup, goClient, store}},
+				backup:          {runtimeLibrary, []string{store}},
+				checkpoint:      {runtimeLibrary, []string{store}},
+				history:         {runtimeLibrary, []string{checkpoint, store}},
+				httpapi:         {runtimeLibrary, []string{store}},
+				readiness:       {runtimeLibrary, []string{wal}},
+				store:           {runtimeLibrary, nil},
+				wal:             {runtimeLibrary, []string{store}},
+				goClient:        {standalone, []string{store}},
+			}
+			if len(tt.adapterImports) > 0 {
+				command := rules[server]
+				command.imports = append(command.imports, adapter)
+				rules[server] = command
+				rules[adapter] = rule{runtimeLibrary, tt.adapterImports}
+			}
+			if len(tt.relayImports) > 0 {
+				rules[relay] = rule{runtimeLibrary, tt.relayImports}
+			}
+			requireValidCommandFixture(t, rules)
+			if problems := pagingBoundaryProblems(rules); len(problems) > 0 {
+				t.Fatalf("fixture violates the HTTP paging boundary: %v", problems)
+			}
+			if problems := operatorBoundaryProblems(rules); len(problems) > 0 {
+				t.Fatalf("fixture violates the operator boundary: %v", problems)
 			}
 			if got := storageAuthorityProblems(rules); !slices.Equal(got, tt.want) {
 				t.Errorf("storageAuthorityProblems() = %q, want %q", got, tt.want)

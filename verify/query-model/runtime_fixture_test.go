@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,6 +74,7 @@ type runtimeQueryFixture struct {
 	budget      int
 	concurrency int
 	journal     [][]byte
+	checkpoint  []store.Row // decoded prefix for the tail-only replacement fixture
 	covered     int
 	active      fixtureGeneration
 	captures    map[string]fixtureCapture
@@ -208,9 +210,14 @@ func (f *runtimeQueryFixture) closeIssuer() error {
 }
 
 func (f *runtimeQueryFixture) replay(ctx context.Context) (*store.Store, model.QueryRecovery, error) {
+	return replayFixtureJournal(ctx, f.checkpoint, f.journal)
+}
+
+func replayFixtureJournal(ctx context.Context, checkpoint []store.Row, journal [][]byte) (*store.Store, model.QueryRecovery, error) {
 	s := new(store.Store)
-	var stats model.QueryRecovery
-	for i, body := range f.journal {
+	s.Publish(checkpoint)
+	stats := model.QueryRecovery{CommittedRows: len(checkpoint)}
+	for i, body := range journal {
 		if err := ctx.Err(); err != nil {
 			return nil, stats, err
 		}
@@ -226,6 +233,64 @@ func (f *runtimeQueryFixture) replay(ctx context.Context) (*store.Store, model.Q
 		s.Publish(rows)
 	}
 	return s, stats, ctx.Err()
+}
+
+// activateTail consumes only whole frames from the current journal. The
+// successor is reconstructed from its new checkpoint and the carried suffix.
+// No covered journal frame is available to the next replacement.
+func (f *runtimeQueryFixture) activateTail(ctx context.Context, cutoff int) (model.ReplacementGeneration, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	committed := f.active.store.PublishedCount()
+	if cutoff <= f.covered || cutoff > committed || len(f.checkpoint) != f.covered {
+		return model.ReplacementGeneration{}, fmt.Errorf("invalid tail cutoff %d (covered=%d committed=%d)", cutoff, f.covered, committed)
+	}
+	checkpoint := slices.Clone(f.checkpoint)
+	consumed := 0
+	for len(checkpoint) < cutoff && consumed < len(f.journal) {
+		if err := ctx.Err(); err != nil {
+			return model.ReplacementGeneration{}, err
+		}
+		rows, err := store.DecodeIngest(f.journal[consumed])
+		if err != nil {
+			return model.ReplacementGeneration{}, fmt.Errorf("decode tail frame %d: %w", consumed+1, err)
+		}
+		checkpoint = append(checkpoint, rows...)
+		consumed++
+	}
+	if len(checkpoint) != cutoff {
+		return model.ReplacementGeneration{}, fmt.Errorf("tail cutoff %d does not match a whole frame boundary", cutoff)
+	}
+	tail := slices.Clone(f.journal[consumed:])
+	s, stats, err := replayFixtureJournal(ctx, checkpoint, tail)
+	if err != nil {
+		return model.ReplacementGeneration{}, err
+	}
+	if stats.CommittedRows != committed {
+		return model.ReplacementGeneration{}, fmt.Errorf("tail activation recovered %d committed rows, want %d", stats.CommittedRows, committed)
+	}
+	f.checkpoint, f.journal, f.covered = checkpoint, tail, cutoff
+	f.active = fixtureGeneration{s, f.active.serial + 1}
+	return f.replacementPointLocked(), nil
+}
+
+func (f *runtimeQueryFixture) replacementPointLocked() model.ReplacementGeneration {
+	return model.ReplacementGeneration{
+		Generation: uint64(f.active.serial), CoveredRows: f.covered,
+		CommittedRows: f.active.store.PublishedCount(), Complete: true,
+	}
+}
+
+func (f *runtimeQueryFixture) retiredPins(ctx context.Context) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var live uint64
+	for _, capture := range f.captures {
+		if capture.generation < f.active.serial {
+			live++
+		}
+	}
+	return live, ctx.Err()
 }
 
 func (f *runtimeQueryFixture) publish(ctx context.Context, cutoff int) error {

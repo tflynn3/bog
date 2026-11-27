@@ -29,11 +29,12 @@ func TestReleaseFixedBudgetBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("candidate revision=%s binary_sha256=%s fixture=%s", id.Revision, id.BinarySHA256, id.Fixture)
 	t.Setenv("BOG_CAPACITY_CONTROL", "1")
 
 	for _, tc := range querymodel.FixedBudgetCases() {
 		t.Run(tc.Fixture, func(t *testing.T) {
+			t.Logf("candidate revision=%s binary_sha256=%s fixture=%s query_fixture=%s reference_work_budget=%d response_byte_cap=%d first_limit=%d resume_limit=%d",
+				id.Revision, id.BinarySHA256, id.Fixture, tc.Fixture, tc.ReferenceWorkBudget, tc.ResponseByteCap, tc.FirstLimit, tc.ResumeLimit)
 			ctx, cancel := context.WithTimeout(t.Context(), budgetWalkDeadline)
 			defer cancel()
 			raw := &http.Client{
@@ -50,141 +51,210 @@ func TestReleaseFixedBudgetBackfill(t *testing.T) {
 				}
 				return serve(ctx, binary, raw, flags, check)
 			}
-			if err := searchBackfillBudget(ctx, t, raw, tc, budgetWalkMax, launch); err != nil {
+			if err := qualifyBackfillBudgets(ctx, t, raw, tc, budgetWalkMax, launch); err != nil {
 				t.Fatal(err)
-			}
-
-			// A fresh capture of the larger ledger may need more work than the
-			// seed walk. Use a separate fixture at the search ceiling.
-			if err := launch(ctx, budgetWalkMax, func(ctx context.Context, base string) error {
-				result, err := checkFixedBudgetBackfill(ctx, t, raw, base, tc, true)
-				if err == nil && result.Outcome != querymodel.FixedBudgetExhausted {
-					return fmt.Errorf("expected a complete held and fresh walk, got %s", result.Outcome)
-				}
-				return err
-			}); err != nil {
-				t.Fatalf("generation replacement at work budget %d: %v", budgetWalkMax, err)
 			}
 		})
 	}
 }
 
-func searchBackfillBudget(ctx context.Context, t *testing.T, raw *http.Client, tc querymodel.FixedBudgetCase, maxBudget int, launch budgetLaunch) error {
+type backfillTrial string
+
+const (
+	ordinaryBackfill backfillTrial = "ordinary"
+	retainedBackfill backfillTrial = "retained"
+	heldBackfill     backfillTrial = "replacement"
+)
+
+type backfillBudgetBoundary struct {
+	issuing, rejected int // rejected is zero at the budget floor.
+}
+
+func qualifyBackfillBudgets(ctx context.Context, t *testing.T, raw *http.Client, tc querymodel.FixedBudgetCase, maxBudget int, launch budgetLaunch) error {
+	t.Helper()
+	if _, err := searchBackfillBudget(ctx, t, raw, tc, maxBudget, ordinaryBackfill, launch); err != nil {
+		return fmt.Errorf("ordinary budget search: %w", err)
+	}
+	retained, err := searchBackfillBudget(ctx, t, raw, tc, maxBudget, retainedBackfill, launch)
+	if err != nil {
+		return fmt.Errorf("retained budget search: %w", err)
+	}
+
+	var augmented backfillCapture
+	err = launch(ctx, retained.issuing, func(ctx context.Context, base string) error {
+		result, err := checkFixedBudgetBackfill(ctx, t, raw, base, tc, heldBackfill, &augmented)
+		t.Logf("trial=%s work_budget=%d adjacent_lower_clean_rejection=%d held=%+v", heldBackfill, retained.issuing, retained.rejected, result)
+		if err != nil {
+			return err
+		}
+		if result.Outcome != querymodel.FixedBudgetExhausted {
+			return fmt.Errorf("expected exact held exhaustion, got %s", result.Outcome)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("generation replacement at retained issuing work budget %d: %w", retained.issuing, err)
+	}
+
+	// Replay the acknowledged batches and publications on a fresh candidate.
+	// Certification of the augmented capture can require a larger budget.
+	if err := launch(ctx, maxBudget, func(ctx context.Context, base string) error {
+		stats, err := checkFreshBackfill(ctx, t, raw, base, tc, augmented)
+		t.Logf("trial=fresh work_budget=%d fresh=%+v error=%v", maxBudget, stats, err)
+		return err
+	}); err != nil {
+		return fmt.Errorf("fresh walk after replacement and backfill at work budget %d: %w", maxBudget, err)
+	}
+	return nil
+}
+
+func searchBackfillBudget(ctx context.Context, t *testing.T, raw *http.Client, tc querymodel.FixedBudgetCase, maxBudget int, trial backfillTrial, launch budgetLaunch) (backfillBudgetBoundary, error) {
 	t.Helper()
 	if maxBudget < 1 || tc.ReferenceWorkBudget < 1 {
-		return errors.New("work budgets must be positive")
+		return backfillBudgetBoundary{}, errors.New("work budgets must be positive")
 	}
 	low, high := 1, maxBudget
-	issuing, rejected := 0, 0
+	var boundary backfillBudgetBoundary
 	// Probe the historical budget first, then bisect. Only a clean opening
 	// refusal can move the lower bound. Every issuing probe must exhaust.
 	budget := min(tc.ReferenceWorkBudget, high)
 search:
 	for low <= high {
 		if err := ctx.Err(); err != nil {
-			return err
+			return backfillBudgetBoundary{}, err
 		}
 		var result querymodel.FixedBudgetResult
 		err := launch(ctx, budget, func(ctx context.Context, base string) error {
+			t.Logf("trial=%s work_budget=%d response_byte_cap=%d", trial, budget, tc.ResponseByteCap)
 			var err error
-			result, err = checkFixedBudgetBackfill(ctx, t, raw, base, tc, false)
-			t.Logf("work_budget=%d response_byte_cap=%d held=%+v", budget, tc.ResponseByteCap, result)
+			result, err = checkFixedBudgetBackfill(ctx, t, raw, base, tc, trial, nil)
+			t.Logf("trial=%s work_budget=%d held=%+v", trial, budget, result)
 			return err
 		})
 		if err != nil {
-			return fmt.Errorf("work budget %d: %w", budget, err)
+			return backfillBudgetBoundary{}, fmt.Errorf("work budget %d: %w", budget, err)
 		}
 		if err := ctx.Err(); err != nil {
-			return err
+			return backfillBudgetBoundary{}, err
 		}
 		switch result.Outcome {
 		case querymodel.FixedBudgetCleanRejection:
-			rejected = budget
+			boundary.rejected = budget
 			if budget == high {
 				break search
 			}
 			low = budget + 1
 		case querymodel.FixedBudgetExhausted:
-			issuing, high = budget, budget-1
+			boundary.issuing, high = budget, budget-1
 		default:
-			return fmt.Errorf("work budget %d: candidate probe has no conclusive result (%q)", budget, result.Outcome)
+			return backfillBudgetBoundary{}, fmt.Errorf("work budget %d: candidate probe has no conclusive result (%q)", budget, result.Outcome)
 		}
 		budget = low + (high-low)/2
 	}
-	if issuing == 0 {
-		return fmt.Errorf("no cursor issued at work budgets through %d", maxBudget)
+	if boundary.issuing == 0 {
+		return backfillBudgetBoundary{}, fmt.Errorf("no cursor issued at work budgets through %d", maxBudget)
 	}
-	if rejected != issuing-1 {
-		return fmt.Errorf("issuing work budget %d lacks a clean rejection at budget %d", issuing, issuing-1)
+	if boundary.rejected != boundary.issuing-1 {
+		return backfillBudgetBoundary{}, fmt.Errorf("issuing work budget %d lacks a clean rejection at budget %d", boundary.issuing, boundary.issuing-1)
 	}
-	if issuing == 1 {
-		t.Log("issuing_work_budget=1 (budget floor)")
-	} else {
-		t.Logf("issuing_work_budget=%d adjacent_lower_clean_rejection=%d", issuing, rejected)
-	}
-	return nil
+	t.Logf("trial=%s issuing_work_budget=%d adjacent_lower_clean_rejection=%d", trial, boundary.issuing, boundary.rejected)
+	return boundary, nil
 }
 
-func checkFixedBudgetBackfill(ctx context.Context, t *testing.T, raw *http.Client, base string, tc querymodel.FixedBudgetCase, replace bool) (querymodel.FixedBudgetResult, error) {
+// backfillCapture records the successful held trial's inputs for the fresh walk.
+type backfillCapture struct {
+	batches [][]querymodel.Row
+	filter  querymodel.Filter
+}
+
+func acknowledgeBackfill(ctx context.Context, t *testing.T, raw *http.Client, base string, batch []querymodel.Row) error {
+	rows := make([]row, len(batch))
+	for i, item := range batch {
+		rows[i] = row{TS: item.Time.UTC().Format(time.RFC3339Nano), Line: item.Line}
+	}
+	status, err := ingest(ctx, raw, base, rows)
+	t.Logf("acknowledge rows=%d ingest_http_status=%d", len(batch), status)
+	return err
+}
+
+func checkFixedBudgetBackfill(ctx context.Context, t *testing.T, raw *http.Client, base string, tc querymodel.FixedBudgetCase, trial backfillTrial, augmented *backfillCapture) (querymodel.FixedBudgetResult, error) {
 	t.Helper()
 	pager, err := newReleasePager(base, raw, int(tc.ResponseByteCap))
 	if err != nil {
 		return querymodel.FixedBudgetResult{}, err
 	}
-	var ledger querymodel.Log
+	var committed int
 	var predecessor backfillCompaction
 	acknowledge := func(ctx context.Context, batch []querymodel.Row) error {
-		rows := make([]row, len(batch))
-		for i, item := range batch {
-			rows[i] = row{TS: item.Time.UTC().Format(time.RFC3339Nano), Line: item.Line}
-		}
-		status, err := ingest(ctx, raw, base, rows)
-		t.Logf("acknowledge rows=%d ingest_http_status=%d", len(batch), status)
-		if err != nil {
+		if err := acknowledgeBackfill(ctx, t, raw, base, batch); err != nil {
 			return err
 		}
-		seeding := ledger.HighWater() == 0
-		ledger.Append(batch)
-		if replace && seeding {
-			// Give the held cursor an observed, published predecessor to pin.
-			predecessor, err = publishBackfillGeneration(ctx, raw, base, ledger.HighWater(), nil)
+		seeding := committed == 0
+		committed += len(batch)
+		if augmented != nil {
+			augmented.batches = append(augmented.batches, slices.Clone(batch))
+		}
+		if trial != ordinaryBackfill && seeding {
+			seed, err := publishBackfillGeneration(ctx, raw, base, committed, nil)
 			if err != nil {
 				return fmt.Errorf("publish seed generation: %w", err)
 			}
-			t.Logf("seed_generation=%+v", predecessor)
+			predecessor = seed
+			t.Logf("trial=%s seed_generation=%+v", trial, seed)
 		}
 		return nil
 	}
-	var filter querymodel.Filter
 	fetch := func(ctx context.Context, req querymodel.WireRequest) (querymodel.WirePage, error) {
-		filter = req.Filter
+		if augmented != nil {
+			augmented.filter = req.Filter
+		}
 		return fetchBackfillPage(ctx, pager, req)
 	}
 	var hook querymodel.AfterCapture
-	if replace {
+	if trial == heldBackfill {
 		hook = func(ctx context.Context, _ string) error {
-			replacement, err := publishBackfillGeneration(ctx, raw, base, ledger.HighWater(), &predecessor)
+			replacement, err := publishBackfillGeneration(ctx, raw, base, committed, &predecessor)
 			if err != nil {
 				return fmt.Errorf("publish replacement with cursor held: %w", err)
 			}
-			t.Logf("replacement_generation=%+v", replacement)
+			t.Logf("trial=%s replacement_generation=%+v", trial, replacement)
 			return nil
 		}
 	}
-	result, err := querymodel.RunFixedBudgetCase(ctx, tc, acknowledge, fetch, hook)
-	if err != nil || result.Outcome != querymodel.FixedBudgetExhausted || !replace {
-		return result, err
+	return querymodel.RunFixedBudgetCase(ctx, tc, acknowledge, fetch, hook)
+}
+
+func checkFreshBackfill(ctx context.Context, t *testing.T, raw *http.Client, base string, tc querymodel.FixedBudgetCase, augmented backfillCapture) (querymodel.WireStats, error) {
+	t.Helper()
+	pager, err := newReleasePager(base, raw, int(tc.ResponseByteCap))
+	if err != nil {
+		return querymodel.WireStats{}, err
+	}
+	var ledger querymodel.Log
+	var predecessor *backfillCompaction
+	for i, batch := range augmented.batches {
+		if err := acknowledgeBackfill(ctx, t, raw, base, batch); err != nil {
+			return querymodel.WireStats{}, fmt.Errorf("replay batch %d: %w", i+1, err)
+		}
+		cutoff := ledger.Append(batch)
+		// Recreate the seed and first backfill publications. The second
+		// backfill remains in the live tail, as it did in the held trial.
+		if i < 2 {
+			published, err := publishBackfillGeneration(ctx, raw, base, cutoff, predecessor)
+			if err != nil {
+				return querymodel.WireStats{}, fmt.Errorf("replay publication at cutoff %d: %w", cutoff, err)
+			}
+			t.Logf("trial=fresh published_generation=%+v", published)
+			predecessor = &published
+		}
 	}
 	walk := querymodel.WireWalk{
-		Filter: filter, RowLimits: []int{tc.ResumeLimit},
+		Filter: augmented.filter, RowLimits: []int{tc.ResumeLimit},
 		Limits: querymodel.WireLimits{MaxPages: ledger.HighWater(), MaxPageBytes: tc.ResponseByteCap, Timeout: 8 * time.Second},
 	}
-	stats, err := querymodel.VerifyWireWalk(ctx, &ledger, walk, fetch, nil)
-	if err != nil {
-		return result, fmt.Errorf("fresh walk after replacement and backfill: %w", err)
-	}
-	t.Logf("held=%+v fresh=%+v", result.WireStats, stats)
-	return result, nil
+	return querymodel.VerifyWireWalk(ctx, &ledger, walk, func(ctx context.Context, req querymodel.WireRequest) (querymodel.WirePage, error) {
+		return fetchBackfillPage(ctx, pager, req)
+	}, nil)
 }
 
 func fetchBackfillPage(ctx context.Context, pager *releasePager, req querymodel.WireRequest) (querymodel.WirePage, error) {
@@ -383,7 +453,10 @@ func TestFixedBudgetBackfillRetryBoundary(t *testing.T) {
 			if wantBudgets == nil {
 				wantBudgets = []int{11}
 			}
-			err := searchBackfillBudget(t.Context(), t, raw, fixture, maxBudget, launch)
+			boundary, err := searchBackfillBudget(t.Context(), t, raw, fixture, maxBudget, ordinaryBackfill, launch)
+			if tc.want == "" && boundary != (backfillBudgetBoundary{issuing: tc.threshold, rejected: tc.threshold - 1}) {
+				t.Errorf("boundary = %+v, want issuing %d and adjacent rejection %d", boundary, tc.threshold, tc.threshold-1)
+			}
 			if (tc.want == "" && err != nil) || (tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want))) {
 				t.Errorf("error = %v, want %q", err, tc.want)
 			}
@@ -397,30 +470,33 @@ func TestFixedBudgetBackfillRetryBoundary(t *testing.T) {
 	}
 }
 
+const backfillTestAck = "HTTP/1.1 204 No Content\r\n\r\n"
+
+func backfillTestPage(line, token string) string {
+	headers := "Content-Type: application/x-ndjson\r\n"
+	if token != "" {
+		headers += nextCursor + ": " + token + "\r\n"
+	}
+	return lengthResponse(200, headers, fmt.Sprintf("{\"ts\":%q,\"line\":%q}\n", fixtureStart, line))
+}
+
+func backfillTestCompaction(state string, generation, covered, committed int) string {
+	body := fmt.Sprintf(`{"state":%q,"generation":%d,"covered_rows":%d,"committed_rows":%d}`, state, generation, covered, committed)
+	return lengthResponse(200, "Content-Type: application/json\r\n", body)
+}
+
 func TestFixedBudgetBackfillPublication(t *testing.T) {
 	t.Parallel()
-	const ack = "HTTP/1.1 204 No Content\r\n\r\n"
-	ndjson := func(line, token string) string {
-		headers := "Content-Type: application/x-ndjson\r\n"
-		if token != "" {
-			headers += nextCursor + ": " + token + "\r\n"
-		}
-		return lengthResponse(200, headers, fmt.Sprintf("{\"ts\":%q,\"line\":%q}\n", fixtureStart, line))
-	}
-	control := func(state string, generation, covered, committed int) string {
-		body := fmt.Sprintf(`{"state":%q,"generation":%d,"covered_rows":%d,"committed_rows":%d}`, state, generation, covered, committed)
-		return lengthResponse(200, "Content-Type: application/json\r\n", body)
-	}
 	for _, tc := range []struct {
 		name, publication, lastFreshRow, want string
 	}{
-		{name: "observed replacement", publication: control("complete", 8, 4, 4), lastFreshRow: "new final tie"},
-		{name: "stale generation", publication: control("complete", 7, 4, 4), want: "unexpected compaction state"},
-		{name: "wrong cutoff", publication: control("complete", 8, 3, 4), want: "unexpected compaction state"},
-		{name: "wrong committed rows", publication: control("complete", 8, 4, 5), want: "unexpected compaction state"},
+		{name: "observed replacement", publication: backfillTestCompaction("complete", 8, 4, 4), lastFreshRow: "new final tie"},
+		{name: "stale generation", publication: backfillTestCompaction("complete", 7, 4, 4), want: "unexpected compaction state"},
+		{name: "wrong cutoff", publication: backfillTestCompaction("complete", 8, 3, 4), want: "unexpected compaction state"},
+		{name: "wrong committed rows", publication: backfillTestCompaction("complete", 8, 4, 5), want: "unexpected compaction state"},
 		{name: "missing generation", publication: lengthResponse(200, "", `{"state":"complete","covered_rows":4,"committed_rows":4}`), want: "invalid compaction"},
 		{name: "control unavailable", publication: lengthResponse(404, "", "missing"), want: "returned HTTP 404"},
-		{name: "fresh capture lost backfill", publication: control("complete", 8, 4, 4), lastFreshRow: "z", want: "fresh walk after replacement"},
+		{name: "fresh capture lost backfill", publication: backfillTestCompaction("complete", 8, 4, 4), lastFreshRow: "z", want: "fresh walk after replacement"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -437,24 +513,30 @@ func TestFixedBudgetBackfillPublication(t *testing.T) {
 				{path: "/_capacity/compaction?action=status&cutoff=4"},
 			}
 			replies := []string{
-				ack, control("complete", 0, 0, 3), control("running", 0, 0, 3), control("complete", 7, 3, 3),
-				ndjson("c", token1), ack, control("running", 7, 3, 4), control("running", 7, 3, 4), tc.publication,
+				backfillTestAck, backfillTestCompaction("complete", 0, 0, 3), backfillTestCompaction("running", 0, 0, 3), backfillTestCompaction("complete", 7, 3, 3),
+				backfillTestPage("c", token1), backfillTestAck, backfillTestCompaction("running", 7, 3, 4), backfillTestCompaction("running", 7, 3, 4), tc.publication,
 			}
 			if tc.lastFreshRow != "" {
 				requests = append(requests, held[3:]...)
-				replies = append(replies, ndjson("a", token2), ack, ndjson("b", ""))
-				cursor := ""
-				for i, line := range []string{"c", "a", "b", "z", tc.lastFreshRow} {
-					requests = append(requests, backfillRequest{path: "/query", cursor: cursor})
-					cursor = ""
-					if i < 4 {
-						cursor = strings.Repeat(string(rune('C'+i)), 44)
-					}
-					replies = append(replies, ndjson(line, cursor))
-				}
+				replies = append(replies, backfillTestPage("a", token2), backfillTestAck, backfillTestPage("b", ""))
 			}
 			raw := &http.Client{Transport: scriptedBackfillTransport(t, requests, replies)}
-			result, err := checkFixedBudgetBackfill(t.Context(), t, raw, "http://127.0.0.1", querymodel.FixedBudgetCases()[0], true)
+			fixture := querymodel.FixedBudgetCases()[0]
+			var augmented backfillCapture
+			result, err := checkFixedBudgetBackfill(t.Context(), t, raw, "http://127.0.0.1", fixture, heldBackfill, &augmented)
+			if tc.lastFreshRow != "" {
+				if err != nil || result.Outcome != querymodel.FixedBudgetExhausted {
+					t.Fatalf("held result=%+v error=%v", result, err)
+				}
+				requests, replies := freshBackfillScript(tc.lastFreshRow)
+				raw.Transport = scriptedBackfillTransport(t, requests, replies)
+				stats, freshErr := checkFreshBackfill(t.Context(), t, raw, "http://127.0.0.1", fixture, augmented)
+				if freshErr != nil {
+					err = fmt.Errorf("fresh walk after replacement: %w", freshErr)
+				} else if stats.Pages != 5 || stats.Rows != 5 {
+					t.Fatalf("fresh walk stats=%+v, want five pages and rows", stats)
+				}
+			}
 			if tc.want == "" {
 				if err != nil || result.Outcome != querymodel.FixedBudgetExhausted {
 					t.Fatalf("result=%+v error=%v", result, err)
@@ -463,6 +545,143 @@ func TestFixedBudgetBackfillPublication(t *testing.T) {
 				t.Fatalf("error=%v, want %q", err, tc.want)
 			} else if tc.lastFreshRow == "" && (result.Outcome != querymodel.FixedBudgetIssuedCursor || result.Page != 1) {
 				t.Fatalf("unexpected progress on publication failure: %+v", result)
+			}
+		})
+	}
+}
+
+// freshBackfillScript replays the seed and both writes with the same
+// checkpoint/tail split before opening the augmented cursor.
+func freshBackfillScript(lastRow string) ([]backfillRequest, []string) {
+	held := heldBackfillRequests("", "")
+	requests := []backfillRequest{
+		held[0],
+		{path: "/_capacity/compaction?action=status&cutoff=0"},
+		{path: "/_capacity/compaction?action=start&cutoff=3"},
+		{path: "/_capacity/compaction?action=status&cutoff=3"},
+		held[2],
+		{path: "/_capacity/compaction?action=start&cutoff=4"},
+		{path: "/_capacity/compaction?action=status&cutoff=4"},
+		held[4],
+	}
+	seed := backfillTestCompaction("complete", 7, 3, 3)
+	replacement := backfillTestCompaction("complete", 8, 4, 4)
+	replies := []string{backfillTestAck, backfillTestCompaction("complete", 0, 0, 3), seed, seed,
+		backfillTestAck, replacement, replacement, backfillTestAck}
+	lines := []string{"c", "a", "b", "z", lastRow}
+	cursor := ""
+	for i, line := range lines {
+		requests = append(requests, backfillRequest{path: "/query", cursor: cursor})
+		cursor = ""
+		if i < len(lines)-1 {
+			cursor = strings.Repeat(string(rune('C'+i)), 44)
+		}
+		replies = append(replies, backfillTestPage(line, cursor))
+	}
+	return requests, replies
+}
+
+func TestFixedBudgetBackfillReplacementAtRetainedBoundary(t *testing.T) {
+	t.Parallel()
+	const ordinaryBudget, retainedBudget, maxBudget = 11, 15, 44
+	refusal := lengthResponse(503, "Content-Type: text/plain\r\n", budgetRejectionBody)
+	token1, token2 := strings.Repeat("A", 44), strings.Repeat("B", 44)
+	open, resume, terminal := backfillTestPage("c", token1), backfillTestPage("a", token2), backfillTestPage("b", "")
+	held := heldBackfillRequests(token1, token2)
+	seedRequests := []backfillRequest{
+		held[0],
+		{path: "/_capacity/compaction?action=status&cutoff=0"},
+		{path: "/_capacity/compaction?action=start&cutoff=3"},
+		{path: "/_capacity/compaction?action=status&cutoff=3"},
+	}
+	seed := backfillTestCompaction("complete", 7, 3, 3)
+	seedReplies := []string{backfillTestAck, backfillTestCompaction("complete", 0, 0, 3), seed, seed}
+	replacementRequests := []backfillRequest{
+		held[1], held[2],
+		{path: "/_capacity/compaction?action=start&cutoff=4"},
+		{path: "/_capacity/compaction?action=status&cutoff=4"},
+	}
+	replacement := backfillTestCompaction("complete", 8, 4, 4)
+	replacementReplies := []string{open, backfillTestAck, replacement, replacement}
+
+	for _, tc := range []struct {
+		name         string
+		resumeBudget int
+	}{
+		{name: "exhausts at measured budget", resumeBudget: retainedBudget},
+		{name: "stalls at measured budget and exhausts above it", resumeBudget: retainedBudget + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := querymodel.FixedBudgetCases()[0]
+			raw := new(http.Client)
+			ordinaryProbes := []int{11, 5, 8, 9, 10}
+			retainedProbes := []int{11, 28, 19, 15, 13, 14}
+			wantBudgets := slices.Concat(ordinaryProbes, retainedProbes, []int{retainedBudget})
+			if tc.resumeBudget == retainedBudget {
+				wantBudgets = append(wantBudgets, maxBudget)
+			}
+			var budgets []int
+			withScript := func(ctx context.Context, requests []backfillRequest, replies []string, check func(context.Context, string) error) error {
+				raw.Transport = scriptedBackfillTransport(t, requests, replies)
+				return check(ctx, "http://127.0.0.1")
+			}
+			replacementScript := func(ctx context.Context, budget int, check func(context.Context, string) error) error {
+				pages := []string{resume, backfillTestAck, terminal}
+				if budget < tc.resumeBudget {
+					pages = []string{refusal}
+				}
+				return withScript(ctx, slices.Concat(seedRequests, replacementRequests, held[3:]),
+					slices.Concat(seedReplies, replacementReplies, pages), check)
+			}
+			launch := func(ctx context.Context, budget int, check func(context.Context, string) error) error {
+				probe := len(budgets)
+				budgets = append(budgets, budget)
+				switch {
+				case probe < len(ordinaryProbes):
+					replies := []string{backfillTestAck, open, backfillTestAck, resume, backfillTestAck, terminal}
+					if budget < ordinaryBudget {
+						replies = []string{backfillTestAck, refusal}
+					}
+					return withScript(ctx, held, replies, check)
+				case probe < len(ordinaryProbes)+len(retainedProbes):
+					replies := []string{open, backfillTestAck, resume, backfillTestAck, terminal}
+					if budget < retainedBudget {
+						replies = []string{refusal}
+					}
+					return withScript(ctx, slices.Concat(seedRequests, held[1:]), slices.Concat(seedReplies, replies), check)
+				case probe == len(ordinaryProbes)+len(retainedProbes):
+					return replacementScript(ctx, budget, check)
+				default:
+					requests, replies := freshBackfillScript("new final tie")
+					return withScript(ctx, requests, replies, check)
+				}
+			}
+
+			err := qualifyBackfillBudgets(t.Context(), t, raw, fixture, maxBudget, launch)
+			if !slices.Equal(budgets, wantBudgets) {
+				t.Errorf("launch budgets = %v, want %v", budgets, wantBudgets)
+			}
+			if tc.resumeBudget == retainedBudget {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "generation replacement at retained issuing work budget 15") ||
+				!strings.Contains(err.Error(), "page 2 limit=1 HTTP 503") {
+				t.Fatalf("expected replacement continuation failure at work budget %d, got %v", retainedBudget, err)
+			}
+			// Demonstrate that this failure would be hidden by the old
+			// replacement check at the higher budget.
+			if err := replacementScript(t.Context(), maxBudget, func(ctx context.Context, base string) error {
+				result, err := checkFixedBudgetBackfill(ctx, t, raw, base, fixture, heldBackfill, nil)
+				if err == nil && result.Outcome != querymodel.FixedBudgetExhausted {
+					return fmt.Errorf("expected exhaustion, got %s", result.Outcome)
+				}
+				return err
+			}); err != nil {
+				t.Fatalf("higher-budget control: %v", err)
 			}
 		})
 	}

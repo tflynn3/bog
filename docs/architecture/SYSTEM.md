@@ -16,7 +16,7 @@ authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
 The Linux amd64 and arm64 production inventories at
-`a720df0d818b19ba3359aa4226b8b844c8f5e063` agree on the 19 root-module
+`f432cf9a9f98aba41f7e787c70faaba015ab1226` agree on the 19 root-module
 production packages and 23 direct imports between them shown below.
 `cmd/bog` reaches HTTP, readiness, store, and WAL and recovers an ordinary
 WAL into an in-memory store. The command still uses path-based readiness
@@ -125,8 +125,9 @@ flowchart TD
 ## Retained-history handoff
 
 #108 must compose the retained `PageSource` in `cmd/bog` and inject it through
-`httpapi.NewWithPageSource`. HTTP owns admission, cursor authentication and
-expiry, fixed-budget certification through exhaustion, and NDJSON framing.
+`httpapi.NewWithPageSource`. Core Engineering owns the HTTP paging contract,
+including admission, cursor authentication and expiry, fixed-budget
+certification through exhaustion, and NDJSON framing.
 The adapter pins the validated generation and the matching durable,
 query-visible tail together under WAL owner synchronization. A held cursor
 keeps its original view across replacement while fresh walks see later
@@ -356,16 +357,21 @@ qualification requires adapters that observe a shared-deployment implementation.
 
 ## Fitness and registry ownership
 
-Architecture in the bog AgentSet owns the architecture record and
-fitness registry, including this diagram check. `bog-storage` owns #108
-recovery, publication, and command composition. `bog-query` owns the
-HTTP paging contract. Release Verification owns the two native verdicts.
+Core Architecture in the bog AgentSet owns the architecture record and
+fitness registry, including the diagram and constructor checks.
+`bog-storage` owns #108 recovery, publication, and command composition.
+Core Engineering owns the HTTP paging contract. Release Verification
+owns the native Linux amd64 and arm64 verdicts for the same composed
+revision. #108 remains the release gate.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification),
 [Tail-only recovery contract](../adr/0035-tail-only-retained-recovery-contract.md)
 
-At the reviewed Storage SHA, compare both Linux inventories. The command
-wiring PR updates `internal/archtest/architecture_test.go` with the exact
+Land the constructor fitness change ahead of Storage's registry and
+topology update. Recheck write leases at dispatch and at the Storage
+handoff. At the reviewed Storage SHA, compare both Linux inventories
+and rerun the architecture suite. The command wiring PR updates
+`internal/archtest/architecture_test.go` with the exact
 imports and roles, `internal/archtest/staged_packages_test.go` with the
 remaining staging declarations, and `docs/architecture/SYSTEM.md` with the
 measured revision, diagram, and role table. Preserve the operator backup
@@ -383,6 +389,17 @@ Runtime closure, and Staged membership against the same registry. Test
 imports and nested modules are outside the root-module production registry.
 [Diagram fitness test](../../internal/archtest/system_diagram_test.go)
 
+- When the registry marks any of checkpoint, history, or backup as a
+  runtime library, `cmd/bog` must reference
+  `readiness.NewHandlerForDirectory` and exclude `readiness.NewHandler`.
+  When the registry marks history as a runtime library, `cmd/bog` must
+  also reference `httpapi.NewWithPageSource` and exclude `httpapi.New`,
+  `httpapi.NewWithQueryMaxResponseBytes`, and `httpapi.NewWithQueryLimits`.
+  The typed scan checks the selected production Go files independently
+  for Linux amd64 and arm64. The fully staged baseline may use the
+  compatibility constructors.
+  [Constructor boundary](../adr/0040-retained-runtime-constructor-boundary.md),
+  [Constructor fitness test](../../internal/archtest/retained_runtime_wiring_test.go)
 - HTTP owns the paging seam. It cannot reach checkpoint, history, or
   backup, even through a registered intermediary. Readiness can observe
   the WAL outcome and cannot reach retained storage packages.

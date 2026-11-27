@@ -1,42 +1,49 @@
 # ADR 0040 — Retained runtime constructor boundary
 
-**Status** — Proposed for Cycle 176. Core Architecture owns this decision.
+**Status** — Proposed for Cycle 176 and amended for Cycle 177. Core
+Architecture owns this decision.
 
 ## Decision
 
-`cmd/bog` owns the retained storage composition. It injects its retained
-`PageSource` through `httpapi.NewWithPageSource`. The source captures the
-selected generation and its exact committed WAL suffix under the owner's
-synchronization. HTTP owns paging admission, cursor lifecycle, and delivery.
+`cmd/bog` owns the retained storage composition. When history is server-wired,
+it injects its retained `PageSource` through `httpapi.NewWithPageSource`.
+The source captures the selected generation and its exact committed WAL
+suffix under the owner's synchronization. Core Engineering owns the HTTP
+paging contract, including admission, cursor lifecycle, and delivery.
 [Runtime cutover](0015-retained-history-runtime-cutover.md),
 [Command-owned storage composition](0026-command-owned-retained-storage-composition.md)
 
-The command gives `readiness.NewHandlerForDirectory` an independently
-opened, unlocked descriptor for the WAL owner's pinned directory. Open the
-descriptor relative to the pinned directory so readiness keeps sampling the
-active filesystem after a path retarget. A duplicate of the WAL descriptor
+When any retained library is server-wired, the command gives
+`readiness.NewHandlerForDirectory` an independently opened, unlocked
+descriptor for the WAL owner's pinned directory. Open the descriptor relative
+to the pinned directory so readiness keeps sampling the active filesystem
+after a path retarget. A duplicate of the WAL descriptor
 would share its lock. The command owns the probe descriptor and cancels the
 probes before closing it.
 [Readiness descriptor handoff](0005-pinned-writable-recovery-authority.md#readiness-descriptor-handoff-60)
 
 ## Fitness check
 
-The rule activates when the existing package registry marks all three of
-`internal/checkpoint`, `internal/history`, and `internal/backup` as runtime
-libraries. The staged baseline may still use the compatibility constructors.
-After activation, check the production Go files selected for `cmd/bog`
-on Linux amd64 and arm64 using the architecture suite's build settings.
-For each target independently, require at least one typed reference to
-the package-level function `httpapi.NewWithPageSource` from
-`bog/internal/httpapi` and at least one to
-`readiness.NewHandlerForDirectory` from `bog/internal/readiness`. Report
-each missing constructor with its target.
-Reject references to `httpapi.New`, `httpapi.NewWithQueryMaxResponseBytes`,
-`httpapi.NewWithQueryLimits`, and `readiness.NewHandler`, and report
-their file, position, and constructor. Both checks use the defining
-import path and function identity. Calls and function values count,
-including references through aliased and dot imports. Only selected
-production files in `cmd/bog` contribute references.
+The package registry records server wiring through the runtime library
+role. When all three retained libraries are staged, the command may use
+the compatibility constructors. Apply each requirement as soon as its
+registry condition holds.
+
+| Runtime library in the registry | Required constructor | Excluded constructors |
+| --- | --- | --- |
+| Any of `internal/checkpoint`, `internal/history`, or `internal/backup` | `readiness.NewHandlerForDirectory` | `readiness.NewHandler` |
+| `internal/history` | `httpapi.NewWithPageSource` | `httpapi.New`, `httpapi.NewWithQueryMaxResponseBytes`, `httpapi.NewWithQueryLimits` |
+
+Checkpoint or backup can be promoted with compatibility paging while
+history is staged. History promotion activates both requirements.
+Evaluate each Linux target, amd64 and arm64, independently using the
+architecture suite's build settings and selected production Go files in
+`cmd/bog`. Both checks use typed references to package-level functions
+identified by their defining import paths, `bog/internal/readiness` and
+`bog/internal/httpapi`. Calls and function values count, including
+references through aliased and dot imports. Report each missing
+constructor with its target and each excluded reference with its file,
+position, and constructor.
 
 The existing fitness suites continue to enforce dependency direction,
 cycles, package reachability, and staging declarations. Constructor
@@ -68,13 +75,17 @@ references.
 
 ## Integration
 
-Storage owns the #108 runtime wiring, role promotions, and measured
-topology. Rerun the architecture suite on the composed #108 SHA after
-the registry promotes all three libraries. Review this rule on that
-revision with Storage checking source and descriptor ownership and
-Query checking the `PageSource` and paging lifecycle. Release
-Verification owns native amd64 and arm64 qualification of that
-revision, including exact live and restart walks at 196,608 and
-393,216 rows under 128 MiB with swap disabled.
+Land the Core Architecture fitness change before Storage's registry and
+topology update. Recheck write leases at dispatch and at the Storage
+handoff. Storage owns #108 runtime wiring, role promotions, and measured
+topology. On each promotion and on the final composed #108 SHA, verify
+the registry against both Linux production inventories and rerun the
+architecture suite. Storage reviews source and descriptor ownership.
+Core Engineering reviews the `PageSource` and paging lifecycle.
+
+#108 remains the release gate. Release Verification qualifies the same
+composed revision on native Linux amd64 and arm64, including exact live
+and restart walks at 196,608 and 393,216 rows under 128 MiB with swap
+disabled.
 [Storage cutover](https://github.com/tflynn3/bog/issues/108),
 [Query delivery and release handoff](0039-query-delivery-and-retained-cutover.md)

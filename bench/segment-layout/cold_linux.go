@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"time"
 
 	"bog/internal/checkpoint"
@@ -31,31 +30,58 @@ type coldTarget struct {
 	phases     []coldPhase
 }
 
-func collectCold(ctx context.Context, cfg config) (_ coldReport, err error) {
+func collectCold(ctx context.Context, cfg config) (_ coldMatrixReport, err error) {
 	if err := ctx.Err(); err != nil {
-		return coldReport{}, err
+		return coldMatrixReport{}, err
 	}
 	dir, err := os.MkdirTemp(cfg.dir, "bog-segment-cold-")
 	if err != nil {
-		return coldReport{}, err
+		return coldMatrixReport{}, err
 	}
 	defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
 	env, err := benchmarkEnvironment(dir, cfg)
 	if err != nil {
-		return coldReport{}, err
+		return coldMatrixReport{}, err
 	}
 	env["cache_policy"] = coldCachePolicy
-	input := fixture(cfg.batches, cfg.profile == "entropy", cfg.fixtureSeed)
 	var runID [16]byte
 	if _, err := rand.Read(runID[:]); err != nil {
-		return coldReport{}, fmt.Errorf("cold pairing run ID: %w", err)
+		return coldMatrixReport{}, fmt.Errorf("cold pairing run ID: %w", err)
 	}
+	result := coldMatrixReport{
+		SchemaVersion: coldMatrixSchema, Mode: "cold-matrix", Revision: cfg.revision,
+		RunID: hex.EncodeToString(runID[:]), Environment: env,
+		Protocol: matrixProtocol(cfg.profile, cfg.runs),
+	}
+	for _, profile := range result.Protocol.ProfileOrder {
+		profileDir := filepath.Join(dir, profile)
+		if err := os.Mkdir(profileDir, 0700); err != nil {
+			return coldMatrixReport{}, err
+		}
+		cfg.profile = profile
+		report, err := collectColdProfile(ctx, cfg, profileDir, result.RunID, env)
+		if err != nil {
+			return coldMatrixReport{}, fmt.Errorf("%s: %w", profile, err)
+		}
+		result.Profiles = append(result.Profiles, report)
+		if err := os.RemoveAll(profileDir); err != nil {
+			return coldMatrixReport{}, err
+		}
+	}
+	if err := result.validateHeader(); err != nil {
+		return coldMatrixReport{}, err
+	}
+	return result, ctx.Err()
+}
+
+func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env map[string]any) (coldReport, error) {
+	input := fixture(cfg.batches, cfg.profile == "entropy", cfg.fixtureSeed)
 	result := coldReport{
-		SchemaVersion: pairedColdSchema, Mode: "cold", Revision: cfg.revision, Environment: env,
+		SchemaVersion: coldMatrixSchema, Mode: "cold", Revision: cfg.revision, Environment: env,
 		Fixture: coldFixture{cfg.profile, cfg.scale, cfg.fixtureSeed, cfg.batches, cfg.runs, blockTarget},
 		Oracle:  coldOracle, Live: liveReport{Status: "unavailable", Reason: "no pinned binary supplied"},
 	}
-	result.Pairing = &coldPairing{RunID: hex.EncodeToString(runID[:]), FixtureSHA256: coldFixtureDigest(result.Fixture, input)}
+	result.Pairing = &coldPairing{RunID: runID, FixtureSHA256: coldFixtureDigest(result.Fixture, input)}
 	bursts := append([]backfill{{"initial", nil}}, input.backfills()...)
 	targets := make([]coldTarget, 1+len(layouts))
 	targets[0].name = productionV1
@@ -115,6 +141,7 @@ func prepareColdTargets(ctx context.Context, cfg config, dir string, burst backf
 		(burst.name != "initial" && (baseline.Rewrite == nil || baseline.Rewrite.AppendedWALBytes == 0)) {
 		return errors.New("unexpected production publication returned by worker")
 	}
+	baseline.StoredBytes = new(baseline.storedBytes())
 	targets[0].path, targets[0].production = productionDir, true
 	targets[0].phases = append(targets[0].phases, baseline)
 	for i, l := range layouts {
@@ -124,6 +151,7 @@ func prepareColdTargets(ctx context.Context, cfg config, dir string, burst backf
 		if err != nil {
 			return fmt.Errorf("%s: %w", l.name(), err)
 		}
+		pub.StoredBytes = new(pub.storedBytes())
 		target.path = path
 		target.phases = append(target.phases, pub)
 	}
@@ -219,21 +247,25 @@ func prepareColdExperimental(ctx context.Context, dir string, burst backfill, ro
 		pub.BloomBytes = int64(len(next.Segments)) * int64(len(summary{}))
 	}
 	if baseline != nil {
-		amp := writeAmplification(uint64(pub.RewrittenBytes+pub.ManifestBytes), baseline.AppendedWALBytes, coldRewriteBoundary)
+		amp := writeAmplification(uint64(pub.RewrittenBytes)+uint64(pub.ManifestBytes), baseline.AppendedWALBytes, coldRewriteBoundary)
 		pub.Rewrite = &amp
 	}
 	return pub, path, nil
 }
 
 func sampleColdPhase(ctx context.Context, cfg config, targets []coldTarget, rows []checkpoint.BlockRow, phase int, pairing *coldPairing) error {
-	for qi, q := range coldQueries() {
+	for qi, q := range coldQueryPlan(coldMatrixSchema) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		want := reference(rows, q)
 		digest := coldRowsDigest(want)
+		selectivity := measureColdSelectivity(rows, q, len(want))
 		for i := range targets {
 			pub := &targets[i].phases[phase]
-			pub.Queries = append(pub.Queries, coldQueryReport{Query: q.name, Literal: q.literal, Start: q.start, End: q.end, Matches: len(want)})
+			pub.Queries = append(pub.Queries, coldQueryReport{Query: q.name, Literal: q.literal, Start: q.start, End: q.end, Matches: len(want), Selectivity: &selectivity})
 		}
-		for sample := range coldRuns(q, cfg.runs) {
+		for sample := range coldQueryRuns(coldMatrixSchema, q, cfg.runs) {
 			round := sample + 1
 			pairID := pairing.pairID(coldPhases[phase], q, round)
 			// Rotate the leading layout to reduce systematic sample-order effects.
@@ -273,15 +305,15 @@ func sampleColdQuery(ctx context.Context, cfg config, req coldRequest, want []ch
 	if err != nil {
 		return err
 	}
-	if sample.Proof != nil {
-		return errors.New("unexpected pairing evidence in worker output")
+	if sample.Proof != nil || (sample.Scan == nil) != req.Production {
+		return errors.New("invalid pairing or scan evidence in worker output")
 	}
 	dst.Samples = append(dst.Samples, sample)
 	return nil
 }
 
 func coldWorker(ctx context.Context, req coldRequest, out io.Writer) error {
-	for _, q := range coldQueries() {
+	for _, q := range coldQueryPlan(coldMatrixSchema) {
 		if q.name == req.Query {
 			if req.Production {
 				return coldProductionQuery(ctx, req.Path, q, out)
@@ -359,35 +391,6 @@ func adviseCold(ctx context.Context, path string) error {
 		return fmt.Errorf("evict %s: %w", filepath.Base(path), err)
 	}
 	return nil
-}
-
-func scanColdSnapshot(ctx context.Context, dir string, current snapshot, q query) (matches []checkpoint.BlockRow, sample coldSample, err error) {
-	var decoder blockDecoder
-	defer decoder.close()
-	reads := new(payloadReads)
-	var peak int
-	for _, ref := range current.Segments {
-		if err := ctx.Err(); err != nil {
-			return nil, coldSample{}, err
-		}
-		f, err := openSegment(dir, ref)
-		if err != nil {
-			return nil, coldSample{}, err
-		}
-		read, err := decoder.scan(f, ref.FileBytes, ref.RawBytes, ref.indexWidth(), q, func(raw []byte, buffers int) error {
-			if len(raw) != ref.RawBytes || (len(raw) > blockTarget && le.Uint32(raw[4:8]) != 1) {
-				return errLayout
-			}
-			return matchBlock(raw, buffers, q, &matches, &peak)
-		})
-		if err := errors.Join(err, f.Close()); err != nil {
-			return nil, coldSample{}, fmt.Errorf("scan %s: %w", ref.Name, err)
-		}
-		reads.Blocks += read.Blocks
-		reads.Bytes += read.Bytes
-	}
-	slices.SortFunc(matches, ordered)
-	return matches, coldSample{Payload: reads, DecodeBytes: &peak}, ctx.Err()
 }
 
 func timeColdQuery(out io.Writer, scan func() ([]checkpoint.BlockRow, coldSample, error)) error {

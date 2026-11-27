@@ -34,25 +34,44 @@ the same profile, size and dependency versions. Timings vary.
 
 ## Cold incremental comparison
 
-Storage owns this nested module. Run the schema v6 comparison on native
-Linux with a disk-backed work directory.
+Storage owns this nested module. Run the schema v7 cold matrix on native
+Linux with a disk-backed work directory. From the repository root, set
+`work` to an existing scratch directory and `artifacts` to an existing
+evidence directory. Use the build, validate, and archive steps from the
+segment-layout workflow for each native runner.
 
 ```sh
+revision=$(git rev-parse HEAD)
 cd bench/segment-layout
-go run . -cold -smoke -dir /path/to/data
-go run . -cold -dir /path/to/data -fixture mixed -scale medium -seed 44 \
-  -runs 21 -revision "$(git rev-parse HEAD)" > cold-mixed-medium.json
-go run . -validate-report cold-mixed-medium.json
+CGO_ENABLED=0 go build -o "$artifacts/segment-layout" .
+"$artifacts/segment-layout" -cold -smoke -seed 44 -revision "$revision" \
+  -dir "$work" > "$artifacts/cold-smoke.json"
+"$artifacts/segment-layout" -validate-report "$artifacts/cold-smoke.json"
+"$artifacts/segment-layout" -cold -scale medium -seed 44 -runs 21 \
+  -revision "$revision" -dir "$work" > "$artifacts/cold-medium.json"
+"$artifacts/segment-layout" -validate-report "$artifacts/cold-medium.json"
+tar -C "$artifacts" -czf "$artifacts/segment-layout.tar.gz" segment-layout
 ```
 
-Run both `mixed` and `entropy` with the same seed, scale, run count, and
-filesystem. The report includes paired codec deltas, experimental samples,
-the production v1 storage component, and live server compaction. Each experiment uses a
-64 KiB target and one immutable file per segment. Raw, LZ4, and Zstd each
-run with Bloom disabled and enabled. Late clustered and scattered
-backfills independently extend the same initial fixture. The v1 baseline
-publishes each fixture with the production checkpoint publisher and scans it
-with the production retained-history reader.
+Keep the validated JSON and matching executable archive together under the
+runner architecture. The existing workflow runs the cold matrix regression
+on native amd64 and arm64 and uploads its incremental smoke report. The
+commands above produce the cold artifacts when run on those architectures.
+
+A single `-cold` invocation runs both `mixed` and `entropy` with the same
+PCG seed, batch schedule, scale, query schedule, and filesystem. Use
+`-fixture entropy` to run entropy first. The report records profile order,
+the batch pattern, seed, exact query windows, repetitions, and the cache
+procedure. Mixed combines repetitive text and variable warnings. Entropy
+adds four PCG-generated 64-bit values encoded as hex to each ordinary row.
+Both include tied timestamps, duplicate rows, edge timestamps, and a
+maximum-size singleton. Each profile contains the production v1 storage
+component and all six experimental layouts. Each experiment uses a 64 KiB
+target and one immutable file per segment. Raw, LZ4, and Zstd each run with
+Bloom disabled and enabled. Four-row clustered and scattered backfills
+independently extend the same initial fixture. The v1 baseline publishes
+each fixture with the production checkpoint publisher and scans it with
+the production retained-history reader.
 
 Each sample starts a fresh Linux worker, opens the same published generation
 for that layout and phase, loads the manifest, and initializes the reader.
@@ -67,8 +86,13 @@ collection, and transfer to the oracle. This measures cold segment reads
 against an initialized reader.
 
 The runner rotates layout order across matched samples. `-runs` applies
-to full-range and bounded sparse queries. Each phase and layout also
-runs one absent, one-byte, two-byte, three-byte, and all-rows probe.
+to the full-range sparse, bounded sparse, medium, and dense probes. Sparse
+selects the first row of every 31st batch plus matching backfill rows.
+Bounded sparse uses the first 37 seconds from the fixture epoch. Medium
+selects every eighth ordinary row and dense selects four out of five, with
+matching backfill duplicates in both. Each query records the population,
+time-window, and matching row counts as exact selectivity denominators.
+Each phase and layout also runs one absent, one-byte, two-byte, three-byte, and all-rows probe.
 The parent verifies every returned timestamp, append ordinal, and line byte
 against the independent append-log oracle before accepting the sample.
 The all-rows probe verifies the complete generation. The short-literal
@@ -77,9 +101,10 @@ their payload counts unchanged.
 
 ### Paired codec results
 
-`pairing.comparisons` contains 36 comparisons. Each of the three codec pairs
-(raw/LZ4, raw/Zstd, LZ4/Zstd) is measured in both Bloom settings, for both
-sparse queries, on the initial snapshot and after each independent backfill.
+Each profile's `pairing.comparisons` contains 72 comparisons. Each of the
+three codec pairs (raw/LZ4, raw/Zstd, LZ4/Zstd) is measured in both Bloom
+settings, for all four repeated queries, on the initial snapshot and after
+each independent backfill.
 All round deltas are candidate minus baseline, so a negative delta favors
 the candidate on that metric. Join a round to its endpoint samples using
 `pair_id` and the layout names. The ID binds the execution, fixture, exact query
@@ -92,20 +117,22 @@ oracle and recomputes all comparisons from their endpoint samples.
 | --- | --- |
 | `physical_read_bytes` | Delta in Linux `read_bytes` charged to each query worker, including readahead. `storage_read_observed_rounds` counts rounds with a positive reading on either endpoint. |
 | `peak_worker_rss_bytes` | Delta in the two workers' whole-process high-water RSS for that round. |
-| `rewrite_amplification` | Backfill-only delta in logical synced segment and manifest bytes and in bytes written per appended WAL byte. The report repeats the phase's single publication comparison for each sparse query. |
+| `rewrite_amplification` | Backfill-only delta in logical synced segment and manifest bytes and in bytes written per appended WAL byte. The report repeats the phase's single publication comparison for each repeated query. |
+| `tradeoffs` | Candidate minus baseline for cold p95, process and physical read p95, payload and stored bytes, segment fan-out, and peak block decode bytes. The p95 deltas subtract endpoint percentiles. |
 
 The read and memory summaries show nearest-rank p50 of the signed round
 deltas and the number of lower, equal, and higher rounds. Use
 `candidate_lower` or `baseline_lower` to find comparisons where one layout
-was at least as good on every measured metric in every round and improved
-at least one. `tradeoff_or_variable` means the direction changed across
+has a favorable delta and all other reported tradeoff deltas, rewrite
+bytes, and paired physical-read and RSS rounds are favorable or equal. `tradeoff_or_variable` means the direction changed across
 metrics or rounds. `equal` means all observed deltas were zero. Check
 `storage_read_observed_rounds` before drawing storage conclusions because
 successful cache advice can still yield cached reads. Compare results across
 both fixture profiles and backfill phases before choosing a layout.
 
-The validator still accepts existing schema v5 cold reports. The paired
-deltas and per-round identity are required in schema v6.
+The validator accepts historical schema v5 and v6 cold reports. Schema v7
+requires both matched profiles and independently reconstructs their query
+selectivities, segment packing, decoded fan-out, and decode ceilings.
 
 ### Individual worker measurements
 
@@ -115,6 +142,9 @@ deltas and per-round identity are required in schema v6.
 | `process_read_bytes_p95` | Linux `rchar` delta, less the observer's own first counter read, including index and payload reads served from cache. |
 | `storage_read_bytes_p95` | Linux `read_bytes` delta charged to the worker, including readahead. A cache hit can yield zero. |
 | `experimental_payload` | Logical compressed or raw payload blocks and bytes, excluding index and Bloom metadata. Compare the matched on/off samples for each codec. |
+| `stored_segment_and_manifest_bytes` | Logical bytes in the generation's retained segment files and current manifest, including codec and Bloom metadata. |
+| `experimental_scan` | Segment indexes visited, their logical index bytes, segments whose payloads were decoded, and the largest decoded raw block. Time and Bloom pruning can reduce decoded fan-out. |
+| `experimental_scan.decode` | Ordinary and oversized peak working bytes with ceilings. The ordinary ceiling follows the 64 KiB target. A larger block must contain one row and uses a size-specific ceiling capped by the existing block format. |
 | `peak_decode_bytes` | Experimental maximum live single-block payload buffers, decoded rows, and line bytes. Codec internals and accumulated results are outside this count. |
 | `peak_decode_go_heap_upper_bound_bytes` | Maximum query-window Go allocation delta, an upper bound on Go heap allocated for decoding in that window. It also covers other query allocations, such as results, and observer overhead. The v1 reader exposes this bound and worker RSS for memory comparison. |
 | `peak_worker_rss_bytes` | Worker high-water RSS through the scan, including startup and reader initialization. |
@@ -126,8 +156,8 @@ binary from the same shipped revision on each target architecture.
 ```sh
 go run . -cold -dir /path/to/data -fixture mixed -scale medium -seed 44 \
   -runs 21 -revision "$(git rev-parse HEAD)" \
-  -bog-bin /path/to/pinned/bog -bog-revision "$candidate_revision" > cold-live-mixed-medium.json
-go run . -validate-report cold-live-mixed-medium.json
+  -bog-bin /path/to/pinned/bog -bog-revision "$candidate_revision" > cold-live-medium.json
+go run . -validate-report cold-live-medium.json
 ```
 
 The live section measures process-attributed filesystem writes around
@@ -136,7 +166,7 @@ ordered loopback query results for a bounded sparse query and all three
 short literals, and the full persisted checkpoint after shutdown. A
 missing candidate or unavailable control endpoint is recorded in the live
 section. The live comparison is pending #53. The historical measurements
-below describe the earlier full-rewrite experiment. Use schema v6 evidence
+below describe the earlier full-rewrite experiment. Use schema v7 evidence
 to assess the incremental format, including compressed size, Bloom metadata
 cost, cold query latency and I/O, and backfill amplification.
 

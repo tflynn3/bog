@@ -45,29 +45,31 @@ type coldLayout struct {
 }
 
 type coldPhase struct {
-	Phase         string `json:"phase"`
-	Rows          int    `json:"rows"`
-	Segments      int    `json:"segments"`
-	ManifestBytes int64  `json:"manifest_bytes"`
-	BloomBytes    int64  `json:"bloom_metadata_bytes"`
+	Phase         string  `json:"phase"`
+	Rows          int     `json:"rows"`
+	Segments      int     `json:"segments"`
+	ManifestBytes int64   `json:"manifest_bytes"`
+	BloomBytes    int64   `json:"bloom_metadata_bytes"`
+	StoredBytes   *uint64 `json:"stored_segment_and_manifest_bytes,omitempty"`
 	segmentBytes
 	Rewrite *amplification    `json:"rewrite_amplification,omitempty"`
 	Queries []coldQueryReport `json:"queries"`
 }
 
 type coldQueryReport struct {
-	Query                         string       `json:"query"`
-	Literal                       string       `json:"literal"`
-	Start                         time.Time    `json:"start_inclusive"`
-	End                           time.Time    `json:"end_exclusive"`
-	Matches                       int          `json:"matching_rows"`
-	Samples                       []coldSample `json:"samples"`
-	P95NS                         int64        `json:"cold_p95_ns"`
-	ReadBytesP95                  int64        `json:"process_read_bytes_p95"`
-	StorageReadBytesP95           int64        `json:"storage_read_bytes_p95"`
-	PeakDecodeBytes               *int         `json:"peak_decode_bytes,omitempty"`
-	PeakDecodeHeapUpperBoundBytes uint64       `json:"peak_decode_go_heap_upper_bound_bytes"`
-	PeakRSSBytes                  uint64       `json:"peak_worker_rss_bytes"`
+	Query                         string           `json:"query"`
+	Literal                       string           `json:"literal"`
+	Start                         time.Time        `json:"start_inclusive"`
+	End                           time.Time        `json:"end_exclusive"`
+	Matches                       int              `json:"matching_rows"`
+	Selectivity                   *coldSelectivity `json:"selectivity,omitempty"`
+	Samples                       []coldSample     `json:"samples"`
+	P95NS                         int64            `json:"cold_p95_ns"`
+	ReadBytesP95                  int64            `json:"process_read_bytes_p95"`
+	StorageReadBytesP95           int64            `json:"storage_read_bytes_p95"`
+	PeakDecodeBytes               *int             `json:"peak_decode_bytes,omitempty"`
+	PeakDecodeHeapUpperBoundBytes uint64           `json:"peak_decode_go_heap_upper_bound_bytes"`
+	PeakRSSBytes                  uint64           `json:"peak_worker_rss_bytes"`
 }
 
 type coldSample struct {
@@ -78,6 +80,7 @@ type coldSample struct {
 	DecodeBytes       *int             `json:"decode_bytes,omitempty"`
 	GoAllocationBytes uint64           `json:"go_allocation_bytes"`
 	PeakRSSBytes      uint64           `json:"worker_rss_bytes"`
+	Scan              *coldScanMetrics `json:"experimental_scan,omitempty"`
 	Proof             *coldSampleProof `json:"pairing,omitempty"`
 }
 
@@ -114,13 +117,6 @@ func coldQueries() []query {
 		}
 	}
 	return result
-}
-
-func coldRuns(q query, runs int) int {
-	if q.literal == sparseLiteral {
-		return runs
-	}
-	return 1
 }
 
 func (q *coldQueryReport) summarize() {
@@ -200,6 +196,9 @@ func validateBenchmarkReport(in io.Reader) error {
 	if err := json.Unmarshal(raw, &header); err != nil {
 		return err
 	}
+	if header.Version == coldMatrixSchema {
+		return validateColdMatrixJSON(raw)
+	}
 	if header.Version == 5 || header.Version == pairedColdSchema {
 		var report coldReport
 		cold := json.NewDecoder(bytes.NewReader(raw))
@@ -223,7 +222,7 @@ func (r coldReport) validate() error {
 	if err := r.validateColdMeasurements(); err != nil {
 		return err
 	}
-	if r.SchemaVersion == pairedColdSchema {
+	if r.SchemaVersion == pairedColdSchema || r.SchemaVersion == coldMatrixSchema {
 		return r.validatePairs()
 	}
 	if r.Pairing != nil {
@@ -245,7 +244,7 @@ func (r coldReport) validate() error {
 
 func (r coldReport) validateColdMeasurements() error {
 	f := r.Fixture
-	if (r.SchemaVersion != 5 && r.SchemaVersion != pairedColdSchema) || r.Mode != "cold" || !knownRevision(r.Revision) || r.Oracle != coldOracle ||
+	if (r.SchemaVersion != 5 && r.SchemaVersion != pairedColdSchema && r.SchemaVersion != coldMatrixSchema) || r.Mode != "cold" || !knownRevision(r.Revision) || r.Oracle != coldOracle ||
 		r.Environment["os"] != "linux" || r.Environment["cache_policy"] != coldCachePolicy ||
 		(f.Profile != "mixed" && f.Profile != "entropy") || f.Batches < 1 || f.Batches > maxBatches ||
 		f.SparseRuns < 1 || f.SparseRuns > maxRuns || f.TargetBytes != blockTarget {
@@ -262,7 +261,7 @@ func (r coldReport) validateColdMeasurements() error {
 	for i := range f.Batches {
 		rows += batchPattern[i%len(batchPattern)]
 	}
-	if err := validateColdLayout(r.Production, rows, f.SparseRuns, true); err != nil {
+	if err := validateColdLayout(r.Production, rows, f.SparseRuns, r.SchemaVersion, true); err != nil {
 		return err
 	}
 	for i, l := range layouts {
@@ -270,7 +269,7 @@ func (r coldReport) validateColdMeasurements() error {
 		if got.Name != l.name() {
 			return fmt.Errorf("expected experimental layout %s, got %s", l.name(), got.Name)
 		}
-		if err := validateColdLayout(got, rows, f.SparseRuns, false); err != nil {
+		if err := validateColdLayout(got, rows, f.SparseRuns, r.SchemaVersion, false); err != nil {
 			return err
 		}
 		for j, phase := range got.Phases {
@@ -296,7 +295,7 @@ func (r coldReport) validateColdMeasurements() error {
 	return r.Live.validate(r.Production.Phases)
 }
 
-func validateColdLayout(l coldLayout, rows, runs int, production bool) error {
+func validateColdLayout(l coldLayout, rows, runs, schema int, production bool) error {
 	if len(l.Phases) != len(coldPhases) {
 		return fmt.Errorf("%s: incomplete phase matrix", l.Name)
 	}
@@ -310,6 +309,13 @@ func validateColdLayout(l coldLayout, rows, runs int, production bool) error {
 			phase.RetainedBytes < phase.ReusedBytes || phase.RetainedBytes-phase.ReusedBytes != phase.RewrittenBytes ||
 			(production && phase.BloomBytes != 0) {
 			return fmt.Errorf("%s/%s: invalid publication counters", l.Name, phase.Phase)
+		}
+		if schema == coldMatrixSchema {
+			if phase.StoredBytes == nil || *phase.StoredBytes != phase.storedBytes() {
+				return fmt.Errorf("%s/%s: stored bytes disagree with retained segment and manifest bytes", l.Name, phase.Phase)
+			}
+		} else if phase.StoredBytes != nil {
+			return fmt.Errorf("%s/%s: unexpected stored byte total", l.Name, phase.Phase)
 		}
 		if i == 0 {
 			if phase.Rewrite != nil || phase.ReusedBytes != 0 || phase.RetiredBytes != 0 {
@@ -326,18 +332,30 @@ func validateColdLayout(l coldLayout, rows, runs int, production bool) error {
 				return fmt.Errorf("%s/%s: invalid rewrite amplification", l.Name, phase.Phase)
 			}
 		}
-		probes := coldQueries()
+		probes := coldQueryPlan(schema)
 		if len(phase.Queries) != len(probes) {
 			return fmt.Errorf("%s/%s: incomplete query matrix", l.Name, phase.Phase)
 		}
 		for j, q := range probes {
 			got := phase.Queries[j]
-			if err := got.validate(q, wantRows, coldRuns(q, runs), production); err != nil {
+			if err := got.validate(q, wantRows, coldQueryRuns(schema, q, runs), production); err != nil {
 				return fmt.Errorf("%s/%s/%s: %w", l.Name, phase.Phase, q.name, err)
+			}
+			if (got.Selectivity != nil) != (schema == coldMatrixSchema) {
+				return fmt.Errorf("%s/%s/%s: unexpected selectivity evidence", l.Name, phase.Phase, q.name)
+			}
+			for _, sample := range got.Samples {
+				if (sample.Scan != nil) != (schema == coldMatrixSchema && !production) {
+					return fmt.Errorf("%s/%s/%s: invalid experimental scan evidence", l.Name, phase.Phase, q.name)
+				}
 			}
 		}
 	}
 	return nil
+}
+
+func (p coldPhase) storedBytes() uint64 {
+	return uint64(p.RetainedBytes) + uint64(p.ManifestBytes)
 }
 
 func validColdAmplification(a *amplification, boundary string) bool {

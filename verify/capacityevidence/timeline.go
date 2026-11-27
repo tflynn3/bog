@@ -67,14 +67,21 @@ type memoryCurrentSample struct {
 	Error     string  `json:"error"`
 }
 
+type filesystemObservation struct {
+	ObservedNS   *int64            `json:"observed_ns"`
+	StagingBytes *int64            `json:"checkpoint_staging_apparent_bytes"`
+	Unavailable  map[string]string `json:"unavailable,omitempty"`
+}
+
 type backfillSample struct {
-	Memory      *memoryCurrentSample `json:"cgroup_memory_current"`
-	Event       string               `json:"event"`
-	ElapsedNS   int64                `json:"elapsed_ns"`
-	SentNS      *int64               `json:"request_sent_ns"`
-	Compaction  *compactionEvidence  `json:"status"`
-	StatusError string               `json:"status_error"`
-	Metrics     runtimeObservations  `json:"candidate_status_metrics"`
+	Filesystem  *filesystemObservation `json:"filesystem,omitempty"`
+	Memory      *memoryCurrentSample   `json:"cgroup_memory_current"`
+	Event       string                 `json:"event"`
+	ElapsedNS   int64                  `json:"elapsed_ns"`
+	SentNS      *int64                 `json:"request_sent_ns"`
+	Compaction  *compactionEvidence    `json:"status"`
+	StatusError string                 `json:"status_error"`
+	Metrics     runtimeObservations    `json:"candidate_status_metrics"`
 }
 
 type runtimeObservations struct {
@@ -139,7 +146,7 @@ type backfillCutoffs struct {
 	held, publish, final int
 }
 
-func (b backfillEvidence) validate(want backfillCutoffs) error {
+func (b backfillEvidence) validate(want backfillCutoffs, previousPublication, peak uint64) error {
 	if b.Status != "pass" || b.Failure != "" {
 		return fmt.Errorf("timeline did not pass: status %q, failure %q", b.Status, b.Failure)
 	}
@@ -169,19 +176,39 @@ func (b backfillEvidence) validate(want backfillCutoffs) error {
 	if pins.Status != "observed" || pins.Reason != "" || pins.Held == nil || *pins.Held == 0 || pins.After == nil || *pins.After != 0 {
 		return fmt.Errorf("require observed pin drain from a positive held count to zero after retirement (status %q, reason %q)", pins.Status, pins.Reason)
 	}
-	return b.validateSamples(want)
+	return b.validateSamples(want, previousPublication, peak)
 }
 
-func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
-	var elapsed, startSent, overlapSent, lastRunningSent, exhaustedAt, retriedAt, retiredAt, drainStarted int64
-	var published, finalObserved, held, drained, fresh bool
+func (b backfillEvidence) validateSamples(want backfillCutoffs, previousPublication, peak uint64) error {
+	var elapsed, startSent, lastRunningSent, exhaustedAt, retriedAt, retiredAt, drainStarted int64
+	var overlap, published, finalObserved, held, drained, fresh bool
 	var predecessor uint64
+	var committed int
+	var stagingObservedAt, firstRead int64
+	var memory memoryObservation
 	for _, sample := range b.Samples {
-		if sample.ElapsedNS < elapsed {
+		if sample.ElapsedNS < max(elapsed, stagingObservedAt) {
 			return errors.New("cutover samples must be in elapsed time order")
 		}
 		previousElapsed := elapsed
 		elapsed = sample.ElapsedNS
+		// Storage is sampled after this event or HTTP reply. Carry its
+		// timestamp forward so the next probe cannot start before it.
+		earliest := max(previousElapsed, stagingObservedAt)
+		if fs := sample.Filesystem; fs != nil && fs.StagingBytes != nil {
+			const staging = "checkpoint_staging_apparent_bytes"
+			if *fs.StagingBytes < 0 || fs.Unavailable[staging] != "" {
+				return fmt.Errorf("%s sample has invalid %s", sample.Event, staging)
+			}
+			if fs.ObservedNS == nil || *fs.ObservedNS < elapsed {
+				return fmt.Errorf("%s sample has invalid filesystem staging observation timing", sample.Event)
+			}
+			stagingObservedAt = *fs.ObservedNS
+		}
+		running := sample.Event == "compaction_start" || sample.Event == "overlap" || sample.Event == "status_poll"
+		if sample.Memory != nil && (!running || sample.Event == "compaction_start") {
+			return errors.New("memory.current sample outside running status polls")
+		}
 		hasStatus := sample.StatusError == "" && sample.SentNS != nil && sample.Compaction != nil
 		if err := sample.Metrics.validate(hasStatus); err != nil {
 			return fmt.Errorf("%s sample: %w", sample.Event, err)
@@ -222,30 +249,34 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 		if sample.StatusError != "" && !retry {
 			return fmt.Errorf("%s sample failed: %s", sample.Event, sample.StatusError)
 		}
-		if sample.SentNS == nil || *sample.SentNS <= 0 || *sample.SentNS > elapsed {
+		if sample.SentNS == nil || *sample.SentNS <= 0 || *sample.SentNS > elapsed ||
+			(!retry && *sample.SentNS == elapsed) {
 			return fmt.Errorf("missing or invalid request timing for %s sample", sample.Event)
 		}
-		if sample.Event == "status_poll" {
-			lastRunningSent = *sample.SentNS
-			continue
+		sent := *sample.SentNS
+		if drain && (retiredAt == 0 || sent < retiredAt) {
+			return errors.New("pin drain sample did not follow explicit capture retirement")
+		}
+		if sample.Event == "before_retirement" && (retriedAt == 0 || sent < retriedAt) {
+			return errors.New("before_retirement must observe the positive held pin count at the final cutoff after terminal page replay")
+		}
+		if sent < earliest {
+			return fmt.Errorf("%s sample request overlapped a previous observation", sample.Event)
 		}
 		if drain {
-			if retiredAt == 0 || *sample.SentNS < retiredAt {
-				return errors.New("pin drain sample did not follow explicit capture retirement")
-			}
-			if *sample.SentNS < previousElapsed {
-				return errors.New("pin drain status request overlapped a previous observation")
-			}
 			if drained || (sample.Event == "after_retirement") != (drainStarted == 0) {
 				return errors.New("pin drain must start with after_retirement and end at the first observed zero")
 			}
 			if drainStarted == 0 {
-				drainStarted = *sample.SentNS
+				drainStarted = sent
 			}
 			if elapsed-drainStarted > int64(DrainBudget) {
 				return errors.New("pin drain sample exceeded the drain budget")
 			}
 			if retry {
+				if sample.Compaction != nil {
+					return fmt.Errorf("%s sample has compaction state on a failed request", sample.Event)
+				}
 				continue
 			}
 		}
@@ -253,33 +284,64 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 			return fmt.Errorf("missing request timing or compaction state for %s sample", sample.Event)
 		}
 		c := *sample.Compaction
-		switch sample.Event {
-		case "compaction_start":
-			if startSent != 0 || c.State != "running" || c.Generation >= b.Publication.Generation ||
-				c.CoveredRows != want.held || c.CommittedRows != want.publish {
-				return errors.New("compaction start did not observe the predecessor at the requested cutoff")
+		if running {
+			if sample.Event == "compaction_start" {
+				if startSent != 0 || c.Generation >= b.Publication.Generation || c.CommittedRows != want.publish {
+					return errors.New("compaction start did not observe the predecessor at the requested cutoff")
+				}
+				if previousPublication != 0 && c.Generation <= previousPublication {
+					return errors.New("scattered predecessor must advance past clustered publication at the seed checkpoint")
+				}
+				startSent, predecessor, committed = sent, c.Generation, want.publish
 			}
-			startSent, predecessor = *sample.SentNS, c.Generation
-			continue
-		case "overlap":
-			if startSent == 0 || overlapSent != 0 || *sample.SentNS <= startSent ||
-				c.State != "running" || c.Generation != predecessor || c.CoveredRows != want.held ||
-				c.CommittedRows < want.publish+BatchRows || c.CommittedRows > want.final {
-				return errors.New("overlap did not observe backfill on the predecessor generation")
+			if startSent == 0 || published || c.State != "running" || c.Generation != predecessor ||
+				c.CoveredRows != want.held || c.CommittedRows < committed || c.CommittedRows > want.final {
+				return fmt.Errorf("%s sample must observe the same running compaction at the predecessor cutoff", sample.Event)
 			}
-			overlapSent = *sample.SentNS
+			if sample.Event == "overlap" {
+				if overlap || c.CommittedRows < want.publish+BatchRows {
+					return errors.New("overlap did not observe backfill on the predecessor generation")
+				}
+				if sample.Memory == nil {
+					return errors.New("require a bracketed memory.current overlap sample after backfill")
+				}
+				overlap = true
+			}
+			if m := sample.Memory; m != nil {
+				if memory.Samples == MemorySampleLimit || m.ReadStart < earliest ||
+					m.ReadEnd <= m.ReadStart || m.ReadEnd > sent {
+					return errors.New("mis-timed or excessive memory.current samples")
+				}
+				if m.Error != "" {
+					return fmt.Errorf("live memory.current sampling failed: %s", m.Error)
+				}
+				if m.Bytes == nil || *m.Bytes == 0 || *m.Bytes > peak {
+					return errors.New("missing, zero, or above-final-memory.peak memory.current bytes")
+				}
+				if memory.Samples == 0 {
+					firstRead, memory.Min, memory.Max = m.ReadStart, *m.Bytes, *m.Bytes
+				}
+				memory.Samples++
+				memory.Span = m.ReadEnd - firstRead
+				memory.Min = min(memory.Min, *m.Bytes)
+				memory.Max = max(memory.Max, *m.Bytes)
+			}
+			lastRunningSent, committed = sent, c.CommittedRows
 			continue
 		}
-		if overlapSent == 0 || c.State != "complete" || c.Generation != b.Publication.Generation ||
-			c.CoveredRows != want.publish || c.CommittedRows < want.publish || c.CommittedRows > want.final {
+		if !overlap || c.State != "complete" || c.Generation != b.Publication.Generation ||
+			c.CoveredRows != want.publish || c.CommittedRows < committed || c.CommittedRows > want.final {
 			return fmt.Errorf("%s sample did not observe publication at the requested cutoff", sample.Event)
 		}
 		if sample.Event == "publication" {
 			if published {
 				return errors.New("duplicate publication sample")
 			}
+			if memory.Samples < 2 {
+				return errors.New("require multiple bracketed memory.current samples including overlap before publication")
+			}
 			pub := b.Publication
-			if pub.LowerNS < max(overlapSent, lastRunningSent)-startSent || pub.LowerNS > *sample.SentNS-startSent ||
+			if pub.LowerNS < lastRunningSent-startSent || pub.LowerNS > sent-startSent ||
 				pub.UpperNS != elapsed-startSent {
 				return errors.New("publication lag bounds disagree with observed request timing")
 			}
@@ -288,6 +350,7 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 		if !published {
 			return fmt.Errorf("%s sample preceded publication", sample.Event)
 		}
+		committed = c.CommittedRows
 		pins := sample.Metrics.RetiredPins
 		switch sample.Event {
 		case "publication", "final_cutoff":
@@ -296,7 +359,7 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 			}
 			finalObserved = finalObserved || c.CommittedRows == want.final
 		case "before_retirement":
-			if retriedAt == 0 || *sample.SentNS < retriedAt || held || c.CommittedRows != want.final ||
+			if held || c.CommittedRows != want.final ||
 				pins == nil || *pins != *b.PinDrain.Held {
 				return errors.New("before_retirement must observe the positive held pin count at the final cutoff after terminal page replay")
 			}
@@ -313,82 +376,7 @@ func (b backfillEvidence) validateSamples(want backfillCutoffs) error {
 	if !published || !finalObserved || !held || !drained || !fresh {
 		return errors.New("missing runtime samples for publication, final cutoff, held pin, pin drain, or fresh visibility")
 	}
-	return nil
-}
-
-func (t backfillEvidence) validateLiveMemory(peak uint64) error {
-	var lastRunning, firstRead int64
-	var predecessor uint64
-	var committed int
-	var overlap, published bool
-	var summary memoryObservation
-	for _, s := range t.Samples {
-		m, c := s.Memory, s.Compaction
-		switch s.Event {
-		case "compaction_start", "overlap", "status_poll":
-			if published || s.StatusError != "" || s.SentNS == nil || *s.SentNS <= 0 ||
-				*s.SentNS < lastRunning || s.ElapsedNS <= *s.SentNS || c == nil {
-				return fmt.Errorf("invalid running status timing or reply for %s", s.Event)
-			}
-		case "publication":
-			if m != nil || published || s.StatusError != "" || c == nil ||
-				s.SentNS == nil || *s.SentNS < lastRunning || s.ElapsedNS <= *s.SentNS ||
-				c.CommittedRows < committed {
-				return errors.New("invalid publication after running memory observations")
-			}
-			if !overlap || summary.Samples < 2 {
-				return errors.New("require multiple bracketed memory.current samples including overlap before publication")
-			}
-			published = true
-			continue
-		default:
-			if m != nil {
-				return errors.New("memory.current sample outside running status polls")
-			}
-			continue
-		}
-		if s.Event == "compaction_start" {
-			if lastRunning != 0 || m != nil || c.Generation >= t.Publication.Generation ||
-				c.CommittedRows != t.Cutoff {
-				return errors.New("memory evidence requires a valid running compaction start")
-			}
-			predecessor, committed = c.Generation, t.Cutoff
-		} else if lastRunning == 0 {
-			return errors.New("memory evidence requires a prior running compaction start")
-		}
-		if c.State != "running" || c.Generation != predecessor || c.CoveredRows != t.HeldCutoff ||
-			c.CommittedRows < committed || c.CommittedRows > t.FinalCutoff {
-			return errors.New("memory evidence requires running status for the same compaction")
-		}
-		if s.Event == "overlap" {
-			next := min(t.Cutoff+(t.Cutoff-t.HeldCutoff), t.FinalCutoff)
-			if m == nil || overlap || c.CommittedRows < next {
-				return errors.New("require a bracketed memory.current overlap sample after backfill")
-			}
-			overlap = true
-		}
-		if m != nil {
-			if summary.Samples == MemorySampleLimit || m.ReadStart < lastRunning ||
-				m.ReadEnd <= m.ReadStart || m.ReadEnd > *s.SentNS {
-				return errors.New("mis-timed or excessive memory.current samples")
-			}
-			if m.Error != "" {
-				return fmt.Errorf("live memory.current sampling failed: %s", m.Error)
-			}
-			if m.Bytes == nil || *m.Bytes == 0 || *m.Bytes > peak {
-				return errors.New("missing, zero, or above-final-memory.peak memory.current bytes")
-			}
-			if summary.Samples == 0 {
-				firstRead, summary.Min, summary.Max = m.ReadStart, *m.Bytes, *m.Bytes
-			}
-			summary.Samples++
-			summary.Span = m.ReadEnd - firstRead
-			summary.Min = min(summary.Min, *m.Bytes)
-			summary.Max = max(summary.Max, *m.Bytes)
-		}
-		lastRunning, committed = s.ElapsedNS, c.CommittedRows
-	}
-	if !published || t.Memory == nil || *t.Memory != summary {
+	if b.Memory == nil || *b.Memory != memory {
 		return errors.New("missing or inconsistent memory.current observation span or range")
 	}
 	return nil

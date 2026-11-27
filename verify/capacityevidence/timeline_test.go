@@ -53,9 +53,8 @@ func cutoverTimeline(pattern string, held, requested, final int, predecessor, ge
 func TestValidateCutoverTimelineSequence(t *testing.T) {
 	t.Parallel()
 
-	seed := 196608
-	clustered := backfillCutoffs{seed - 2*BatchRows, seed - BatchRows, seed}
-	scattered := backfillCutoffs{seed, seed + BatchRows, seed + TailRows}
+	seed := SmallScale
+	small, large := observationRecord(t, seed), observationRecord(t, LargeScale)
 	sampleIndex := func(b *backfillEvidence, event string) int {
 		return slices.IndexFunc(b.Samples, func(s backfillSample) bool { return s.Event == event })
 	}
@@ -73,6 +72,113 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 		mutate  func(*backfillEvidence)
 		problem string
 	}{
+		{
+			name: "premature completion labeled as a running poll", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				poll := sample(b, "status_poll")
+				poll.Compaction = &compactionEvidence{"complete", b.Publication.Generation, b.Cutoff, b.FinalCutoff}
+			},
+			problem: "running",
+		},
+		{
+			name: "null running poll status", pattern: "scattered",
+			mutate:  func(b *backfillEvidence) { sample(b, "status_poll").Compaction = nil },
+			problem: "status_poll sample",
+		},
+		{
+			name: "scattered predecessor predates seed checkpoint", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				for i := range b.Samples {
+					if c := b.Samples[i].Compaction; c != nil && c.State == "running" {
+						c.Generation = 40 // The clustered publication still covers seed minus a batch.
+					}
+				}
+			},
+			problem: "seed checkpoint",
+		},
+		{
+			name: "repeated running poll with no new committed rows", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				i := sampleIndex(b, "status_poll")
+				poll := b.Samples[i]
+				poll.SentNS, poll.ElapsedNS, poll.Memory = new(int64(45)), 46, nil
+				b.Samples = slices.Insert(b.Samples, i+1, poll)
+				b.Publication.LowerNS = 25
+			},
+		},
+		{
+			name: "running poll overlaps prior reply", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				s := sample(b, "status_poll")
+				s.Memory, s.SentNS = nil, new(int64(34))
+			},
+			problem: "status_poll sample",
+		},
+		{
+			name: "running poll regresses committed rows", pattern: "scattered",
+			mutate:  func(b *backfillEvidence) { sample(b, "status_poll").Compaction.CommittedRows-- },
+			problem: "same running compaction",
+		},
+		{
+			name: "publication regresses committed rows", pattern: "scattered",
+			mutate:  func(b *backfillEvidence) { sample(b, "publication").Compaction.CommittedRows-- },
+			problem: "publication at the requested cutoff",
+		},
+		{
+			name: "publication bounds include the last running request", pattern: "scattered",
+			mutate:  func(b *backfillEvidence) { b.Publication.LowerNS-- },
+			problem: "publication lag bounds",
+		},
+		{
+			name: "memory read starts before prior running reply", pattern: "scattered",
+			mutate:  func(b *backfillEvidence) { sample(b, "status_poll").Memory.ReadStart = 34 },
+			problem: "mis-timed or excessive memory.current samples",
+		},
+		{
+			name: "optional unavailable staging observation", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				sample(b, "overlap").Filesystem = &filesystemObservation{Unavailable: map[string]string{
+					"checkpoint_staging_apparent_bytes": "scan failed",
+				}}
+			},
+		},
+		{
+			name: "timed staging, runtime and memory bytes are independent", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				s := sample(b, "overlap")
+				s.Filesystem = &filesystemObservation{ObservedNS: new(int64(36)), StagingBytes: new(int64(8192))}
+				s.Metrics.StagingUsed = new(uint64(0))
+				sample(b, "publication").Filesystem = &filesystemObservation{ObservedNS: new(int64(57)), StagingBytes: new(int64(0))}
+			},
+		},
+		{
+			name: "staging bytes missing observation time", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				sample(b, "overlap").Filesystem = &filesystemObservation{StagingBytes: new(int64(0))}
+			},
+			problem: "filesystem staging observation timing",
+		},
+		{
+			name: "staging observation before its reply", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				sample(b, "overlap").Filesystem = &filesystemObservation{ObservedNS: new(int64(34)), StagingBytes: new(int64(0))}
+			},
+			problem: "filesystem staging observation timing",
+		},
+		{
+			name: "next memory read starts before staging scan", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				sample(b, "overlap").Filesystem = &filesystemObservation{ObservedNS: new(int64(37)), StagingBytes: new(int64(0))}
+			},
+			problem: "mis-timed or excessive memory.current samples",
+		},
+		{
+			name: "negative staged bytes", pattern: "scattered",
+			mutate: func(b *backfillEvidence) {
+				sample(b, "overlap").Filesystem = &filesystemObservation{ObservedNS: new(int64(36)), StagingBytes: new(int64(-1))}
+			},
+			problem: "checkpoint_staging_apparent_bytes",
+		},
 		{name: "clustered final count in publication", pattern: "clustered"},
 		{name: "scattered publication before last acknowledgement", pattern: "scattered"},
 		{
@@ -196,6 +302,22 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 			problem: "after_retirement sample failed",
 		},
 		{
+			name: "zero at the drain budget boundary", pattern: "clustered",
+			mutate: func(b *backfillEvidence) {
+				poll := sample(b, "drain_poll")
+				poll.ElapsedNS = *sample(b, "after_retirement").SentNS + int64(DrainBudget)
+				poll.SentNS = new(poll.ElapsedNS - 1)
+				sample(b, "fresh_visible").ElapsedNS = poll.ElapsedNS + 1
+			},
+		},
+		{
+			name: "drain retry cannot overlap the previous request", pattern: "clustered",
+			mutate: func(b *backfillEvidence) {
+				sample(b, "drain_poll").SentNS = new(sample(b, "after_retirement").ElapsedNS - 1)
+			},
+			problem: "request overlapped a previous observation",
+		},
+		{
 			name: "late zero exceeds producer drain budget", pattern: "clustered",
 			mutate: func(b *backfillEvidence) {
 				poll := sample(b, "drain_poll")
@@ -208,22 +330,22 @@ func TestValidateCutoverTimelineSequence(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			want, previous, generation := clustered, 38, 40
-			if tc.pattern == "scattered" {
-				want, previous, generation = scattered, 41, 42
-			}
-			var timeline backfillEvidence
-			data := cutoverTimeline(tc.pattern, want.held, want.publish, want.final, previous, generation)
-			if err := json.Unmarshal([]byte(data), &timeline); err != nil {
+			var r record
+			if err := json.Unmarshal(small, &r); err != nil {
 				t.Fatal(err)
 			}
+			phase := 0
+			if tc.pattern == "scattered" {
+				phase = 1
+			}
 			if tc.mutate != nil {
-				tc.mutate(&timeline)
+				tc.mutate(&r.Diagnostics.Timelines[phase])
 			}
-			err := timeline.validate(want)
-			if tc.problem == "" && err != nil || tc.problem != "" && (err == nil || !strings.Contains(err.Error(), tc.problem)) {
-				t.Fatalf("wanted %q, got %v", tc.problem, err)
+			data, err := json.Marshal(r)
+			if err != nil {
+				t.Fatal(err)
 			}
+			checkWireProof(t, data, large, tc.problem)
 		})
 	}
 }
@@ -264,7 +386,9 @@ func TestValidateCapacityObservations(t *testing.T) {
 	small, large := observationRecord(t, SmallScale), observationRecord(t, LargeScale)
 	for _, tc := range []struct {
 		name, event, metrics, statusError, problem string
+		omitStatus                                 bool
 	}{
+		{name: "omitted running poll status", event: "status_poll", omitStatus: true, problem: "compaction state for status_poll sample"},
 		{name: "historical omission", event: "compaction_start"},
 		{name: "numeric zero and empty live pin set", event: "compaction_start",
 			metrics: `{"pending_compactions":0,"oldest_pinned_generation":null}`},
@@ -342,6 +466,9 @@ func TestValidateCapacityObservations(t *testing.T) {
 			if tc.metrics != "" {
 				s["candidate_status_metrics"] = jsontext.Value(tc.metrics)
 			}
+			if tc.omitStatus {
+				delete(s, "status")
+			}
 			if tc.statusError != "" {
 				s["status_error"], s["status"] = tc.statusError, nil
 			}
@@ -350,21 +477,26 @@ func TestValidateCapacityObservations(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			envelope := fmt.Appendf(nil, `{"schema_version":1,"fixture":%q,"mode":"live","cases":{%q:{"status":"pass","evidence":[%s,%s]}}}`,
-				FixtureID, Case, data, large)
-			for _, result := range []struct {
-				entry string
-				err   error
-			}{
-				{"ValidateRecord", ValidateRecord(data)},
-				{"ValidateReport", ValidateReport(envelope)},
-			} {
-				if tc.problem == "" && result.err != nil ||
-					tc.problem != "" && (result.err == nil || !strings.Contains(result.err.Error(), tc.problem)) {
-					t.Errorf("%s error = %v, want %q", result.entry, result.err, tc.problem)
-				}
-			}
+			checkWireProof(t, data, large, tc.problem)
 		})
+	}
+}
+
+func checkWireProof(t *testing.T, data, large []byte, problem string) {
+	t.Helper()
+	envelope := fmt.Appendf(nil, `{"schema_version":1,"fixture":%q,"mode":"live","cases":{%q:{"status":"pass","evidence":[%s,%s]}}}`,
+		FixtureID, Case, data, large)
+	for _, result := range []struct {
+		entry string
+		err   error
+	}{
+		{"ValidateRecord", ValidateRecord(data)},
+		{"ValidateReport", ValidateReport(envelope)},
+	} {
+		if problem == "" && result.err != nil ||
+			problem != "" && (result.err == nil || !strings.Contains(result.err.Error(), problem)) {
+			t.Errorf("%s error = %v, want %q", result.entry, result.err, problem)
+		}
 	}
 }
 
@@ -377,13 +509,15 @@ func observationRecord(t *testing.T, seed int) []byte {
 			{Lifetime: "restart", Ready: 1, Reaped: true, ExitCode: new(int(0))},
 		},
 	}
-	for i, pattern := range [...]string{"clustered", "scattered"} {
+	for _, pattern := range [...]string{"clustered", "scattered"} {
+		predecessor, generation := 38, 40
 		held, requested, final := seed-2*BatchRows, seed-BatchRows, seed
 		if pattern == "scattered" {
 			held, requested, final = seed, seed+BatchRows, seed+TailRows
+			predecessor, generation = 47, 52
 		}
 		var b backfillEvidence
-		if err := json.Unmarshal([]byte(cutoverTimeline(pattern, held, requested, final, i, i+1)), &b); err != nil {
+		if err := json.Unmarshal([]byte(cutoverTimeline(pattern, held, requested, final, predecessor, generation)), &b); err != nil {
 			t.Fatal(err)
 		}
 		start, overlap := b.Samples[0], &b.Samples[1]
@@ -404,7 +538,7 @@ func observationRecord(t *testing.T, seed int) []byte {
 	data, err := json.Marshal(record{
 		Fixture: fixture{seed, TailRows, LineBytes, BatchRows, MemoryLimit},
 		Status:  "pass", Workload: "pass", Phase: "complete", TimedOut: new(false), RecoveredRows: seed + TailRows,
-		Compaction:  compactionEvidence{"complete", 2, seed + BatchRows, seed + TailRows},
+		Compaction:  compactionEvidence{"complete", 52, seed + BatchRows, seed + TailRows},
 		Diagnostics: d,
 		Cleanup:     cleanupEvidence{Status: "pass", CandidateReaped: true, SubtreeEmpty: true, SubtreeRemoved: true, StoreRemoved: true},
 		CgroupLimit: new(uint64(MemoryLimit)), CgroupSwap: new(uint64(0)), CgroupOOM: new(uint64(0)), CgroupPeak: 2048,

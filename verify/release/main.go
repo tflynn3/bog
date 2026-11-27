@@ -22,6 +22,7 @@ func run(ctx context.Context, args []string) error {
 	revision := flags.String("revision", "", "full candidate commit SHA")
 	fixture := flags.String("fixture", "", "release fixture ID")
 	var output, admission, durability, capacity, parity string
+	var queryModelEvents, queryHandlerEvents string
 	var opts validationOptions
 	if validate {
 		opts.requireRetarget = os.Getenv("BOG_RELEASE_REQUIRE_RETARGET") == "1"
@@ -30,6 +31,8 @@ func run(ctx context.Context, args []string) error {
 		flags.StringVar(&durability, "durability", "", "durability report")
 		flags.StringVar(&capacity, "capacity", "", "capacity report")
 		flags.StringVar(&parity, "parity", "", "recovery parity report (required with -require-cutover)")
+		flags.StringVar(&queryModelEvents, "query-model-events", "", "native pinned query replay and #104 Go test JSON events")
+		flags.StringVar(&queryHandlerEvents, "query-handler-events", "", "native #104 candidate handler Go test JSON events")
 	} else {
 		flags.StringVar(&output, "report", "", "admission report output path")
 	}
@@ -69,6 +72,9 @@ func run(ctx context.Context, args []string) error {
 			if checkErr := validateFile(parity, id, cases, opts); checkErr != nil {
 				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
 			}
+		}
+		if queryModelEvents != "" || queryHandlerEvents != "" {
+			err = errors.Join(err, validateQueryQualification(queryModelEvents, queryHandlerEvents, id))
 		}
 		return err
 	}

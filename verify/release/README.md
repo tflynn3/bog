@@ -1,6 +1,8 @@
 # Linux release verification
 
-Dispatch the **Linux release verification** workflow with the full commit SHA.
+Dispatch the **Linux release verification** workflow with the full SHA of
+the reviewed revision containing both the #108 runtime wiring and #116 HTTP
+changes.
 Both native jobs must pass. The amd64 job uses `ubuntu-24.04` with
 `GOAMD64=v1`, and the arm64 job uses `ubuntu-24.04-arm` with
 `GOARM64=v8.0`. Each job builds the candidate once with Go 1.27.0 and
@@ -16,8 +18,9 @@ The release fixture ID is `linux-release-v1`. The workflow runs
 capacity control scope, and strict report validation from the workflow
 checkout (`gate`). It runs
 `go run ./verify/linux` (#3) and `go run ./bench/retained-history` (#32) from the
-candidate checkout. The query-model race suite runs from `gate`, which
-supplies the oracle and backfill test. The sibling commands provision their
+candidate checkout. The query-model race suite runs from `gate` against the
+pinned server. The direct HTTP handler fixtures compile from the candidate
+checkout. The sibling commands provision their
 Linux fixtures and use the supplied binary. The gate fails if any required
 evidence is missing, including on revisions with earlier harness entry points.
 The capacity producer runs as the runner user in a systemd service with delegated
@@ -91,6 +94,30 @@ The artifacts include `capacity-control-scope-events.jsonl`,
 `capacity_control_scope.log`, and the producer entry in `producers.txt`.
 Schema-v1 report validation continues to accept historical evidence.
 [ADR 0034](../../docs/adr/0034-capacity-control-release-qualification.md)
+
+## Query lifecycle qualification
+
+Both native jobs set `BOG_QUERY_VERIFY_104=1`. The gate checkout runs the
+baseline seeded replay on the ordinary and retained paths and the #104
+pinned fitting-page probe at opening limits 1 and 10 on both issuers.
+Both pinned tests must log the candidate revision and SHA-256. The runner
+checks the executable against its build-time checksum before and after
+each query race run.
+
+From the candidate checkout, the handler fixtures exercise socket delivery
+failures before and after headers, reuse of a capture slot, retirement and
+drain at capture capacity, and fitting pages at both opening limits. This
+uses the candidate's HTTP implementation for socket faults and paused
+resumes.
+
+The native validator consumes `query-model-events.jsonl` and
+`query-handler-events.jsonl` alongside the existing reports. It requires
+one passing event per required test and subtest and a passing package
+event from each run. A skip, failure, missing event, duplicate pass, or
+mismatched pinned identity blocks qualification. For local validation,
+provide both `-query-model-events` and `-query-handler-events` with the
+existing report arguments. Historical report validation still works with
+both event flags omitted.
 
 ## Durability evidence
 

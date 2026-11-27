@@ -320,6 +320,17 @@ func TestValidateCommand(t *testing.T) {
 	if err := run(t.Context(), args); err != nil {
 		t.Fatal(err)
 	}
+	modelPath := filepath.Join(dir, "query-model-events.jsonl")
+	handlerPath := filepath.Join(dir, "query-handler-events.jsonl")
+	writeFixture(t, modelPath, []byte(passingQueryEvents(t, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id)))
+	queryArgs := append(append([]string(nil), args...), "-query-model-events", modelPath, "-query-handler-events", handlerPath)
+	if err := run(t.Context(), queryArgs); !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), handlerPath) {
+		t.Fatalf("validation accepted missing query handler evidence: %v", err)
+	}
+	writeFixture(t, handlerPath, []byte(passingQueryEvents(t, queryHandlerTests, nil, id)))
+	if err := run(t.Context(), queryArgs); err != nil {
+		t.Fatalf("validation rejected passing query evidence: %v", err)
+	}
 	t.Setenv("BOG_RELEASE_REQUIRE_RETARGET", "1")
 	if err := run(t.Context(), args); err == nil || !strings.Contains(err.Error(), "durability report: case \"enospc\": healthy_to_full") {
 		t.Fatalf("native validation accepted historical durability evidence: %v", err)

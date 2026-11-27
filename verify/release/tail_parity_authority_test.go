@@ -22,7 +22,8 @@ const (
 	tailTestWAL        = "bog.wal.tail-fixture"
 )
 
-// tailParityAuthority mirrors the proposed encoding documented in ADR 0038.
+// tailParityAuthority decodes the v2 writable selector independently of
+// Storage. ADR 0038 defines the wire contract used by this probe.
 type tailParityAuthority struct {
 	Version int `json:"version"`
 	tailParityPoint
@@ -61,6 +62,14 @@ func readTailParityAuthority(root *os.Root) (tailParityAuthority, error) {
 	}
 	if a.Version != 2 {
 		return a, fmt.Errorf("unsupported selector version %d", a.Version)
+	}
+	if a.CoveredOffset < walMagicBytes || a.CommittedEnd < a.CoveredOffset {
+		return a, fmt.Errorf("invalid selector byte bounds [%d, %d)", a.CoveredOffset, a.CommittedEnd)
+	}
+	if a.NextOrdinal < 0 || a.CommittedOrdinal < a.NextOrdinal ||
+		(a.CommittedOrdinal == a.NextOrdinal) != (a.CommittedEnd == a.CoveredOffset) {
+		return a, fmt.Errorf("invalid selector ordinal bounds [%d, %d) for byte bounds [%d, %d)",
+			a.NextOrdinal, a.CommittedOrdinal, a.CoveredOffset, a.CommittedEnd)
 	}
 	if !strings.HasPrefix(a.Tail, "bog.wal.tail-") || a.Tail == "bog.wal.tail-" ||
 		strings.ContainsAny(a.Tail, "/\\\x00") {
@@ -139,6 +148,12 @@ func TestSelectedTailAuthorityFields(t *testing.T) {
 		{"covered ordinal", func(a *tailParityAuthority) { a.NextOrdinal++ }, "selected recovery point"},
 		{"committed offset", func(a *tailParityAuthority) { a.CommittedEnd++ }, "selected recovery point"},
 		{"committed ordinal", func(a *tailParityAuthority) { a.CommittedOrdinal++ }, "selected recovery point"},
+		{"covered offset before magic", func(a *tailParityAuthority) { a.CoveredOffset = walMagicBytes - 1 }, "invalid selector byte bounds"},
+		{"reversed offsets", func(a *tailParityAuthority) { a.CommittedEnd = a.CoveredOffset - 1 }, "invalid selector byte bounds"},
+		{"reversed ordinals", func(a *tailParityAuthority) { a.CommittedOrdinal = a.NextOrdinal - 1 }, "invalid selector ordinal bounds"},
+		{"negative ordinal", func(a *tailParityAuthority) { a.NextOrdinal = -1 }, "invalid selector ordinal bounds"},
+		{"nonempty bytes with empty ordinal span", func(a *tailParityAuthority) { a.CommittedOrdinal = a.NextOrdinal }, "invalid selector ordinal bounds"},
+		{"empty bytes with nonempty ordinal span", func(a *tailParityAuthority) { a.CommittedEnd = a.CoveredOffset }, "invalid selector ordinal bounds"},
 		{"suffix digest", func(a *tailParityAuthority) { a.SuffixSHA256 = strings.Repeat("0", 64) }, "selected recovery point"},
 		{"device", func(a *tailParityAuthority) { a.TailDevice++ }, "file identity"},
 		{"inode", func(a *tailParityAuthority) { a.TailInode++ }, "file identity"},
@@ -176,6 +191,18 @@ func TestSelectedTailAuthorityEnvelope(t *testing.T) {
 		{name: "duplicate version", want: "malformed JSON object", edit: func(payload []byte) (json.RawMessage, string) {
 			duplicate := append([]byte(`{"version":1,`), payload[1:]...)
 			return duplicate, parityDigest(duplicate)
+		}},
+		{name: "escaped duplicate version", want: "malformed JSON object", edit: func(payload []byte) (json.RawMessage, string) {
+			duplicate := append([]byte(`{"versio\u006e":2,`), payload[1:]...)
+			return duplicate, parityDigest(duplicate)
+		}},
+		{name: "wrong casing", want: `missing or null "tail"`, edit: func(payload []byte) (json.RawMessage, string) {
+			changed := bytes.Replace(payload, []byte(`"tail":`), []byte(`"Tail":`), 1)
+			return changed, parityDigest(changed)
+		}},
+		{name: "checksummed extension", edit: func(payload []byte) (json.RawMessage, string) {
+			extended := append([]byte(`{"extension":{"detail":true},`), payload[1:]...)
+			return extended, parityDigest(extended)
 		}},
 		{name: "null required field", want: `missing or null "tail"`, edit: func(payload []byte) (json.RawMessage, string) {
 			missing := bytes.Replace(payload, []byte(`"tail":"`+tailTestWAL+`"`), []byte(`"tail":null`), 1)

@@ -100,9 +100,12 @@ Schema-v1 report validation continues to accept historical evidence.
 Both native jobs set `BOG_QUERY_VERIFY_104=1`. The gate checkout runs the
 baseline seeded replay on the ordinary and retained paths and the #104
 pinned fitting-page probe at opening limits 1 and 10 on both issuers.
-Both pinned tests must log the candidate revision and SHA-256. The runner
-checks the executable against its build-time checksum before and after
-each query race run.
+The same run includes `TestPinnedQueryGenerationReplacement`, which
+checks held and fresh query results across two generation replacements,
+byte-exact terminal replay, and capture release on a writable tail-only
+restore. Each of the three pinned tests logs the candidate revision and
+SHA-256. The runner checks the executable against its build-time checksum
+before and after each query race run.
 
 From the candidate checkout, the handler fixtures exercise socket delivery
 failures before and after headers, reuse of a capture slot, retirement and
@@ -110,14 +113,18 @@ drain at capture capacity, and fitting pages at both opening limits. This
 uses the candidate's HTTP implementation for socket faults and paused
 resumes.
 
-The native validator consumes `query-model-events.jsonl` and
-`query-handler-events.jsonl` alongside the existing reports. It requires
-one passing event per required test and subtest and a passing package
-event from each run. A skip, failure, missing event, duplicate pass, or
-mismatched pinned identity blocks qualification. For local validation,
-provide both `-query-model-events` and `-query-handler-events` with the
-existing report arguments. Historical report validation still works with
-both event flags omitted.
+Strict cutover validation requires both `-query-model-events` and
+`-query-handler-events` alongside the existing report arguments. Pass
+`query-model-events.jsonl` from the gate checkout and
+`query-handler-events.jsonl` from the candidate checkout. The validator
+requires one passing event per required test and subtest and one package
+pass from each run. The replacement test must report exactly one matching
+full revision and SHA-256 before its single pass, and that pass must appear
+before the model package pass. A required skip, a failure, or missing,
+duplicate, or mismatched required evidence blocks qualification.
+Historical report validation allows both event flags to be omitted. If
+either is supplied, both are required and the existing replay and handler
+checks apply.
 
 ## Durability evidence
 

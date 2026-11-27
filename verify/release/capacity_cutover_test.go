@@ -4,6 +4,7 @@ import (
 	jsonv1 "encoding/json"
 	"encoding/json/jsontext"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +93,48 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
 		}
 		releaseArgs = append(releaseArgs, "-"+companion.name, path)
 	}
+	modelPath := filepath.Join(dir, "query-model-events.jsonl")
+	handlerPath := filepath.Join(dir, "query-handler-events.jsonl")
+	writeFixture(t, modelPath, []byte(passingCutoverQueryEvents(t, id)))
+	writeFixture(t, handlerPath, []byte(passingQueryEvents(t, queryHandlerTests, nil, id)))
+	modelArgs := []string{"-query-model-events", modelPath}
+	handlerArgs := []string{"-query-handler-events", handlerPath}
+	t.Run("strict CLI requires both query artifacts", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "capacity.json")
+		writeFixture(t, path, data)
+		for _, tc := range []struct {
+			name    string
+			flags   []string
+			missing string
+		}{
+			{"neither flag", nil, "-query-model-events, -query-handler-events"},
+			{"only model flag", modelArgs, "-query-handler-events"},
+			{"only handler flag", handlerArgs, "-query-model-events"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				args := append(append([]string(nil), releaseArgs...), "-capacity", path)
+				err := run(t.Context(), append(args, tc.flags...))
+				want := "query qualification requires both -query-model-events and -query-handler-events: missing " + tc.missing + ": " + os.ErrNotExist.Error()
+				if !errors.Is(err, os.ErrNotExist) || err.Error() != want {
+					t.Fatalf("validation = %v, want %q", err, want)
+				}
+			})
+		}
+		args := append(append([]string(nil), releaseArgs...), "-capacity", path)
+		args = append(args, "-query-model-events", modelPath, "-query-handler-events", handlerPath)
+		archivedPath := filepath.Join(t.TempDir(), "archived-model-events.jsonl")
+		writeFixture(t, archivedPath, []byte(passingQueryEvents(t, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id)))
+		want := fmt.Sprintf("query model events: validate %q: %s reported 0 passes, expected 1\n%s reported 0 candidate identities, expected 1",
+			archivedPath, pinnedQueryReplacement, pinnedQueryReplacement)
+		if err := run(t.Context(), append(args, "-query-model-events", archivedPath)); err == nil || err.Error() != want {
+			t.Fatalf("validation = %v, want %q", err, want)
+		}
+		if err := run(t.Context(), args); err != nil {
+			t.Fatalf("strict validation rejected complete evidence: %v", err)
+		}
+	})
+	releaseArgs = append(releaseArgs, modelArgs...)
+	releaseArgs = append(releaseArgs, handlerArgs...)
 	type object = map[string]any
 	at := func(o object, key string) object { return o[key].(map[string]any) }
 	index := func(o object, key string, i int) object { return o[key].([]any)[i].(map[string]any) }

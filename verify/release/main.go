@@ -26,13 +26,13 @@ func run(ctx context.Context, args []string) error {
 	var opts validationOptions
 	if validate {
 		opts.requireRetarget = os.Getenv("BOG_RELEASE_REQUIRE_RETARGET") == "1"
-		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require live capacity, recovery parity, immediate post-restore crash, and two-cycle tail-only evidence")
+		flags.BoolVar(&opts.requireCutover, "require-cutover", os.Getenv("BOG_RELEASE_REQUIRE_CUTOVER") == "1", "require live capacity, full recovery parity, and candidate-bound query replacement evidence")
 		flags.StringVar(&admission, "admission", "", "admission report")
 		flags.StringVar(&durability, "durability", "", "durability report")
 		flags.StringVar(&capacity, "capacity", "", "capacity report")
 		flags.StringVar(&parity, "parity", "", "recovery parity report (required with -require-cutover)")
-		flags.StringVar(&queryModelEvents, "query-model-events", "", "native pinned query replay and #104 Go test JSON events")
-		flags.StringVar(&queryHandlerEvents, "query-handler-events", "", "native #104 candidate handler Go test JSON events")
+		flags.StringVar(&queryModelEvents, "query-model-events", "", "native pinned query model Go test JSON events (required with -require-cutover)")
+		flags.StringVar(&queryHandlerEvents, "query-handler-events", "", "native candidate handler Go test JSON events (required with -require-cutover)")
 	} else {
 		flags.StringVar(&output, "report", "", "admission report output path")
 	}
@@ -73,8 +73,8 @@ func run(ctx context.Context, args []string) error {
 				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
 			}
 		}
-		if queryModelEvents != "" || queryHandlerEvents != "" {
-			err = errors.Join(err, validateQueryQualification(ctx, queryModelEvents, queryHandlerEvents, id))
+		if opts.requireCutover || queryModelEvents != "" || queryHandlerEvents != "" {
+			err = errors.Join(err, validateQueryQualification(ctx, queryModelEvents, queryHandlerEvents, id, opts.requireCutover))
 		}
 		return err
 	}

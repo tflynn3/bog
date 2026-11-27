@@ -49,6 +49,21 @@ forbidden package. The import check protects this dependency direction.
 Command tests must verify that the CLI uses only read-only operations from
 the packages it imports. [Operator boundary fitness tests](../../internal/archtest/operator_boundary_test.go)
 
+## Linux restore drill evidence
+
+The CLI drill compares the restored server with the immutable bundle before
+and after an operator-controlled restart, with writes paused for both phases.
+The opt-in Linux test harness supplies the restart boundary and launches an
+explicit candidate on a separate disposable restore. After both read-only
+comparisons succeed, the harness submits one backfill batch with tied
+timestamps through HTTP and requires a 204 response. It restarts the same
+binary on the same data directory, verifies listener ownership, and compares
+the complete ordered walk through the terminal page against the original
+fixture and the batch in append order for equal timestamps. It then verifies
+the reference bundle at its original recovery point. The harness owns fixture
+setup, append submission, and process lifecycle. The server owns writable
+recovery and publication. [Native Linux test invocation](../../cmd/bog-verify/README.md#restore-drill)
+
 ## Registration and release
 
 Core engineering maintains the command's role and measured direct imports
@@ -60,9 +75,8 @@ cycle, and reachability checks.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Command root boundaries](0012-command-root-boundaries.md)
 
-#53 remains the release gate. Operator parity uses the verified image as
-its reference. Release parity uses fixture inputs and the independent
-append-log oracle to qualify the pinned server binary, including a live
-append and an exact walk after restart. Operator results describe the
-selected image and endpoint at the checked query scope.
+`verify/release` remains the authority for release parity. It uses fixture
+inputs and the independent append-log oracle to qualify the pinned server
+binary, including a live append and an exact walk after restart. Operator
+results describe the selected image and endpoint at the checked query scope.
 [Release verifier composition](0008-release-verifier-composition.md)

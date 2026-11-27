@@ -3,14 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,18 +26,21 @@ import (
 )
 
 // TestRestoreDrillShippedServer exercises the separately built server binary
-// on a disposable copy of a verified reference image, including restart.
+// on a disposable restore, first for read-only parity and then for writable recovery.
 func TestRestoreDrillShippedServer(t *testing.T) {
-	binary := os.Getenv("BOG_RESTORE_DRILL_BINARY")
-	if binary == "" {
+	binary, supplied := os.LookupEnv("BOG_RESTORE_DRILL_BINARY")
+	if !supplied {
 		t.Skip("set BOG_RESTORE_DRILL_BINARY to the shipped retained-restore server")
+	}
+	if binary == "" {
+		t.Fatal("BOG_RESTORE_DRILL_BINARY is empty")
 	}
 	binary, err := filepath.Abs(binary)
 	check(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	t.Cleanup(cancel)
 
-	bundle, _, point := makeBundle(t)
+	bundle, rows, point := makeBundle(t)
 	restored := filepath.Join(t.TempDir(), "restored")
 	check(t, backup.Restore(ctx, bundle, restored))
 	reserved, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -57,18 +63,142 @@ func TestRestoreDrillShippedServer(t *testing.T) {
 		if err := current.stop(); err != nil {
 			return err
 		}
-		current, err = startDrillCandidate(t, ctx, binary, restored, addr)
-		return err
+		next, err := startDrillCandidate(t, ctx, binary, restored, addr)
+		if err != nil {
+			return err
+		}
+		current = next
+		return nil
 	})
 	var out bytes.Buffer
 	status, err := drillBackup(ctx, opts, server, boundary, &out)
 	if err != nil || status != exitOK {
 		t.Fatalf("restore drill exit %d: %v\n%s", status, err, &out)
 	}
-	check(t, current.checkListener(addr.Port))
-	check(t, current.stop())
 	if strings.Count(out.String(), "rows=4") != 2 || strings.Count(out.String(), formatPoint(point)) != 2 {
 		t.Fatalf("unexpected drill result:\n%s", &out)
+	}
+
+	// Backfill across the checkpoint and committed tail ties. Reverse lexical
+	// order within the new batch makes an incorrect line tie-break visible.
+	added := []client.Row{
+		{TS: opts.query.Start, Line: "keep-backfill-z"},
+		{TS: opts.query.Start, Line: "keep-backfill-a"},
+	}
+	var batch bytes.Buffer
+	encoder := json.NewEncoder(&batch)
+	for _, row := range added {
+		check(t, encoder.Encode(row))
+	}
+	check(t, current.checkListener(addr.Port))
+	outcome, err := server.Ingest(ctx, batch.Bytes())
+	if err != nil || outcome != client.IngestCommitted {
+		t.Fatalf("post-drill ingest: want HTTP 204, got outcome %v, error %v", outcome, err)
+	}
+	server.CloseIdleConnections()
+	if err := boundary.WaitForRestart(ctx); err != nil {
+		t.Fatalf("restart after acknowledged ingest: %v", err)
+	}
+
+	// Walk the entire fixture, including the rows excluded by the CLI drill.
+	query := opts.query
+	query.Contains = ""
+	query.End = query.End.Add(time.Nanosecond)
+	want := slices.Concat(rows, added)
+	slices.SortStableFunc(want, func(a, b client.Row) int { return a.TS.Compare(b.TS) })
+	check(t, compareRecoveredRows(ctx, server, query, opts.maxPages, want))
+	check(t, current.checkListener(addr.Port))
+	check(t, current.stop())
+
+	verified, err := backup.Verify(ctx, bundle)
+	check(t, err)
+	if verified != point {
+		t.Fatalf("reference recovery point changed: want %s, got %s", formatPoint(point), formatPoint(verified))
+	}
+}
+
+func compareRecoveredRows(ctx context.Context, server *client.Client, query client.Query, maxPages int, want []client.Row) error {
+	walk, err := server.NewBoundedWalk(query, maxPages)
+	if err != nil {
+		return err
+	}
+	reference := func(context.Context) (queryPage, error) {
+		// compare consumes its input pages.
+		return queryPage{rows: slices.Clone(want), terminal: true}, nil
+	}
+	live := func(ctx context.Context) (queryPage, error) {
+		p, err := walk.NextPage(ctx)
+		return queryPage{rows: p.Rows, terminal: p.NextCursor == ""}, err
+	}
+	if _, _, err := compare(ctx, reference, live); err != nil {
+		return fmt.Errorf("post-ingest recovery: %w", err)
+	}
+	return nil
+}
+
+func TestCompareRecoveredRows(t *testing.T) {
+	t.Parallel()
+	start, err := time.Parse(time.RFC3339, fixtureStart)
+	check(t, err)
+	query := client.Query{Start: start, End: start.Add(time.Second), Limit: 2}
+	want := []client.Row{{TS: start, Line: "z"}, {TS: start, Line: "a"}, {TS: start, Line: "a"}}
+	for _, tc := range []struct {
+		name      string
+		pages     [][]string
+		maxPages  int
+		wantError string
+	}{
+		{"empty terminal page", [][]string{{"z", "a"}, {"a"}, nil}, 3, ""},
+		{"missing duplicate", [][]string{{"z", "a"}, nil}, 3, "length mismatch at row 3"},
+		{"reordered ties", [][]string{{"a", "z"}, {"a"}}, 3, "line mismatch at row 1"},
+		{"unexpected trailing row", [][]string{{"z", "a"}, {"a"}, {"extra"}}, 3, "length mismatch at row 4"},
+		{"budget before terminal", [][]string{{"z", "a"}, {"a"}, nil}, 2, client.ErrPageBudget.Error()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			responses := make(map[string]client.Page)
+			cursor := ""
+			for i, lines := range tc.pages {
+				var page client.Page
+				for _, line := range lines {
+					page.Rows = append(page.Rows, client.Row{TS: start, Line: line})
+				}
+				if i+1 < len(tc.pages) {
+					page.NextCursor = fixtureCursor(byte(i + 1))
+				}
+				responses[cursor] = page
+				cursor = page.NextCursor
+			}
+			httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				page, ok := responses[r.URL.Query().Get("cursor")]
+				if !ok {
+					http.Error(w, "unexpected cursor", http.StatusBadRequest)
+					return
+				}
+				if page.NextCursor != "" {
+					w.Header().Set("Bog-Next-Cursor", page.NextCursor)
+				}
+				encoder := json.NewEncoder(w)
+				for _, row := range page.Rows {
+					if err := encoder.Encode(row); err != nil {
+						t.Errorf("write query row: %v", err)
+						return
+					}
+				}
+			}))
+			defer httpServer.Close()
+			server, err := client.New(httpServer.URL, nil)
+			check(t, err)
+			defer server.CloseIdleConnections()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			err = compareRecoveredRows(ctx, server, query, tc.maxPages, want)
+			if tc.wantError == "" {
+				check(t, err)
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("want error containing %q, got %v", tc.wantError, err)
+			}
+		})
 	}
 }
 

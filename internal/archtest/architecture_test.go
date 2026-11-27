@@ -40,9 +40,10 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// At 26535d86d556b, cmd/bog reaches HTTP, readiness, store, and WAL on both
+// At 62d13b7fa374, cmd/bog reaches HTTP, readiness, store, and WAL on both
 // Linux targets. Promote retained libraries with measured #108 wiring and
-// activation evidence. The offline backup consumer is already registered.
+// activation evidence. The operator's direct backup import is independent
+// of server reachability.
 var registry = map[string]rule{
 	exportCommand:                {verifier, []string{goClient}},
 	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
@@ -410,7 +411,13 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 				problems = append(problems, fmt.Sprintf("forbidden production import: %s -> %s", path, imported))
 			}
 		}
+		registeredImports := make(map[string]bool, len(r.imports))
 		for _, imported := range r.imports {
+			if registeredImports[imported] {
+				problems = append(problems, fmt.Sprintf("duplicate production import registration: %s -> %s", path, imported))
+				continue
+			}
+			registeredImports[imported] = true
 			if _, isLocal := production[imported]; !isLocal || !slices.Contains(imports, imported) {
 				problems = append(problems, fmt.Sprintf("stale production import registration: %s -> %s", path, imported))
 			}
@@ -422,6 +429,78 @@ func architectureProblems(packages map[string]listedPackage, rules map[string]ru
 	}
 	problems = append(problems, storageDirectionProblems(packages, production)...)
 	return problems
+}
+
+func TestRetainedCommandImportRegistrations(t *testing.T) {
+	t.Parallel()
+	const (
+		backup     = "bog/internal/backup"
+		checkpoint = "bog/internal/checkpoint"
+		history    = "bog/internal/history"
+		store      = "bog/internal/store"
+		wal        = "bog/internal/wal"
+	)
+	for _, tt := range []struct {
+		name, importer string
+		imports        []string
+		want           []string
+	}{
+		{name: "checkpoint reaches the server through history"},
+		{
+			name:     "registry adds an unmeasured direct checkpoint edge",
+			importer: server,
+			imports:  []string{backup, checkpoint, history, wal},
+			want:     []string{"stale production import registration: " + server + " -> " + checkpoint},
+		},
+		{
+			name:     "registry omits a measured server import of backup",
+			importer: server,
+			imports:  []string{history, wal},
+			want:     []string{"forbidden production import: " + server + " -> " + backup},
+		},
+		{
+			name:     "registry duplicates the server backup edge",
+			importer: server,
+			imports:  []string{backup, history, wal, backup},
+			want:     []string{"duplicate production import registration: " + server + " -> " + backup},
+		},
+		{
+			name:     "registry duplicates the offline backup edge",
+			importer: operatorCommand,
+			imports:  []string{backup, goClient, store, backup},
+			want:     []string{"duplicate production import registration: " + operatorCommand + " -> " + backup},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rules := map[string]rule{
+				server:          {serverCommand, []string{backup, history, wal}},
+				operatorCommand: {verifier, []string{backup, goClient, store}},
+				backup:          {runtimeLibrary, []string{store}},
+				checkpoint:      {runtimeLibrary, []string{store}},
+				history:         {runtimeLibrary, []string{checkpoint, store}},
+				store:           {role: runtimeLibrary},
+				wal:             {runtimeLibrary, []string{store}},
+				goClient:        {standalone, []string{store}},
+			}
+			packages := make(map[string]listedPackage, len(rules))
+			for path, entry := range rules {
+				name := "library"
+				if path == server || path == operatorCommand {
+					name = "main"
+				}
+				packages[path] = productionPackage(name, entry.imports...)
+			}
+			if tt.importer != "" {
+				entry := rules[tt.importer]
+				entry.imports = tt.imports
+				rules[tt.importer] = entry
+			}
+			if got := architectureProblems(packages, rules); !slices.Equal(got, tt.want) {
+				t.Errorf("architectureProblems() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 // Follow production imports through dependencies outside the root module too.

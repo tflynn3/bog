@@ -1,19 +1,35 @@
 # ADR 0049 — Retained runtime promotion
 
-**Status** — Promotion criteria recorded for Cycle 191. The reviewed #108
-Storage revision, package promotions, and native qualification are pending.
+**Status** — Baseline remeasured for Cycle 193. The reviewed #108 Storage
+handoff, package promotions, and native qualification are pending.
 
 ## Context
 
-At `26535d86d556b9700bfb8a8b6c2c8379dcbfc094`, the Linux amd64 and arm64
+At `62d13b7fa3744feb213d227de10e8ee2b496b4a7`, the Linux amd64 and arm64
 inventories agree on 19 root-module production packages and 23 direct
-imports. The server's direct imports are HTTP, readiness, store, and WAL.
-It replays the ordinary WAL into memory and uses the legacy paging and
-path-based readiness constructors. History imports checkpoint and store.
+imports. The server's four direct root-module imports, HTTP, readiness,
+store, and WAL, are also its entire root-module dependency closure.
+`cmd/bog.run` opens the ordinary WAL into a `store.Store` and installs
+`newReadyHandler`. That helper passes the store to
+`httpapi.NewWithQueryLimits` and the configured path to
+`readiness.NewHandler`. `wal.Log.Capture` pins the published WAL prefix
+and its bounds under the WAL mutex. The serving path has no adapter
+that pairs this capture with a retained generation.
+History imports checkpoint and store.
 Checkpoint and backup each import store. The operator command already
 imports backup for offline image verification. Checkpoint, history, and
 backup remain staged at this revision.
 [Measured system graph](../architecture/SYSTEM.md#declared-linux-production-import-graph)
+
+## Storage handoff
+
+Core Architecture owns the record and fitness changes. Storage owns
+#108's recovery, publication, and command wiring, including #47's
+shutdown cleanup and #15's startup filesystem diagnostics. Recheck the
+active write leases at handoff and bind the evidence to the reviewed
+Storage SHA. The measured base supplies the topology before cutover.
+The reviewed wiring SHA and its activation evidence are required for
+each role change.
 
 ## Decision
 
@@ -35,9 +51,16 @@ owner synchronization. HTTP keeps ownership of admission, paging,
 delivery, and capture retirement and receives the source through
 `httpapi.NewWithPageSource`. Readiness uses
 `readiness.NewHandlerForDirectory` with a fresh, unlocked open relative to
-the pinned WAL directory. The command cancels probes before closing the
-descriptor and drains admitted HTTP and storage users before releasing
-the WAL lock.
+the pinned WAL directory. Check directory identity at the serving call
+site and confirm that readiness samples it after a configured-path
+retarget. Cancel probes before closing their handle and keep a stalled
+sample out of the drain path.
+
+Stop admission and drain HTTP. Close the HTTP API to retire captures and
+wait for admitted users and source releases. Drain admitted maintenance
+and export work before closing storage and releasing the WAL lock.
+Review startup error cleanup and verify that a failed drain retains the
+lock until process exit.
 [Constructor and ownership checks](0040-retained-runtime-constructor-boundary.md),
 [Query lifecycle and shutdown](0039-query-delivery-and-retained-cutover.md)
 
@@ -47,11 +70,13 @@ Storage SHA and the corresponding activation evidence is available.
 
 | Library | Activation evidence |
 | --- | --- |
-| `internal/checkpoint` | Validate and publish the successor under pinned storage authority, with durable selection and live replacement at the requested cutoff. |
+| `internal/checkpoint` | Validate and durably select the successor under pinned storage authority before live activation at the requested cutoff. |
 | `internal/history` | Serve ordered checkpoint and suffix rows through the command-owned page source. Demonstrate a held cursor through replacement and acknowledged backfill, plus exact fresh and restarted walks and final pin drain. |
 | `internal/backup` | Use backup APIs in server composition. Start writable on a verified restore, acknowledge a new append, and demonstrate exact HTTP parity after restart. Preserve `cmd/bog-verify`'s direct offline import. |
 
 Keep idempotency staged until its separate keyed-ingest criteria are met.
+Operator backup consumption leaves the backup library staged until
+server reachability and its writable restore evidence are available.
 The release producers continue to exercise a separate pinned process and
 the query oracle stays independent. HTTP and readiness stay outside the
 retained storage dependency tree. Checkpoint and backup consume their
@@ -79,18 +104,30 @@ Core Architecture and Storage review the exact direct edges and server
 closure from both Linux inventories and update the fitness registry,
 staging declarations, SYSTEM.md graph and table, and measured SHA in the
 same PR. Run the architecture suite on the combined revision before
-merge. It checks production boundaries, cycles, package reachability and
-staging, documentation parity, and typed constructor references for each
-Linux target. The constructor guard applies if either the registered role
-or measured server reachability calls for it. Review the source and
-descriptor passed at the serving call sites as part of the handoff.
+merge. Run `go vet ./internal/archtest`,
+`go test -race -count=1 ./internal/archtest`, and
+`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...`. The suite checks
+production boundaries, cycles, orphan registrations, package reachability
+and staging, documentation parity, and typed constructor references for
+each Linux target. The constructor guard applies if either the registered
+role or measured server reachability calls for it. Source review must
+trace the serving adapter from the HTTP constructor to synchronized
+generation and WAL suffix acquisition, and trace the probe descriptor
+from the readiness constructor to the independent directory open.
 
 Release Verification qualifies the same clean composed revision on
 native Linux amd64 and arm64 using each job's SHA-256-pinned binary.
 Require strict evidence at 196,608 and 393,216 rows under a 128 MiB cgroup
 cap with swap disabled, including exact replacement and restart walks,
 restored parity, readiness after directory retargets, and verified
-cleanup. The Linux cross-build verifies compilation. The two native
-verdicts establish qualification.
+cleanup. Reclamation evidence covers the held predecessor, admitted
+readers after cursor retirement, final pin drain and artifact removal,
+and intact successor storage. The release fixture exercises the
+verifier's ability to detect a retained predecessor and a stalled reader.
+
+The Linux inventories measure topology and the cross-build verifies
+compilation. Record the native amd64 and arm64 verdicts against the
+composed candidate revision and each runner's binary checksum. Both are
+pending. #108 remains the release gate.
 [System fitness and registry ownership](../architecture/SYSTEM.md#fitness-and-registry-ownership),
 [Native release evidence](../architecture/SYSTEM.md#release-evidence)

@@ -144,13 +144,18 @@ scenario.
 
 The probe requires the following observations in order.
 
-1. Publish a predecessor with a committed suffix and open a one-row
+1. Publish a predecessor with a committed suffix. Read the writable
+   selector and manifest from the pinned directory and record the
+   predecessor's manifest, tail, and segment identities. Open a one-row
    page with a continuation. Admit the continuation on a socket with a
    small receive window, read the headers, and wait for TCP zero-window
    backpressure. A competing query must receive HTTP 503 because the
    continuation occupies the sole query slot.
 2. Acknowledge backfill and publish the successor at the exact cutoff.
-   Observe exactly one retired predecessor pin and confirm that the
+   Identify the predecessor-exclusive files and the files shared with
+   the successor. Record the successor's selector, file identities,
+   and content digests. Require exactly one retired predecessor pin
+   and a candidate-owned descriptor for its tail. Confirm that the
    continuation still occupies the slot and remains backpressured.
 3. Verify listener ownership and send SIGTERM. Before releasing the
    response, require new connections to be refused, the candidate to
@@ -162,10 +167,25 @@ The probe requires the following observations in order.
    no continuation header or trailer, and the exact predecessor rows
    in order, including ties and duplicates. Require zero exit status
    and reap the original process before restart.
-5. Restart the same binary on the same directory and walk through
+5. Before restart, reacquire the exclusive lock with a fresh open of
+   the pinned directory. While holding it, require predecessor-exclusive
+   paths and file identities to be absent throughout the directory tree,
+   including staging paths. Require the successor selector, file
+   identities, and contents to match the observations from replacement,
+   including shared files. Release the lock.
+6. Restart the same binary on the same directory and walk through
    exhaustion. Compare every row in order and with exact multiplicity
    against the independent ledger of acknowledged appends, including
    backfill. Require child teardown and fixture cleanup.
+
+The native shutdown run observes the held pin and descriptor while the
+candidate is alive and verifies reclaimed files before startup recovery can
+intervene. The release retirement fixture supplies the corresponding live
+baseline after final reader drain, with an explicit zero retired pin count
+and no predecessor descriptor. Storage's command lifecycle test supplies
+the ordering evidence for resource closure before WAL lock release and
+must verify lock retention on failed drain. Review that evidence on the
+composed candidate along with both native gate results.
 
 In each native artifact, inspect `retained-shutdown-events.jsonl`,
 `retained_shutdown.log`, and `producers.txt`. The gate requires exactly
@@ -175,6 +195,9 @@ pass blocks qualification. The manifest must contain one exit-zero
 `retained_shutdown` record with the expected candidate revision, native
 architecture, and gate checkout SHA. This is a workflow evidence check.
 Historical schema-v1 report validation still uses the existing reports.
+Recheck the active write leases at dispatch and at the reviewed Storage
+handoff. Bind both native results to the same composed revision and record
+the binary digest for each architecture.
 [Gate evidence checks](../../docs/adr/0048-release-gate-evidence-checks.md#retained-shutdown),
 [Retained-shutdown test](retained_shutdown_linux_test.go)
 

@@ -146,10 +146,6 @@ func pinBinary(source, dest, revision string) (digest string, err error) {
 	return digest, nil
 }
 
-func writeReport(path string, r report) error {
-	return (capacityevidence.ReportPublisher{}).WriteReport(path, r)
-}
-
 func createFixtureRoot(parent string) (string, error) {
 	if parent == "" {
 		parent = os.TempDir()
@@ -166,6 +162,7 @@ func createFixtureRoot(parent string) (string, error) {
 func run(ctx context.Context, args []string, publish func(string, report) error) (err error) {
 	var o options
 	var cutoverReport, correlatedReport string
+	var createOnly bool
 	f := flag.NewFlagSet("retained-history", flag.ContinueOnError)
 	f.StringVar(&correlatedReport, "validate-capacity-correlation", "", "require correlated capacity proof in an existing report")
 	f.BoolVar(&o.requireCorrelation, "require-capacity-correlation", false, "require replay, pin age, capacity credit, and cgroup peak for each live replacement")
@@ -174,6 +171,7 @@ func run(ctx context.Context, args []string, publish func(string, report) error)
 	f.StringVar(&o.revision, "revision", "", "full lowercase commit SHA")
 	f.StringVar(&o.fixture, "fixture", "", "fixture ID (linux-release-v1)")
 	f.StringVar(&o.report, "report", "", "schema-v1 JSON report path")
+	f.BoolVar(&createOnly, "report-create-only", false, "create a report in the inherited directory on descriptor 3")
 	f.StringVar(&o.mode, "mode", "live", "live or legacy")
 	f.StringVar(&o.workDir, "work-dir", "", "parent for disposable stores on a local Linux filesystem")
 	f.StringVar(&o.cgroupParent, "cgroup-parent", "", "delegated cgroup v2 parent (default: current cgroup)")
@@ -204,6 +202,13 @@ func run(ctx context.Context, args []string, publish func(string, report) error)
 	source, sourceErr := os.Stat(o.binary)
 	if dest, destErr := os.Stat(o.report); sourceErr == nil && destErr == nil && os.SameFile(source, dest) {
 		return errors.New("binary and report refer to the same file")
+	}
+	if createOnly {
+		proof, err := openProofDestination(o.report)
+		if err != nil {
+			return err
+		}
+		publish = func(_ string, r report) error { return proof.publish(r) }
 	}
 	ctx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()

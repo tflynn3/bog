@@ -1,24 +1,23 @@
 # ADR 0052 — Shared verifier report publication
 
-**Status** — Private transaction extracted for Cycle 201. Shared package
-and delegated runner adoption are proposed for a follow-up PR.
+**Status** — Adopted for shared report publication and delegated Linux capacity.
 
 ## Context
 
-`verify/release` and `bench/retained-history` publish standalone reports
-through `capacityevidence.ReportPublisher.WriteReport`. The nested
-`bench/segment-layout` module also uses this API. The Linux delegated
-runner has a separate transaction and opens its report and capacity proof
-parents before starting the workload. Its early absence checks can reject
-stale outputs, but another writer can create either entry before the final
-rename. Ordinary replacement would overwrite that writer's evidence.
+Release and retained-history originally shared a private replacement
+transaction with the nested `bench/segment-layout` module. The Linux
+delegated runner opened both output parents before the workload and used
+a separate transaction. Its early absence checks reject stale outputs.
+A writer can still create either entry before commit, so delegated
+outputs require atomic create-only semantics.
 [Shared capacity evidence](0020-shared-capacity-evidence.md),
 [Runner destination checks](../../verify/linux/runner_destinations.go)
 
 ## Transaction boundary
 
-The private Go transaction takes a context, an already-open pinned parent,
-a validated destination basename, and encoded bytes. The basename is one
+The shared `reportpublication.Publish` transaction takes a context, an
+already-open pinned parent, a destination basename, encoded bytes, and
+an explicit replacement or create-only mode. The basename is one
 filename component, excluding an empty name, `.`, and `..`. The transaction
 returns the publication state and an operation error. The caller owns the
 parent and must keep it open for the whole call. The transaction owns each staging file
@@ -46,25 +45,24 @@ opening the parent. It splits the path without cleaning the parent spelling
 so the filesystem resolves symlinks and dot segments in order. It uses
 replacement semantics, mode `0600` at staging creation, and the existing
 16-attempt collision budget. It closes the parent it opened and wraps
-errors with the original path and actual publication state. The release and
-retained-history callers already reach the transaction through this API.
-[Transaction and compatibility wrapper](../../verify/capacityevidence/report_publication.go)
+errors with the original path and actual publication state. Release and
+retained-history encode their reports and call the shared replacement
+entry point. The capacity evidence package keeps its compatibility API for
+the nested benchmark.
+[Shared transaction](../../verify/reportpublication/publication.go),
+[Compatibility wrapper](../../verify/capacityevidence/report_publication.go)
 
 ## Delegated adoption
 
-Move the transaction and directory-relative publication operations into
-`verify/reportpublication` as verifier support independent of report
-schemas and validation. The shared transaction takes encoded bytes. Each
-producer owns encoding, schema, candidate identity, and evidence
-acceptance. Keep standalone release, retained-history, segment-layout, and
-runner preflight publication on explicit replacement. Migrate the nested
-benchmark's publishing call or keep a compatibility wrapper backed by the
-shared package.
+`verify/reportpublication` is verifier support. Each producer owns
+encoding, schema, candidate identity, and evidence acceptance. Standalone
+release, retained-history, segment-layout, and runner preflight publication
+use replacement.
 
 Delegated capacity requires create-only commits for both supervisor evidence
 and the proof emitted by the capacity producer. Keep the early absence and
-alias checks for diagnostics. Pass the producer an explicit create-only
-mode along with its inherited proof-parent descriptor. Enforce absence
+alias checks for diagnostics. The runner passes `-report-create-only` and its pinned proof parent on
+descriptor 3. The producer uses that descriptor directly. Enforce absence
 at the commit point with descriptor-relative Linux
 `renameat2(RENAME_NOREPLACE)` in the pinned parent. An existing entry,
 including a symlink, yields an unpublished outcome with an
@@ -74,12 +72,13 @@ publication.
 The supervisor retains ownership of each pinned parent until its last use,
 through workload completion and proof reading for the proof parent, and
 through final publication for the report parent. The producer owns the
-handles it opens or receives in its own process. Each caller closes its own handles once
-and joins close errors with the relevant operation error. Keep the
-destination identity and executable alias checks, and keep proof reading
-bound to the pinned parent and expected regular file. A producer
-publication conflict must fail the delegated run and the competing entry
-must never count as proof of that run.
+handles it opens or receives in its own process. Each caller closes its
+own handles once and joins close errors with the relevant operation error.
+Destination identity and executable alias checks stay at the runner.
+After a successful producer exit, the supervisor opens the expected regular
+file relative to the pinned parent and reads at most 4 MiB of proof bytes,
+with one additional byte to detect oversize input. Producer exit failure and
+publication conflicts fail the delegated run before proof decoding.
 [Runner transaction](../../verify/linux/runner_report.go),
 [Proof descriptor handoff](../../verify/linux/capacity_runner_linux.go)
 
@@ -96,25 +95,17 @@ Exercise successful create-only commit and directory sync failure, and
 retain the standalone replacement, path-retarget, cancellation, and alias
 fixtures.
 
-In the adoption PR, register `verify/reportpublication` as verifier
-support with zero root-module production imports. Update the exact direct
-imports for `verify/release`, `verify/linux`, and `bench/retained-history`
-to include it. If a compatibility wrapper remains in
-`verify/capacityevidence`, explicitly register and allow that one outgoing
-edge in the capacity fitness rule. Preserve the validator's two direct
-production consumers and exclude the Linux runner from its reachability.
-Keep the nested module outside the root-module inventory.
+The Linux amd64 and arm64 inventories register `verify/reportpublication`
+as verifier support with zero root-module production imports. The direct
+consumers are `verify/release`, `verify/linux`, `bench/retained-history`, and
+the compatibility wrapper in `verify/capacityevidence`. The validator's
+only production consumers remain release and retained-history. The nested
+module is outside the root-module inventory.
 
-Update the measured revision, package table, evidence diagram nodes and
-edges, and release evidence and fitness descriptions in `SYSTEM.md`.
-Check the shared publisher's registered role, exact imports, and
-reachability in both measured Linux graphs. Only the declared evidence
-producers and any explicitly registered compatibility wrapper may reach
-it in root-module production. Include fixture violations through
+Fitness tests check the publisher's role, exact imports, and permitted
+reachability on both Linux graphs. Fixtures cover forbidden paths through
 registered and external intermediaries from the server, offline
 verification and export commands, and unrelated production packages.
-Preserve verifier consumer ownership, command boundaries, and oracle
-independence.
 [Architecture registry](../../internal/archtest/architecture_test.go),
 [Capacity evidence fitness](../../internal/archtest/capacity_evidence_boundary_test.go),
 [Verifier consumer fitness](../../internal/archtest/verifier_consumers_test.go),
@@ -122,6 +113,4 @@ independence.
 
 Release Verification owns implementation and the delegated fixtures.
 Core Architecture owns the registry, diagram, and fitness changes.
-Coordinate leases with the #108 promotion before dispatching adoption.
-This extraction introduces no production package or root-module import
-edge and requires no change to the active promotion's architecture files.
+The registry, system diagram, and caller adoption land together.

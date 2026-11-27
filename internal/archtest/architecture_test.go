@@ -40,7 +40,7 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// At 74e56a7d2f46, cmd/bog reaches HTTP, readiness, store, and WAL on both
+// At ADR 0052 adoption, cmd/bog reaches HTTP, readiness, store, and WAL on both
 // Linux targets. Promote retained libraries with measured #108 wiring and
 // activation evidence. The operator's direct backup import is independent
 // of server reachability.
@@ -61,10 +61,11 @@ var registry = map[string]rule{
 	"bog/internal/ingest":        {testOnly, nil},
 	"bog/internal/archtest":      {testOnly, nil},
 	fuzzVerifier:                 {testOnly, nil},
-	"bog/verify/release":         {verifier, []string{goClient, capacityEvidenceVerifier, listenerVerifier}},
-	"bog/verify/linux":           {verifier, nil},
-	"bog/bench/retained-history": {verifier, []string{capacityEvidenceVerifier, listenerVerifier}},
-	capacityEvidenceVerifier:     {verifierModel, nil},
+	"bog/verify/release":         {verifier, []string{goClient, capacityEvidenceVerifier, listenerVerifier, reportPublisher}},
+	"bog/verify/linux":           {verifier, []string{reportPublisher}},
+	"bog/bench/retained-history": {verifier, []string{capacityEvidenceVerifier, listenerVerifier, reportPublisher}},
+	capacityEvidenceVerifier:     {verifierModel, []string{reportPublisher}},
+	reportPublisher:              {verifierModel, nil},
 	listenerVerifier:             {verifierModel, nil},
 	"bog/verify/query-model":     {verifierModel, nil},
 	streamPolicyVerifier:         {verifierModel, nil},
@@ -142,6 +143,9 @@ func checkLinuxArchitecture(t *testing.T, arch string) {
 		t.Error(problem)
 	}
 	for _, problem := range capacityEvidenceBoundaryProblems(packages, registry) {
+		t.Error(problem)
+	}
+	for _, problem := range reportPublicationBoundaryProblems(packages, registry) {
 		t.Error(problem)
 	}
 	for _, problem := range architectureProblems(packages, registry) {

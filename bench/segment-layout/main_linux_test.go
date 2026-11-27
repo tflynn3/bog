@@ -16,7 +16,7 @@ import (
 
 func TestMain(m *testing.M) {
 	if len(os.Args) == 3 && os.Args[1] == workerFlag {
-		if err := worker(context.Background(), os.Args[2], os.Stdout); err != nil {
+		if err := runTestWorker(os.Args[2]); err != nil {
 			log.Print(err)
 			os.Exit(1)
 		}
@@ -26,6 +26,13 @@ func TestMain(m *testing.M) {
 		log.Fatal(err)
 	}
 	os.Exit(m.Run())
+}
+
+func runTestWorker(arg string) error {
+	if ready := os.Getenv(liveVerificationReadyEnv); ready != "" {
+		return holdLiveVerificationLock(arg, ready)
+	}
+	return worker(context.Background(), arg, os.Stdout)
 }
 
 func TestSmokeLayouts(t *testing.T) {

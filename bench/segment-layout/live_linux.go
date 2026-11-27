@@ -92,7 +92,7 @@ func (c pinnedCandidate) measure(ctx context.Context, cfg config, dir string, in
 			return liveReport{}, err
 		}
 		trialCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
-		sample, unavailable, err := liveTrial(trialCtx, c.path, data, input, burst, denominators[burst.name], cfg.cold, cfg.requireLive)
+		sample, unavailable, err := liveTrial(trialCtx, cfg, c.path, data, input, burst, denominators[burst.name])
 		cancel()
 		if err != nil {
 			return liveReport{}, fmt.Errorf("%s live compaction: %w", burst.name, err)
@@ -115,7 +115,7 @@ func (c pinnedCandidate) measure(ctx context.Context, cfg config, dir string, in
 	return result, nil
 }
 
-func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burst backfill, denominator uint64, queryParity, strict bool) (publicationMeasurement, string, error) {
+func liveTrial(ctx context.Context, cfg config, binary, dir string, input fixtureInput, burst backfill, denominator uint64) (publicationMeasurement, string, error) {
 	if err := withSeededPublication(ctx, dir, input, nil); err != nil {
 		return publicationMeasurement{}, "", err
 	}
@@ -124,11 +124,10 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 		return publicationMeasurement{}, "", err
 	}
 	count := len(input.rows) + len(burst.batch)
-	rows := input.withBackfill(burst)
 	var sample publicationMeasurement
 	var unavailable string
 	err = withCandidate(ctx, binary, dir, func(s liveService) (err error) {
-		s.strict = strict
+		s.strict = cfg.requireLive
 		initial, status, err := s.control(ctx, http.MethodGet, "status", len(input.rows))
 		if err != nil {
 			return err
@@ -177,11 +176,11 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 		if after < before {
 			return errors.New("server write_bytes counter decreased")
 		}
-		if strict && after == before {
+		if cfg.requireLive && after == before {
 			return errors.New("live compaction charged no Linux write_bytes; choose a disk-backed work directory")
 		}
-		if queryParity {
-			if err := s.checkPublishedQueries(ctx, rows); err != nil {
+		if cfg.cold {
+			if err := s.checkPublishedQueries(ctx, input.withBackfill(burst)); err != nil {
 				return err
 			}
 		}
@@ -189,10 +188,10 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 			return err
 		}
 		sample = publicationMeasurement{
-			Scenario: burst.name, CoveredRows: count, ElapsedNS: elapsed.Nanoseconds(), HTTPQueryParity: queryParity,
+			Scenario: burst.name, CoveredRows: count, ElapsedNS: elapsed.Nanoseconds(), HTTPQueryParity: cfg.cold,
 			WriteAmplification: writeAmplification(after-before, denominator, liveBoundary),
 		}
-		if strict {
+		if cfg.requireLive {
 			sample.Publication = &livePublication{Before: initial, After: completed}
 		}
 		return nil
@@ -200,13 +199,25 @@ func liveTrial(ctx context.Context, binary, dir string, input fixtureInput, burs
 	if err != nil || unavailable != "" {
 		return sample, unavailable, err
 	}
-	if err := verifyPublished(dir, rows); err != nil {
-		return sample, "", err
+	req := componentRequest{Dir: dir, Profile: cfg.profile, Scenario: burst.name, Batches: cfg.batches, Seed: cfg.fixtureSeed}
+	if err := verifyLivePublication(ctx, req); err != nil {
+		return sample, "", fmt.Errorf("persisted checkpoint parity: %w", err)
 	}
 	if sample.Publication != nil {
 		sample.Publication.PersistedParity = true
 	}
-	return sample, "", ctx.Err()
+	return sample, "", nil
+}
+
+func verifyLivePublication(ctx context.Context, req componentRequest) error {
+	var result liveVerificationResult
+	if err := runQualificationWorker(ctx, workerRequest{LiveVerification: &req}, &result); err != nil {
+		return err
+	}
+	if !result.PersistedParity {
+		return errors.New("live verification worker did not confirm persisted parity")
+	}
+	return ctx.Err()
 }
 
 func withCandidate(ctx context.Context, binary, dir string, run func(liveService) error) (err error) {

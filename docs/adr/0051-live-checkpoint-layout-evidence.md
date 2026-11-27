@@ -19,6 +19,17 @@ profiles must demonstrate exact cutoff advancement, ordered HTTP query
 parity, and full persisted row parity for clustered and scattered
 backfills. PR smoke and historical report validation remain available.
 
+For a live trial to succeed, seeding, candidate startup, compaction,
+HTTP parity when requested, shutdown, and persisted parity must all
+finish within one trial deadline.
+After the candidate exits and releases the data directory, a separate
+benchmark worker reconstructs the fixture and backfill from their
+parameters. It checks the published cutoff and compares every persisted
+row by timestamp, append ordinal, and line bytes, including duplicates.
+The benchmark records persisted parity only after the worker succeeds
+within the remaining trial time. On cancellation or deadline expiry the
+benchmark terminates and reaps the worker before cleaning up the directory.
+
 ## Storage decision
 
 Storage owns the layout decision after cutover. It will compare stored
@@ -27,6 +38,9 @@ memory, and backfill write amplification on both architectures and
 profiles. The component and experimental rewrite counters report logical
 writes. The candidate's live ratio uses Linux process-attributed writes
 over the compaction interval with the same committed WAL byte denominator.
+The live elapsed time and process write delta cover the existing
+compaction observation interval. Candidate shutdown and persisted
+verification fall outside those measurements.
 Storage can use the live result to judge whether the component trade-offs
 justify a format proposal. This evidence track adds no release gate or
 format migration requirement to #108.

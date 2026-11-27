@@ -17,13 +17,14 @@ import (
 )
 
 type workerRequest struct {
-	Path, Literal string
-	Start, End    time.Time
-	Component     *componentRequest
-	Decode        *decodeRequest
-	Qualification *qualificationRequest
-	Cold          *coldRequest
-	ColdPrepare   *componentRequest
+	Path, Literal    string
+	Start, End       time.Time
+	Component        *componentRequest
+	LiveVerification *componentRequest
+	Decode           *decodeRequest
+	Qualification    *qualificationRequest
+	Cold             *coldRequest
+	ColdPrepare      *componentRequest
 }
 
 type querySample struct {
@@ -48,6 +49,17 @@ func worker(ctx context.Context, arg string, out io.Writer) error {
 			return err
 		}
 		return json.NewEncoder(out).Encode(m)
+	}
+	if req.LiveVerification != nil {
+		req := *req.LiveVerification
+		input, burst, err := req.fixtureBackfill()
+		if err != nil {
+			return err
+		}
+		if err := verifyPublished(req.Dir, input.withBackfill(burst)); err != nil {
+			return err
+		}
+		return json.NewEncoder(out).Encode(liveVerificationResult{PersistedParity: true})
 	}
 	if req.Qualification != nil {
 		return qualificationWorker(ctx, *req.Qualification, out)

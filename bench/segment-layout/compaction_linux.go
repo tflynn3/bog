@@ -22,10 +22,31 @@ type compactionReport struct {
 	Live      liveReport               `json:"live_server"`
 }
 
+// componentRequest identifies the fixture used by the publication and
+// persisted parity workers.
 type componentRequest struct {
 	Dir, Profile, Scenario string
 	Batches                int
 	Seed                   uint64
+}
+
+// liveVerificationResult is an internal worker reply, emitted only after the
+// persisted cutoff and all rows match and the directory lock is released.
+type liveVerificationResult struct {
+	PersistedParity bool
+}
+
+func (req componentRequest) fixtureBackfill() (fixtureInput, backfill, error) {
+	if req.Batches < 1 || req.Batches > maxBatches || (req.Profile != "mixed" && req.Profile != "entropy") {
+		return fixtureInput{}, backfill{}, errors.New("invalid compaction fixture request")
+	}
+	input := fixture(req.Batches, req.Profile == "entropy", req.Seed)
+	for _, burst := range input.backfills() {
+		if burst.name == req.Scenario {
+			return input, burst, nil
+		}
+	}
+	return fixtureInput{}, backfill{}, fmt.Errorf("unknown compaction scenario %q", req.Scenario)
 }
 
 func measureCompaction(ctx context.Context, cfg config, dir string, input fixtureInput) (compactionReport, map[string]uint64, error) {
@@ -203,28 +224,25 @@ func (p publicationRun) publish(ctx context.Context, previous *checkpoint.Manife
 }
 
 func measureComponent(ctx context.Context, req componentRequest) (publicationMeasurement, error) {
-	input := fixture(req.Batches, req.Profile == "entropy", req.Seed)
-	for _, burst := range input.backfills() {
-		if req.Scenario != burst.name {
-			continue
-		}
-		rows := input.withBackfill(burst)
-		var sample publicationMeasurement
-		err := withSeededPublication(ctx, req.Dir, input, func(p publicationRun, previous *checkpoint.Manifest) error {
-			if err := p.append(burst.batch); err != nil {
-				return err
-			}
-			var err error
-			_, sample, err = p.publish(ctx, previous, len(rows))
-			return err
-		})
-		sample.Scenario = burst.name
-		if err != nil {
-			return sample, err
-		}
-		return sample, verifyPublished(req.Dir, rows)
+	input, burst, err := req.fixtureBackfill()
+	if err != nil {
+		return publicationMeasurement{}, err
 	}
-	return publicationMeasurement{}, fmt.Errorf("unknown component scenario %q", req.Scenario)
+	rows := input.withBackfill(burst)
+	var sample publicationMeasurement
+	err = withSeededPublication(ctx, req.Dir, input, func(p publicationRun, previous *checkpoint.Manifest) error {
+		if err := p.append(burst.batch); err != nil {
+			return err
+		}
+		var err error
+		_, sample, err = p.publish(ctx, previous, len(rows))
+		return err
+	})
+	sample.Scenario = burst.name
+	if err != nil {
+		return sample, err
+	}
+	return sample, verifyPublished(req.Dir, rows)
 }
 
 func verifyPublished(dir string, rows []checkpoint.BlockRow) (err error) {

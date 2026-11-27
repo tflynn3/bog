@@ -196,7 +196,7 @@ func TestCapacityWorkloadCompletionChecksListener(t *testing.T) {
 			}}
 			candidate := &candidateEvidence{Lifetime: tc.lifetime}
 			opts := options{mode: "live", control: control}
-			p, err := r.exercise(ctx, opts, capacityListenerFixture(t, tc.dropPath), t.TempDir(), listenerTestGroup(t), fixture{}, candidate)
+			p, err := r.exercise(ctx, opts, capacityListenerFixture(t, tc.dropPath), t.TempDir(), listenerTestGroup(t), fixture{}, candidate, nil)
 			if p != nil {
 				t.Cleanup(func() { testReap(t, p) })
 			}
@@ -213,6 +213,39 @@ func TestCapacityWorkloadCompletionChecksListener(t *testing.T) {
 			}
 			if got := strings.Contains(message, "workload completion listener: candidate no longer owns"); got != (tc.dropPath != "") {
 				t.Errorf("listener diagnosis = %v", err)
+			}
+		})
+	}
+}
+
+func TestLiveCandidateDirectoryIsCheckedAfterReadiness(t *testing.T) {
+	for _, substitute := range []bool{false, true} {
+		t.Run(strconv.FormatBool(substitute), func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			trial := testRestartTrial(t)
+			r := result{Diagnostics: &capacityDiagnostics{
+				Queries: make(map[string]*queryPhase), Unavailable: make(map[string]string),
+			}}
+			binary := capacityListenerFixture(t, "")
+			lifetime, want := "startup", "live compaction status HTTP 404"
+			if substitute {
+				quote := func(path string) string { return "'" + strings.ReplaceAll(path, "'", "'\\''") + "'" }
+				binary = capacityListenerScript(t, "cd "+quote(t.TempDir())+" && exec "+quote(binary)+` "$@"`)
+				lifetime, want = "restart", "restart candidate directory: fixture directory changed"
+			}
+			candidate := &candidateEvidence{Lifetime: lifetime}
+			opts := options{mode: "live", control: "/_capacity/compaction"}
+			p, err := r.exercise(ctx, opts, binary, trial.dir, listenerTestGroup(t), fixture{}, candidate, trial)
+			if p != nil {
+				t.Cleanup(func() { testReap(t, p) })
+			}
+			if err == nil || !strings.Contains(err.Error(), want) || candidate.Ready == nil {
+				t.Fatalf("candidate readiness = %v, workload = %v, want %q", candidate.Ready, err, want)
+			}
+			if substitute && (trial.evidence.Restarted == nil || *trial.evidence.Restarted == *trial.evidence.Original) {
+				t.Fatalf("fixture substitution was not recorded: %+v", trial.evidence)
 			}
 		})
 	}

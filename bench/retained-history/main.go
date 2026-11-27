@@ -154,7 +154,7 @@ func createFixtureRoot(parent string) (string, error) {
 		parent = os.TempDir()
 	}
 	// The launcher changes into the store before executing the candidate,
-	// which needs absolute paths for both the executable and -data-dir.
+	// which needs an absolute executable path.
 	absoluteParent, err := filepath.Abs(parent)
 	if err != nil {
 		return "", fmt.Errorf("resolve fixture parent: %w", err)

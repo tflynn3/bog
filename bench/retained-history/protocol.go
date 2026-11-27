@@ -25,6 +25,7 @@ type service struct {
 	client            *http.Client
 	queryPhases       map[string]*queryPhase
 	readMemoryCurrent func(context.Context) (uint64, error)
+	acknowledged      *acknowledgedRows
 }
 
 func newService(base string) service {

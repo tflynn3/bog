@@ -119,6 +119,7 @@ type capacityDiagnostics struct {
 	Backfills         []*backfillTimeline    `json:"backfill_timelines,omitempty"`
 	Queries           map[string]*queryPhase `json:"queries"`
 	Candidates        []*candidateEvidence   `json:"candidates"`
+	Restart           *restartEvidence       `json:"restart,omitempty"`
 	ReplayDuration    *time.Duration         `json:"replay_duration_ns"`
 	StagingBytes      *int64                 `json:"peak_sampled_checkpoint_staging_bytes"`
 	PinCount          *int                   `json:"peak_sampled_pin_records"`

@@ -98,7 +98,8 @@ func (f fixture) appendRange(ctx context.Context, s service, lo, hi int, samples
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		b, err := f.batch(i, min(i+f.BatchRows, hi))
+		end := min(i+f.BatchRows, hi)
+		b, err := f.batch(i, end)
 		if err != nil {
 			return err
 		}
@@ -108,6 +109,11 @@ func (f fixture) appendRange(ctx context.Context, s service, lo, hi int, samples
 		}
 		if samples != nil {
 			*samples = append(*samples, ingestSample{d, time.Now()})
+		}
+		if s.acknowledged != nil {
+			if err := s.acknowledged.acknowledge(i, end); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

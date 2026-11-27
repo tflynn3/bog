@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"bog/verify/reportpublication"
 )
 
 const cgroupMount = "/sys/fs/cgroup"
@@ -56,6 +58,7 @@ func runDelegated(ctx context.Context, mode string, args []string) (err error) {
 		Probe: runnerProbe{Arch: runtime.GOARCH}}
 	if mode == "capacity" {
 		r.Capacity = newRunnerCapacity()
+		dest.report.mode = reportpublication.CreateOnly
 	}
 	defer func() {
 		if dest.proof != nil {

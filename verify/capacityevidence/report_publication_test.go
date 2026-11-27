@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"bog/verify/reportpublication"
 )
 
 func TestReplaceReportCancellation(t *testing.T) {
@@ -50,7 +52,7 @@ func TestReplaceReportCancellation(t *testing.T) {
 				return nil
 			}
 
-			state, err := replaceReport(ctx, dir, "report.json", []byte("replacement"))
+			state, err := reportpublication.Publish(ctx, dir, "report.json", []byte("replacement"), reportpublication.Replace)
 			if state != tc.state || !errors.Is(err, tc.wantErr) {
 				t.Fatalf("outcome = (%q, %v), want (%q, %v)", state, err, tc.state, tc.wantErr)
 			}

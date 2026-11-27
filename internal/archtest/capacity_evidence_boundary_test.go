@@ -15,6 +15,9 @@ func capacityEvidenceBoundaryProblems(packages map[string]listedPackage, rules m
 		problems = append(problems, fmt.Sprintf("%s must be registered as %s", capacityEvidenceVerifier, verifierModel))
 	}
 	for _, imported := range packages[capacityEvidenceVerifier].Imports {
+		if imported == reportPublisher {
+			continue // Compatibility wrapper for the nested benchmark.
+		}
 		if dependency := packages[imported]; dependency.Module != nil && dependency.Module.Main && dependency.production() {
 			problems = append(problems, fmt.Sprintf("forbidden capacity evidence import: %s -> %s", capacityEvidenceVerifier, imported))
 		}
@@ -113,7 +116,8 @@ func TestCapacityEvidenceBoundaryFixtures(t *testing.T) {
 				releaseVerifier:          {verifier, []string{capacityEvidenceVerifier}},
 				retainedBench:            {verifier, []string{capacityEvidenceVerifier}},
 				linuxVerifier:            {role: verifier},
-				capacityEvidenceVerifier: {role: verifierModel},
+				capacityEvidenceVerifier: {verifierModel, []string{reportPublisher}},
+				reportPublisher:          {role: verifierModel},
 			}
 			maps.Copy(rules, tc.changes)
 			packages := make(map[string]listedPackage, len(rules))

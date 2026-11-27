@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"bog/verify/reportpublication"
 )
 
 func TestRunnerReportPublicationStates(t *testing.T) {
@@ -15,21 +17,21 @@ func TestRunnerReportPublicationStates(t *testing.T) {
 	failure := errors.New("injected failure")
 	for _, tc := range []struct {
 		name, failAt, cancelAt string
-		state                  reportPublicationState
+		state                  reportpublication.State
 		cause                  error
 		operations             []string
 	}{
-		{"cancel before staging", "", "start", reportUnpublished, context.Canceled, []string{"close directory"}},
-		{"create fails", "create", "", reportUnpublished, failure, []string{"create", "close directory"}},
-		{"write fails", "write", "", reportUnpublished, failure, []string{"create", "write", "close file", "remove", "close directory"}},
-		{"short write", "short", "", reportUnpublished, io.ErrShortWrite, []string{"create", "write", "close file", "remove", "close directory"}},
-		{"file sync fails", "sync file", "", reportUnpublished, failure, []string{"create", "write", "sync file", "close file", "remove", "close directory"}},
-		{"file close fails", "close file", "", reportUnpublished, failure, []string{"create", "write", "sync file", "close file", "remove", "close directory"}},
-		{"cancel before rename", "", "close file", reportUnpublished, context.Canceled, []string{"create", "write", "sync file", "close file", "remove", "close directory"}},
-		{"rename fails", "rename", "", reportUnpublished, failure, []string{"create", "write", "sync file", "close file", "rename", "remove", "close directory"}},
-		{"directory sync fails", "sync directory", "", reportUnsynced, failure, []string{"create", "write", "sync file", "close file", "rename", "sync directory", "close directory"}},
-		{"directory close fails", "close directory", "", reportPublished, failure, []string{"create", "write", "sync file", "close file", "rename", "sync directory", "close directory"}},
-		{"cancel after rename", "", "rename", reportPublished, nil, []string{"create", "write", "sync file", "close file", "rename", "sync directory", "close directory"}},
+		{"cancel before staging", "", "start", reportpublication.Unpublished, context.Canceled, []string{"close directory"}},
+		{"create fails", "create", "", reportpublication.Unpublished, failure, []string{"create", "close directory"}},
+		{"write fails", "write", "", reportpublication.Unpublished, failure, []string{"create", "write", "close file", "remove", "close directory"}},
+		{"short write", "short", "", reportpublication.Unpublished, io.ErrShortWrite, []string{"create", "write", "close file", "remove", "close directory"}},
+		{"file sync fails", "sync file", "", reportpublication.Unpublished, failure, []string{"create", "write", "sync file", "close file", "remove", "close directory"}},
+		{"file close fails", "close file", "", reportpublication.Unpublished, failure, []string{"create", "write", "sync file", "close file", "remove", "close directory"}},
+		{"cancel before rename", "", "close file", reportpublication.Unpublished, context.Canceled, []string{"create", "write", "sync file", "close file", "remove", "close directory"}},
+		{"rename fails", "rename", "", reportpublication.Unpublished, failure, []string{"create", "write", "sync file", "close file", "rename", "remove", "close directory"}},
+		{"directory sync fails", "sync directory", "", reportpublication.DurabilityUncertain, failure, []string{"create", "write", "sync file", "close file", "rename", "sync directory", "close directory"}},
+		{"directory close fails", "close directory", "", reportpublication.DurablyPublished, failure, []string{"create", "write", "sync file", "close file", "rename", "sync directory", "close directory"}},
+		{"cancel after rename", "", "rename", reportpublication.DurablyPublished, nil, []string{"create", "write", "sync file", "close file", "rename", "sync directory", "close directory"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -59,21 +61,21 @@ func TestRunnerReportPublicationStates(t *testing.T) {
 				return nil
 			}
 			ops.short = tc.failAt == "short"
-			err = writeRunnerReport(ctx, ops, path, dest.name, "new")
-			var publication *runnerPublicationError
+			err = writeRunnerReport(ctx, ops, path, dest.name, "new", reportpublication.Replace)
+			var publication *reportpublication.Error
 			if tc.cause == nil {
 				if err != nil {
 					t.Fatal(err)
 				}
 			} else if !errors.Is(err, tc.cause) || !errors.As(err, &publication) ||
-				publication.state != tc.state || publication.path != path {
+				publication.State != tc.state || publication.Path != path {
 				t.Fatalf("publication error = %v, want %q with %v", err, tc.state, tc.cause)
 			}
 			if !slices.Equal(tc.operations, ops.operations) {
 				t.Fatalf("operations = %v, want %v", ops.operations, tc.operations)
 			}
 			want := "previous"
-			if tc.state != reportUnpublished {
+			if tc.state != reportpublication.Unpublished {
 				want = "\"new\"\n"
 			}
 			if data, err := os.ReadFile(path); err != nil || string(data) != want {
@@ -93,7 +95,7 @@ type reportDirectoryFixture struct {
 	short      bool
 }
 
-func (d *reportDirectoryFixture) OpenExclusive(name string) (runnerStagingFile, error) {
+func (d *reportDirectoryFixture) OpenExclusive(name string) (reportpublication.StagingFile, error) {
 	if err := d.action("create"); err != nil {
 		return nil, err
 	}
@@ -127,7 +129,7 @@ func (d *reportDirectoryFixture) Close() error {
 }
 
 type reportFileFixture struct {
-	runnerStagingFile
+	reportpublication.StagingFile
 	action func(string) error
 	short  bool
 }
@@ -139,18 +141,18 @@ func (f reportFileFixture) Write(data []byte) (int, error) {
 	if f.short {
 		data = data[:len(data)-1]
 	}
-	return f.runnerStagingFile.Write(data)
+	return f.StagingFile.Write(data)
 }
 
 func (f reportFileFixture) Sync() error {
 	if err := f.action("sync file"); err != nil {
 		return err
 	}
-	return f.runnerStagingFile.Sync()
+	return f.StagingFile.Sync()
 }
 
 func (f reportFileFixture) Close() error {
-	return errors.Join(f.action("close file"), f.runnerStagingFile.Close())
+	return errors.Join(f.action("close file"), f.StagingFile.Close())
 }
 
 func TestRunnerReportRetargetDuringStaging(t *testing.T) {
@@ -177,7 +179,7 @@ func TestRunnerReportRetargetDuringStaging(t *testing.T) {
 		}
 		return nil
 	}}
-	if err := writeRunnerReport(t.Context(), dir, path, dest.name, "pinned"); err != nil {
+	if err := writeRunnerReport(t.Context(), dir, path, dest.name, "pinned", reportpublication.Replace); err != nil {
 		t.Fatal(err)
 	}
 	for parent, want := range map[string]string{original: "\"pinned\"\n", alternate: "decoy"} {

@@ -27,12 +27,12 @@ func (r *runnerReport) runCapacity(ctx context.Context, files controlFiles, prod
 	// Keep this supervisor and the producer in the runner subgroup. Only
 	// the benchmark's two candidate fixtures belong under the 128 MiB cap.
 	// ExtraFiles maps the validated proof directory to descriptor 3 in
-	// the producer. It opens this parent itself before staging its report.
+	// the producer, which stages and commits relative to that descriptor.
 	proofPath := "/proc/self/fd/3/" + proof.name
 	cmd := exec.CommandContext(ctx, producer, "-binary", binary, "-revision", r.Revision,
 		"-fixture", r.Fixture, "-mode", "live", "-cgroup-parent", r.Probe.Parent,
-		"-work-dir", work, "-report", proofPath)
-	cmd.ExtraFiles = []*os.File{proof.dir}
+		"-work-dir", work, "-report", proofPath, "-report-create-only")
+	cmd.ExtraFiles = []*os.File{proof.File()}
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 15 * time.Second
 	var output limitedLog
@@ -62,30 +62,37 @@ func (r *runnerReport) runCapacity(ctx context.Context, files controlFiles, prod
 	if accountingErr != nil {
 		r.Capacity.AccountingError = accountingErr.Error()
 	}
-	kind := runnerFailure
-	data, reportErr := readProducerProof(proof)
-	if reportErr == nil {
-		kind, reportErr = r.readCapacity(data)
-	} else {
-		reportErr = fmt.Errorf("read capacity producer report: %w", reportErr)
-	}
 	switch {
 	case waitErr != nil && verifierReserveFailure(r.Capacity.Output):
 		r.FailureKind = addressSpaceFailure
 	case ctx.Err() != nil:
 		r.FailureKind = cancelledFailure
 		waitErr = errors.Join(waitErr, ctx.Err())
-	case reportErr != nil:
-		r.FailureKind = kind
+	case waitErr != nil:
+		r.FailureKind = runnerFailure
 	}
-	return errors.Join(waitErr, reportErr, accountingErr)
+	// Only a successful producer can attest that it committed the proof.
+	// A conflicting writer may have published schema-valid bytes.
+	if waitErr != nil {
+		return errors.Join(fmt.Errorf("capacity producer did not complete successfully: %w", waitErr), accountingErr)
+	}
+	data, err := readProducerProof(proof)
+	if err != nil {
+		r.FailureKind = runnerFailure
+		return errors.Join(fmt.Errorf("read capacity producer report: %w", err), accountingErr)
+	}
+	kind, reportErr := r.readCapacity(data)
+	r.FailureKind = kind
+	return errors.Join(reportErr, accountingErr)
 }
+
+const maxProducerProofBytes = 4 << 20
 
 // readProducerProof opens the published entry relative to the same directory
 // passed to the producer. Require its regular file rather than following a
 // substituted symlink or blocking on a FIFO.
 func readProducerProof(proof *reportDestination) (_ []byte, err error) {
-	fd, err := syscall.Openat(int(proof.dir.Fd()), proof.name,
+	fd, err := syscall.Openat(int(proof.File().Fd()), proof.name,
 		syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "open capacity proof", Path: proof.path, Err: err}
@@ -99,7 +106,17 @@ func readProducerProof(proof *reportDestination) (_ []byte, err error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("capacity proof %q must be a regular file", proof.path)
 	}
-	return io.ReadAll(f)
+	if info.Size() > maxProducerProofBytes {
+		return nil, fmt.Errorf("capacity proof %q exceeds %d bytes", proof.path, maxProducerProofBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxProducerProofBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxProducerProofBytes {
+		return nil, fmt.Errorf("capacity proof %q exceeds %d bytes", proof.path, maxProducerProofBytes)
+	}
+	return data, nil
 }
 
 func (r *runnerCapacity) observeUntilExit(files controlFiles, parent, work string, wait <-chan error) error {

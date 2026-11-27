@@ -392,11 +392,16 @@ the pinned candidate identity across evidence reports. Release, retained
 history, and runner preflight publish through the shared transaction.
 Standalone publication replaces an existing entry. The delegated supervisor
 and producer use Linux atomic create-only commits in the parents opened by
-the supervisor. The supervisor reads a bounded regular proof from the
-inherited parent only after the producer exits successfully. Publication
-records whether commit failed, committed with uncertain durability, or
-completed both syncs.
-[Shared report publication](../adr/0052-shared-report-publication.md)
+the supervisor. After exit zero, the supervisor reads a bounded regular proof
+from the pinned parent and requires both live scales to pass. Reserved exit 20
+attests to a candidate workload failure with a durably committed diagnostic
+proof and successful publication cleanup. The supervisor validates identity,
+scales, and consistency with the exit before merging per-scale evidence.
+The delegated verdict remains failed. Other nonzero exits, signals, and
+cancellation leave any producer proof unaccepted. The commands have no
+production import paths to each other, including through intermediaries.
+[Shared report publication](../adr/0052-shared-report-publication.md),
+[Delegated capacity proof outcome](../adr/0054-delegated-capacity-proof-outcome.md),
 [Capacity evidence validation](../adr/0018-capacity-evidence-validation.md),
 [Shared capacity evidence boundary](../adr/0020-shared-capacity-evidence.md)
 

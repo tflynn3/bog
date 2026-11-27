@@ -237,16 +237,25 @@ func checkMarkers(data []byte, markers []string) error {
 }
 
 func inspectResponse(response Response, markers []string) error {
-	if err := checkMarkers(response.Body, markers); err != nil {
+	return inspectSurfaces(response, func(surface []byte) error {
+		return checkMarkers(surface, markers)
+	})
+}
+
+func inspectSurfaces(response Response, inspect func([]byte) error) error {
+	size := len(response.Body)
+	if size > MaxEvidenceBytes {
+		return ErrIncomplete
+	}
+	if err := inspect(response.Body); err != nil {
 		return err
 	}
-	size := len(response.Body)
 	for key, values := range response.Headers {
 		size += len(key)
 		if size > MaxEvidenceBytes {
 			return ErrIncomplete
 		}
-		if err := checkMarkers([]byte(key), markers); err != nil {
+		if err := inspect([]byte(key)); err != nil {
 			return err
 		}
 		for _, value := range values {
@@ -254,7 +263,7 @@ func inspectResponse(response Response, markers []string) error {
 			if size > MaxEvidenceBytes {
 				return ErrIncomplete
 			}
-			if err := checkMarkers([]byte(value), markers); err != nil {
+			if err := inspect([]byte(value)); err != nil {
 				return err
 			}
 		}

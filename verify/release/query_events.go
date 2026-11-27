@@ -2,14 +2,22 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 )
 
-const queryEventPackage = "bog/verify/query-model"
+const (
+	queryEventPackage      = "bog/verify/query-model"
+	maxQueryEventBytes     = 16 << 20                   // Per event artifact, including ignored lines.
+	maxQueryEventLineBytes = bufio.MaxScanTokenSize - 1 // Bytes before the newline.
+)
 
 const (
 	pinnedQueryReplay = "TestPinnedQueryModelReplay"
@@ -40,27 +48,31 @@ var queryHandlerTests = []string{
 	"TestRetainedCaptureRetirementDrainsAtCapacity",
 }
 
-func validateQueryQualification(model, handlers string, id identity) error {
+func validateQueryQualification(ctx context.Context, model, handlers string, id identity) error {
 	if model == "" || handlers == "" {
-		return errors.New("query qualification requires both -query-model-events and -query-handler-events")
+		missing := "-query-model-events"
+		if handlers == "" {
+			missing = "-query-handler-events"
+		}
+		return fmt.Errorf("query qualification requires both -query-model-events and -query-handler-events: missing %s: %w",
+			missing, os.ErrNotExist)
 	}
 	return errors.Join(
-		validateQueryEventFile(model, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id),
-		validateQueryEventFile(handlers, queryHandlerTests, nil, id),
+		validateQueryEventFile(ctx, "query model events", model, pinnedQueryTests, []string{pinnedQueryReplay, pinnedQuery104}, id),
+		validateQueryEventFile(ctx, "query handler events", handlers, queryHandlerTests, nil, id),
 	)
 }
 
-func validateQueryEventFile(path string, tests, pinned []string, id identity) (err error) {
-	file, err := openRegular(path)
+func validateQueryEventFile(ctx context.Context, phase, path string, tests, pinned []string, id identity) error {
+	file, _, err := openRegular(ctx, nil, path, maxQueryEventBytes)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: open %q: %w", phase, path, err)
 	}
-	defer func() {
-		if err = errors.Join(err, file.Close()); err != nil {
-			err = fmt.Errorf("query events %s: %w", path, err)
-		}
-	}()
-	return validateQueryEvents(file, tests, pinned, id)
+	err = validateQueryEvents(ctx, file, maxQueryEventBytes, tests, pinned, id)
+	if err := errors.Join(err, file.Close()); err != nil {
+		return fmt.Errorf("%s: validate %q: %w", phase, path, err)
+	}
+	return nil
 }
 
 type queryTestEvent struct {
@@ -70,7 +82,7 @@ type queryTestEvent struct {
 	Output  string
 }
 
-func validateQueryEvents(r io.Reader, tests, pinned []string, id identity) error {
+func validateQueryEvents(ctx context.Context, r io.Reader, limit int64, tests, pinned []string, id identity) error {
 	// An empty test name denotes the package result. A parent can pass
 	// even when a required subtest skips, so require every named level.
 	required := []string{""}
@@ -96,11 +108,18 @@ func validateQueryEvents(r io.Reader, tests, pinned []string, id identity) error
 	}
 	wantIdentity := fmt.Sprintf("%s binary_sha256=%s", id.Revision, id.BinarySHA256)
 
-	scanner := bufio.NewScanner(r)
+	scanner := bufio.NewScanner(newArtifactReader(ctx, r, limit))
+	scanner.Buffer(nil, maxQueryEventLineBytes+1)
+	scanner.Split(scanQueryEventLine)
+	line := 0
 	for scanner.Scan() {
-		var event queryTestEvent
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			return fmt.Errorf("decode Go test event: %w", err)
+		line++
+		if err := errors.Join(ctx.Err(), scanner.Err()); err != nil {
+			return fmt.Errorf("read Go test events at line %d: %w", line, err)
+		}
+		event, err := decodeQueryEvent(scanner.Bytes())
+		if err != nil {
+			return fmt.Errorf("decode Go test event at line %d: %w", line, err)
 		}
 		if event.Package != queryEventPackage {
 			continue
@@ -129,8 +148,8 @@ func validateQueryEvents(r io.Reader, tests, pinned []string, id identity) error
 			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read Go test events: %w", err)
+	if err := errors.Join(ctx.Err(), scanner.Err()); err != nil {
+		return fmt.Errorf("read Go test events at line %d: %w", line+1, err)
 	}
 	for _, test := range required {
 		if passes[test] != 1 {
@@ -141,6 +160,63 @@ func validateQueryEvents(r io.Reader, tests, pinned []string, id identity) error
 		if identities[test] != 1 {
 			return fmt.Errorf("%s reported %d candidate identities, expected 1", test, identities[test])
 		}
+	}
+	return nil
+}
+
+func scanQueryEventLine(data []byte, atEOF bool) (int, []byte, error) {
+	if len(data) > maxQueryEventLineBytes && bytes.IndexByte(data, '\n') == -1 {
+		return 0, nil, fmt.Errorf("%w (Go test event line exceeds %d bytes)", errArtifactOversized, maxQueryEventLineBytes)
+	}
+	return bufio.ScanLines(data, atEOF)
+}
+
+func decodeQueryEvent(data []byte) (queryTestEvent, error) {
+	var event queryTestEvent
+	fields, err := decodeFields(data, map[string]any{"Action": &event.Action})
+	if err != nil {
+		return event, err
+	}
+	if event.Action == "" {
+		return event, fmt.Errorf("%w: empty Action", errArtifactMalformed)
+	}
+	// The go command can interleave build diagnostics with test events.
+	// These use ImportPath in place of Package.
+	if event.Action == "build-output" || event.Action == "build-fail" {
+		var path string
+		if err := readQueryEventField(fields["ImportPath"], "ImportPath", &path); err != nil {
+			return event, err
+		}
+		if path == "" {
+			return event, fmt.Errorf("%w: empty ImportPath", errArtifactMalformed)
+		}
+		return event, nil
+	}
+	if err := readQueryEventField(fields["Package"], "Package", &event.Package); err != nil {
+		return event, err
+	}
+	if event.Package == "" {
+		return event, fmt.Errorf("%w: empty Package", errArtifactMalformed)
+	}
+	if raw, ok := fields["Test"]; ok {
+		if err := readQueryEventField(raw, "Test", &event.Test); err != nil {
+			return event, err
+		}
+	}
+	if raw, ok := fields["Output"]; ok || event.Action == "output" {
+		if err := readQueryEventField(raw, "Output", &event.Output); err != nil {
+			return event, err
+		}
+	}
+	return event, nil
+}
+
+func readQueryEventField(raw jsontext.Value, key string, dest *string) error {
+	if len(raw) == 0 || raw.Kind() == 'n' {
+		return fmt.Errorf("%w: missing or null %q", errArtifactMalformed, key)
+	}
+	if err := json.Unmarshal(raw, dest); err != nil {
+		return fmt.Errorf("%w: %s: %w", errArtifactMalformed, key, err)
 	}
 	return nil
 }

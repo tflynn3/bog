@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json/jsontext"
@@ -10,11 +11,9 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
-	"syscall"
 
 	"bog/verify/capacityevidence"
 )
@@ -54,19 +53,26 @@ var admissionCases = []string{"one_slot_saturation", "ingest_during_saturation",
 var durabilityCases = []string{"sigkill", "recovery", "enospc"}
 var capacityCases = []string{capacityCase}
 
-func readIdentity(binary, revision, fixture string) (id identity, err error) {
+func readIdentity(ctx context.Context, binary, revision, fixture string) (id identity, err error) {
 	if !filepath.IsAbs(binary) || !fullRevision.MatchString(revision) || fixture == "" {
 		return id, errors.New("require an absolute -binary path, a full lowercase SHA in -revision, and a nonempty -fixture")
 	}
-	file, err := openRegular(binary)
+	file, info, err := openRegular(ctx, nil, binary, -1)
 	if err != nil {
-		return id, err
+		return id, fmt.Errorf("open candidate %q: %w", binary, err)
 	}
-	defer func() { err = errors.Join(err, file.Close()) }()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close candidate %q: %w", binary, closeErr))
+		}
+	}()
 	hash := sha256.New()
-	copied, err := io.Copy(hash, file)
+	copied, err := io.Copy(hash, newArtifactReader(ctx, file, info.Size()))
 	if err != nil {
-		return id, err
+		return id, fmt.Errorf("hash candidate %q: %w", binary, err)
+	}
+	if copied != info.Size() {
+		return id, fmt.Errorf("hash candidate %q: file shrank during read", binary)
 	}
 	if copied == 0 {
 		return id, errors.New("candidate must be nonempty")
@@ -78,18 +84,18 @@ func readIdentity(binary, revision, fixture string) (id identity, err error) {
 func decodeFields(data []byte, fields map[string]any) (map[string]jsontext.Value, error) {
 	var object map[string]jsontext.Value
 	if err := json.Unmarshal(data, &object); err != nil {
-		return nil, fmt.Errorf("malformed JSON object: %w", err)
+		return nil, fmt.Errorf("%w: malformed JSON object: %w", errArtifactMalformed, err)
 	}
 	if object == nil {
-		return nil, errors.New("expected JSON object")
+		return nil, fmt.Errorf("%w: expected JSON object", errArtifactMalformed)
 	}
 	for key, dest := range fields {
 		raw, exists := object[key]
 		if !exists || raw.Kind() == 'n' {
-			return nil, fmt.Errorf("missing or null %q", key)
+			return nil, fmt.Errorf("%w: missing or null %q", errArtifactMalformed, key)
 		}
 		if err := json.Unmarshal(raw, dest); err != nil {
-			return nil, fmt.Errorf("%s: %w", key, err)
+			return nil, fmt.Errorf("%w: %s: %w", errArtifactMalformed, key, err)
 		}
 	}
 	return object, nil
@@ -256,39 +262,20 @@ func validateRetarget(evidence map[string]jsontext.Value) error {
 	return nil
 }
 
-func validateFile(path string, expected identity, required []string, opts validationOptions) (err error) {
-	file, err := openRegular(path)
+const maxReportBytes = 16 << 20
+
+func validateFile(ctx context.Context, path string, expected identity, required []string, opts validationOptions) error {
+	data, err := readArtifact(ctx, nil, path, maxReportBytes)
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, file.Close()) }()
-	const maxReport = 16 << 20
-	data, err := io.ReadAll(io.LimitReader(file, maxReport+1))
+	err = errors.Join(validateReportWithOptions(data, expected, required, opts), ctx.Err())
 	if err != nil {
-		return err
+		return fmt.Errorf("%w (validate report %q)", err, path)
 	}
-	if len(data) > maxReport {
-		return errors.New("report exceeds 16 MiB")
-	}
-	return validateReportWithOptions(data, expected, required, opts)
+	return nil
 }
 
 func writeReport(path string, results report) error {
 	return (capacityevidence.ReportPublisher{}).WriteReport(path, results)
-}
-
-func openRegular(path string) (*os.File, error) {
-	// Open without blocking on pipes or devices supplied in place of a file.
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, err
-	}
-	info, err := file.Stat()
-	if err == nil && !info.Mode().IsRegular() {
-		err = fmt.Errorf("%s is not a regular file", path)
-	}
-	if err != nil {
-		return nil, errors.Join(err, file.Close())
-	}
-	return file, nil
 }

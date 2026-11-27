@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -359,7 +360,7 @@ func TestValidateCommand(t *testing.T) {
 	// Keep the archived capacity report as an independent strict failure.
 	// The combined command must report parity errors even when capacity fails.
 	capacityPath := filepath.Join(dir, "capacity.json")
-	capacityErr := validateFile(capacityPath, id, capacityCases, validationOptions{requireCutover: true})
+	capacityErr := validateFile(t.Context(), capacityPath, id, capacityCases, validationOptions{requireCutover: true})
 	if capacityErr == nil {
 		t.Fatal("archived capacity unexpectedly satisfied strict validation")
 	}
@@ -500,7 +501,7 @@ func TestAdmissionReportRetainsFixtureAndProbeFailures(t *testing.T) {
 	if err := writeReport(path, report{id, cases}); err != nil {
 		t.Fatal(err)
 	}
-	err = validateFile(path, id, admissionCases, validationOptions{})
+	err = validateFile(t.Context(), path, id, admissionCases, validationOptions{})
 	if err == nil || !strings.HasPrefix(err.Error(), `case "saturation_fixture": expected pass, got "fail": primary probe problem`) ||
 		!strings.Contains(err.Error(), "cleanup problem") || !strings.Contains(err.Error(), skip) {
 		t.Fatalf("incorrect validation diagnostic: %v", err)
@@ -564,5 +565,39 @@ func TestBudgetEvidenceKeepsLegacyFields(t *testing.T) {
 	if err := json.Unmarshal(fields["probes"], &probes); err != nil || len(probes) != 2 ||
 		probes[0].Budget != 4 || probes[0].Outcome != probeIssued || probes[1].Budget != 2 || probes[1].Outcome != probeRejected {
 		t.Errorf("probe evidence = %+v, error = %v", probes, err)
+	}
+}
+
+func TestParityReportArtifactRead(t *testing.T) {
+	t.Parallel()
+	id := identity{schemaVersion, testRevision, strings.Repeat("a", 64), capacityFixtureID}
+	path := filepath.Join(t.TempDir(), "parity.json")
+	check := func() error {
+		return validateFile(t.Context(), path, id, []string{restoredParityCase}, validationOptions{})
+	}
+	if err := check(); !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), "open artifact") ||
+		!strings.Contains(err.Error(), path) {
+		t.Fatalf("missing report = %v", err)
+	}
+	writeFixture(t, path, []byte(`{"schema_version":1,`))
+	if err := check(); !errors.Is(err, errArtifactMalformed) || !strings.Contains(err.Error(), "validate report") ||
+		!strings.Contains(err.Error(), path) {
+		t.Fatalf("truncated report = %v", err)
+	}
+	// Historical reports allow a pass without a restored evidence object.
+	historical, err := json.Marshal(report{id, map[string]outcome{restoredParityCase: {Status: "pass"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historical = append(historical, bytes.Repeat([]byte(" "), maxReportBytes-len(historical))...)
+	writeFixture(t, path, historical)
+	if err := check(); err != nil {
+		t.Fatalf("historical report at the byte limit = %v", err)
+	}
+	if err := os.Truncate(path, maxReportBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if err := check(); !errors.Is(err, errArtifactOversized) || !strings.Contains(err.Error(), path) {
+		t.Fatalf("report one byte over the limit = %v", err)
 	}
 }

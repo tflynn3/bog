@@ -62,7 +62,7 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "pinned-candidate")
 	writeFixture(t, binary, []byte("pinned candidate"))
-	id, err := readIdentity(binary, testRevision, capacityFixtureID)
+	id, err := readIdentity(t.Context(), binary, testRevision, capacityFixtureID)
 	if err != nil {
 		t.Fatal(err)
 	}

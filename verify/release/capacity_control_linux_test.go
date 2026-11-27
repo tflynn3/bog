@@ -30,7 +30,7 @@ func TestReleaseCapacityControlScope(t *testing.T) {
 	if binary == "" {
 		t.Skip("pinned release candidate required")
 	}
-	id, err := readIdentity(binary, os.Getenv("BOG_RELEASE_REVISION"), os.Getenv("BOG_RELEASE_FIXTURE"))
+	id, err := readIdentity(t.Context(), binary, os.Getenv("BOG_RELEASE_REVISION"), os.Getenv("BOG_RELEASE_FIXTURE"))
 	if err != nil {
 		t.Fatal(err)
 	}

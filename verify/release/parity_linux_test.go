@@ -38,7 +38,7 @@ func TestReleaseRestoredParity(t *testing.T) {
 		t.Skip("release parity report path required")
 	}
 	binary := os.Getenv("BOG_RELEASE_BINARY")
-	id, err := readIdentity(binary, os.Getenv("BOG_RELEASE_REVISION"), os.Getenv("BOG_RELEASE_FIXTURE"))
+	id, err := readIdentity(t.Context(), binary, os.Getenv("BOG_RELEASE_REVISION"), os.Getenv("BOG_RELEASE_FIXTURE"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestParityReportPublishesAllOutcomesOnStartFailure(t *testing.T) {
 	t.Setenv("TMPDIR", fixtures)
 	binary := filepath.Join(output, "invalid-candidate")
 	writeFixture(t, binary, []byte("not an executable"))
-	id, err := readIdentity(binary, testRevision, capacityFixtureID)
+	id, err := readIdentity(t.Context(), binary, testRevision, capacityFixtureID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,19 +321,33 @@ func parityFetch(pager *releasePager) querymodel.FetchWirePage {
 // The fixture is private and quiescent throughout export, so the files
 // supply one immutable checkpoint and committed WAL view.
 type paritySnapshot struct {
-	dir   string
+	ctx   context.Context
+	root  *os.Root
 	point backup.Point
 }
 
 func (s paritySnapshot) Point() backup.Point { return s.point }
 func (s paritySnapshot) OpenManifest() (io.ReadCloser, error) {
-	return os.Open(filepath.Join(s.dir, "bog.checkpoint"))
+	return s.openArtifact("bog.checkpoint", tailManifestLimit)
 }
 func (s paritySnapshot) OpenSegment(name string) (io.ReadCloser, error) {
-	return os.Open(filepath.Join(s.dir, name))
+	return s.openArtifact(name, checkpoint.MaxBlockSize)
 }
 func (s paritySnapshot) OpenWAL() (backup.WALReader, error) {
-	return os.Open(filepath.Join(s.dir, "bog.wal"))
+	// Export reads at absolute offsets through this committed endpoint.
+	f, _, err := openRegular(s.ctx, s.root, "bog.wal", s.point.CommittedEnd)
+	if err != nil {
+		return nil, fmt.Errorf("open fixture WAL bog.wal: %w", err)
+	}
+	return f, nil
+}
+
+func (s paritySnapshot) openArtifact(name string, limit int64) (io.ReadCloser, error) {
+	f, _, err := openRegular(s.ctx, s.root, name, limit)
+	if err != nil {
+		return nil, fmt.Errorf("open fixture artifact %q: %w", name, err)
+	}
+	return boundedArtifactFile(s.ctx, f, limit), nil
 }
 
 func appendParityBatch(dir string, rows []querymodel.Row) (err error) {
@@ -382,34 +396,42 @@ func makeRestoredFixture(ctx context.Context, root string, rows []querymodel.Row
 	if err := legacy.Close(); err != nil {
 		return "", point, err
 	}
-	raw, err := os.ReadFile(filepath.Join(source, "bog.checkpoint"))
-	if err != nil {
-		return "", point, err
-	}
-	var envelope struct {
-		Payload json.RawMessage `json:"payload"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return "", point, err
-	}
-	snapshot := paritySnapshot{source, backup.Point{
-		Generation:    sha256.Sum256(envelope.Payload),
-		CoveredOffset: manifest.CoveredOffset,
-		NextOrdinal:   manifest.NextOrdinal,
-		CommittedEnd:  end,
-	}}
 	bundle, target := filepath.Join(root, "bundle"), filepath.Join(root, "restored")
-	if err := backup.Export(ctx, snapshot, bundle); err != nil {
+	captured, err := exportParityFixture(ctx, source, bundle, manifest.CoveredOffset, manifest.NextOrdinal, end)
+	if err != nil {
 		return "", point, err
 	}
 	point, err = backup.Verify(ctx, bundle)
 	if err != nil {
 		return "", point, err
 	}
-	if point != snapshot.point {
+	if point != captured {
 		return "", point, errors.New("verified backup point differs from captured point")
 	}
 	return target, point, backup.Restore(ctx, bundle, target)
+}
+
+func exportParityFixture(ctx context.Context, source, bundle string, covered int64, next uint64, end int64) (_ backup.Point, err error) {
+	root, err := os.OpenRoot(source)
+	if err != nil {
+		return backup.Point{}, fmt.Errorf("open fixture source %q: %w", source, err)
+	}
+	defer func() { err = errors.Join(err, root.Close()) }()
+	raw, err := readArtifact(ctx, root, "bog.checkpoint", tailManifestLimit)
+	if err != nil {
+		return backup.Point{}, fmt.Errorf("read fixture checkpoint: %w", err)
+	}
+	var payload json.RawMessage
+	if _, err := decodeFields(raw, map[string]any{"payload": &payload}); err != nil {
+		return backup.Point{}, fmt.Errorf("decode fixture checkpoint bog.checkpoint: %w", err)
+	}
+	point := backup.Point{
+		Generation:    sha256.Sum256(payload),
+		CoveredOffset: covered,
+		NextOrdinal:   next,
+		CommittedEnd:  end,
+	}
+	return point, backup.Export(ctx, paritySnapshot{ctx: ctx, root: root, point: point}, bundle)
 }
 
 func TestReleaseRestoredFixture(t *testing.T) {

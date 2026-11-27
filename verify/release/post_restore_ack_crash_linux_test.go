@@ -27,7 +27,7 @@ func TestReleasePostRestoreAckCrash(t *testing.T) {
 		t.Skip("release post-restore acknowledgment crash report path required")
 	}
 	binary := os.Getenv("BOG_RELEASE_BINARY")
-	id, err := readIdentity(binary, os.Getenv("BOG_RELEASE_REVISION"), os.Getenv("BOG_RELEASE_FIXTURE"))
+	id, err := readIdentity(t.Context(), binary, os.Getenv("BOG_RELEASE_REVISION"), os.Getenv("BOG_RELEASE_FIXTURE"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -45,7 +45,7 @@ func run(ctx context.Context, args []string) error {
 	if !validate && output == "" {
 		return errors.New("-report is required")
 	}
-	id, err := readIdentity(*binary, *revision, *fixture)
+	id, err := readIdentity(ctx, *binary, *revision, *fixture)
 	if err != nil {
 		return err
 	}
@@ -58,7 +58,7 @@ func run(ctx context.Context, args []string) error {
 			{"durability", durability, durabilityCases},
 			{"capacity", capacity, capacityCases},
 		} {
-			if checkErr := validateFile(check.path, id, check.cases, opts); checkErr != nil {
+			if checkErr := validateFile(ctx, check.path, id, check.cases, opts); checkErr != nil {
 				err = errors.Join(err, fmt.Errorf("%s report: %w", check.name, checkErr))
 			}
 		}
@@ -69,12 +69,12 @@ func run(ctx context.Context, args []string) error {
 			if opts.requireCutover {
 				cases = cutoverParityCases
 			}
-			if checkErr := validateFile(parity, id, cases, opts); checkErr != nil {
+			if checkErr := validateFile(ctx, parity, id, cases, opts); checkErr != nil {
 				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
 			}
 		}
 		if queryModelEvents != "" || queryHandlerEvents != "" {
-			err = errors.Join(err, validateQueryQualification(queryModelEvents, queryHandlerEvents, id))
+			err = errors.Join(err, validateQueryQualification(ctx, queryModelEvents, queryHandlerEvents, id))
 		}
 		return err
 	}

@@ -38,12 +38,21 @@ type tailAuthorityEnvelope struct {
 	SHA256  string          `json:"sha256"`
 }
 
-func readTailParityAuthority(root *os.Root) (tailParityAuthority, error) {
+func readTailParityAuthority(ctx context.Context, root *os.Root) (tailParityAuthority, error) {
 	var a tailParityAuthority
-	raw, err := readTailArtifact(root, tailAuthorityName, tailAuthorityLimit)
+	raw, err := readArtifact(ctx, root, tailAuthorityName, tailAuthorityLimit)
 	if err != nil {
 		return a, err
 	}
+	a, err = decodeTailParityAuthority(raw)
+	if err != nil {
+		return a, fmt.Errorf("decode selector %q: %w: %w", tailAuthorityName, errArtifactMalformed, err)
+	}
+	return a, nil
+}
+
+func decodeTailParityAuthority(raw []byte) (tailParityAuthority, error) {
+	var a tailParityAuthority
 	var envelope tailAuthorityEnvelope
 	if _, err := decodeFields(raw, map[string]any{"payload": &envelope.Payload, "sha256": &envelope.SHA256}); err != nil {
 		return a, err
@@ -90,45 +99,45 @@ type selectedParityTail struct {
 // openSelectedParityTail observes a stopped candidate through its pinned
 // directory. On success the caller owns the returned file.
 func openSelectedParityTail(ctx context.Context, root *os.Root, want tailParityPoint, suffix []byte) (selectedParityTail, error) {
-	if err := ctx.Err(); err != nil {
-		return selectedParityTail{}, err
-	}
-	a, err := readTailParityAuthority(root)
+	a, err := readTailParityAuthority(ctx, root)
 	if err != nil {
 		return selectedParityTail{}, fmt.Errorf("read writable selector %s: %w", tailAuthorityName, err)
 	}
 	if err := checkTailParityPoint(a.tailParityPoint, want); err != nil {
-		return selectedParityTail{}, fmt.Errorf("selected recovery point: %w", err)
+		return selectedParityTail{}, fmt.Errorf("selected recovery point in %q: %w: %w", tailAuthorityName, errArtifactMalformed, err)
 	}
 	if a.TailBase != a.CoveredOffset {
-		return selectedParityTail{}, fmt.Errorf("selected tail base %d, want %d", a.TailBase, a.CoveredOffset)
+		return selectedParityTail{}, fmt.Errorf("selected tail base in %q: %w: got %d, want %d", tailAuthorityName, errArtifactMalformed, a.TailBase, a.CoveredOffset)
 	}
 	size := int64(len(suffix))
-	if size > tailParityByteLimit || a.CommittedEnd-a.TailBase != size {
-		return selectedParityTail{}, fmt.Errorf("selected tail committed byte count differs from bounded fixture size %d", size)
+	if size > tailParityByteLimit {
+		return selectedParityTail{}, fmt.Errorf("read selected tail %q: %w", a.Tail, artifactSizeError(tailParityByteLimit))
 	}
-	f, info, err := openTailArtifact(root, a.Tail, size)
-	if err != nil {
-		return selectedParityTail{}, fmt.Errorf("open selected tail: %w", err)
+	if a.CommittedEnd-a.TailBase != size {
+		return selectedParityTail{}, fmt.Errorf("read selected tail %q: %w: committed byte count differs from fixture size %d", a.Tail, errArtifactMalformed, size)
 	}
-	actual, err := checkSelectedParityTail(f, info, a, suffix)
+	f, info, err := openRegular(ctx, root, a.Tail, size)
 	if err != nil {
-		return selectedParityTail{}, errors.Join(err, f.Close())
+		return selectedParityTail{}, fmt.Errorf("open selected tail %q: %w", a.Tail, err)
+	}
+	actual, err := checkSelectedParityTail(ctx, f, info, a, suffix)
+	if err != nil {
+		return selectedParityTail{}, fmt.Errorf("read selected tail %q: %w", a.Tail, errors.Join(err, f.Close()))
 	}
 	return selectedParityTail{authority: a, file: f, info: info, suffix: actual}, nil
 }
 
-func checkSelectedParityTail(f *os.File, info os.FileInfo, a tailParityAuthority, suffix []byte) ([]byte, error) {
+func checkSelectedParityTail(ctx context.Context, f *os.File, info os.FileInfo, a tailParityAuthority, suffix []byte) ([]byte, error) {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || uint64(st.Dev) != a.TailDevice || uint64(st.Ino) != a.TailInode {
-		return nil, errors.New("selected tail file identity differs from writable selector")
+		return nil, fmt.Errorf("%w: selected tail file identity differs from writable selector", errArtifactMalformed)
 	}
-	actual, err := readBoundedTailArtifact(f, int64(len(suffix)))
+	actual, err := io.ReadAll(newArtifactReader(ctx, f, int64(len(suffix))))
 	if err != nil {
-		return nil, fmt.Errorf("read selected tail: %w", err)
+		return nil, err
 	}
 	if !bytes.Equal(actual, suffix) || parityDigest(actual) != a.SuffixSHA256 {
-		return nil, errors.New("selected tail bytes or digest differ from expected suffix")
+		return nil, fmt.Errorf("%w: selected tail bytes or digest differ from expected suffix", errArtifactMalformed)
 	}
 	return actual, nil
 }

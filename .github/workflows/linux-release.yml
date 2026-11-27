@@ -125,10 +125,10 @@ jobs:
             sha256sum "$BINARY" | tee "$EVIDENCE/binary.sha256"
           } 2>&1 | tee "$EVIDENCE/build.log"
 
-      - name: Preflight release command flags
+      - name: Preflight release commands and strict validators
         id: preflight
         if: steps.build.outcome == 'success'
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: |
           require_flags() {
             local command=$1 usage=$2
@@ -137,6 +137,20 @@ jobs:
             for flag in "$@"; do
               if ! grep -Eq "^[[:space:]]+-${flag}([[:space:]]|$)" <<< "$usage"; then
                 printf '%s does not advertise -%s\n' "$command" "$flag" >&2
+                return 1
+              fi
+            done
+          }
+          require_tests() {
+            local package=$1 pattern output test status=0
+            shift
+            pattern=$(IFS='|'; printf '^(%s)$' "$*")
+            output=$(timeout --kill-after=5s 1m go test -v -count=1 -run "$pattern" "$package" 2>&1) || status=$?
+            printf '%s\n' "$output"
+            if (( status != 0 )); then return "$status"; fi
+            for test in "$@"; do
+              if ! grep -Eq "^--- PASS: ${test} \\(" <<< "$output"; then
+                printf '%s did not pass required test %s\n' "$package" "$test" >&2
                 return 1
               fi
             done
@@ -154,6 +168,11 @@ jobs:
             candidate_help=$(timeout --kill-after=5s 10s "$BINARY" -help 2>&1) ||
               { printf 'candidate server help failed\n%s\n' "$candidate_help" >&2; exit 1; }
             require_flags "candidate server" "$candidate_help" addr data-dir query-concurrency query-max-response-bytes query-work-budget
+            (
+              cd gate
+              require_tests ./verify/release TestValidateCommand TestValidateRecoveryEvidence TestValidateCutoverCapacityProof
+              require_tests ./bench/retained-history TestStrictCutoverReportProof
+            )
           } 2>&1 | tee "$EVIDENCE/preflight.log"
 
       - name: Run release evidence producers
@@ -161,18 +180,17 @@ jobs:
         timeout-minutes: 52
         run: |
           record() {
-            local name=$1 status=$2
-            printf '%s revision=%s arch=%s exit=%d\n' "$name" "$REVISION" "$EXPECTED_ARCH" "$status" | tee -a "$EVIDENCE/producers.txt"
+            local name=$1 status=$2 checkout=$3 checkout_sha=$4
+            printf '%s revision=%s arch=%s exit=%d checkout=%s checkout_sha=%s\n' \
+              "$name" "$REVISION" "$EXPECTED_ARCH" "$status" "$checkout" "$checkout_sha" | tee -a "$EVIDENCE/producers.txt"
           }
           common=(-binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE")
           runner_uid=$(id -u)
           runner_gid=$(id -g)
           admission() (
-            cd gate || exit
             timeout --kill-after=5s 2m go run ./verify/release "${common[@]}" -report "$EVIDENCE/admission.json"
           )
           durability() (
-            cd candidate || exit
             timeout --kill-after=5s 2m go build -trimpath -o "$RUNNER_TEMP/bog-durability-verifier" ./verify/linux || exit
             fixture_parent=$(mktemp -d "$RUNNER_TEMP/bog-durability.XXXXXXXX") || exit
             cleanup() {
@@ -194,7 +212,6 @@ jobs:
               "${common[@]}" -report "$EVIDENCE/durability.json"
           )
           capacity() (
-            cd candidate || exit
             work=$(mktemp -d "$RUNNER_TEMP/bog-capacity.XXXXXXXX") || exit
             cleanup() {
               local status=$?
@@ -240,16 +257,20 @@ jobs:
               ' capacity "$work" "$EVIDENCE" "${common[@]}"
           )
           parity() (
-            cd gate || exit
             export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
             export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
             timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
           )
           failed=0
           for name in admission durability capacity parity; do
+            case "$name" in
+              admission|parity) checkout=gate ;;
+              durability|capacity) checkout=candidate ;;
+            esac
+            checkout_sha=$(git -C "$checkout" rev-parse HEAD)
             statuses=(0 0)
-            "$name" 2>&1 | tee "$EVIDENCE/$name.log" || statuses=("${PIPESTATUS[@]}")
-            record "$name" "${statuses[0]}" || failed=1
+            (cd "$checkout" && "$name") 2>&1 | tee "$EVIDENCE/$name.log" || statuses=("${PIPESTATUS[@]}")
+            record "$name" "${statuses[0]}" "$checkout" "$checkout_sha" || failed=1
             if (( statuses[0] != 0 || statuses[1] != 0 )); then failed=1; fi
           done
           exit "$failed"
@@ -264,9 +285,12 @@ jobs:
           {
             failed=0
             sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
+            checkout_sha=$(git rev-parse HEAD)
+            printf 'release validator checkout=gate checkout_sha=%s\n' "$checkout_sha"
             go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
+            printf 'capacity validator checkout=gate checkout_sha=%s\n' "$checkout_sha"
             go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1
             exit "$failed"
           } 2>&1 | tee "$EVIDENCE/validation.log"

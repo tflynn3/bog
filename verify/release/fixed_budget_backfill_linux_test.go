@@ -167,7 +167,7 @@ func acknowledgeBackfill(ctx context.Context, t *testing.T, raw *http.Client, ba
 
 func checkFixedBudgetBackfill(ctx context.Context, t *testing.T, raw *http.Client, base string, tc querymodel.FixedBudgetCase, trial backfillTrial, augmented *backfillCapture) (querymodel.FixedBudgetResult, error) {
 	t.Helper()
-	pager, err := newReleasePager(base, raw, int(tc.ResponseByteCap))
+	pager, err := newObservedOraclePager(base, raw, int(tc.ResponseByteCap))
 	if err != nil {
 		return querymodel.FixedBudgetResult{}, err
 	}
@@ -196,7 +196,18 @@ func checkFixedBudgetBackfill(ctx context.Context, t *testing.T, raw *http.Clien
 		if augmented != nil {
 			augmented.filter = req.Filter
 		}
-		return fetchBackfillPage(ctx, pager, req)
+		var encodedBody []byte
+		page, err := fetchBackfillPage(context.WithValue(ctx, oracleBodyKey{}, &encodedBody), pager, req)
+		if err != nil {
+			return querymodel.WirePage{}, err
+		}
+		if encodedBody == nil || int64(len(encodedBody)) != page.BodyBytes {
+			return querymodel.WirePage{}, &querymodel.FixedBudgetHTTPError{
+				StatusCode: http.StatusOK, Cause: errors.New("missing complete query body evidence"),
+			}
+		}
+		page.EncodedBody = encodedBody
+		return page, nil
 	}
 	var hook querymodel.AfterCapture
 	if trial == heldBackfill {
@@ -209,7 +220,7 @@ func checkFixedBudgetBackfill(ctx context.Context, t *testing.T, raw *http.Clien
 			return nil
 		}
 	}
-	return querymodel.RunFixedBudgetCase(ctx, tc, acknowledge, fetch, hook)
+	return querymodel.RunStrictFixedBudgetCase(ctx, tc, acknowledge, fetch, hook)
 }
 
 func checkFreshBackfill(ctx context.Context, t *testing.T, raw *http.Client, base string, tc querymodel.FixedBudgetCase, augmented backfillCapture) (querymodel.WireStats, error) {
@@ -246,11 +257,7 @@ func checkFreshBackfill(ctx context.Context, t *testing.T, raw *http.Client, bas
 }
 
 func fetchBackfillPage(ctx context.Context, pager *releasePager, req querymodel.WireRequest) (querymodel.WirePage, error) {
-	if !req.Filter.Start.Equal(pager.query.Start) || !req.Filter.End.Equal(pager.query.End) ||
-		req.MaxPageBytes != pager.client.MaxPageBytes {
-		return querymodel.WirePage{}, errors.New("oracle bounds differ from the configured release pager")
-	}
-	page, res, err := pager.fetch(ctx, req.Filter.Contains, req.Limit, req.Cursor)
+	page, res, err := fetchOraclePage(ctx, pager, req)
 	if res == nil {
 		return querymodel.WirePage{}, err
 	}
@@ -263,17 +270,10 @@ func fetchBackfillPage(ctx context.Context, pager *releasePager, req querymodel.
 			}
 		}
 	}
-	if err == nil && (res.ContentLength < 0 || res.Header.Get("Content-Length") == "") {
-		err = errors.New("missing exact Content-Length on query response")
-	}
 	if err != nil {
 		return querymodel.WirePage{}, &querymodel.FixedBudgetHTTPError{StatusCode: res.StatusCode, Cause: err}
 	}
-	rows := make([]querymodel.Row, len(page.Rows))
-	for i, item := range page.Rows {
-		rows[i] = querymodel.Row{Time: item.TS, Line: item.Line}
-	}
-	return querymodel.WirePage{Rows: rows, NextCursor: page.NextCursor, BodyBytes: res.ContentLength}, nil
+	return page, nil
 }
 
 type backfillCompaction struct {
@@ -453,6 +453,42 @@ func TestFixedBudgetBackfillRetryBoundary(t *testing.T) {
 			}
 			if tc.brokenBudget > 0 && (err == nil || !strings.Contains(err.Error(), "page 3 limit=1 HTTP 503")) {
 				t.Errorf("missing continuation failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestFixedBudgetBackfillRequiresExactTerminalReplay(t *testing.T) {
+	t.Parallel()
+	token1, token2 := strings.Repeat("A", 44), strings.Repeat("B", 44)
+	const ndjson = "Content-Type: application/x-ndjson\r\n"
+	original := fmt.Sprintf("{\"ts\":%q,\"line\":\"b\"}\n", fixtureStart)
+	reordered := fmt.Sprintf("{\"line\":\"b\",\"ts\":%q}\n", fixtureStart)
+	if len(original) != len(reordered) || original == reordered {
+		t.Fatal("terminal fixture must differ at the same encoded length")
+	}
+	for _, tc := range []struct {
+		name, replay string
+		wantOutcome  querymodel.FixedBudgetOutcome
+		wantErr      string
+	}{
+		{name: "identical", replay: original, wantOutcome: querymodel.FixedBudgetExhausted},
+		{name: "same row and size with reordered fields", replay: reordered, wantOutcome: querymodel.FixedBudgetIssuedCursor, wantErr: "replayed terminal body differs from the original encoded body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			replies := []string{
+				backfillTestAck, backfillTestPage("c", token1),
+				backfillTestAck, backfillTestPage("a", token2),
+				backfillTestAck, lengthResponse(http.StatusOK, ndjson, original),
+				lengthResponse(http.StatusOK, ndjson, tc.replay),
+			}
+			raw := &http.Client{Transport: scriptedBackfillTransport(t, heldBackfillRequests(token1, token2), replies)}
+			result, err := checkFixedBudgetBackfill(t.Context(), t, raw, "http://127.0.0.1", querymodel.FixedBudgetCases()[0], ordinaryBackfill, nil)
+			if (tc.wantErr == "" && err != nil) || (tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr))) ||
+				result.Outcome != tc.wantOutcome || result.Phase != "terminal_replay" ||
+				result.Pages != 3 || result.Rows != 3 || result.Page != 3 || result.Limit != 1 || result.HTTPStatus != http.StatusOK {
+				t.Fatalf("terminal replay = %+v, %v, want %s with %v", result, err, tc.wantOutcome, tc.wantErr)
 			}
 		})
 	}

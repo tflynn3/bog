@@ -413,30 +413,16 @@ func remainingTailParityArtifact(ctx context.Context, root *os.Root, pid int, re
 		return remaining, nil
 	}
 
-	// Stat follows each procfs descriptor to its device and inode, even
-	// after the candidate unlinks the file.
-	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
-	entries, err := os.ReadDir(fdDir)
-	if err != nil {
-		return "", fmt.Errorf("inspect candidate descriptors: %w", err)
+	artifacts := make([]retirementArtifact, 0, len(retired))
+	for _, name := range retired {
+		artifacts = append(artifacts, retirementArtifact{name: name, info: before[name]})
 	}
-	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-		fd := filepath.Join(fdDir, entry.Name())
-		info, err := os.Stat(fd)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue // A descriptor may close between listing and stat.
-		}
-		if err != nil {
-			return "", fmt.Errorf("stat candidate descriptor %s: %w", fd, err)
-		}
-		for _, name := range retired {
-			if os.SameFile(before[name], info) {
-				return fmt.Sprintf("retired artifact %q still open in candidate descriptor %s", name, fd), nil
-			}
-		}
+	artifact, fd, err := observeRetirementDescriptor(ctx, pid, artifacts)
+	if err != nil {
+		return "", err
+	}
+	if fd != "" {
+		return fmt.Sprintf("retired artifact %q still open in candidate descriptor %s", artifact, fd), nil
 	}
 	return "", nil
 }

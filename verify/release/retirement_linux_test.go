@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,36 +28,6 @@ type retirementRetainedError struct {
 
 func (e *retirementRetainedError) Error() string {
 	return fmt.Sprintf("deliberately retained %d predecessor pin(s) with %q open", e.pins, e.artifact)
-}
-
-// Match an open file by device and inode in this PID alone. The parent keeps
-// its own descriptor open across the test so a process-wide scan of the
-// fixture directory or a scan of the verifier's FDs cannot prove drain.
-func retirementCandidateHasFile(ctx context.Context, pid int, file os.FileInfo) (bool, error) {
-	if pid <= 0 {
-		return false, fmt.Errorf("invalid fixture PID %d", pid)
-	}
-	dir := fmt.Sprintf("/proc/%d/fd", pid)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false, err
-	}
-	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		info, err := os.Stat(filepath.Join(dir, entry.Name()))
-		if errors.Is(err, fs.ErrNotExist) {
-			continue // A descriptor can close between readdir and stat.
-		}
-		if err != nil {
-			return false, err
-		}
-		if os.SameFile(info, file) {
-			return true, nil
-		}
-	}
-	return false, ctx.Err()
 }
 
 type retirementRead struct {
@@ -129,11 +98,11 @@ func observeRetirementHold(ctx context.Context, client *http.Client, base string
 	if _, err := retiredTailParityFiles(root, old, active); err != nil {
 		return nil, err
 	}
-	open, err := retirementCandidateHasFile(ctx, pid, old.files[old.tail])
+	_, fd, err := observeRetirementDescriptor(ctx, pid, []retirementArtifact{{name: old.tail, info: old.files[old.tail]}})
 	if err != nil {
 		return nil, retirementPhase("observe held descriptor", err)
 	}
-	if !open {
+	if fd == "" {
 		return nil, errors.New("fixture lacks its pinned predecessor tail descriptor")
 	}
 	if err := ctx.Err(); err != nil {
@@ -300,6 +269,8 @@ func TestRetainedGenerationRetirement(t *testing.T) {
 			t.Cleanup(func() { closeTailFixture(t, root) })
 			old := retirementStorage(t, root, retirementPredecessor)
 			active := retirementStorage(t, root, retirementSuccessor)
+			// Keep the verifier's descriptor open so the candidate-only scan
+			// must distinguish their ownership of the same file.
 			parentTail, err := root.Open(old.tail)
 			if err != nil {
 				t.Fatal(err)
@@ -319,11 +290,11 @@ func TestRetainedGenerationRetirement(t *testing.T) {
 			err = serveDirectoryWithCandidate(ctx, retirementFixtureBinary(t), dir, raw, nil, "", (*candidateProcess).stop,
 				func(ctx context.Context, base string, candidatePID int) error {
 					pid = candidatePID
-					open, err := retirementCandidateHasFile(ctx, pid, old.files[old.tail])
+					_, fd, err := observeRetirementDescriptor(ctx, pid, []retirementArtifact{{name: old.tail, info: old.files[old.tail]}})
 					if err != nil {
 						return fmt.Errorf("inspect fixture before capture: %w", err)
 					}
-					if open {
+					if fd != "" {
 						return errors.New("fixture held a predecessor descriptor before capture")
 					}
 					if tc.stall {

@@ -1,10 +1,9 @@
 # ADR 0039 — Query delivery and retained cutover
 
-**Status** — Proposed for Cycle 169. Core Architecture owns this decision.
-Storage, Query, and Release Verification review the runtime, HTTP, and
-evidence handoffs respectively. Query's reviewed #116 change and Release
-Verification's native gate are on main. Storage's #108 composition and
-qualification of the combined runtime are pending.
+**Status** — Cycle 174 cutover decision. Core Architecture owns the
+decision and measured graph. Query's reviewed #116 change and Release
+Verification's native gate are on main. The reviewed Storage SHA, the
+atomic runtime and governance landing, and both native verdicts are pending.
 [#108](https://github.com/tflynn3/bog/issues/108),
 [#116 handoff](https://github.com/tflynn3/bog/commit/5c70815f3271ece893cfdc725b3a8a0b18c2e29d),
 [Native gate handoff](https://github.com/tflynn3/bog/commit/8d62fb925c4b9b7b86856af99a6f4c1732e9fba7)
@@ -91,6 +90,14 @@ the bounded API drain.
 
 ## Retained composition and shutdown
 
+Ship #108 as the default bounded retained-history runtime. Keep one Linux
+process, one HTTP listener, one writable WAL owner, and one pinned local
+data directory. Establish writable authority before listening. Validate
+the selected generation and replay its exact bounded committed suffix
+on restart. Gate capacity control behind explicit opt-in on the loopback
+listener. [Retained-history runtime cutover](0015-retained-history-runtime-cutover.md),
+[Capacity-control qualification](0034-capacity-control-release-qualification.md)
+
 Storage supplies the command-local `PageSource` through
 `httpapi.NewWithPageSource`. Under WAL owner synchronization it selects and
 pins a validated generation with the matching WAL identity, covered
@@ -103,6 +110,11 @@ selection and the final storage reference. The opt-in loopback retirement
 route delegates to the same API instance that issued the cursor.
 [Runtime cutover](0015-retained-history-runtime-cutover.md),
 [WAL capture and activation](0005-pinned-writable-recovery-authority.md#capture-and-activation-handoff)
+
+The command supplies `readiness.NewHandlerForDirectory` with an independently
+opened, unlocked descriptor relative to the WAL owner's pinned directory.
+Readiness probes keep observing the active filesystem after a path retarget.
+[Constructor boundary](0040-retained-runtime-constructor-boundary.md)
 
 1. The command stops admitting new work and scheduling maintenance,
    cancels readiness probes, and drains HTTP while the source and WAL
@@ -117,9 +129,8 @@ route delegates to the same API instance that issued the cursor.
    drain keep the WAL and lock held until process exit.
 
 Storage owns writable restore, append visibility, and activation under
-the same pinned directory and incorporates #47 and #15 in its WAL and
-startup work. The #108 wiring PR records the measured topology in
-`SYSTEM.md` and updates executable architecture fitness checks.
+the same pinned directory. #108 includes the WAL shutdown cleanup from
+#47 and startup filesystem diagnostics from #15.
 [Command composition](0026-command-owned-retained-storage-composition.md),
 [Writable authority verification](0038-writable-authority-verification.md)
 
@@ -149,9 +160,10 @@ retained publication, and byte-exact terminal replay. Require
 [Query model handoff](../../verify/query-model/README.md)
 
 On `ubuntu-24.04` (native amd64, `GOAMD64=v1`) and `ubuntu-24.04-arm`
-(native arm64, `GOARM64=v8.0`), build the same clean, reviewed #108 and
-#116 revision once per runner and use that runner's SHA-256-pinned binary
-for every producer. Check the digest before and after each query race run.
+(native arm64, `GOARM64=v8.0`), build the same clean, composed revision
+with #108 and #116 once per runner and use that runner's SHA-256-pinned
+binary for every producer. Check the digest before and after each query race
+run.
 From the pinned gate checkout, require `TestPinnedQueryModelReplay`
 in ordinary and retained modes and `TestPinnedQueryModel104` at opening
 limits 1 and 10 in legacy (without compaction) and retained (with exact
@@ -168,11 +180,13 @@ binary digest from both pinned query test roots. A required skip, a failed
 run, a missing or duplicate required pass, or an identity mismatch blocks
 qualification. Keep the existing fixed-budget backfill gate at the issuing
 budget, strict restored and restart parity, and the live capacity and
-pin-drain checks. Require both native verdicts and verified cleanup.
+pin-drain checks. Exercise both 196,608- and 393,216-row capacity fixtures
+under a 128 MiB cgroup cap with swap disabled. Mark release readiness only
+after both native jobs pass strict validation and verify cleanup.
 [Native release gate](https://github.com/tflynn3/bog/blob/8d62fb925c4b9b7b86856af99a6f4c1732e9fba7/verify/release/README.md#query-lifecycle-qualification),
 [Fixed-budget backfill evidence](0030-fixed-budget-replacement-evidence.md)
 
-## Costs and dispatch
+## Costs and integration
 
 Certification and bounded response preparation add latency before the first
 cursor. Flushing cursor headers before the body adds a transport flush.
@@ -183,11 +197,44 @@ bounded lifetime. Slow writes and source releases extend the time slots
 and storage remain charged and can delay reclamation or cause capacity
 refusals.
 
-Cycle 169 reserved one Architecture track within the conservative
-three-slot budget. At dispatch the ordered repository lease was held and
-merge-ready for this ADR alone, with no other active repository lease
-covering the path. The base and upstream main had no ADR 0039. Use the
-reviewed Query and Release Verification changes above and confirm the
-composition and drain sequence against Storage's reviewed #108 handoff
-before qualifying the combined revision. Core Architecture routes this
-single-path change for Storage, Query, and Release Verification review.
+#108 is the sole PM-selected item for Cycle 174. Run three ordered tracks
+for Storage runtime wiring, Core Architecture governance, and Release
+Verification integration. With the active constructor guard, that uses
+four of ten delivery slots. Keep #119–#122 queued. The proposed write sets
+are disjoint from one another and from both held leases in the supplied
+scope, including the constructor guard's ordered reads. Recheck live
+leases at dispatch and at integration handoff. The constructor guard and
+its ADR remain under their existing ownership.
+
+Storage hands off an immutable reviewed SHA containing the #108 runtime
+wiring. Core Architecture records that SHA here and measures the exact
+root-module production imports and roles for Linux amd64 and arm64.
+Review dependency direction, acyclicity, staged
+ownership, and operator and evidence isolation. Promote checkpoint,
+history, and backup together with the server wiring once both inventories
+and review confirm their activation criteria. Keep keyed ingest staged
+under its own owner and criteria. Query reviews the `PageSource` and
+capture lifecycle.
+
+Run `go test -count=1 ./internal/archtest` on the composed revision.
+Require both measured inventories to agree with the executable registry
+and require the Mermaid graph and package table to pass the registry
+fitness checks. Land the reviewed Storage and Architecture diffs in one PR
+or atomic merge.
+Release Verification qualifies that composed revision and owns the
+candidate evidence.
+
+The Cycle 174 base `c3724de2bb26fa234c32f6ebf0e5d21f9e9fb679`
+has identical Linux amd64 and arm64 inventories of 19 root-module
+production packages and 23 direct root-module imports. In each,
+`cmd/bog` imports HTTP, readiness, store, and WAL and uses ordinary WAL
+recovery and in-memory paging. The baseline with the governance changes
+passed `go test -count=1 ./internal/archtest`, `go vet ./internal/archtest`,
+`go test -race -count=1 ./internal/archtest`, and the Linux amd64
+cross-build. These results cover the baseline graph and its boundaries.
+The #108 issue and published refs provide no reviewed Storage wiring SHA
+for this base. The supplied lease snapshot covers dispatch scope review.
+The live lease recheck and composed inventory comparison are pending at
+the Storage handoff, along with the retained role promotions, atomic
+landing, and native qualification.
+[Measured graph and fitness ownership](../architecture/SYSTEM.md#fitness-and-registry-ownership)

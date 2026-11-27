@@ -75,12 +75,13 @@ type scriptedCapture struct {
 }
 
 type fixturePeer struct {
-	mu       sync.Mutex
-	rows     []httpFixtureRow
-	captures map[string]scriptedCapture
-	serial   int
-	trimCap  int
-	requests []string
+	mu            sync.Mutex
+	rows          []httpFixtureRow
+	captures      map[string]scriptedCapture
+	serial        int
+	trimCap       int
+	requests      []string
+	refuseOpening bool
 }
 
 func (p *fixturePeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +128,10 @@ func (p *fixturePeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.requests = append(p.requests, fmt.Sprintf("first:%s:%d", literal, limit))
+		if p.refuseOpening {
+			http.Error(w, "query work budget exhausted", http.StatusServiceUnavailable)
+			return
+		}
 		capture = scriptedCapture{start: start, end: end, literal: literal}
 		for _, row := range p.rows {
 			if row.Time.Compare(start) >= 0 && row.Time.Compare(end) < 0 && strings.Contains(row.Line, literal) {

@@ -49,6 +49,11 @@ type WirePage struct {
 	Rows       []Row
 	NextCursor string
 	BodyBytes  int64
+	// EncodedBody is the exact accepted NDJSON, including line endings.
+	// Nil means unavailable. A non-nil empty slice witnesses an empty body.
+	// If supplied, its length must equal BodyBytes. Adapters may reuse the
+	// backing storage after the next fetch begins.
+	EncodedBody []byte
 }
 
 // FetchWirePage is the boundary between the independent model and a transport.
@@ -282,6 +287,9 @@ func checkWirePage(req WireRequest, page WirePage, remaining []Entry, offset int
 	n := len(page.Rows)
 	if page.BodyBytes < 0 || page.BodyBytes > req.MaxPageBytes {
 		return fmt.Errorf("encoded body has %d bytes, want 0 through %d", page.BodyBytes, req.MaxPageBytes)
+	}
+	if page.EncodedBody != nil && int64(len(page.EncodedBody)) != page.BodyBytes {
+		return fmt.Errorf("encoded body witness has %d bytes, reported %d", len(page.EncodedBody), page.BodyBytes)
 	}
 	if (page.BodyBytes == 0) != (n == 0) {
 		return fmt.Errorf("encoded body has %d bytes for %d rows", page.BodyBytes, n)

@@ -11,12 +11,18 @@ import (
 // QueryTraceAdapter binds an initially empty, exclusively owned endpoint to a
 // trace. Acknowledge and Fetch use the existing wire contracts. A retained
 // fixture supplies Publish, which must observe activation at the exact
-// acknowledged cutoff before returning. The runner invokes it after the seed
-// and again with the opening cursor held, after the first backfill.
+// acknowledged cutoff before returning. VerifyQueryCosts publishes the seed
+// once. VerifyQueryTrace also publishes after the first backfill while the
+// opening cursor is held.
 type QueryTraceAdapter struct {
 	Acknowledge AcknowledgeBatch
 	Fetch       FetchWirePage
 	Publish     func(ctx context.Context, cutoff int) error
+
+	// ObserveScanBytes optionally reports a trial-local scan measurement for
+	// VerifyQueryCosts. The trial samples it after the accepted walk and
+	// before replay. Count only query scan input from the walk's requests.
+	ObserveScanBytes func(context.Context) (QueryScanBytes, error)
 
 	// Lifecycle is optional. If supplied, the runner exercises the complete
 	// lifecycle at the configured maximum work budget.
@@ -99,67 +105,87 @@ func VerifyQueryTrace(ctx context.Context, cfg QueryTraceConfig, launch LaunchQu
 	defer cancel()
 
 	probe := func(budget int, lifecycle bool) (rejected bool, held WireStats, err error) {
-		if err := ctx.Err(); err != nil {
-			return false, held, err
-		}
-		calls := 0
-		var runErr error
-		launchErr := launch(ctx, budget, func(adapter QueryTraceAdapter) error {
-			calls++
-			if calls != 1 {
-				runErr = errors.New("launcher called the trial more than once")
-				return runErr
-			}
+		err = launchQueryTrial(ctx, budget, launch, func(adapter QueryTraceAdapter) error {
+			var runErr error
 			rejected, held, runErr = runQueryTrace(ctx, cfg, walk, data, adapter, lifecycle, &result)
 			return runErr
 		})
-		if calls == 0 && launchErr == nil {
-			launchErr = errors.New("launcher did not run the trial")
-		}
-		if launchErr != nil {
-			if runErr == nil || errors.Is(launchErr, runErr) {
-				runErr = launchErr
-			} else {
-				runErr = errors.Join(runErr, launchErr)
-			}
-		}
-		if runErr != nil {
-			return false, held, fmt.Errorf("work budget %d: %w", budget, runErr)
-		}
-		return rejected, held, ctx.Err()
+		return rejected, held, err
 	}
 
-	// Probe the configured ceiling first so rejection there cannot be
-	// mistaken for the upper edge of a successful interval.
-	rejected, held, err := probe(cfg.MaxWorkBudget, false)
+	var err error
+	result.MinimumWorkBudget, result.RejectedBudget, result.BoundaryHeld, err = queryBudgetBoundary(cfg.MaxWorkBudget, func(budget int) (bool, WireStats, error) {
+		return probe(budget, false)
+	})
 	if err != nil {
 		return result, err
 	}
-	if rejected {
-		return result, fmt.Errorf("no issuing opening at work budget %d", cfg.MaxWorkBudget)
-	}
-	low, high := 0, cfg.MaxWorkBudget
-	for high-low > 1 {
-		budget := low + (high-low)/2
-		rejected, stats, err := probe(budget, false)
-		if err != nil {
-			return result, err
-		}
-		if rejected {
-			low = budget
-		} else {
-			high, held = budget, stats
-		}
-	}
-	if low == 0 {
-		return result, errors.New("minimum issuing budget has no positive adjacent rejection")
-	}
-	result.MinimumWorkBudget, result.RejectedBudget, result.BoundaryHeld = high, low, held
-	rejected, result.Held, err = probe(cfg.MaxWorkBudget, true)
+	rejected, held, err := probe(cfg.MaxWorkBudget, true)
+	result.Held = held
 	if err == nil && rejected {
 		err = errors.New("lifecycle trial rejected an opening at the previously issuing work ceiling")
 	}
 	return result, err
+}
+
+func launchQueryTrial(ctx context.Context, budget int, launch LaunchQueryTrace, run func(QueryTraceAdapter) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	calls := 0
+	var runErr error
+	launchErr := launch(ctx, budget, func(adapter QueryTraceAdapter) error {
+		calls++
+		if calls != 1 {
+			runErr = errors.Join(runErr, errors.New("launcher called the trial more than once"))
+			return runErr
+		}
+		runErr = run(adapter)
+		return runErr
+	})
+	if calls == 0 && launchErr == nil {
+		launchErr = errors.New("launcher did not run the trial")
+	}
+	if launchErr != nil {
+		if runErr == nil || errors.Is(launchErr, runErr) {
+			runErr = launchErr
+		} else {
+			runErr = errors.Join(runErr, launchErr)
+		}
+	}
+	if runErr != nil {
+		return fmt.Errorf("work budget %d: %w", budget, runErr)
+	}
+	return ctx.Err()
+}
+
+// queryBudgetBoundary bisects a monotonic opening refusal. An issuing probe
+// supplies evidence only after its complete walk and terminal replay pass.
+func queryBudgetBoundary[T any](ceiling int, probe func(int) (bool, T, error)) (issuing, rejected int, evidence T, err error) {
+	refused, best, err := probe(ceiling)
+	if err != nil {
+		return 0, 0, evidence, err
+	}
+	if refused {
+		return 0, 0, evidence, fmt.Errorf("no issuing opening at work budget %d", ceiling)
+	}
+	low, high := 0, ceiling
+	for high-low > 1 {
+		budget := low + (high-low)/2
+		refused, trial, err := probe(budget)
+		if err != nil {
+			return 0, 0, evidence, err
+		}
+		if refused {
+			low = budget
+		} else {
+			high, best = budget, trial
+		}
+	}
+	if low == 0 {
+		return 0, 0, evidence, errors.New("minimum issuing budget has no positive adjacent rejection")
+	}
+	return high, low, best, nil
 }
 
 func runQueryTrace(ctx context.Context, cfg QueryTraceConfig, walk WireWalk, data seededWireData, adapter QueryTraceAdapter, lifecycle bool, result *QueryTraceResult) (bool, WireStats, error) {
@@ -173,34 +199,10 @@ func runQueryTrace(ctx context.Context, cfg QueryTraceConfig, walk WireWalk, dat
 		return false, held, errors.New("recovery bounds and complete lifecycle controls must be supplied together")
 	}
 	var log Log
-	acknowledge := func(ctx context.Context, batches [][]Row) error {
-		for i, rows := range batches {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if err := adapter.Acknowledge(ctx, rows); err != nil {
-				return fmt.Errorf("batch %d: %w", i+1, err)
-			}
-			log.Append(rows)
-		}
-		return ctx.Err()
-	}
-	publish := func(ctx context.Context) error {
-		if adapter.Publish == nil {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := adapter.Publish(ctx, log.HighWater()); err != nil {
-			return fmt.Errorf("publish through ordinal %d: %w", log.HighWater(), err)
-		}
-		return ctx.Err()
-	}
-	if err := acknowledge(ctx, data.initial); err != nil {
+	if err := acknowledgeTraceBatches(ctx, &log, adapter.Acknowledge, data.initial); err != nil {
 		return false, held, fmt.Errorf("seed: %w", err)
 	}
-	if err := publish(ctx); err != nil {
+	if err := publishTraceCutoff(ctx, adapter.Publish, log.HighWater()); err != nil {
 		return false, held, fmt.Errorf("seed: %w", err)
 	}
 	if lifecycle && control != nil {
@@ -222,13 +224,13 @@ func runQueryTrace(ctx context.Context, cfg QueryTraceConfig, walk WireWalk, dat
 		}
 		return page, err
 	}, func(ctx context.Context, _ string) error {
-		if err := acknowledge(ctx, data.later[:1]); err != nil {
+		if err := acknowledgeTraceBatches(ctx, &log, adapter.Acknowledge, data.later[:1]); err != nil {
 			return fmt.Errorf("first backfill: %w", err)
 		}
-		if err := publish(ctx); err != nil {
+		if err := publishTraceCutoff(ctx, adapter.Publish, log.HighWater()); err != nil {
 			return fmt.Errorf("replacement: %w", err)
 		}
-		if err := acknowledge(ctx, data.later[1:]); err != nil {
+		if err := acknowledgeTraceBatches(ctx, &log, adapter.Acknowledge, data.later[1:]); err != nil {
 			return fmt.Errorf("tail backfill: %w", err)
 		}
 		return nil
@@ -288,6 +290,29 @@ func runQueryTrace(ctx context.Context, cfg QueryTraceConfig, walk WireWalk, dat
 		return false, held, fmt.Errorf("restarted walk: %w", err)
 	}
 	return false, held, nil
+}
+
+func acknowledgeTraceBatches(ctx context.Context, log *Log, acknowledge AcknowledgeBatch, batches [][]Row) error {
+	for i, rows := range batches {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := acknowledge(ctx, rows); err != nil {
+			return fmt.Errorf("batch %d: %w", i+1, err)
+		}
+		log.Append(rows)
+	}
+	return ctx.Err()
+}
+
+func publishTraceCutoff(ctx context.Context, publish func(context.Context, int) error, cutoff int) error {
+	if err := ctx.Err(); err != nil || publish == nil {
+		return err
+	}
+	if err := publish(ctx, cutoff); err != nil {
+		return fmt.Errorf("publish through ordinal %d: %w", cutoff, err)
+	}
+	return ctx.Err()
 }
 
 func requireUnavailableCapture(ctx context.Context, fetch FetchWirePage, req WireRequest, status int) error {

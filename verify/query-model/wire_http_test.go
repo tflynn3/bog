@@ -82,6 +82,10 @@ type fixturePeer struct {
 	trimCap       int
 	requests      []string
 	refuseOpening bool
+
+	// A non-nil scanInput enables the encoded-row scan meter.
+	scanInput    []json.RawMessage
+	scannedBytes uint64
 }
 
 func (p *fixturePeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -89,10 +93,21 @@ func (p *fixturePeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer p.mu.Unlock()
 	if r.Method == http.MethodPost && r.URL.Path == "/ingest" {
 		var batch []httpFixtureRow
+		var encodedBatch []json.RawMessage
 		dec := json.NewDecoder(r.Body)
 		for {
 			var row httpFixtureRow
-			err := dec.Decode(&row)
+			var err error
+			if p.scanInput == nil {
+				err = dec.Decode(&row)
+			} else {
+				var encoded json.RawMessage
+				err = dec.Decode(&encoded)
+				if err == nil {
+					err = json.Unmarshal(encoded, &row)
+					encodedBatch = append(encodedBatch, encoded)
+				}
+			}
 			if err == io.EOF {
 				break
 			}
@@ -103,6 +118,7 @@ func (p *fixturePeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			batch = append(batch, row)
 		}
 		p.rows = append(p.rows, batch...)
+		p.scanInput = append(p.scanInput, encodedBatch...)
 		p.requests = append(p.requests, "ingest")
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -133,7 +149,18 @@ func (p *fixturePeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		capture = scriptedCapture{start: start, end: end, literal: literal}
-		for _, row := range p.rows {
+		rows := p.rows
+		if p.scanInput != nil {
+			rows = make([]httpFixtureRow, len(p.scanInput))
+			for i, encoded := range p.scanInput {
+				p.scannedBytes += uint64(len(encoded))
+				if err := json.Unmarshal(encoded, &rows[i]); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+		}
+		for _, row := range rows {
 			if row.Time.Compare(start) >= 0 && row.Time.Compare(end) < 0 && strings.Contains(row.Line, literal) {
 				row.Time = row.Time.UTC()
 				capture.rows = append(capture.rows, row)

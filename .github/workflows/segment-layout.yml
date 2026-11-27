@@ -57,7 +57,7 @@ jobs:
           export TMPDIR="$RUNNER_TEMP"
           go vet ./...
           go test -race -count=1 ./...
-      - name: Build and validate a smoke report
+      - name: Build and validate incremental and cold smoke reports
         shell: bash
         env:
           CGO_ENABLED: '0'
@@ -68,6 +68,9 @@ jobs:
           "$artifacts/segment-layout" -incremental -smoke -seed 44 \
             -revision "$(git rev-parse HEAD)" -dir "$RUNNER_TEMP" > "$artifacts/report.json"
           "$artifacts/segment-layout" -validate-report "$artifacts/report.json"
+          "$artifacts/segment-layout" -cold -smoke -seed 44 \
+            -revision "$(git rev-parse HEAD)" -dir "$RUNNER_TEMP" > "$artifacts/cold-smoke.json"
+          "$artifacts/segment-layout" -validate-report "$artifacts/cold-smoke.json"
           tar -C "$artifacts" -czf "$artifacts/segment-layout.tar.gz" segment-layout
       - uses: actions/upload-artifact@v4
         with:
@@ -75,4 +78,5 @@ jobs:
           path: |
             ${{ runner.temp }}/segment-layout-artifacts/segment-layout.tar.gz
             ${{ runner.temp }}/segment-layout-artifacts/report.json
+            ${{ runner.temp }}/segment-layout-artifacts/cold-smoke.json
           if-no-files-found: error

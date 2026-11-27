@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -108,11 +109,11 @@ func validColdRunID(id string) bool {
 
 // sealPairs runs before publication. The ordinary cold report validator
 // establishes the complete layout, phase and query matrix before pairing.
-func (r *coldReport) sealPairs(input fixtureInput) error {
+func (r *coldReport) sealPairs(ctx context.Context, input fixtureInput) error {
 	if err := r.validateColdMeasurements(); err != nil {
 		return err
 	}
-	pairs, err := r.derivePairs(input)
+	pairs, err := r.derivePairs(ctx, input)
 	if err != nil {
 		return err
 	}
@@ -125,7 +126,7 @@ func (r coldReport) validatePairs() error {
 		return errors.New("missing or invalid cold pairing run identity")
 	}
 	input := fixture(r.Fixture.Batches, r.Fixture.Profile == "entropy", r.Fixture.Seed)
-	pairs, err := r.derivePairs(input)
+	pairs, err := r.derivePairs(context.Background(), input)
 	if err != nil {
 		return err
 	}
@@ -152,7 +153,7 @@ func validatePairEncoding(raw json.RawMessage, pairing *coldPairing) error {
 	return validateColdFields(wire.Pairing, canonical, "cold codec comparison")
 }
 
-func (r coldReport) derivePairs(input fixtureInput) ([]coldCodecPair, error) {
+func (r coldReport) derivePairs(ctx context.Context, input fixtureInput) ([]coldCodecPair, error) {
 	p := r.Pairing
 	if p == nil || !validColdRunID(p.RunID) || p.FixtureSHA256 != coldFixtureDigest(r.Fixture, input) {
 		return nil, errors.New("cold pairing fixture or execution identity mismatch")
@@ -161,25 +162,37 @@ func (r coldReport) derivePairs(input fixtureInput) ([]coldCodecPair, error) {
 	bursts := input.backfills()
 	allLayouts := append([]coldLayout{r.Production}, r.Experimental...)
 	var pairs []coldCodecPair
+	var initialBlocks [][]checkpoint.BlockRow
+	inventories := make([]snapshot, len(layouts))
+	if hasColdMatrixEvidence(r.SchemaVersion) {
+		initialBlocks = partition(input.rows)
+	}
 	for phaseIndex, phase := range coldPhases {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		rows := input.rows
 		if phaseIndex > 0 {
 			burst := bursts[phaseIndex-1]
 			rows = input.withBackfill(burst)
-			wantWAL, err := coldBackfillWALBytes(burst)
+			backfill, err := describeColdBackfill(burst)
 			if err != nil {
 				return nil, fmt.Errorf("%s: encode fixture backfill: %w", phase, err)
+			}
+			if r.SchemaVersion == coldMatrixSchema && r.Backfills[phaseIndex-1] != backfill {
+				return nil, fmt.Errorf("%s: backfill timeline or WAL bytes disagree with fixture", phase)
 			}
 			// The measurement validator already matched every experimental
 			// denominator to production. Verify their common value against
 			// the bytes represented by the fixture's one committed frame.
-			if got := r.Production.Phases[phaseIndex].Rewrite.AppendedWALBytes; got != wantWAL {
-				return nil, fmt.Errorf("%s: measured WAL growth %d, fixture frame %d", phase, got, wantWAL)
+			if got := r.Production.Phases[phaseIndex].Rewrite.AppendedWALBytes; got != backfill.AppendedWALBytes {
+				return nil, fmt.Errorf("%s: measured WAL growth %d, fixture frame %d", phase, got, backfill.AppendedWALBytes)
 			}
 		}
 		var shapes []coldBlockShape
-		if r.SchemaVersion == coldMatrixSchema {
-			shapes = coldBlockShapes(coldPhaseBlocks(input.rows, rows))
+		if hasColdMatrixEvidence(r.SchemaVersion) {
+			blocks, reused := coldPhaseBlocks(initialBlocks, len(input.rows), rows)
+			shapes = coldBlockShapes(blocks)
 			all := coldLimits(shapes, query{start: firstTime, end: endTime}, false)
 			for j, l := range layouts {
 				pub := r.Experimental[j].Phases[phaseIndex]
@@ -189,13 +202,30 @@ func (r coldReport) derivePairs(input fixtureInput) ([]coldCodecPair, error) {
 					(l.codec == rawCodec && pub.RetainedBytes-index != all.rawPayload) {
 					return nil, fmt.Errorf("%s/%s: stored bytes or segment count disagree with fixture", l.name(), phase)
 				}
+				if r.SchemaVersion == coldMatrixSchema {
+					current, err := coldPublicationInventory(pub, l, shapes, inventories[j], reused)
+					if err != nil {
+						return nil, fmt.Errorf("%s/%s: %w", l.name(), phase, err)
+					}
+					if phaseIndex == 0 {
+						inventories[j] = current
+					}
+					if l.prune {
+						if err := validateColdPayloadPair(r.Experimental[int(l.codec)].Phases[phaseIndex], pub); err != nil {
+							return nil, fmt.Errorf("%s/%s: %w", l.name(), phase, err)
+						}
+					}
+				}
 			}
 		}
 		// Check every probe, including the complete generation, before using
 		// this phase's timings or publication counters in the comparisons.
 		digests := make([]string, len(probes))
 		for qi, q := range probes {
-			want := reference(rows, q)
+			want, err := coldReference(ctx, rows, q)
+			if err != nil {
+				return nil, err
+			}
 			digest := coldRowsDigest(want)
 			digests[qi] = digest
 			pairIDs := make([]string, coldQueryRuns(r.SchemaVersion, q, r.Fixture.SparseRuns))
@@ -224,9 +254,19 @@ func (r coldReport) derivePairs(input fixtureInput) ([]coldCodecPair, error) {
 					if layouts[li-1].prune {
 						shape = limits[1]
 					}
-					for i, s := range got.Samples {
-						if err := shape.validate(s, layouts[li-1], l.Phases[phaseIndex].RetainedBytes); err != nil {
-							return nil, fmt.Errorf("%s/%s/%s round %d: %w", l.Name, phase, q.name, i+1, err)
+					pub := l.Phases[phaseIndex]
+					if err := shape.validate(got.Samples[0], layouts[li-1], pub.RetainedBytes); err != nil {
+						return nil, fmt.Errorf("%s/%s/%s: %w", l.Name, phase, q.name, err)
+					}
+					if r.SchemaVersion == coldMatrixSchema {
+						if err := validateColdInventoryScan(shapes, pub.PayloadSizes, q, layouts[li-1].prune, got.Samples[0]); err != nil {
+							return nil, fmt.Errorf("%s/%s/%s: %w", l.Name, phase, q.name, err)
+						}
+					}
+					for _, s := range got.Samples[1:] {
+						if s.ReadBytes < s.Scan.IndexBytes || s.ReadBytes-s.Scan.IndexBytes < s.Payload.Bytes ||
+							*s.DecodeBytes != s.Scan.Decode.PeakWorkingBytes {
+							return nil, fmt.Errorf("%s/%s/%s: sample counters disagree with scan evidence", l.Name, phase, q.name)
 						}
 						if *s.Scan != *got.Samples[0].Scan {
 							return nil, fmt.Errorf("%s/%s/%s: experimental scan counters vary between rounds", l.Name, phase, q.name)
@@ -253,16 +293,7 @@ func (r coldReport) derivePairs(input fixtureInput) ([]coldCodecPair, error) {
 			}
 		}
 	}
-	return pairs, nil
-}
-
-func coldBackfillWALBytes(burst backfill) (uint64, error) {
-	const walFrameHeaderBytes = 16
-	body, _, err := encodeBatch(burst.batch)
-	if err != nil {
-		return 0, err
-	}
-	return uint64(len(body) + walFrameHeaderBytes), nil
+	return pairs, ctx.Err()
 }
 
 func validateColdProofs(layout string, got coldQueryReport, count int, digest string, pairIDs []string) error {

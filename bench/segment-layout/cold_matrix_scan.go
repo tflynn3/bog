@@ -34,8 +34,8 @@ func scanColdSnapshot(ctx context.Context, dir string, current snapshot, q query
 		if err != nil {
 			return nil, coldSample{}, err
 		}
-		read, err := decoder.scan(f, ref.FileBytes, ref.RawBytes, ref.indexWidth(), q, func(raw []byte, buffers int) error {
-			return metrics.match(raw, ref.RawBytes, buffers, q, &matches)
+		read, err := decoder.scan(ctx, f, ref.FileBytes, ref.RawBytes, ref.indexWidth(), q, func(raw []byte, buffers int) error {
+			return metrics.match(ctx, raw, ref.RawBytes, buffers, q, &matches)
 		})
 		if err := errors.Join(err, f.Close()); err != nil {
 			return nil, coldSample{}, fmt.Errorf("scan %s: %w", ref.Name, err)
@@ -46,11 +46,17 @@ func scanColdSnapshot(ctx context.Context, dir string, current snapshot, q query
 		reads.Blocks += read.Blocks
 		reads.Bytes += read.Bytes
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, coldSample{}, err
+	}
 	slices.SortFunc(matches, ordered)
-	return matches, coldSample{Payload: &reads, DecodeBytes: &metrics.Decode.PeakWorkingBytes, Scan: &metrics}, ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return nil, coldSample{}, err
+	}
+	return matches, coldSample{Payload: &reads, DecodeBytes: &metrics.Decode.PeakWorkingBytes, Scan: &metrics}, nil
 }
 
-func (m *coldScanMetrics) match(raw []byte, declared, buffers int, q query, matches *[]checkpoint.BlockRow) error {
+func (m *coldScanMetrics) match(ctx context.Context, raw []byte, declared, buffers int, q query, matches *[]checkpoint.BlockRow) error {
 	if len(raw) != declared || len(raw) < blockHeader+blockRowWidth || len(raw) > maxBlock {
 		return errLayout
 	}
@@ -79,7 +85,12 @@ func (m *coldScanMetrics) match(raw []byte, declared, buffers int, q query, matc
 	} else {
 		m.Decode.PeakOrdinaryBytes = max(m.Decode.PeakOrdinaryBytes, working)
 	}
-	for _, row := range rows {
+	for i, row := range rows {
+		if i%1024 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		if !row.Row.TS.Before(q.start) && row.Row.TS.Before(q.end) && strings.Contains(row.Row.Line, q.literal) {
 			*matches = append(*matches, row)
 		}

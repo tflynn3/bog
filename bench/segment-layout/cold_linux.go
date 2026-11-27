@@ -48,10 +48,12 @@ func collectCold(ctx context.Context, cfg config) (_ coldMatrixReport, err error
 	if _, err := rand.Read(runID[:]); err != nil {
 		return coldMatrixReport{}, fmt.Errorf("cold pairing run ID: %w", err)
 	}
+	protocol := matrixProtocol(cfg.profile, cfg.runs)
+	protocol.Budgets = new(matrixBudgets(cfg.timeout))
 	result := coldMatrixReport{
 		SchemaVersion: coldMatrixSchema, Mode: "cold-matrix", Revision: cfg.revision,
 		RunID: hex.EncodeToString(runID[:]), Environment: env,
-		Protocol: matrixProtocol(cfg.profile, cfg.runs),
+		Protocol: protocol,
 	}
 	for _, profile := range result.Protocol.ProfileOrder {
 		profileDir := filepath.Join(dir, profile)
@@ -93,6 +95,11 @@ func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env 
 		rows := input.rows
 		if phaseIndex != 0 {
 			rows = input.withBackfill(burst)
+			scenario, err := describeColdBackfill(burst)
+			if err != nil {
+				return coldReport{}, fmt.Errorf("%s backfill fixture: %w", burst.name, err)
+			}
+			result.Backfills = append(result.Backfills, scenario)
 		}
 		prepareCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
 		err := prepareColdTargets(prepareCtx, cfg, dir, burst, rows, targets)
@@ -121,7 +128,10 @@ func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env 
 		}
 		result.Live = live
 	}
-	if err := result.sealPairs(input); err != nil {
+	if err := matrixBudgets(cfg.timeout).validateMeasurements(result); err != nil {
+		return coldReport{}, err
+	}
+	if err := result.sealPairs(ctx, input); err != nil {
 		return coldReport{}, err
 	}
 	return result, ctx.Err()
@@ -243,6 +253,7 @@ func prepareColdExperimental(ctx context.Context, dir string, burst backfill, ro
 		return coldPhase{}, "", err
 	}
 	pub := coldPhase{Phase: burst.name, Rows: len(rows), Segments: len(next.Segments), ManifestBytes: info.Size(), segmentBytes: account}
+	pub.PayloadSizes = coldPayloadSizes(next)
 	if l.prune {
 		pub.BloomBytes = int64(len(next.Segments)) * int64(len(summary{}))
 	}
@@ -258,7 +269,10 @@ func sampleColdPhase(ctx context.Context, cfg config, targets []coldTarget, rows
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		want := reference(rows, q)
+		want, err := coldReference(ctx, rows, q)
+		if err != nil {
+			return err
+		}
 		digest := coldRowsDigest(want)
 		selectivity := measureColdSelectivity(rows, q, len(want))
 		for i := range targets {
@@ -305,7 +319,7 @@ func sampleColdQuery(ctx context.Context, cfg config, req coldRequest, want []ch
 	if err != nil {
 		return err
 	}
-	if sample.Proof != nil || (sample.Scan == nil) != req.Production {
+	if sample.Proof != nil || sample.DecodeBytes == nil || (sample.Scan == nil) != req.Production {
 		return errors.New("invalid pairing or scan evidence in worker output")
 	}
 	dst.Samples = append(dst.Samples, sample)
@@ -341,11 +355,11 @@ func coldProductionQuery(ctx context.Context, dir string, q query, out io.Writer
 	if err != nil {
 		return err
 	}
-	var envelope struct{ Payload checkpoint.Manifest }
-	if err := json.Unmarshal(data, &envelope); err != nil {
+	manifest, _, err := checkpoint.DecodeManifest(data)
+	if err != nil {
 		return err
 	}
-	for _, seg := range envelope.Payload.Segments {
+	for _, seg := range manifest.Segments {
 		if err := adviseCold(ctx, filepath.Join(dir, seg.Name)); err != nil {
 			return err
 		}
@@ -356,6 +370,16 @@ func coldProductionQuery(ctx context.Context, dir string, q query, out io.Writer
 			return nil
 		})
 		return rows, sample, err
+	}, func(rows []checkpoint.BlockRow, sample *coldSample) error {
+		m, err := measureColdV1(ctx, dir, manifest.Segments, q, rows)
+		if err != nil {
+			return err
+		}
+		if m.readBytes != sample.ReadBytes {
+			return fmt.Errorf("v1 buffer accounting read %d bytes, production scan read %d bytes", m.readBytes, sample.ReadBytes)
+		}
+		sample.DecodeBytes = &m.peak
+		return nil
 	})
 }
 
@@ -375,7 +399,7 @@ func coldExperimentalQuery(ctx context.Context, path string, q query, out io.Wri
 	}
 	return timeColdQuery(out, func() ([]checkpoint.BlockRow, coldSample, error) {
 		return scanColdSnapshot(ctx, dir, current, q)
-	})
+	}, nil)
 }
 
 func adviseCold(ctx context.Context, path string) error {
@@ -393,7 +417,7 @@ func adviseCold(ctx context.Context, path string) error {
 	return nil
 }
 
-func timeColdQuery(out io.Writer, scan func() ([]checkpoint.BlockRow, coldSample, error)) error {
+func timeColdQuery(out io.Writer, scan func() ([]checkpoint.BlockRow, coldSample, error), account func([]checkpoint.BlockRow, *coldSample) error) error {
 	var first, last runtime.MemStats
 	runtime.ReadMemStats(&first)
 	before, err := currentReadIO()
@@ -419,6 +443,11 @@ func timeColdQuery(out io.Writer, scan func() ([]checkpoint.BlockRow, coldSample
 	sample.PeakRSSBytes, err = selfPeakRSS()
 	if err != nil {
 		return err
+	}
+	if account != nil {
+		if err := account(rows, &sample); err != nil {
+			return err
+		}
 	}
 	return writeQuerySample(out, sample, rows)
 }

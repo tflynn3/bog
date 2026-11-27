@@ -52,22 +52,22 @@ func testPairedReport(t *testing.T) coldReport {
 		raw.summarize()
 		lz4.summarize()
 		if pi > 0 {
-			denominator, err := coldBackfillWALBytes(input.backfills()[pi-1])
+			backfill, err := describeColdBackfill(input.backfills()[pi-1])
 			if err != nil {
 				t.Fatal(err)
 			}
 			prod := r.Production.Phases[pi].Rewrite
-			*prod = writeAmplification(prod.WrittenBytes, denominator, prod.Boundary)
+			*prod = writeAmplification(prod.WrittenBytes, backfill.AppendedWALBytes, prod.Boundary)
 			for i, l := range layouts {
 				p := &r.Experimental[i].Phases[pi]
 				if l.codec == lz4Codec {
 					p.ManifestBytes -= 60
 				}
-				*p.Rewrite = writeAmplification(uint64(p.RewrittenBytes+p.ManifestBytes), denominator, coldRewriteBoundary)
+				*p.Rewrite = writeAmplification(uint64(p.RewrittenBytes+p.ManifestBytes), backfill.AppendedWALBytes, coldRewriteBoundary)
 			}
 		}
 	}
-	if err := r.sealPairs(input); err != nil {
+	if err := r.sealPairs(t.Context(), input); err != nil {
 		t.Fatal(err)
 	}
 	return r

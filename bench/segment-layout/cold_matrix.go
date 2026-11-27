@@ -12,7 +12,14 @@ import (
 	"bog/internal/checkpoint"
 )
 
-const coldMatrixSchema = 7
+const (
+	historicalColdMatrixSchema = 7
+	coldMatrixSchema           = 8
+)
+
+func hasColdMatrixEvidence(schema int) bool {
+	return schema == historicalColdMatrixSchema || schema == coldMatrixSchema
+}
 
 type coldMatrixReport struct {
 	SchemaVersion int            `json:"schema_version"`
@@ -25,16 +32,17 @@ type coldMatrixReport struct {
 }
 
 type coldProtocol struct {
-	FixtureVersion string      `json:"fixture_version"`
-	ProfileOrder   []string    `json:"profile_order"`
-	BatchPattern   []int       `json:"ordinary_batch_pattern_rows"`
-	BackfillRows   int         `json:"rows_per_independent_backfill"`
-	MaxRawBlock    int         `json:"max_raw_block_bytes"`
-	ZstdWindow     int         `json:"zstd_max_window_bytes"`
-	MaxLineBytes   int         `json:"max_line_bytes"`
-	CachePolicy    string      `json:"cache_policy"`
-	SampleOrder    string      `json:"sample_order"`
-	Probes         []coldProbe `json:"probes"`
+	FixtureVersion string       `json:"fixture_version"`
+	ProfileOrder   []string     `json:"profile_order"`
+	BatchPattern   []int        `json:"ordinary_batch_pattern_rows"`
+	BackfillRows   int          `json:"rows_per_independent_backfill"`
+	MaxRawBlock    int          `json:"max_raw_block_bytes"`
+	ZstdWindow     int          `json:"zstd_max_window_bytes"`
+	MaxLineBytes   int          `json:"max_line_bytes"`
+	CachePolicy    string       `json:"cache_policy"`
+	SampleOrder    string       `json:"sample_order"`
+	Probes         []coldProbe  `json:"probes"`
+	Budgets        *coldBudgets `json:"budgets,omitempty"`
 }
 
 type coldProbe struct {
@@ -64,7 +72,7 @@ func matrixProtocol(first string, runs int) coldProtocol {
 
 func coldQueryPlan(schema int) []query {
 	plan := coldQueries()
-	if schema == coldMatrixSchema {
+	if hasColdMatrixEvidence(schema) {
 		for _, q := range queries() {
 			if q.name == "medium" || q.name == "dense" {
 				plan = append(plan, q)
@@ -75,7 +83,7 @@ func coldQueryPlan(schema int) []query {
 }
 
 func coldComparisonProbe(schema int, q query) bool {
-	return q.literal == sparseLiteral || (schema == coldMatrixSchema && (q.name == "medium" || q.name == "dense"))
+	return q.literal == sparseLiteral || (hasColdMatrixEvidence(schema) && (q.name == "medium" || q.name == "dense"))
 }
 
 func coldQueryRuns(schema int, q query, runs int) int {
@@ -100,7 +108,11 @@ func decodeColdEvidence(data []byte, dst any, label string) error {
 	if err := json.Unmarshal(data, dst); err != nil {
 		return err
 	}
-	canonical, err := json.Marshal(dst)
+	return validateColdEncoding(data, dst, label)
+}
+
+func validateColdEncoding(data []byte, value any, label string) error {
+	canonical, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
@@ -141,7 +153,12 @@ func validateColdMatrixJSON(raw json.RawMessage) error {
 		if err := profile.validate(); err != nil {
 			return fmt.Errorf("%s: %w", profile.Fixture.Profile, err)
 		}
-		if err := validatePairEncoding(wire.Profiles[i], profile.Pairing); err != nil {
+		if report.SchemaVersion == coldMatrixSchema {
+			if err := report.Protocol.Budgets.validateMeasurements(profile); err != nil {
+				return fmt.Errorf("%s: %w", profile.Fixture.Profile, err)
+			}
+		}
+		if err := validateColdEncoding(wire.Profiles[i], profile, "cold profile"); err != nil {
 			return fmt.Errorf("%s: %w", profile.Fixture.Profile, err)
 		}
 	}
@@ -149,18 +166,25 @@ func validateColdMatrixJSON(raw json.RawMessage) error {
 }
 
 func (r coldMatrixReport) validateHeader() error {
-	if r.SchemaVersion != coldMatrixSchema || r.Mode != "cold-matrix" || !knownRevision(r.Revision) ||
+	if !hasColdMatrixEvidence(r.SchemaVersion) || r.Mode != "cold-matrix" || !knownRevision(r.Revision) ||
 		!validColdRunID(r.RunID) || len(r.Profiles) != 2 {
 		return errors.New("invalid cold matrix header")
 	}
 	first := r.Profiles[0]
-	if !reflect.DeepEqual(r.Protocol, matrixProtocol(first.Fixture.Profile, first.Fixture.SparseRuns)) {
+	expected := matrixProtocol(first.Fixture.Profile, first.Fixture.SparseRuns)
+	if r.SchemaVersion == coldMatrixSchema {
+		if r.Protocol.Budgets == nil || r.Protocol.Budgets.ColdP95NS <= 0 {
+			return errors.New("missing or invalid cold matrix budgets")
+		}
+		expected.Budgets = new(matrixBudgets(time.Duration(r.Protocol.Budgets.ColdP95NS)))
+	}
+	if !reflect.DeepEqual(r.Protocol, expected) {
 		return errors.New("invalid cold matrix fixture protocol or sample schedule")
 	}
 	for i, p := range r.Profiles {
 		wantFixture := first.Fixture
 		wantFixture.Profile = r.Protocol.ProfileOrder[i]
-		if p.Fixture != wantFixture || p.SchemaVersion != coldMatrixSchema || p.Revision != r.Revision ||
+		if p.Fixture != wantFixture || p.SchemaVersion != r.SchemaVersion || p.Revision != r.Revision ||
 			!reflect.DeepEqual(p.Environment, r.Environment) || p.Pairing == nil || p.Pairing.RunID != r.RunID {
 			return fmt.Errorf("cold matrix profile %d disagrees on fixture, execution, revision or environment", i+1)
 		}
@@ -173,17 +197,17 @@ func (r coldMatrixReport) validateHeader() error {
 }
 
 // Reconstruct the shared append-order packing once per phase from the fixture.
-func coldPhaseBlocks(initial, rows []checkpoint.BlockRow) [][]checkpoint.BlockRow {
-	blocks := partition(initial)
-	if len(initial) == len(rows) {
-		return blocks
+func coldPhaseBlocks(blocks [][]checkpoint.BlockRow, initialRows int, rows []checkpoint.BlockRow) ([][]checkpoint.BlockRow, int) {
+	if initialRows == len(rows) {
+		return blocks, 0
 	}
 	last := blocks[len(blocks)-1]
-	appended := rows[len(initial):]
+	appended := rows[initialRows:]
 	if rawBlockBytes(last)+encodedRowBytes(appended[0]) > blockTarget {
-		return append(blocks, partition(appended)...)
+		return append(slices.Clone(blocks), partition(appended)...), len(blocks)
 	}
-	return append(blocks[:len(blocks)-1], partition(rows[len(initial)-len(last):])...)
+	reused := len(blocks) - 1
+	return append(slices.Clone(blocks[:reused]), partition(rows[initialRows-len(last):])...), reused
 }
 
 type coldBlockShape struct {
@@ -218,16 +242,24 @@ type coldScanLimits struct {
 	rawPayload                  int64
 }
 
+func (b coldBlockShape) matches(q query, bloom bool) bool {
+	return !b.max.Before(q.start) && b.min.Before(q.end) && (!bloom || b.bloom.mayContain(q.literal))
+}
+
+func (b coldBlockShape) workingBytes() int {
+	return 2*b.rawBytes - blockHeader + b.rowCount*(decodedRowBytes-blockRowWidth)
+}
+
 func coldLimits(shapes []coldBlockShape, q query, bloom bool) coldScanLimits {
 	s := coldScanLimits{visited: len(shapes)}
 	for _, b := range shapes {
-		if b.max.Before(q.start) || !b.min.Before(q.end) || (bloom && !b.bloom.mayContain(q.literal)) {
+		if !b.matches(q, bloom) {
 			continue
 		}
 		s.decoded++
 		s.maxRaw = max(s.maxRaw, b.rawBytes)
 		s.rawPayload += int64(b.rawBytes)
-		working := 2*b.rawBytes - blockHeader + b.rowCount*(decodedRowBytes-blockRowWidth)
+		working := b.workingBytes()
 		if b.rawBytes > blockTarget {
 			s.oversized++
 			s.oversizedPeak = max(s.oversizedPeak, working)

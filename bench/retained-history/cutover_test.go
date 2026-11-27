@@ -144,6 +144,44 @@ func TestCutoverRequiresOverlapMemoryForEveryTimeline(t *testing.T) {
 	}
 }
 
+func TestStrictCutoverTimeoutVerdict(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "capacity.json")
+	if err := writeReport(path, passingCutoverReport()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, after, ok := strings.Cut(string(data), `"timed_out": false,`)
+	if !ok {
+		t.Fatal("producer report missing explicit false timeout verdict")
+	}
+
+	for _, tc := range []struct {
+		name, field, want string
+	}{
+		{"explicit false", `"timed_out": false,`, ""},
+		{"missing", "", "missing or null timed_out"},
+		{"null", `"timed_out": null,`, "missing or null timed_out"},
+		{"timed out", `"timed_out": true,`, "require timed_out to be false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "capacity.json")
+			if err := os.WriteFile(path, []byte(before+tc.field+after), 0600); err != nil {
+				t.Fatal(err)
+			}
+			err := run(t.Context(), []string{"-validate-cutover", path})
+			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Fatalf("validation error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestArchivedReportAndStrictValidation(t *testing.T) {
 	const archive = "evidence/legacy-linux-arm64.json"
 	if err := validateCutoverFile(archive); err == nil || !strings.Contains(err.Error(), "schema-v1 live") {

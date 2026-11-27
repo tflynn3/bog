@@ -18,7 +18,7 @@ authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
 The Linux amd64 and arm64 production inventories at
-`62d13b7fa3744feb213d227de10e8ee2b496b4a7` agree on the 19 root-module
+`74e56a7d2f46abd010eb0a86414b179fff06ecae` agree on the 20 root-module
 production packages and 23 direct imports between them shown below.
 The entire root-module closure of `cmd/bog` consists of the command plus
 HTTP, readiness, store, and WAL. The command recovers an ordinary WAL into
@@ -71,6 +71,7 @@ flowchart TD
         History["internal/history"]
         Backup["internal/backup (also used offline)"]
         Idempotency["internal/idempotency (staged keyed ingest)"]
+        StreamPolicyEngine["internal/streampolicy"]
         History --> Checkpoint
     end
     Client["internal/client (standalone)"]
@@ -211,6 +212,7 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `internal/history` | Staged | Generation validation, ordered scans, pins, and reclamation |
 | `internal/backup` | Staged | Pinned export, verification, restore, offline reads, and staging recovery. `cmd/bog-verify` keeps its direct offline dependency through promotion. |
 | `internal/idempotency` | Staged | Keyed-ingest coordination and durable backend contract |
+| `internal/streampolicy` | Staged | Atomic policy activation, scoped grant decisions, query masking, and whole-batch ingest redaction |
 | `cmd/bog-verify` | Operator command | Read-only image verification and complete HTTP query parity |
 | `cmd/bog-export` | Operator command | Stream ordered NDJSON from the server's HTTP query API |
 | `internal/client` | Standalone | Production HTTP client for `cmd/bog-verify`, `cmd/bog-export`, and `verify/release`, including complete-page framing, opaque cursors, and ingest outcomes |
@@ -239,6 +241,13 @@ bodies, and retries after an ambiguous response and process restart.
 [Retained runtime promotion](../adr/0049-retained-runtime-promotion.md),
 [Staging declarations](../../internal/archtest/staged_packages_test.go),
 [Ingest retry contract](../ingest-retries.md)
+
+Core Engineering owns the staged stream-policy engine. It has zero direct
+root-module production imports and is outside the measured server closure
+on both Linux targets. Activation requires measured server reachability
+and the independent serving evidence specified by ADR 0050 on native
+Linux amd64 and arm64.
+[Stream-policy decision boundary](../adr/0050-stream-policy-decision-boundary.md)
 
 ## Ranked quality attributes
 
@@ -489,7 +498,10 @@ independently. The measured walk also follows external production imports.
 - Stream policy conformance runs outside every registered production command
   dependency tree. Its own production imports cannot reach internal packages
   or command roots, including through external production dependencies.
-  [Stream policy boundary](../../internal/archtest/stream_policy_boundary_test.go)
+  The engine cannot reach other root-module packages, and operator and
+  evidence packages must stay independent of it.
+  [Conformance boundary](../../internal/archtest/stream_policy_boundary_test.go),
+  [Engine boundary](../../internal/archtest/stream_policy_engine_boundary_test.go)
 - The release and capacity producers are the only production consumers of
   the listener helper. The check follows indirect imports as well.
   [Candidate listener boundary](../../internal/archtest/listener_boundary_test.go)

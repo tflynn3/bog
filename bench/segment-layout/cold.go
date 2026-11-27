@@ -18,16 +18,17 @@ const coldRewriteBoundary = "logical bytes in newly written synced experimental 
 var coldPhases = [...]string{"initial", "clustered", "scattered"}
 
 type coldReport struct {
-	SchemaVersion int            `json:"schema_version"`
-	Mode          string         `json:"mode"`
-	Revision      string         `json:"revision"`
-	Fixture       coldFixture    `json:"fixture"`
-	Environment   map[string]any `json:"environment"`
-	Oracle        string         `json:"oracle"`
-	Production    coldLayout     `json:"production_v1_component"`
-	Experimental  []coldLayout   `json:"experimental_layouts"`
-	Live          liveReport     `json:"live_server_compaction"`
-	Pairing       *coldPairing   `json:"pairing,omitempty"`
+	SchemaVersion int                   `json:"schema_version"`
+	Mode          string                `json:"mode"`
+	Revision      string                `json:"revision"`
+	Fixture       coldFixture           `json:"fixture"`
+	Environment   map[string]any        `json:"environment"`
+	Oracle        string                `json:"oracle"`
+	Production    coldLayout            `json:"production_v1_component"`
+	Experimental  []coldLayout          `json:"experimental_layouts"`
+	Live          liveReport            `json:"live_server_compaction"`
+	Backfills     []coldBackfillFixture `json:"backfill_scenarios,omitempty"`
+	Pairing       *coldPairing          `json:"pairing,omitempty"`
 }
 
 type coldFixture struct {
@@ -50,6 +51,8 @@ type coldPhase struct {
 	Segments      int     `json:"segments"`
 	ManifestBytes int64   `json:"manifest_bytes"`
 	BloomBytes    int64   `json:"bloom_metadata_bytes"`
+	PayloadSizes  []int   `json:"experimental_segment_payload_bytes,omitempty"`
+	V1DecodeBound *uint64 `json:"v1_decode_buffer_upper_bound_bytes,omitempty"`
 	StoredBytes   *uint64 `json:"stored_segment_and_manifest_bytes,omitempty"`
 	segmentBytes
 	Rewrite *amplification    `json:"rewrite_amplification,omitempty"`
@@ -135,6 +138,29 @@ func (q *coldQueryReport) summarize() {
 	q.P95NS, q.ReadBytesP95, q.StorageReadBytesP95 = p95(times), p95(reads), p95(storage)
 }
 
+func parseProcessIO(data []byte, field string) (uint64, error) {
+	var value uint64
+	var found bool
+	for line := range strings.Lines(string(data)) {
+		key, raw, _ := strings.Cut(line, ":")
+		if key != field {
+			continue
+		}
+		if found {
+			return 0, fmt.Errorf("duplicate /proc io counter %s", field)
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid /proc io counter %s: %w", field, err)
+		}
+		value, found = n, true
+	}
+	if !found {
+		return 0, fmt.Errorf("missing /proc io counter %s", field)
+	}
+	return value, nil
+}
+
 type readIO struct {
 	logical, storage int64
 	snapshotBytes    int64
@@ -190,13 +216,16 @@ func validateBenchmarkReport(in io.Reader) error {
 	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
 		return fmt.Errorf("expected one benchmark report, trailing input: %v", err)
 	}
+	if err := rejectDuplicateReportFields(raw); err != nil {
+		return err
+	}
 	var header struct {
 		Version int `json:"schema_version"`
 	}
 	if err := json.Unmarshal(raw, &header); err != nil {
 		return err
 	}
-	if header.Version == coldMatrixSchema {
+	if hasColdMatrixEvidence(header.Version) {
 		return validateColdMatrixJSON(raw)
 	}
 	if header.Version == 5 || header.Version == pairedColdSchema {
@@ -222,7 +251,7 @@ func (r coldReport) validate() error {
 	if err := r.validateColdMeasurements(); err != nil {
 		return err
 	}
-	if r.SchemaVersion == pairedColdSchema || r.SchemaVersion == coldMatrixSchema {
+	if r.SchemaVersion == pairedColdSchema || hasColdMatrixEvidence(r.SchemaVersion) {
 		return r.validatePairs()
 	}
 	if r.Pairing != nil {
@@ -244,7 +273,7 @@ func (r coldReport) validate() error {
 
 func (r coldReport) validateColdMeasurements() error {
 	f := r.Fixture
-	if (r.SchemaVersion != 5 && r.SchemaVersion != pairedColdSchema && r.SchemaVersion != coldMatrixSchema) || r.Mode != "cold" || !knownRevision(r.Revision) || r.Oracle != coldOracle ||
+	if (r.SchemaVersion != 5 && r.SchemaVersion != pairedColdSchema && !hasColdMatrixEvidence(r.SchemaVersion)) || r.Mode != "cold" || !knownRevision(r.Revision) || r.Oracle != coldOracle ||
 		r.Environment["os"] != "linux" || r.Environment["cache_policy"] != coldCachePolicy ||
 		(f.Profile != "mixed" && f.Profile != "entropy") || f.Batches < 1 || f.Batches > maxBatches ||
 		f.SparseRuns < 1 || f.SparseRuns > maxRuns || f.TargetBytes != blockTarget {
@@ -253,6 +282,10 @@ func (r coldReport) validateColdMeasurements() error {
 	if (f.Scale == "smoke" && (f.Batches != scaleBatches["small"] || f.SparseRuns != 1)) ||
 		(f.Scale != "smoke" && f.Scale != "custom" && scaleBatches[f.Scale] != f.Batches) {
 		return errors.New("cold report fixture scale disagrees with batches or sample count")
+	}
+	if (r.SchemaVersion == coldMatrixSchema && len(r.Backfills) != len(coldPhases)-1) ||
+		(r.SchemaVersion != coldMatrixSchema && r.Backfills != nil) {
+		return errors.New("invalid cold backfill scenario evidence")
 	}
 	if r.Production.Name != productionV1 || len(r.Experimental) != len(layouts) {
 		return errors.New("expected production v1 and six experimental layouts")
@@ -310,12 +343,27 @@ func validateColdLayout(l coldLayout, rows, runs, schema int, production bool) e
 			(production && phase.BloomBytes != 0) {
 			return fmt.Errorf("%s/%s: invalid publication counters", l.Name, phase.Phase)
 		}
-		if schema == coldMatrixSchema {
+		if hasColdMatrixEvidence(schema) {
 			if phase.StoredBytes == nil || *phase.StoredBytes != phase.storedBytes() {
 				return fmt.Errorf("%s/%s: stored bytes disagree with retained segment and manifest bytes", l.Name, phase.Phase)
 			}
 		} else if phase.StoredBytes != nil {
 			return fmt.Errorf("%s/%s: unexpected stored byte total", l.Name, phase.Phase)
+		}
+		if schema == coldMatrixSchema {
+			if production {
+				if phase.PayloadSizes != nil || phase.Segments > coldV1MaxSegments ||
+					phase.V1DecodeBound == nil || *phase.V1DecodeBound != coldV1DecodeBound(phase.Segments) {
+					return fmt.Errorf("%s/%s: invalid v1 decode buffer upper bound", l.Name, phase.Phase)
+				}
+				if i > 0 && phase.Rewrite != nil && phase.Rewrite.WrittenBytes < uint64(phase.RewrittenBytes)+uint64(phase.ManifestBytes) {
+					return fmt.Errorf("%s/%s: v1 publication writes omit segment or manifest bytes", l.Name, phase.Phase)
+				}
+			} else if phase.V1DecodeBound != nil || len(phase.PayloadSizes) != phase.Segments {
+				return fmt.Errorf("%s/%s: incomplete experimental segment payload inventory", l.Name, phase.Phase)
+			}
+		} else if phase.V1DecodeBound != nil || phase.PayloadSizes != nil {
+			return fmt.Errorf("%s/%s: unexpected budget evidence", l.Name, phase.Phase)
 		}
 		if i == 0 {
 			if phase.Rewrite != nil || phase.ReusedBytes != 0 || phase.RetiredBytes != 0 {
@@ -341,11 +389,11 @@ func validateColdLayout(l coldLayout, rows, runs, schema int, production bool) e
 			if err := got.validate(q, wantRows, coldQueryRuns(schema, q, runs), production); err != nil {
 				return fmt.Errorf("%s/%s/%s: %w", l.Name, phase.Phase, q.name, err)
 			}
-			if (got.Selectivity != nil) != (schema == coldMatrixSchema) {
+			if (got.Selectivity != nil) != hasColdMatrixEvidence(schema) {
 				return fmt.Errorf("%s/%s/%s: unexpected selectivity evidence", l.Name, phase.Phase, q.name)
 			}
 			for _, sample := range got.Samples {
-				if (sample.Scan != nil) != (schema == coldMatrixSchema && !production) {
+				if (sample.Scan != nil) != (hasColdMatrixEvidence(schema) && !production) {
 					return fmt.Errorf("%s/%s/%s: invalid experimental scan evidence", l.Name, phase.Phase, q.name)
 				}
 			}

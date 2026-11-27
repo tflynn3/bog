@@ -48,10 +48,12 @@ func collectCold(ctx context.Context, cfg config) (_ coldMatrixReport, err error
 	if _, err := rand.Read(runID[:]); err != nil {
 		return coldMatrixReport{}, fmt.Errorf("cold pairing run ID: %w", err)
 	}
+	protocol := matrixProtocol(cfg.profile, cfg.runs)
+	protocol.Budgets = new(matrixBudgets(cfg.timeout))
 	result := coldMatrixReport{
 		SchemaVersion: coldMatrixSchema, Mode: "cold-matrix", Revision: cfg.revision,
 		RunID: hex.EncodeToString(runID[:]), Environment: env,
-		Protocol: matrixProtocol(cfg.profile, cfg.runs),
+		Protocol: protocol,
 	}
 	for _, profile := range result.Protocol.ProfileOrder {
 		profileDir := filepath.Join(dir, profile)
@@ -93,6 +95,11 @@ func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env 
 		rows := input.rows
 		if phaseIndex != 0 {
 			rows = input.withBackfill(burst)
+			scenario, err := describeColdBackfill(burst)
+			if err != nil {
+				return coldReport{}, fmt.Errorf("%s backfill fixture: %w", burst.name, err)
+			}
+			result.Backfills = append(result.Backfills, scenario)
 		}
 		prepareCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
 		err := prepareColdTargets(prepareCtx, cfg, dir, burst, rows, targets)
@@ -121,7 +128,10 @@ func collectColdProfile(ctx context.Context, cfg config, dir, runID string, env 
 		}
 		result.Live = live
 	}
-	if err := result.sealPairs(input); err != nil {
+	if err := matrixBudgets(cfg.timeout).validateMeasurements(result); err != nil {
+		return coldReport{}, err
+	}
+	if err := result.sealPairs(ctx, input); err != nil {
 		return coldReport{}, err
 	}
 	return result, ctx.Err()
@@ -142,6 +152,7 @@ func prepareColdTargets(ctx context.Context, cfg config, dir string, burst backf
 		return errors.New("unexpected production publication returned by worker")
 	}
 	baseline.StoredBytes = new(baseline.storedBytes())
+	baseline.V1DecodeBound = new(coldV1DecodeBound(baseline.Segments))
 	targets[0].path, targets[0].production = productionDir, true
 	targets[0].phases = append(targets[0].phases, baseline)
 	for i, l := range layouts {
@@ -243,6 +254,7 @@ func prepareColdExperimental(ctx context.Context, dir string, burst backfill, ro
 		return coldPhase{}, "", err
 	}
 	pub := coldPhase{Phase: burst.name, Rows: len(rows), Segments: len(next.Segments), ManifestBytes: info.Size(), segmentBytes: account}
+	pub.PayloadSizes = coldPayloadSizes(next)
 	if l.prune {
 		pub.BloomBytes = int64(len(next.Segments)) * int64(len(summary{}))
 	}
@@ -258,7 +270,10 @@ func sampleColdPhase(ctx context.Context, cfg config, targets []coldTarget, rows
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		want := reference(rows, q)
+		want, err := coldReference(ctx, rows, q)
+		if err != nil {
+			return err
+		}
 		digest := coldRowsDigest(want)
 		selectivity := measureColdSelectivity(rows, q, len(want))
 		for i := range targets {

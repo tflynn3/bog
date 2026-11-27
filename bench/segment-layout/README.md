@@ -34,7 +34,7 @@ the same profile, size and dependency versions. Timings vary.
 
 ## Cold incremental comparison
 
-Storage owns this nested module. Run the schema v7 cold matrix on native
+Storage owns this nested module. Run the schema v8 cold matrix on native
 Linux with a disk-backed work directory. From the repository root, set
 `work` to an existing scratch directory and `artifacts` to an existing
 evidence directory. Use the build, validate, and archive steps from the
@@ -53,10 +53,9 @@ CGO_ENABLED=0 go build -o "$artifacts/segment-layout" .
 tar -C "$artifacts" -czf "$artifacts/segment-layout.tar.gz" segment-layout
 ```
 
-Keep the validated JSON and matching executable archive together under the
-runner architecture. The existing workflow runs the cold matrix regression
-on native amd64 and arm64 and uploads its incremental smoke report. The
-commands above produce the cold artifacts when run on those architectures.
+The dedicated workflow runs the benchmark tests and uploads validated cold
+and incremental smoke reports with the matching executable archive on native
+Linux amd64 and arm64. The commands above also produce a medium cold report.
 
 A single `-cold` invocation runs both `mixed` and `entropy` with the same
 PCG seed, batch schedule, scale, query schedule, and filesystem. Use
@@ -130,9 +129,29 @@ metrics or rounds. `equal` means all observed deltas were zero. Check
 successful cache advice can still yield cached reads. Compare results across
 both fixture profiles and backfill phases before choosing a layout.
 
-The validator accepts historical schema v5 and v6 cold reports. Schema v7
-requires both matched profiles and independently reconstructs their query
-selectivities, segment packing, decoded fan-out, and decode ceilings.
+Schema v8 records a qualification budget in `protocol.budgets`. Every cold
+p95 must fit the configured `-timeout` in nanoseconds. Experimental ordinary
+decode peaks must fit the 64 KiB block target's working-buffer ceiling.
+Oversized singleton peaks use the decoded block's size-specific ceiling,
+up to the format maximum. The v1 component's decode-buffer upper bound
+covers a 4 KiB read page per published segment and a shared maximum-line
+buffer, with allowance for one buffer growing during the scan. This is a
+bound from the v1 reader's buffer layout. Query results, codec internals,
+and whole-process RSS are outside the buffer budgets.
+
+Each independent backfill records its earliest and latest timestamps,
+distinct timestamp count, row count, and committed WAL bytes. Component
+and experimental rewrite amplification must be at most 1,024 written bytes
+per committed backfill WAL byte, including the frame header in the
+denominator. The two publication paths use the byte boundaries listed
+below. Experimental segment counts, byte totals, and reuse must also
+match the append-tail packing and manifest. The validator reconstructs
+each query's payload reads and live decode working bytes from that
+inventory and the fixture's time and Bloom pruning.
+
+The validator rejects duplicate JSON fields and missing or null required
+cold matrix counters. Explicit zeros are valid where the measurement
+allows them. Historical cold schemas v5 through v7 remain readable.
 
 ### Individual worker measurements
 
@@ -145,6 +164,7 @@ selectivities, segment packing, decoded fan-out, and decode ceilings.
 | `stored_segment_and_manifest_bytes` | Logical bytes in the generation's retained segment files and current manifest, including codec and Bloom metadata. |
 | `experimental_scan` | Segment indexes visited, their logical index bytes, segments whose payloads were decoded, and the largest decoded raw block. Time and Bloom pruning can reduce decoded fan-out. |
 | `experimental_scan.decode` | Ordinary and oversized peak working bytes with ceilings. The ordinary ceiling follows the 64 KiB target. A larger block must contain one row and uses a size-specific ceiling capped by the existing block format. |
+| `v1_decode_buffer_upper_bound_bytes` | Phase-level bound on live production scan read and overflow buffers, derived from the published segment count and the fixture line-size limit. |
 | `peak_decode_bytes` | Experimental maximum live single-block payload buffers, decoded rows, and line bytes. Codec internals and accumulated results are outside this count. |
 | `peak_decode_go_heap_upper_bound_bytes` | Maximum query-window Go allocation delta, an upper bound on Go heap allocated for decoding in that window. It also covers other query allocations, such as results, and observer overhead. The v1 reader exposes this bound and worker RSS for memory comparison. |
 | `peak_worker_rss_bytes` | Worker high-water RSS through the scan, including startup and reader initialization. |
@@ -166,7 +186,7 @@ ordered loopback query results for a bounded sparse query and all three
 short literals, and the full persisted checkpoint after shutdown. A
 missing candidate or unavailable control endpoint is recorded in the live
 section. The live comparison is pending #53. The historical measurements
-below describe the earlier full-rewrite experiment. Use schema v7 evidence
+below describe the earlier full-rewrite experiment. Use schema v8 evidence
 to assess the incremental format, including compressed size, Bloom metadata
 cost, cold query latency and I/O, and backfill amplification.
 

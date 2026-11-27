@@ -163,10 +163,14 @@ func validatePublications(f incrementalFixtureReport, pubs, baseline []publicati
 			return fmt.Errorf("invalid %s publication metadata", qualificationPhases[i])
 		}
 		previous = pub.RetainedBytes
+		// scanSnapshot tracks the maximum across both segment classes and starts
+		// the overall bound at the ordinary bound before considering oversized segments.
 		if d := pub.Decode; target != 0 && (d == nil || d.PeakRSSBytes == 0 ||
 			d.Allocations == 0 || d.AllocationBytes == 0 || d.OversizedSegments != 1 ||
-			d.OrdinaryBoundBytes != decodeBound(target) || d.PeakOrdinaryBytes <= 0 ||
-			d.PeakOrdinaryBytes > d.OrdinaryBoundBytes || d.PeakWorkingBytes > d.WorkingBoundBytes) {
+			d.OrdinaryBoundBytes != decodeBound(target) || d.PeakOrdinaryBytes <= 0 || d.PeakOversizedBytes <= 0 ||
+			d.PeakOrdinaryBytes > d.OrdinaryBoundBytes ||
+			d.PeakWorkingBytes != max(d.PeakOrdinaryBytes, d.PeakOversizedBytes) ||
+			d.WorkingBoundBytes < max(d.OrdinaryBoundBytes, d.PeakWorkingBytes)) {
 			return fmt.Errorf("%s: missing or invalid decode sample", pub.Phase)
 		}
 		if len(pub.Queries) != len(qualificationQueries) {

@@ -92,6 +92,15 @@ append-order oracle, including exact timestamps, ordinals, and line bytes.
   peaks are reported separately so the singleton cannot mask the effect of
   segment size. The working-set accounting excludes metadata, codec internals,
   allocator overhead, and accumulated query results.
+
+  Schema v4 requires each experimental publication to report positive
+  `allocations`, `allocation_bytes`, `peak_rss_bytes`, and ordinary and
+  oversized working-set peaks, with `oversized_segments` equal to one.
+  `peak_working_bytes` equals the larger of `peak_ordinary_working_bytes` and
+  `peak_oversized_working_bytes`. `ordinary_working_bound_bytes` is computed
+  from the layout target and must cover the ordinary peak.
+  `working_bound_bytes` must cover both the ordinary bound and the overall
+  peak. The `production-v1` baseline may omit the decode sample.
 - **Query and publication latency.** Each run uses a fresh Linux process and
   private data directory. Sparse and dense scans run in separate trials.
   Initial queries run against the verified initial generation at idle. Each

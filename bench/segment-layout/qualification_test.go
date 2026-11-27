@@ -74,6 +74,109 @@ func TestQualificationRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestQualificationRequiresPositiveDecodeMeasurements(t *testing.T) {
+	data, err := json.Marshal(validQualification())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{
+		"allocations", "allocation_bytes", "peak_rss_bytes", "oversized_segments",
+		"peak_ordinary_working_bytes", "ordinary_working_bound_bytes",
+		"peak_oversized_working_bytes", "peak_working_bytes", "working_bound_bytes",
+	} {
+		for _, tc := range []struct {
+			name  string
+			value any
+		}{
+			{name: "negative", value: -1},
+			{name: "zero", value: 0},
+			{name: "omitted"},
+		} {
+			t.Run(field+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				var report map[string]any
+				if err := json.Unmarshal(data, &report); err != nil {
+					t.Fatal(err)
+				}
+				layout := report["layouts"].([]any)[0].(map[string]any)
+				pub := layout["publications"].([]any)[0].(map[string]any)
+				decode := pub["decode"].(map[string]any)
+				if _, ok := decode[field]; !ok {
+					t.Fatalf("valid fixture omits %s", field)
+				}
+				if tc.value == nil {
+					delete(decode, field)
+				} else {
+					decode[field] = tc.value
+				}
+				mutated, err := json.Marshal(report)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := validateQualificationJSON(bytes.NewReader(mutated)); err == nil {
+					t.Fatalf("accepted %s %s", tc.name, field)
+				}
+			})
+		}
+	}
+}
+
+func TestQualificationDecodeWorkingSetAccounting(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*decodeWorkingSet)
+		valid  bool
+	}{
+		{"aggregate below oversized peak", func(d *decodeWorkingSet) { d.PeakWorkingBytes-- }, false},
+		{"aggregate above both peaks", func(d *decodeWorkingSet) { d.PeakWorkingBytes++ }, false},
+		{"aggregate below ordinary peak", func(d *decodeWorkingSet) {
+			d.PeakOversizedBytes = d.PeakOrdinaryBytes - 1
+			d.PeakWorkingBytes = d.PeakOversizedBytes
+		}, false},
+		{"ordinary bound differs from target bound", func(d *decodeWorkingSet) { d.OrdinaryBoundBytes-- }, false},
+		{"ordinary peak above ordinary bound", func(d *decodeWorkingSet) {
+			d.PeakOrdinaryBytes = d.OrdinaryBoundBytes + 1
+		}, false},
+		{"overall bound below measured peak", func(d *decodeWorkingSet) {
+			d.WorkingBoundBytes = d.PeakWorkingBytes - 1
+		}, false},
+		{"overall bound below ordinary bound", func(d *decodeWorkingSet) {
+			d.PeakOversizedBytes = d.OrdinaryBoundBytes - 1
+			d.PeakWorkingBytes = d.PeakOversizedBytes
+			d.WorkingBoundBytes = d.PeakWorkingBytes
+		}, false},
+		{"too many oversized segments", func(d *decodeWorkingSet) { d.OversizedSegments++ }, false},
+		{"oversized peak at overall bound", func(d *decodeWorkingSet) {
+			d.WorkingBoundBytes = d.PeakWorkingBytes
+		}, true},
+		{"ordinary peak at both bounds", func(d *decodeWorkingSet) {
+			d.PeakOversizedBytes = d.OrdinaryBoundBytes - 1
+			d.PeakOrdinaryBytes = d.OrdinaryBoundBytes
+			d.PeakWorkingBytes = d.PeakOrdinaryBytes
+			d.WorkingBoundBytes = d.OrdinaryBoundBytes
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			report := validQualification()
+			// Check a later phase and layout so the rule covers the entire matrix.
+			tc.change(&report.Layouts[8].Publications[3].Decode.decodeWorkingSet)
+			data, err := json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validateQualificationJSON(bytes.NewReader(data))
+			if tc.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "zstd/262144: scattered: missing or invalid decode sample") {
+				t.Fatalf("expected a decode sample error for the scattered publication, got %v", err)
+			}
+		})
+	}
+}
+
 func sampleAt(r *incrementalReport, phase int) *qualificationSample {
 	return &r.Layouts[0].Publications[phase].Queries[0].Samples[0]
 }
@@ -94,8 +197,15 @@ func validQualification() incrementalReport {
 			}
 			if target != 0 {
 				p.Decode = &decodeSample{
-					decodeWorkingSet: decodeWorkingSet{OrdinaryBoundBytes: decodeBound(target), PeakOrdinaryBytes: 10, PeakWorkingBytes: 100, WorkingBoundBytes: 1000, OversizedSegments: 1},
-					Allocations:      1, AllocationBytes: 128, PeakRSSBytes: 4096,
+					decodeWorkingSet: decodeWorkingSet{
+						PeakOrdinaryBytes:  target / 2,
+						OrdinaryBoundBytes: decodeBound(target),
+						PeakOversizedBytes: 4 << 20,
+						PeakWorkingBytes:   4 << 20,
+						WorkingBoundBytes:  12 << 20,
+						OversizedSegments:  1,
+					},
+					Allocations: 100, AllocationBytes: 8 << 20, PeakRSSBytes: 16 << 20,
 				}
 			}
 			overlap := int64(12)

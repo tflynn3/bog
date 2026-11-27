@@ -172,6 +172,46 @@ pin-drain checks. Require both native verdicts and verified cleanup.
 [Native release gate](https://github.com/tflynn3/bog/blob/8d62fb925c4b9b7b86856af99a6f4c1732e9fba7/verify/release/README.md#query-lifecycle-qualification),
 [Fixed-budget backfill evidence](0030-fixed-budget-replacement-evidence.md)
 
+### Native retained shutdown
+
+On each native runner, run the opt-in scenario from the verifier checkout
+against that runner's pinned #108 binary. Set `BINARY` to its absolute
+path, `REVISION` to the full composed commit, and `DIGEST` to the
+SHA-256 recorded by the runner's build. Retain the events and require the
+named test to pass on both runners at the same revision.
+
+```sh
+BOG_RELEASE_RETAINED_SHUTDOWN=1 BOG_RELEASE_BINARY="$BINARY" \
+  BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_BINARY_SHA256="$DIGEST" \
+  BOG_RELEASE_FIXTURE=linux-release-v1 \
+  go test -race -json -count=1 -timeout=90s -run '^TestReleaseRetainedShutdown$' \
+    ./verify/release > retained-shutdown-events.jsonl &&
+  python3 verify/release/check_gate_evidence.py test-events \
+    retained-shutdown-events.jsonl bog/verify/release TestReleaseRetainedShutdown
+```
+
+The test checks the digest before launch, before restart, and after the
+scenario. It publishes a predecessor with a committed suffix, captures
+one page, and admits the continuation on a socket with a small receive
+window. It confirms TCP backpressure and an occupied query slot, then
+acknowledges backfill and publishes the successor at the exact cutoff.
+The predecessor pin and blocked continuation must still be observable.
+After SIGTERM the listener must stop accepting connections while the
+candidate remains alive and an independent open of the directory is
+denied the exclusive lock. The verifier then reads the complete framed
+predecessor response, requires exit status zero, and reaps the candidate.
+It restarts on the same directory and compares the complete ordered
+NDJSON walk with the acknowledged append ledger, including timestamp
+ties and duplicates.
+
+Storage's command-level test must observe the issuing API's
+`Close(ctx)` after HTTP drain, completion of source releases and
+admitted maintenance, and readiness descriptor closure before WAL
+close releases the directory lock. It must also exercise a failed
+drain and verify that the WAL and directory lock stay held until
+process exit. The two native runs and Storage's command-level evidence
+are required before closing qualification of the reviewed #108 composition.
+
 ## Costs and dispatch
 
 Certification and bounded response preparation add latency before the first

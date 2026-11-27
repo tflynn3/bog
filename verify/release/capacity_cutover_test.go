@@ -105,7 +105,10 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
 		edit   func(record, timeline object)
 		reject bool
 	}{
-		{name: "immediate and delayed drain"},
+		{name: "explicit no timeout with immediate and delayed drain"},
+		{"missing timeout verdict", func(r, _ object) { delete(r, "timed_out") }, true},
+		{"null timeout verdict", func(r, _ object) { r["timed_out"] = nil }, true},
+		{"timed-out workload", func(r, _ object) { r["timed_out"] = true }, true},
 		{"forward-compatible fields", func(_, b object) { b["extension"] = object{"value": true} }, false},
 		{"samples equal peak", func(r, b object) {
 			peak := r["cgroup_peak_memory_bytes"]
@@ -176,7 +179,7 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
 			if err := os.WriteFile(reportPath, in, 0600); err != nil {
 				t.Fatal(err)
 			}
-			if err := validateReportWithOptions(in, id, capacityCases, cutover); (err != nil) != tc.reject {
+			if err := validateFile(reportPath, id, capacityCases, cutover); (err != nil) != tc.reject {
 				t.Errorf("release validator error = %v, want rejection %t", err, tc.reject)
 			}
 			cmd := exec.CommandContext(t.Context(), producer, "-validate-cutover", reportPath)

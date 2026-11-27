@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	jsonv1 "encoding/json"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -35,8 +36,24 @@ func validateCutoverFile(path string) (err error) {
 	if len(data) > maxReport {
 		return errors.New("capacity report exceeds 16 MiB")
 	}
+	// The producer always writes a boolean. Track presence when reading
+	// strict evidence so missing or null cannot pass as false.
+	decodeResult := json.UnmarshalFromFunc(func(d *jsontext.Decoder, r *result) error {
+		wire := struct {
+			*result
+			TimedOut *bool `json:"timed_out"`
+		}{result: r}
+		if err := json.UnmarshalDecode(d, &wire); err != nil {
+			return err
+		}
+		if wire.TimedOut == nil {
+			return errors.New("missing or null timed_out verdict")
+		}
+		r.TimedOut = *wire.TimedOut
+		return nil
+	})
 	var report report
-	if err := json.Unmarshal(data, &report, jsonv1.FormatDurationAsNano(true)); err != nil {
+	if err := json.Unmarshal(data, &report, jsonv1.FormatDurationAsNano(true), json.WithUnmarshalers(decodeResult)); err != nil {
 		return fmt.Errorf("decode capacity report: %w", err)
 	}
 	return report.validateCutover()
@@ -73,7 +90,10 @@ func (r report) validateCutover() error {
 func (r result) validateCutover(f fixture) error {
 	recorded := r.Fixture
 	recorded.scatteredTail = f.scatteredTail // fixture placement is implicit in live reports
-	if recorded != f || r.Phase != "complete" || r.Status != "pass" || r.Workload != "pass" || r.TimedOut ||
+	if r.TimedOut {
+		return errors.New("require timed_out to be false")
+	}
+	if recorded != f || r.Phase != "complete" || r.Status != "pass" || r.Workload != "pass" ||
 		r.RecoveredRows != f.SeedRows+f.TailRows {
 		return errors.New("missing completed fixture with exact restart parity")
 	}

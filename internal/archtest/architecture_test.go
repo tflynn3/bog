@@ -40,7 +40,9 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// Every staged role also has a declaration in stagedPackages, removed on promotion.
+// For #108, measure the composed command on both Linux targets before
+// promoting checkpoint, history, and backup and removing their declarations.
+// Operator reachability alone leaves a library staged.
 var registry = map[string]rule{
 	exportCommand:                {verifier, []string{goClient}},
 	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},

@@ -16,15 +16,15 @@ type stagingDeclaration struct {
 var stagedPackages = map[string]stagingDeclaration{
 	"bog/internal/checkpoint": {
 		owner:      "bog-storage",
-		activation: "#53 validates and publishes checkpoint generations through the pinned WAL owner and proves durable replacement at the requested cutoff.",
+		activation: "#108 validates and publishes checkpoint generations through the pinned WAL owner and proves durable replacement at the requested cutoff.",
 	},
 	"bog/internal/history": {
 		owner:      "bog-storage",
-		activation: "#53 serves ordered checkpoint and tail rows through the command-owned page source and proves a held HTTP cursor survives generation replacement.",
+		activation: "#108 serves ordered checkpoint and tail rows through the command-owned page source and proves a held HTTP cursor survives generation replacement.",
 	},
 	"bog/internal/backup": {
 		owner:      "bog-storage",
-		activation: "#53 uses backup APIs in server composition and proves verified writable restore, an acknowledged append, and exact HTTP parity after restart.",
+		activation: "#108 uses backup APIs in server composition and proves verified writable restore, an acknowledged append, and exact HTTP parity after restart.",
 	},
 	"bog/internal/idempotency": {
 		owner:      "bog-storage",
@@ -135,6 +135,66 @@ func TestStagedPackageDeclarationFixtures(t *testing.T) {
 			maps.Copy(rules, tt.rules)
 			requireValidCommandFixture(t, rules)
 			if got := stagedPackageProblems(rules, tt.declarations); !slices.Equal(got, tt.want) {
+				t.Errorf("stagedPackageProblems() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRetainedCutoverStaging(t *testing.T) {
+	t.Parallel()
+	const (
+		backup      = "bog/internal/backup"
+		checkpoint  = "bog/internal/checkpoint"
+		history     = "bog/internal/history"
+		idempotency = "bog/internal/idempotency"
+		wal         = "bog/internal/wal"
+	)
+	tests := []struct {
+		name            string
+		staleCheckpoint bool
+		dropIdempotency bool
+		want            []string
+	}{
+		{name: "retained libraries promoted and keyed ingest stays staged"},
+		{
+			name:            "transitively reachable checkpoint still has its staging declaration",
+			staleCheckpoint: true,
+			want:            []string{"stale staging declaration for " + checkpoint + ": package is registered as runtime library"},
+		},
+		{
+			name:            "keyed ingest declaration removed with the retained declarations",
+			dropIdempotency: true,
+			want:            []string{"staged package " + idempotency + " has no staging declaration"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			// Illustrate promotion by reachability without prescribing the
+			// exact set of direct imports in the Storage draft.
+			rules := map[string]rule{
+				server:          {serverCommand, []string{backup, history, wal}},
+				operatorCommand: {verifier, []string{backup}},
+				backup:          {runtimeLibrary, nil},
+				checkpoint:      {runtimeLibrary, nil},
+				history:         {runtimeLibrary, []string{checkpoint}},
+				idempotency:     {staged, nil},
+				wal:             {runtimeLibrary, nil},
+			}
+			requireValidCommandFixture(t, rules)
+			declarations := make(map[string]stagingDeclaration)
+			if !tt.dropIdempotency {
+				declarations[idempotency] = stagingDeclaration{
+					owner: "bog-storage", activation: "Commit and recover retry records atomically with their batches.",
+				}
+			}
+			if tt.staleCheckpoint {
+				declarations[checkpoint] = stagingDeclaration{
+					owner: "bog-storage", activation: "Prove durable replacement at the requested cutoff.",
+				}
+			}
+			if got := stagedPackageProblems(rules, declarations); !slices.Equal(got, tt.want) {
 				t.Errorf("stagedPackageProblems() = %q, want %q", got, tt.want)
 			}
 		})

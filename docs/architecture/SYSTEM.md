@@ -15,6 +15,12 @@ sync, and powersafe overwrite. The ingest and query listener has no built-in
 authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
+The Linux amd64 and arm64 inventories at
+`0b940e742d589d3b2e4f3154803dd8c7e5c462e3` agree on the server graph
+below. The command recovers an ordinary WAL into an in-memory store.
+#108 is the activation handoff for bounded retained recovery and queries.
+[Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md)
+
 ## Declared Linux production import graph
 
 The Mermaid graph declares the production packages and direct root-module
@@ -28,12 +34,12 @@ The declaration includes the fixture-backed stream policy verifier support
 added in #86 and both #87 capacity evidence imports. The shared validator
 and directory-anchored publisher are present in the repository. #87
 qualification still requires running the strict evidence gate against the
-composed #53 runtime on both native Linux runners.
+composed #108 runtime on both native Linux runners.
 [Shared capacity evidence boundary](../adr/0020-shared-capacity-evidence.md)
 
 ```mermaid
 flowchart TD
-    subgraph Runtime["Server and reachable libraries"]
+    subgraph Runtime["Measured server and reachable libraries"]
         Cmd["cmd/bog"]
         HTTP["internal/httpapi"]
         Ready["internal/readiness"]
@@ -51,7 +57,7 @@ flowchart TD
     end
     Operator["cmd/bog-verify"]
     Export["cmd/bog-export"]
-    subgraph Staged["Staged for server activation"]
+    subgraph Staged["Libraries awaiting server activation"]
         Checkpoint["internal/checkpoint"]
         History["internal/history"]
         Backup["internal/backup"]
@@ -101,13 +107,13 @@ flowchart TD
   `GET /ready` combines disk headroom and the terminal WAL group outcome.
   A confirmed rollback reports `wal_rollback` until a later durable
   outcome. An uncertain outcome reports `recovery_required` while the
-  process serves. The measured command samples by configured path. #60
-  wires the existing descriptor sampler to an independently owned handle
-  to the active WAL directory. [Readiness descriptor handoff](../adr/0005-pinned-writable-recovery-authority.md#readiness-descriptor-handoff-60)
+  process serves. The measured command samples by configured path. The
+  #108 handoff includes the descriptor sampler and its independently
+  owned handle to the active WAL directory. [Readiness descriptor handoff](../adr/0005-pinned-writable-recovery-authority.md#readiness-descriptor-handoff-60)
 
 ## Retained-history handoff
 
-#53 composes the retained `PageSource` in `cmd/bog` and injects it through
+#108 composes the retained `PageSource` in `cmd/bog` and injects it through
 `httpapi.NewWithPageSource`. HTTP owns admission, cursor authentication and
 expiry, fixed-budget certification through exhaustion, and NDJSON framing.
 The adapter pins the validated generation and the matching durable,
@@ -129,7 +135,7 @@ Checkpoint, history, and backup receive authority through composition.
 [Runtime storage composition](../adr/0007-runtime-storage-composition.md),
 [Pinned writable recovery](../adr/0005-pinned-writable-recovery-authority.md)
 
-The opt-in loopback capacity control uses the same publication path.
+The cutover's opt-in loopback capacity control uses the same publication path.
 Charge replay and whole-batch append reservations before reading or
 writing the tail. Charge capture, pin, and staging capacity before doing
 work. Credit reclaimed capacity after durable publication and activation
@@ -178,23 +184,26 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `bench/segment-layout` | Nested-module benchmark | Checkpoint layout experiment outside the root module |
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
-`bog-storage` owns the four staged libraries' server activation. Remove each
-staging declaration when server reachability changes its role. Keyed retries
-require the production WAL to commit and recover retry records atomically
-with their batches. Exercise concurrent same-key submissions, conflicting
-bodies, and retries after an ambiguous response and process restart.
+`bog-storage` owns #108 activation for checkpoint, history, and backup.
+Update their roles, staging declarations, and the diagram with the
+reviewed command wiring once both Linux inventories show server
+reachability and the activation criteria are met. Idempotency has its
+own activation criteria. Keyed retries require the production WAL to
+commit and recover retry records atomically with their batches. Exercise
+concurrent same-key submissions, conflicting bodies, and retries after
+an ambiguous response and process restart.
 [Staging declarations](../../internal/archtest/staged_packages_test.go),
 [Ingest retry contract](../ingest-retries.md)
 
 ## Ranked quality attributes
 
-| Rank | Property | Design choice and cost |
-| --- | --- | --- |
-| 1 | Durability | Acknowledge only durable whole batches and activate only durably published generations. Fence on uncertainty and fail startup on invalid committed authority, even when availability suffers. |
-| 2 | Exact queries | Preserve timestamp and ordinal order through restart, restore, and replacement. Certification spends work before cursor issuance, and pinned generations and tails delay reclamation. |
-| 3 | Bounded resources | Bound query work, response bytes, and concurrency. The retained path also bounds replay, append reservations, live captures, pinned generations, and staging. At capacity it can defer maintenance and refuse whole batches. |
-| 4 | Recovery time | Legacy startup replays the full committed WAL. Retained startup validates generation and writable authority, then replays a bounded committed suffix. Validation adds I/O before the listener opens. |
-| 5 | Throughput | Group syncs across admitted commits and prune provably irrelevant scan work. Retaining and hashing the readable v1 WAL prefix costs disk space and bandwidth. Tail-only v1 restores keep the verified checkpoint boundary and have finite writable tail capacity. |
+| Rank | Property | Measured server | #108 cutover requirement and cost |
+| --- | --- | --- | --- |
+| 1 | Durability | Acknowledge only durable whole batches and fence on uncertain WAL outcomes. | Activate only durably selected generations and fail startup on invalid committed authority, even when availability suffers. |
+| 2 | Exact queries | Preserve timestamp and append ordinal order in the in-memory view and through ordinary WAL replay. | Preserve exact order through writable restore and replacement. Certification spends work before cursor issuance, and pins delay reclamation. |
+| 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Bound replay, append reservations, live captures, pinned generations, and staging. Capacity pressure can defer maintenance and refuse whole batches. |
+| 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the generation and writable authority, then replay a bounded committed suffix. Validation adds startup I/O. |
+| 5 | Throughput | Group syncs across admitted commits. | Prune provably irrelevant scan work. Retaining and hashing the readable v1 WAL prefix costs space and I/O. A verified v1 restore has finite writable tail capacity. |
 
 ## Operator verification boundary
 
@@ -234,7 +243,7 @@ builds once with Go 1.27.0 and cgo disabled, and uses that job's pinned
 binary for every producer. Reports bind to the full revision, the native
 binary's SHA-256, and the `linux-release-v1` fixture. Both matrix jobs
 must pass report validation and cleanup. The matrix is configured and
-qualification of the composed #53 revision is pending.
+qualification of the composed #108 revision is pending.
 [Linux release workflow](../../.github/workflows/linux-release.yml)
 
 | Producer | Report | Required evidence |
@@ -283,8 +292,8 @@ details, reports, exit statuses, and logs. `verifier-race.log` includes the
 bounded backup and history corruption corpus. The capacity sample
 records publication at the requested cutoff. Runtime pin drain requires
 a positive retired-generation pin count while the held cursor is live
-and an observed zero after exhaustion. Missing runtime metrics carry an
-unavailable reason. Record the configured resource limits and exercise
+and an observed zero after explicit retirement and drain. Missing runtime
+metrics carry an unavailable reason. Record the configured resource limits and exercise
 whole-batch and maintenance refusal, recovery when capacity returns, and
 expiry with admitted operations still draining.
 [Capacity evidence contract](../../bench/retained-history/README.md#publication-and-pin-drain-sample-contract),
@@ -305,27 +314,18 @@ qualification requires adapters that observe a shared-deployment implementation.
 ## Fitness and registry ownership
 
 Architecture within Core Engineering owns the architecture record and
-fitness registry.
-`bog-storage` owns #53 recovery, publication, and command composition.
-`bog-query` owns the #59 HTTP paging contract. Recheck write leases at
-dispatch and at the Storage draft handoff. #60 follows the #53 command
-lease. Review the measured edges and roles together with the runtime
-wiring in one PR.
+fitness registry. `bog-storage` owns #108 recovery, publication, and command
+composition. `bog-query` owns the #59 HTTP paging contract. Recheck the
+disjoint write leases at dispatch and at the Storage draft handoff.
+Review the measured edges and roles together with the runtime wiring
+in one PR.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification)
 
-Architecture coordinates the SYSTEM.md handoff with Release Verification
-for #87 and with Storage for #53. Run the full architecture suite on the
-composed #87 tree. In the separate #53 runtime wiring PR, update the diagram
-and promote staged roles once both Linux inventories show server reachability
-and the activation criteria are met. Rebase the later registry edit onto the
-first landed PR, then rerun both Linux inventories.
-[#53 package promotion handoff](../adr/0019-package-role-governance.md#53-promotion-handoff)
-
-Architecture coordinates the exporter registry handoff with the #103 and
-#53 owners. Recheck leases at dispatch and handoff. If the pending #53
-cutover claims shared registry files, serialize the edits, rebase the later
-change, and rerun both Linux inventories on the composed tree.
+Keep the existing exporter and release evidence registrations when
+updating the diagram and registry for #108. Rerun both Linux inventories
+on the composed tree.
+[Package role governance](../adr/0019-package-role-governance.md),
 [Exporter integration handoff](../adr/0032-operator-export-boundary.md#integration-and-qualification)
 
 The Architecture workflow runs `go test -count=1 ./internal/archtest`.
@@ -343,7 +343,9 @@ root-module production registry.
   the WAL outcome and cannot reach retained storage packages.
   [Paging boundary](../../internal/archtest/cutover_boundaries_test.go)
 - Checkpoint, history, and backup cannot reach the WAL. Storage cannot
-  depend on HTTP, readiness, or the Go HTTP client.
+  depend on HTTP, readiness, or the Go HTTP client. Only `cmd/bog` may
+  reach both WAL and any retained storage library, including through a
+  relay.
   [Storage authority](../../internal/archtest/storage_authority_test.go)
 - Command roots enforce server, operator verification, and operator export
   exclusions. The oracle and the three release evidence roots enforce their

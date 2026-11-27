@@ -1,7 +1,7 @@
 # ADR 0015 — Retained-history runtime cutover
 
-**Status** — Cycle 153 baseline measured at
-`791e510a3afd11de6de8b4b2e05ac0eb3ce7ccb8`. #108 carries the activation
+**Status** — Cycle 157 baseline measured at
+`ddc0496f00812f17ab913ddb284587f7f216a231`. #108 carries the activation
 contract developed under #53. The supplied revision uses ordinary WAL
 recovery and the in-memory query view on both Linux targets. The reviewed
 Storage SHA, retained package promotion, and native qualification of the
@@ -51,6 +51,26 @@ startup and its bounded tail.
 [Command-owned composition](0026-command-owned-retained-storage-composition.md),
 [Tail-only recovery contract](0035-tail-only-retained-recovery-contract.md)
 
+## Source review at the measured revision
+
+| Seam | Observed behavior |
+| --- | --- |
+| Lock and startup | `wal.Open` locks the pinned directory inode before checking restore names or replaying the ordinary WAL. It rejects `bog.backup` and `bog.wal.tail`. `cmd/bog` calls `net.Listen` after recovery succeeds. |
+| Append and capture | The WAL syncs bytes and publishes the commit marker before publishing whole batches to the in-memory store. `Log.Capture` pins an opened WAL identity and the latest published byte and ordinal bounds. The command's paging path uses `httpapi.NewWithQueryLimits` over the store. |
+| Replacement and restore | The checkpoint and history packages supply the retained primitives. Only the offline operator consumes backup in a production command. Live generation selection, a generation pin paired with the WAL capture, and writable restore startup await the Storage handoff. |
+| Readiness and drain | The command uses `readiness.NewHandler` with the configured path. After stopping probes, it drains HTTP before calling `Log.Close`. WAL close waits for the active writer before closing the directory. On HTTP drain timeout the process exits with the lock still held. Wiring the descriptor sampler, retained API close, and maintenance drain is part of the handoff. |
+
+Review the composed command against the runtime interfaces above using
+the same directory and owner from classification through close. Inspect
+the append and capture synchronization, the durable selector and treatment
+of commits after its cutoff, and the drain order for readers, maintenance,
+and probes. The import graph establishes dependency direction. Native
+probes exercise the ordering and recovery guarantees.
+[Command lifecycle](../../cmd/bog/main.go),
+[Startup and directory lock](../../internal/wal/recovery.go),
+[Capture implementation](../../internal/wal/capture_linux.go),
+[Readiness constructors](../../internal/readiness/wal_linux.go)
+
 ## Trade-offs
 
 Durable whole-batch acknowledgement and synchronized activation preserve
@@ -77,7 +97,7 @@ Promote each retained package when both Linux production inventories
 show that `cmd/bog` reaches it and review confirms its activation criteria.
 Remove the corresponding staging declaration in the same change.
 
-The Cycle 153 baseline inventories agree on these direct root-module
+The Cycle 157 baseline inventories agree on these direct root-module
 production edges and transitive server reachability. Both use
 `go list -deps` under the architecture suite settings.
 
@@ -95,7 +115,9 @@ production edges and transitive server reachability. Both use
 | `cmd/bog-verify` | `internal/backup`, `internal/client`, `internal/store` | Operator command |
 
 The server closure contains the command and its four wired libraries.
-The operator's read-only backup edge is outside that closure.
+The operator's read-only backup edge is outside that closure. The
+observed server activation for checkpoint, history, and backup is
+pending, so their roles and declarations remain staged.
 [Exact production graph](../architecture/SYSTEM.md#declared-linux-production-import-graph)
 
 | Staged package | Owner | Activation criteria | Evidence required from the composed revision |
@@ -136,13 +158,18 @@ Architecture in the existing bog AgentSet owns this ADR, SYSTEM.md,
 `internal/archtest/staged_packages_test.go`. Storage owns the runtime
 draft and its write lease. Release Verification owns the native gate.
 Keep #104 behind the HTTP read lease and retained paging handoff, and
-#81 behind #108's writable recovery contract.
+#81 behind #108's writable recovery contract. Cycle 157 reserves the
+ordered runtime and governance handoff plus an independent pinned-binary
+query replay track. The listener work can proceed independently.
 
-Recheck the four Architecture paths against the active leases at
-dispatch and again at the immutable Storage handoff. The supplied write
-scope covers the four governance files. The handoff lease check requires
-the current active leases and reviewed Storage SHA. Measure the composed
-Linux amd64 and arm64 inventories at that SHA.
+The supplied snapshot lists three held leases and omits the reported
+#108 and pager scopes. PM reports five running tracks and the supplied
+backlog export identifies #81 and #106. The four Architecture paths and
+the listener write set are disjoint and clear the supplied snapshot.
+Live lease scopes and a reviewed Storage SHA were unavailable for this
+measurement. Preserve assignments and recheck the live scopes at dispatch
+and again at the immutable Storage handoff. Measure the composed Linux
+amd64 and arm64 inventories at the reviewed SHA.
 Record the direct edges, transitive server closure, and activation evidence
 for every promotion, and update the registry, staging declarations,
 diagram, and role table together.
@@ -153,9 +180,9 @@ Run `go vet ./internal/archtest`,
 tree and land runtime and governance in one reviewed PR.
 [System fitness settings](../architecture/SYSTEM.md#fitness-and-registry-ownership)
 
-The Cycle 153 baseline architecture vet, race suite, dual Linux inventory
-checks, and Linux amd64 cross-build passed. The activation and native
-qualification evidence still requires the composed revision.
+The supplied QA artifact at `79f0fe8adf1a3642c56990ad8791534fde1c426a`
+records a harness failure. Native verdicts for the measured revision
+are pending. The activation evidence requires the composed revision.
 
 The native matrix qualifies the same clean revision on amd64 and arm64.
 Each runner uses its own SHA-256-pinned binary for all producers. Require
@@ -166,7 +193,9 @@ under a 128 MiB cgroup cap with swap disabled. Require zero cgroup OOM
 kills, exact publication and pin-drain observations, and cleanup evidence.
 Verify readiness and ingest against the active WAL filesystem after path
 retargets. Require a passing capacity-control scope probe on both runners
-and both strict native verdicts.
+and both strict native verdicts. Require both seeded query replay
+subtests to pass against each runner's pinned binary and record the
+matching revision and binary digest.
 [System release evidence](../architecture/SYSTEM.md#release-evidence),
 [Capacity control qualification](0034-capacity-control-release-qualification.md),
 [Release composition](0008-release-verifier-composition.md)

@@ -13,8 +13,9 @@ type stagingDeclaration struct {
 	activation string
 }
 
-// Retain a declaration until the composed server reaches the package on both
-// Linux targets and review confirms its activation criteria.
+// Both Linux inventories at ddc0496f00812 still leave the retained libraries
+// outside cmd/bog. Remove each declaration with its role change once the
+// reviewed Storage handoff meets these criteria.
 var stagedPackages = map[string]stagingDeclaration{
 	"bog/internal/checkpoint": {
 		owner:      "bog-storage",
@@ -30,7 +31,7 @@ var stagedPackages = map[string]stagingDeclaration{
 	},
 	"bog/internal/idempotency": {
 		owner:      "bog-storage",
-		activation: "The production WAL atomically commits and recovers retry records with their batches, and HTTP ingest covers concurrent same-key submissions, conflicting bodies, and retry after an ambiguous response and restart.",
+		activation: "The production WAL atomically commits and recovers retry records with their batches. HTTP ingest verifies concurrent same-key submissions, conflicting bodies, and retry after an ambiguous response and restart.",
 	},
 }
 
@@ -157,6 +158,7 @@ func TestRetainedCutoverStaging(t *testing.T) {
 		operatorOnly          bool
 		keepDeclarations      []string
 		dropIdempotency       bool
+		wireIdempotency       bool
 		leaveCheckpointStaged bool
 		wantArchitecture      []string
 		want                  []string
@@ -198,6 +200,11 @@ func TestRetainedCutoverStaging(t *testing.T) {
 			dropIdempotency: true,
 			want:            []string{"staged package " + idempotency + " has no staging declaration"},
 		},
+		{
+			name:             "keyed ingest is wired while still staged",
+			wireIdempotency:  true,
+			wantArchitecture: []string{idempotency + " is registered as staged but reachability from " + server + " is true"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -219,6 +226,11 @@ func TestRetainedCutoverStaging(t *testing.T) {
 			}
 			if tt.leaveCheckpointStaged {
 				rules[checkpoint] = rule{staged, nil}
+			}
+			if tt.wireIdempotency {
+				command := rules[server]
+				command.imports = append(command.imports, idempotency)
+				rules[server] = command
 			}
 			packages := make(map[string]listedPackage, len(rules))
 			for path, entry := range rules {

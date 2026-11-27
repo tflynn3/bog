@@ -16,14 +16,14 @@ authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
 The Linux amd64 and arm64 production inventories at
-`791e510a3afd11de6de8b4b2e05ac0eb3ce7ccb8` agree on the graph below.
+`ddc0496f00812f17ab913ddb284587f7f216a231` agree on the 19 root-module
+production packages and 23 direct imports between them shown below.
 `cmd/bog` reaches HTTP, readiness, store, and WAL and recovers an ordinary
-WAL into an in-memory store. #108 keeps the same deployment unit and
-adds bounded retained recovery. The WAL owner serializes capture
-selection and generation activation with durable whole-batch
-publication. A verified restore establishes durable writable authority
-under the directory lock before the listener opens. The reviewed Storage
-handoff and the two native qualification verdicts are pending.
+WAL into an in-memory store. The command still uses path-based readiness
+and the in-memory paging constructor. The WAL can capture a published
+prefix, and the command has yet to compose that capability with a
+retained generation. #108's writable restore, live replacement, and
+retained paging await the reviewed Storage handoff.
 [Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md)
 
 ## Declared Linux production import graph
@@ -102,8 +102,9 @@ flowchart TD
 - **Query.** Results match a case-sensitive literal within a half-open
   time range and are ordered by UTC timestamp and global append ordinal.
   That order preserves ties, duplicates, and backfill. The measured
-  server serves a replayed in-memory store. Query concurrency, scan work,
-  and encoded response bytes have independent caps.
+  server supplies the replayed in-memory store through
+  `httpapi.NewWithQueryLimits`. Query concurrency, scan work, and encoded
+  response bytes have independent caps.
 - **Recovery.** The measured server validates and replays the committed
   ordinary WAL before listening. Under the directory lock, it rejects
   restored layouts containing `bog.backup` or `bog.wal.tail`. The offline
@@ -113,12 +114,14 @@ flowchart TD
   A confirmed rollback reports `wal_rollback` until a later durable
   outcome. An uncertain outcome reports `recovery_required` while the
   process serves. The measured command samples by configured path. The
-  #108 handoff includes the descriptor sampler and its independently
-  owned handle to the active WAL directory. [Readiness descriptor handoff](../adr/0005-pinned-writable-recovery-authority.md#readiness-descriptor-handoff-60)
+  #108 handoff calls for `readiness.NewHandlerForDirectory` with a
+  fresh, unlocked open relative to the WAL's pinned directory. The
+  command owns that handle and cancels probes before closing it.
+  [Readiness descriptor handoff](../adr/0005-pinned-writable-recovery-authority.md#readiness-descriptor-handoff-60)
 
 ## Retained-history handoff
 
-#108 will compose the retained `PageSource` in `cmd/bog` and inject it through
+#108 must compose the retained `PageSource` in `cmd/bog` and inject it through
 `httpapi.NewWithPageSource`. HTTP owns admission, cursor authentication and
 expiry, fixed-budget certification through exhaustion, and NDJSON framing.
 The adapter pins the validated generation and the matching durable,
@@ -129,7 +132,7 @@ resumes. Admitted paging and export operations keep their references to
 completion. [Runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
 [Fixed-budget continuations](../adr/0006-fixed-budget-query-continuations.md)
 
-At cutover, `cmd/bog` will classify and validate ordinary WAL, retained
+At cutover, `cmd/bog` must classify and validate ordinary WAL, retained
 checkpoint plus committed suffix, and verified restore under the same
 pinned directory. It establishes durable writable authority for restored
 images before listening. Checkpoint validates and durably publishes
@@ -261,6 +264,12 @@ qualification of the composed #108 revision is pending.
 | `bench/retained-history` | `capacity.json` | Both live scales (196,608 and 393,216 seed rows), each under a 128 MiB cgroup cap with swap disabled. Verify durable replacement at the exact cutoff, a held cursor across acknowledged backfill, exact fresh and restarted walks, and process and cgroup cleanup. Capture publication and retired pin drain evidence at the runtime observation points. |
 | `verify/release` / `TestReleaseRestoredParity` | `parity.json` | Start the pinned binary on a verified restore, compare exact walks with the independent append-log oracle, observe 204 for new backfill, and check the held capture and exact augmented history after restart. Exercise immediate post-ack crash recovery on a separate restored fixture. |
 | `verify/release` / `TestReleaseFixedBudgetBackfill` and `TestReleaseCapacityControlScope` | Passing test events | Exercise fixed-budget paging through backfill and replacement. Check that capacity routes are available only with explicit opt-in on the loopback listener. |
+| `verify/query-model` / `TestPinnedQueryModelReplay` | `query-model-events.jsonl` | Require passing seeded ordinary and retained walks, exact terminal replay, and a candidate identity matching the revision and binary checksum on each runner. |
+
+The supplied QA artifact at `79f0fe8adf1a3642c56990ad8791534fde1c426a`
+records a harness failure. Native qualification for the measured revision
+is pending. The two Linux inventories measure build topology and the cross-build
+checks compilation. Native verdicts require the pinned-binary producers.
 
 The three producers exercise a separate pinned server process through HTTP,
 process lifecycle, and disposable filesystem fixtures. Their Linux production
@@ -325,11 +334,13 @@ qualification requires adapters that observe a shared-deployment implementation.
 Architecture in the bog AgentSet owns the architecture record and
 fitness registry. Storage owns #108 recovery, publication, and command
 composition. Release Verification owns the two native verdicts.
-`bog-query` owns the HTTP paging contract. Recheck read and write leases
-at dispatch and at the immutable Storage handoff. Keep #104 behind the
-HTTP read lease and retained paging handoff, and #81 behind #108's
-writable recovery contract. Review the measured edges and roles together
-with the runtime wiring in one PR.
+`bog-query` owns the HTTP paging contract. Cycle 157 reserves one track for
+the ordered Storage handoff and one for pinned-binary query replay. Preserve
+the existing assignments while rechecking the live read and write leases
+at dispatch and at the reviewed Storage SHA. Keep #104 behind the HTTP
+read lease and retained paging handoff, and #81 behind #108's writable
+recovery contract. Review the measured edges and roles together with the
+runtime wiring in the #108 PR.
 [Linux architecture registry](../../internal/archtest/architecture_test.go),
 [Cutover handoff](../adr/0015-retained-history-runtime-cutover.md#integration-and-qualification)
 
@@ -360,9 +371,9 @@ root-module production registry.
   boundaries through external dependencies as well.
   [Storage authority](../../internal/archtest/storage_authority_test.go)
 - Command roots enforce server, operator verification, and operator export
-  exclusions. The measured Linux graph checks the server, operator
-  verification, oracle, and three release producer boundaries through
-  external production dependencies as well.
+  exclusions. The measured Linux graph checks those exclusions and the
+  oracle and three release producer boundaries through external production
+  dependencies as well.
   [Server boundary](../../internal/archtest/command_roots_test.go),
   [Operator boundary](../../internal/archtest/operator_boundary_test.go),
   [Exporter boundary](../../internal/archtest/export_boundary_test.go),
@@ -370,7 +381,7 @@ root-module production registry.
   [Release evidence boundary](../../internal/archtest/release_evidence_boundary_test.go)
 - Stream policy conformance runs outside every registered production command
   dependency tree. Its own production imports cannot reach internal packages
-  or command roots, including through an intermediary.
+  or command roots, including through external production dependencies.
   [Stream policy boundary](../../internal/archtest/stream_policy_boundary_test.go)
 - The release and capacity producers are the only production consumers of
   the listener helper. The check follows indirect imports as well.

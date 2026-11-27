@@ -40,7 +40,7 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// At 791e510a3afd, cmd/bog reaches HTTP, readiness, store, and WAL on both
+// At ddc0496f00812, cmd/bog reaches HTTP, readiness, store, and WAL on both
 // Linux targets. Promote retained libraries with measured #108 wiring and
 // activation evidence. The offline backup consumer is already registered.
 var registry = map[string]rule{
@@ -158,7 +158,15 @@ func measuredCutoverBoundaryProblems(packages map[string]listedPackage, rules ma
 	problems = append(problems, storageAuthorityProblems(measured)...)
 	problems = append(problems, serverCommandBoundaryProblems(measured)...)
 	problems = append(problems, operatorBoundaryProblems(measured)...)
+	// The exporter registry checks exact direct local imports. Follow the
+	// full graph here to catch forbidden destinations via external packages.
+	for _, path := range slices.Sorted(maps.Keys(registeredReachability(measured, exportCommand))) {
+		if forbiddenExportDependency(path) {
+			problems = append(problems, fmt.Sprintf("forbidden operator export dependency: %s reaches %s", exportCommand, path))
+		}
+	}
 	problems = append(problems, releaseEvidenceBoundaryProblems(measured)...)
+	problems = append(problems, streamPolicyProblems(measured)...)
 	return append(problems, queryOracleProblems(measured)...)
 }
 
@@ -235,6 +243,26 @@ func TestMeasuredCutoverBoundaries(t *testing.T) {
 			},
 		},
 		{
+			name:     "export client reaches history through an external relay",
+			consumer: goClient, target: history,
+			want: []string{
+				"forbidden operator export dependency: " + exportCommand + " reaches " + checkpoint,
+				"forbidden operator export dependency: " + exportCommand + " reaches " + history,
+				"forbidden release evidence dependency: " + releaseVerifier + " reaches " + checkpoint,
+				"forbidden release evidence dependency: " + releaseVerifier + " reaches " + history,
+			},
+		},
+		{
+			name:     "operator reaches stream policy through an external relay",
+			consumer: operatorCommand, target: streamPolicyVerifier,
+			want: []string{"forbidden command dependency: " + operatorCommand + " reaches " + streamPolicyVerifier},
+		},
+		{
+			name:     "stream policy reaches shared rows through an external relay",
+			consumer: streamPolicyVerifier, target: store,
+			want: []string{"forbidden stream policy dependency: " + streamPolicyVerifier + " reaches " + store},
+		},
+		{
 			name:     "server reaches the oracle through an external relay",
 			consumer: server, target: queryModel,
 			want: []string{"forbidden server command dependency: " + server + " reaches " + queryModel},
@@ -256,25 +284,31 @@ func TestMeasuredCutoverBoundaries(t *testing.T) {
 			name:     "release fixtures supply no production edge",
 			consumer: releaseVerifier, target: backup, testOnly: true,
 		},
+		{
+			name:     "export fixtures supply no production edge",
+			consumer: exportCommand, target: history, testOnly: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			rules := map[string]rule{
-				server:          {serverCommand, []string{backup, history, httpapi, readiness, wal}},
-				operatorCommand: {verifier, []string{backup, goClient, store}},
-				releaseVerifier: {verifier, []string{goClient}},
-				linuxVerifier:   {role: verifier},
-				retainedBench:   {role: verifier},
-				queryModel:      {role: verifierModel},
-				backup:          {runtimeLibrary, []string{store}},
-				checkpoint:      {runtimeLibrary, []string{store}},
-				history:         {runtimeLibrary, []string{checkpoint, store}},
-				httpapi:         {runtimeLibrary, []string{store, wal}},
-				readiness:       {runtimeLibrary, []string{store, wal}},
-				wal:             {runtimeLibrary, []string{store}},
-				store:           {role: runtimeLibrary},
-				goClient:        {standalone, []string{store}},
+				server:               {serverCommand, []string{backup, history, httpapi, readiness, wal}},
+				operatorCommand:      {verifier, []string{backup, goClient, store}},
+				exportCommand:        {verifier, []string{goClient}},
+				releaseVerifier:      {verifier, []string{goClient}},
+				linuxVerifier:        {role: verifier},
+				retainedBench:        {role: verifier},
+				queryModel:           {role: verifierModel},
+				streamPolicyVerifier: {role: verifierModel},
+				backup:               {runtimeLibrary, []string{store}},
+				checkpoint:           {runtimeLibrary, []string{store}},
+				history:              {runtimeLibrary, []string{checkpoint, store}},
+				httpapi:              {runtimeLibrary, []string{store, wal}},
+				readiness:            {runtimeLibrary, []string{store, wal}},
+				wal:                  {runtimeLibrary, []string{store}},
+				store:                {role: runtimeLibrary},
+				goClient:             {standalone, []string{store}},
 			}
 
 			packages := make(map[string]listedPackage, len(rules)+1)

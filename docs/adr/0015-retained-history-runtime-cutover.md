@@ -1,13 +1,10 @@
 # ADR 0015 — Retained-history runtime cutover
 
-**Status** — #108 is the Cycle 148 activation handoff for the runtime
-contract developed under #53. At base
-`0b940e742d589d3b2e4f3154803dd8c7e5c462e3`, the Linux amd64 and arm64
-production inventories agree. `cmd/bog` directly imports HTTP,
-readiness, store, and WAL and reaches those same four root-module
-libraries. It serves ordinary WAL recovery and an in-memory query view.
-Storage composition, package promotion, and native qualification are
-pending.
+**Status** — Cycle 150 baseline measured at
+`54347c836018789e0e3a95f7d76a02293169dfc5`. #108 carries the activation
+contract developed under #53. On both Linux targets the server uses
+ordinary WAL recovery and the in-memory query view. The immutable
+Storage handoff, package promotion, and native qualification are pending.
 [#108](https://github.com/tflynn3/bog/issues/108),
 [#53](https://github.com/tflynn3/bog/issues/53)
 
@@ -29,7 +26,7 @@ Fail startup on ambiguous authority or corrupt committed data.
 | --- | --- |
 | HTTP and command adapter | Inject a command-local `httpapi.PageSource` with `httpapi.NewWithPageSource`. The source implements `Page(context.Context, PageRequest, *store.QueryWork) (PageResult, error)` and idempotent `Release(capture string) error`. Repeat the ordered rows, positions, and exhaustion decision for the same captured source request. HTTP owns query admission, the bounded replay plan, cursor authentication and expiry, and complete response framing. |
 | WAL owner and retained view | Serialize durable append visibility, capture selection, and generation activation. Bind the generation and its pin to the matching WAL identity or epoch, covered whole-frame boundary, first uncovered ordinal, and exact durable query-visible end. Merge checkpoint and suffix by UTC timestamp and append ordinal. Publish whole committed batches before HTTP 204. Confirmed rollback publishes no rows. Uncertain outcomes fence the owner pending recovery. |
-| Checkpoint, catalog, and backup | Supply pinned readers, bounds, and reservations through composition. Sync immutable checkpoint files and authority before validating and installing the successor and trimming the live tail. Existing captures and exports hold their generation and tail references through completion. Reclaim only protocol-owned files unreachable from durable authority and all live pins. |
+| Checkpoint, catalog, and backup | The command supplies a pinned generation and matching committed suffix under WAL synchronization, with exact byte and ordinal bounds and independent readers. Checkpoint and backup validate their inputs and own readers they open. Validate and sync the successor before durably selecting it. Serialize selection with append publication so all commits beyond the cutoff survive. Existing captures and exports retain references through completion. Reclaim protocol-owned files only after durable selection and the last relevant pin drains. |
 | Capacity control | Mount `/_capacity/compaction` only with `BOG_CAPACITY_CONTROL=1` and a loopback listener. POST starts asynchronous replacement at the requested committed row cutoff. GET reports progress. Report `running` with the published generation and `complete` only after the newer generation is durable and installed at the exact cutoff. Retirement uses the HTTP API instance that issued the cursor. |
 | Readiness and shutdown | `/ready` observes disk headroom and terminal write outcomes. Supply a separately owned descriptor to the active WAL directory through `readiness.NewHandlerForDirectory`. Stop admission and maintenance scheduling, drain HTTP, and close the HTTP API before closing the WAL owner. Keep the lock until admitted append, publication, and export work drains. A drain timeout leaves the lock held until process exit. |
 
@@ -43,6 +40,15 @@ Admitted operations retain their references through completion.
 [Fixed-budget continuation contract](0006-fixed-budget-query-continuations.md),
 [Retained cursor retirement](0031-retained-cursor-retirement.md),
 [Live capacity control and metrics](../../bench/retained-history/README.md)
+
+The command maps the WAL's logical offsets to the pinned backing file
+and supplies read access to the exact whole frames in the committed suffix.
+It owns the operation pin through cancellation and error cleanup. ADR 0035
+specifies repeatable prefix-free advancement with versioned authority and
+suffix integrity. Review that contract separately from verified v1 writable
+startup and its bounded tail.
+[Command-owned composition](0026-command-owned-retained-storage-composition.md),
+[Tail-only recovery contract](0035-tail-only-retained-recovery-contract.md)
 
 ## Trade-offs
 
@@ -66,12 +72,27 @@ bytes. [V1 prefix digest](0005-pinned-writable-recovery-authority.md#keep-the-v1
 
 ## Staging and command boundaries
 
-Promote each retained package only when both Linux production inventories
-show that `cmd/bog` reaches it. Remove the corresponding staging
-declaration in the same change. As measured, `cmd/bog-verify` reaches
-`internal/backup`, `internal/client`, and `internal/store` directly.
-The server reaches none of checkpoint, history, backup, or idempotency,
-so their staging declarations remain active.
+Promote each retained package when both Linux production inventories
+show that `cmd/bog` reaches it and review confirms its activation criteria.
+Remove the corresponding staging declaration in the same change.
+
+At the Cycle 150 base, `go list -deps` under the architecture suite settings
+reported the same direct root-module production edges and transitive
+server reachability for Linux amd64 and arm64 with cgo disabled.
+
+| Package | Direct root-module production imports | Reachable from `cmd/bog` |
+| --- | --- | --- |
+| `cmd/bog` | HTTP, readiness, store, WAL | Server root |
+| `internal/checkpoint` | Store | No |
+| `internal/history` | Checkpoint, store | No |
+| `internal/backup` | Store | No |
+| `internal/idempotency` | None | No |
+
+The server closure contains only the command and its four direct
+root-module dependencies. `cmd/bog-verify` directly imports backup,
+client, and store. That read-only consumer keeps backup in the
+production inventory while its server activation criteria remain open.
+[Exact production graph](../architecture/SYSTEM.md#declared-linux-production-import-graph)
 
 | Staged package | Owner | Activation criteria |
 | --- | --- | --- |
@@ -82,8 +103,9 @@ so their staging declarations remain active.
 
 A staging declaration must name an owner and state activation criteria.
 The fitness check rejects missing or blank fields and declarations for
-removed or reclassified packages. Review evaluates the criteria and
-test evidence. Exact imports and reachability verify the role.
+removed or reclassified packages. Exact imports and reachability verify
+the role. The Linux inventory also checks the paging and storage authority
+seams through dependencies outside the root module.
 [Staging declaration check](../../internal/archtest/staged_packages_test.go),
 [Command root boundaries](0012-command-root-boundaries.md),
 [Standalone production consumers](0014-standalone-package-consumers.md)
@@ -104,17 +126,25 @@ append ledger and exercises the separate pinned server process.
 
 ## Integration and qualification
 
-Architecture owns the registry and system record. Storage owns the
-runtime draft. Both are in the bog AgentSet and work under disjoint
-write leases. Recheck leases at dispatch and at the immutable Storage
-draft handoff. Measure direct root-module production imports and
-transitive server reachability on the composed tree with the
-architecture suite's Linux amd64 and arm64 settings. Update the measured
-edges, package roles, staging declarations, and system diagram together.
-Run `go test -count=1 ./internal/archtest` and
+Architecture in the bog AgentSet owns this ADR, SYSTEM.md,
+`internal/archtest/architecture_test.go`, and
+`internal/archtest/staged_packages_test.go`. Storage owns the runtime
+draft and its write lease. At the immutable Storage handoff, check the
+four Architecture paths against the five held leases. Use the reviewed
+Storage SHA to measure the composed Linux amd64 and arm64 inventories.
+Record the direct edges, transitive server closure, and activation evidence
+for every promotion, and update the registry, staging declarations,
+diagram, and role table together.
+
+Run `go vet ./internal/archtest`,
+`go test -race -count=1 ./internal/archtest`, and
 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` on the composed
 tree and land runtime and governance in one reviewed PR.
 [System fitness settings](../architecture/SYSTEM.md#fitness-and-registry-ownership)
+
+The baseline governance update passed architecture vet and race checks,
+including both Linux inventory checks, and the Linux amd64 cross-build.
+The activation evidence must come from the composed revision.
 
 The native matrix qualifies the same clean revision on amd64 and arm64.
 Each runner uses its own SHA-256-pinned binary for all producers. Require

@@ -15,10 +15,12 @@ sync, and powersafe overwrite. The ingest and query listener has no built-in
 authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
-The Linux amd64 and arm64 inventories at
-`0b940e742d589d3b2e4f3154803dd8c7e5c462e3` agree on the server graph
-below. The command recovers an ordinary WAL into an in-memory store.
-#108 is the activation handoff for bounded retained recovery and queries.
+The Linux amd64 and arm64 production inventories at
+`54347c836018789e0e3a95f7d76a02293169dfc5` agree on the graph below.
+On both targets the server reaches exactly four root-module libraries:
+HTTP, readiness, store, and WAL. The command recovers an ordinary WAL
+into an in-memory store. #108 is the activation handoff for bounded
+retained recovery and queries.
 [Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md)
 
 ## Declared Linux production import graph
@@ -39,7 +41,7 @@ composed #108 runtime on both native Linux runners.
 
 ```mermaid
 flowchart TD
-    subgraph Runtime["Measured server and reachable libraries"]
+    subgraph Runtime["Server production closure on Linux amd64 and arm64"]
         Cmd["cmd/bog"]
         HTTP["internal/httpapi"]
         Ready["internal/readiness"]
@@ -57,7 +59,7 @@ flowchart TD
     end
     Operator["cmd/bog-verify"]
     Export["cmd/bog-export"]
-    subgraph Staged["Libraries awaiting server activation"]
+    subgraph Staged["Staged outside the server production closure"]
         Checkpoint["internal/checkpoint"]
         History["internal/history"]
         Backup["internal/backup"]
@@ -113,7 +115,7 @@ flowchart TD
 
 ## Retained-history handoff
 
-#108 composes the retained `PageSource` in `cmd/bog` and injects it through
+#108 will compose the retained `PageSource` in `cmd/bog` and inject it through
 `httpapi.NewWithPageSource`. HTTP owns admission, cursor authentication and
 expiry, fixed-budget certification through exhaustion, and NDJSON framing.
 The adapter pins the validated generation and the matching durable,
@@ -124,16 +126,18 @@ resumes. Admitted paging and export operations keep their references to
 completion. [Runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
 [Fixed-budget continuations](../adr/0006-fixed-budget-query-continuations.md)
 
-The cutover validates ordinary WAL, retained checkpoint plus committed
-suffix, and verified restore under the same pinned directory. A restored
-image establishes writable authority before the listener opens. Checkpoint
-validates and durably publishes immutable generations. History owns
-generation scans, pins, and reclamation. Store owns decoded rows and
-their order. Backup consumes pinned readers and bounds. The WAL owner
-coordinates append publication, capture, and generation activation.
-Checkpoint, history, and backup receive authority through composition.
+At cutover, `cmd/bog` will classify and validate ordinary WAL, retained
+checkpoint plus committed suffix, and verified restore under the same
+pinned directory. It establishes durable writable authority for restored
+images before listening. Checkpoint validates and durably publishes
+immutable generations. History owns generation scans, pins, and
+reclamation. Store owns decoded rows and their order. The command uses
+the WAL owner's synchronization to supply checkpoint and backup with a
+pinned recovery view of the generation and its exact committed suffix.
+The command and WAL owner coordinate append publication and activation.
 [Runtime storage composition](../adr/0007-runtime-storage-composition.md),
-[Pinned writable recovery](../adr/0005-pinned-writable-recovery-authority.md)
+[Pinned writable recovery](../adr/0005-pinned-writable-recovery-authority.md),
+[Tail-only recovery view](../adr/0035-tail-only-retained-recovery-contract.md)
 
 The cutover's opt-in loopback capacity control uses the same publication path.
 Charge replay and whole-batch append reservations before reading or
@@ -164,9 +168,9 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `internal/readiness` | Wired | Disk headroom and write outcome observation |
 | `internal/wal` | Wired | Directory locking, commit, replay, and WAL capture |
 | `internal/store` | Wired | Row decoding, publication, and ordered queries |
-| `internal/checkpoint` | Staged | WAL scans, checkpoint format, and durable publication |
-| `internal/history` | Staged | Generation validation, scans, pins, and reclamation |
-| `internal/backup` | Staged | Pinned export, verification, restore, offline reads, and staging recovery. The operator command uses the read-only APIs. |
+| `internal/checkpoint` | Staged | Checkpoint format, bounded WAL scans, and durable generation publication |
+| `internal/history` | Staged | Generation validation, ordered scans, pins, and reclamation |
+| `internal/backup` | Staged | Pinned export, verification, restore, offline reads, and staging recovery. Its production command consumer is `cmd/bog-verify`. |
 | `internal/idempotency` | Staged | Keyed-ingest coordination and durable backend contract |
 | `cmd/bog-verify` | Operator command | Read-only image verification and complete HTTP query parity |
 | `cmd/bog-export` | Operator command | Stream ordered NDJSON from the server's HTTP query API |
@@ -199,10 +203,10 @@ an ambiguous response and process restart.
 
 | Rank | Property | Measured server | #108 cutover requirement and cost |
 | --- | --- | --- | --- |
-| 1 | Durability | Acknowledge only durable whole batches and fence on uncertain WAL outcomes. | Activate only durably selected generations and fail startup on invalid committed authority, even when availability suffers. |
-| 2 | Exact queries | Preserve timestamp and append ordinal order in the in-memory view and through ordinary WAL replay. | Preserve exact order through writable restore and replacement. Certification spends work before cursor issuance, and pins delay reclamation. |
-| 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Bound replay, append reservations, live captures, pinned generations, and staging. Capacity pressure can defer maintenance and refuse whole batches. |
-| 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the generation and writable authority, then replay a bounded committed suffix. Validation adds startup I/O. |
+| 1 | Durability | Acknowledge whole batches after durable commit and fence on uncertain WAL outcomes. | Sync generation files and the writable authority before activation. Fence on uncertain publication and fail startup on invalid committed authority, trading availability for recoverability. |
+| 2 | Exact queries | Preserve timestamp and append ordinal order in memory and through ordinary WAL replay. | Pin the generation with its matching durable tail across pages and verify the same order after writable restore and restart. Certification spends work before cursor issuance, and live pins delay reclamation. |
+| 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Bound replay, whole-batch append reservations, live captures, pinned generations, and staging overlap. Capacity pressure can defer maintenance and refuse whole batches. |
+| 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the selected generation and writable authority, then replay the bounded committed suffix. Manifest, segment, and suffix validation adds startup I/O. |
 | 5 | Throughput | Group syncs across admitted commits. | Prune provably irrelevant scan work. Retaining and hashing the readable v1 WAL prefix costs space and I/O. A verified v1 restore has finite writable tail capacity. |
 
 ## Operator verification boundary
@@ -345,7 +349,8 @@ root-module production registry.
 - Checkpoint, history, and backup cannot reach the WAL. Storage cannot
   depend on HTTP, readiness, or the Go HTTP client. Only `cmd/bog` may
   reach both WAL and any retained storage library, including through a
-  relay.
+  relay. The Linux inventory checks the paging and storage authority
+  boundaries through external dependencies as well.
   [Storage authority](../../internal/archtest/storage_authority_test.go)
 - Command roots enforce server, operator verification, and operator export
   exclusions. The oracle and the three release evidence roots enforce their

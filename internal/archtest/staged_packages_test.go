@@ -13,6 +13,8 @@ type stagingDeclaration struct {
 	activation string
 }
 
+// Retain a declaration until the composed server reaches the package on both
+// Linux targets and review confirms its activation criteria.
 var stagedPackages = map[string]stagingDeclaration{
 	"bog/internal/checkpoint": {
 		owner:      "bog-storage",
@@ -151,16 +153,31 @@ func TestRetainedCutoverStaging(t *testing.T) {
 		wal         = "bog/internal/wal"
 	)
 	tests := []struct {
-		name            string
-		staleCheckpoint bool
-		dropIdempotency bool
-		want            []string
+		name             string
+		operatorOnly     bool
+		keepDeclarations []string
+		dropIdempotency  bool
+		want             []string
 	}{
 		{name: "retained libraries promoted and keyed ingest stays staged"},
 		{
-			name:            "transitively reachable checkpoint still has its staging declaration",
-			staleCheckpoint: true,
-			want:            []string{"stale staging declaration for " + checkpoint + ": package is registered as runtime library"},
+			name:             "operator-only backup stays staged when history and checkpoint are wired",
+			operatorOnly:     true,
+			keepDeclarations: []string{backup},
+		},
+		{
+			name:         "operator-only backup still needs its declaration",
+			operatorOnly: true,
+			want:         []string{"staged package " + backup + " has no staging declaration"},
+		},
+		{
+			name:             "promoted packages retain stale declarations",
+			keepDeclarations: []string{backup, checkpoint, history},
+			want: []string{
+				"stale staging declaration for " + backup + ": package is registered as runtime library",
+				"stale staging declaration for " + checkpoint + ": package is registered as runtime library",
+				"stale staging declaration for " + history + ": package is registered as runtime library",
+			},
 		},
 		{
 			name:            "keyed ingest declaration removed with the retained declarations",
@@ -182,6 +199,10 @@ func TestRetainedCutoverStaging(t *testing.T) {
 				idempotency:     {staged, nil},
 				wal:             {runtimeLibrary, nil},
 			}
+			if tt.operatorOnly {
+				rules[server] = rule{serverCommand, []string{history, wal}}
+				rules[backup] = rule{staged, nil}
+			}
 			requireValidCommandFixture(t, rules)
 			declarations := make(map[string]stagingDeclaration)
 			if !tt.dropIdempotency {
@@ -189,9 +210,9 @@ func TestRetainedCutoverStaging(t *testing.T) {
 					owner: "bog-storage", activation: "Commit and recover retry records atomically with their batches.",
 				}
 			}
-			if tt.staleCheckpoint {
-				declarations[checkpoint] = stagingDeclaration{
-					owner: "bog-storage", activation: "Prove durable replacement at the requested cutoff.",
+			for _, path := range tt.keepDeclarations {
+				declarations[path] = stagingDeclaration{
+					owner: "bog-storage", activation: "Prove the retained operation through the server.",
 				}
 			}
 			if got := stagedPackageProblems(rules, declarations); !slices.Equal(got, tt.want) {

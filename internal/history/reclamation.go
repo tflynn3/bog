@@ -60,15 +60,79 @@ func (c *Catalog) retiredIndex(info os.FileInfo) int {
 // A shared segment or one with live readers remains eligible for a later call.
 // It is safe to call after Close, including while retired readers are draining.
 func (c *Catalog) Reclaim(ctx context.Context, path string) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
+	return c.reclaim(ctx, manifestName, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
 }
 
 // ReclaimPinned is Reclaim using the caller's pinned directory.
 func (c *Catalog) ReclaimPinned(ctx context.Context, dir *os.File) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+	return c.reclaim(ctx, manifestName, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
 }
 
-func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error) {
+// ReclaimSelected protects the generation named by the live selector.
+func (c *Catalog) ReclaimSelected(ctx context.Context, dir *os.File, id GenerationID) error {
+	return c.reclaim(ctx, checkpoint.GenerationManifestName(id), func() (*os.File, os.FileInfo, error) {
+		return openPinnedDirectory(dir)
+	})
+}
+
+// RegisterRetired reconstructs the cleanup inventory for a predecessor named
+// by a selected generation. A missing segment can be a completed unlink from
+// an interrupted cleanup. A present segment must still match the manifest.
+func (c *Catalog) RegisterRetired(ctx context.Context, dir *os.File, id GenerationID) error {
+	c.replace.Lock()
+	defer c.replace.Unlock()
+	if c.current == nil {
+		return os.ErrClosed
+	}
+	info, err := dir.Stat()
+	if err != nil {
+		return err
+	}
+	m, _, err := readManifest(dir, checkpoint.GenerationManifestName(id))
+	if err != nil {
+		return err
+	}
+	current := make(map[string]bool, len(c.current.segments))
+	for _, s := range c.current.segments {
+		current[s.name] = true
+	}
+	index := c.retiredIndex(info)
+	var buf []byte
+	for _, entry := range m.Segments {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if current[entry.Name] {
+			continue
+		}
+		f, stat, err := openRegular(dir, entry.Name)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		if cap(buf) < int(entry.Size) {
+			buf = make([]byte, entry.Size)
+		}
+		sum, _ := parseDigest(entry.SHA256)
+		s := segment{name: entry.Name, digest: sum, stat: stat}
+		if err := s.readVerified(dir, buf[:entry.Size]); err != nil {
+			return err
+		}
+		if index < 0 {
+			index = len(c.retired)
+			c.retired = append(c.retired, retiredDirectory{info: info, segments: make(map[string]os.FileInfo)})
+		}
+		c.retired[index].segments[s.name] = s.stat
+	}
+	return nil
+}
+
+func (c *Catalog) reclaim(ctx context.Context, selected string, open directoryOpener) (err error) {
 	c.replace.Lock()
 	defer c.replace.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -88,7 +152,10 @@ func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error)
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	current, err := loadAt(ctx, dir)
+	if err := checkpoint.CheckPublication(dir); err != nil {
+		return err
+	}
+	current, _, err := loadAuthority(ctx, dir, selected)
 	if err != nil {
 		return err
 	}

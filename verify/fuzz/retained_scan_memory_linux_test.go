@@ -66,7 +66,10 @@ func runScanMemoryProcess(t *testing.T, path string, count int) scanMemoryReport
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^TestRetainedScanMemoryWorker$", "-test.count=1")
 	cmd.WaitDelay = time.Second
-	cmd.Env = append(cmd.Environ(), scanMemoryWorkerEnv+"="+strconv.Itoa(count), scanMemoryCgroupEnv+"="+group)
+	// Measure concurrent scans under the worker's address-space limit with
+	// a fixed scheduler size. Race-runtime thread arenas vary with host CPU
+	// count and can exhaust the virtual limit before the scans are measured.
+	cmd.Env = append(cmd.Environ(), "GOMAXPROCS=2", scanMemoryWorkerEnv+"="+strconv.Itoa(count), scanMemoryCgroupEnv+"="+group)
 	cmd.Dir = path
 	output, err := cmd.CombinedOutput()
 	if err != nil || ctx.Err() != nil {
@@ -100,7 +103,11 @@ func TestRetainedScanMemoryWorker(t *testing.T) {
 	if group != "" {
 		must(t, enterScanMemoryCgroup(group))
 	}
-	setWorkerLimits(t)
+	// Concurrent scans may cause the race runtime to map additional shadow
+	// arenas after initialization. The report separately checks actual Go
+	// heap growth, RSS and delegated cgroup usage.
+	const shadowHeadroom = 512 << 20
+	setWorkerLimitsWithAddressHeadroom(t, addressHeadroom+shadowHeadroom)
 	report := runRetainedScanMemory(t, path, group, count)
 	data, err := json.Marshal(report)
 	must(t, err)

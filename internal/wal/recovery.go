@@ -225,6 +225,12 @@ func readCommitMarker(r io.Reader, size int64) (int64, error) {
 }
 
 func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
+	return l.scanCommitted(end, builder.DecodeFrame)
+}
+
+// scanCommitted validates frames in order and hands each payload to the
+// recovery consumer before reusing its buffer.
+func (l *Log) scanCommitted(end int64, consume func([]byte) error) error {
 	if _, err := l.f.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek WAL header: %w", err)
 	}
@@ -268,7 +274,7 @@ func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
 		if crc32.Checksum(payload, table) != binary.LittleEndian.Uint32(h[8:]) {
 			return fmt.Errorf("invalid WAL checksum at %d", pos)
 		}
-		if err := builder.DecodeFrame(payload); err != nil {
+		if err := consume(payload); err != nil {
 			return fmt.Errorf("invalid WAL payload at %d: %w", pos, err)
 		}
 		pos += int64(len(h)) + int64(n)

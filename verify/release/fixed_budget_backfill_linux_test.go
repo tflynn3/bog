@@ -571,10 +571,10 @@ func TestFixedBudgetBackfillPublication(t *testing.T) {
 		{name: "stale generation", publication: backfillTestCompaction("complete", 7, 4, 4), want: "unexpected compaction state"},
 		{name: "wrong cutoff", publication: backfillTestCompaction("complete", 8, 3, 4), want: "unexpected compaction state"},
 		{name: "wrong committed rows", publication: backfillTestCompaction("complete", 8, 4, 5), want: "unexpected compaction state"},
-		{name: "missing generation", publication: lengthResponse(200, "", `{"state":"complete","covered_rows":4,"committed_rows":4}`), want: `missing or null "generation"`},
-		{name: "null coverage", publication: lengthResponse(200, "", `{"state":"complete","generation":8,"covered_rows":null,"committed_rows":4}`), want: `missing or null "covered_rows"`},
+		{name: "missing generation", publication: lengthResponse(200, "", `{"state":"complete","covered_rows":4,"committed_rows":4}`), want: `missing or null \"generation\"`},
+		{name: "null coverage", publication: lengthResponse(200, "", `{"state":"complete","generation":8,"covered_rows":null,"committed_rows":4}`), want: `missing or null \"covered_rows\"`},
 		{name: "duplicate generation", publication: lengthResponse(200, "", `{"state":"complete","generation":7,"generation":8,"covered_rows":4,"committed_rows":4}`), want: "duplicate"},
-		{name: "mis-cased state", publication: lengthResponse(200, "", `{"State":"complete","generation":8,"covered_rows":4,"committed_rows":4}`), want: `missing or null "state"`},
+		{name: "mis-cased state", publication: lengthResponse(200, "", `{"State":"complete","generation":8,"covered_rows":4,"committed_rows":4}`), want: `missing or null \"state\"`},
 		{name: "control unavailable", publication: lengthResponse(404, "", "missing"), want: "returned HTTP 404"},
 		{name: "fresh capture lost backfill", publication: backfillTestCompaction("complete", 8, 4, 4), lastFreshRow: "z", want: "fresh walk after replacement"},
 	} {

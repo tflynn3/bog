@@ -64,6 +64,7 @@ type PageSourceScanBound interface {
 func NewWithPageSourceAndQueryResources(source PageSource, w appender, maxBytes, concurrency int, workBudget uint64, limits QueryResourceLimits) *API {
 	a := newAPIForSource(source, w, maxBytes, workBudget)
 	a.captures.resources = newQueryResources(limits)
+	a.ingestBytes = &queryByteBudget{limit: 16 << 20, err: errors.New("ingest capacity exhausted")}
 	a.captures.resources.requireScanBound = true
 	a.routes = a.handler(concurrency)
 	return a

@@ -71,13 +71,7 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	response := a.newQueryResponse()
 	defer response.release()
 	req := PageRequest{Filter: params.filter, Limit: params.limit}
-	if err := a.withPage(ctx, req, work, func(result PageResult) error {
-		if len(result.Rows) > params.limit {
-			return errPageSourceContract
-		}
-		_, err := response.appendRows(result.Rows, work)
-		return err
-	}); err != nil {
+	if err := a.prepareOrdinary(ctx, req, &response, work); err != nil {
 		response.release()
 		writeQueryError(w, err)
 		return
@@ -125,4 +119,45 @@ func (a *API) openQuery(w http.ResponseWriter, ctx context.Context, params query
 		return
 	}
 	response.writeOpening(w, token, &cursorMayHaveReached)
+}
+
+// Ordinary queries may consume several bounded scans of a single short-lived
+// source capture. Its lifetime ends before HTTP starts delivery.
+func (a *API) prepareOrdinary(ctx context.Context, req PageRequest, response *queryResponse, work *store.QueryWork) (err error) {
+	defer func() {
+		if req.Capture != "" {
+			err = errors.Join(err, a.captures.source.Release(req.Capture))
+		}
+	}()
+	for req.Limit > 0 {
+		var more bool
+		if err := a.withPage(ctx, req, work, func(result PageResult) error {
+			if req.Capture == "" {
+				req.Capture = result.Capture
+			}
+			if len(result.Rows) > req.Limit || (result.Capture != "" && result.Capture != req.Capture) {
+				return errPageSourceContract
+			}
+			n, err := response.appendRows(result.Rows, work)
+			if err != nil {
+				return err
+			}
+			req.Limit -= n
+			more = result.More && n == len(result.Rows) && req.Limit > 0
+			if more {
+				if n == 0 || !validOpaque(req.Capture) || !validOpaque(string(result.Rows[n-1].Position)) ||
+					req.After == result.Rows[n-1].Position {
+					return errPageSourceContract
+				}
+				req.After = result.Rows[n-1].Position
+			}
+			return nil
+		}); err != nil || !more {
+			return err
+		}
+		if err := work.Charge(1); err != nil {
+			return err
+		}
+	}
+	return nil
 }

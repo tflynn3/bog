@@ -24,8 +24,9 @@ var (
 // More requires at least one returned row and proof of another match. Sources
 // may return fewer rows than requested, and HTTP will fill the response using
 // successive scans. After acquisition, results may omit Capture or repeat the
-// requested ID. Ordinary requests return at most Limit rows and need no
-// retained capture, positions, or lookahead.
+// requested ID. An ordinary request may return a capture and lookahead to
+// fill the response in bounded scans. HTTP retires that capture before delivery
+// and issues no continuation token.
 // HTTP replays the same source anchor and limit even if the client changes
 // limits. The command injects the coordinated retained adapter for #53.
 type PageSource interface {

@@ -185,15 +185,22 @@ func (l *Log) run() {
 	}
 }
 
+const FrameHeaderSize = 16
+
+func frameHeader(payload []byte) [FrameHeaderSize]byte {
+	var h [16]byte
+	n := uint32(len(payload))
+	binary.LittleEndian.PutUint32(h[:], n)
+	binary.LittleEndian.PutUint32(h[4:], ^n)
+	binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(payload, table))
+	binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
+	return h
+}
+
 func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 	next := l.offset
 	for _, req := range group {
-		var h [16]byte
-		n := uint32(len(req.payload))
-		binary.LittleEndian.PutUint32(h[:], n)
-		binary.LittleEndian.PutUint32(h[4:], ^n)
-		binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(req.payload, table))
-		binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
+		h := frameHeader(req.payload)
 		if err := writeAll(l.f, h[:]); err != nil {
 			return "wal_write", l.rollback(err)
 		}

@@ -22,6 +22,7 @@ type API struct {
 	wal              appender
 	fatal            func()
 	slots            chan struct{}
+	ingestBytes      queryByteBudget
 	maxResponseBytes int
 	queryWorkBudget  uint64
 	cursorKey        [32]byte
@@ -69,6 +70,14 @@ func NewWithPageSource(source PageSource, w appender, maxBytes, concurrency int,
 
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.routes.ServeHTTP(w, r)
+}
+
+// DrainOnUncertainAppend lets the process owner shut down in order after
+// the appender has fenced itself and notified the owner. Abort the current
+// response because its batch has an indeterminate durable outcome.
+// Configure this before serving requests.
+func (a *API) DrainOnUncertainAppend() {
+	a.fatal = func() { panic(http.ErrAbortHandler) }
 }
 
 // Close retires captures and waits for admitted capture users and source
@@ -138,6 +147,18 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > store.MaxBatch {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
+	}
+	if a.ingestBytes.limit != 0 {
+		size := r.ContentLength
+		if size < 0 {
+			size = store.MaxBatch
+		}
+		body := queryReservation{budget: &a.ingestBytes}
+		if err := body.grow(uint64(size)); err != nil {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		defer body.release()
 	}
 	b, err := io.ReadAll(io.LimitReader(r.Body, store.MaxBatch+1))
 	if len(b) > store.MaxBatch {

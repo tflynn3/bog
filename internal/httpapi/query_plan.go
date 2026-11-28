@@ -61,9 +61,45 @@ func checkSnapshotScan(result PageResult, req PageRequest, work *store.QueryWork
 func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture, params queryParams, response *queryResponse, work *store.QueryWork) (string, error) {
 	filter := params.filter
 	req := PageRequest{Filter: filter, Limit: params.limit, Snapshot: true}
+	if source, ok := a.captures.source.(PinnedPageSource); ok {
+		if err := work.Charge(1); err != nil {
+			return "", err
+		}
+		id, err := source.CapturePage(ctx)
+		if err != nil {
+			return "", err
+		}
+		capture.sourceID = id
+		if !validOpaque(id) {
+			return "", errPageSourceContract
+		}
+		req.Capture = id
+	}
+	more, err := a.prepareRetainedPage(ctx, capture, &req, response, work)
+	if err != nil || !more {
+		return "", err
+	}
+
+	// Start the replay plan at the actual byte/row cut, including when the
+	// source's first result already proved exhaustion beyond the cut.
+	req.Limit = maxQueryLimit
+	if err := a.certifyQuery(ctx, capture, req, work); err != nil {
+		return "", err
+	}
+	// A replay can validate one token and create another. It can hash the
+	// first anchor once, and certification already covers later positions.
+	if err := work.Charge(2*cursorTokenWork, uint64(len(filter.Contains)), cursorBlockWork(len(req.After))); err != nil {
+		return "", err
+	}
+	cursor := capture.cursor(a.filterDigest(filter), 0, 0, req.After)
+	return a.encodeCursor(cursor), nil
+}
+
+// prepareRetainedPage fills a response on one fixed view across source scans.
+func (a *API) prepareRetainedPage(ctx context.Context, capture *queryCapture, req *PageRequest, response *queryResponse, work *store.QueryWork) (bool, error) {
 	var more bool
 	for {
-		err := a.withPage(ctx, req, work, func(result PageResult) error {
+		err := a.withPage(ctx, *req, work, func(result PageResult) error {
 			if req.Capture == "" {
 				capture.sourceID = result.Capture
 				if !validOpaque(capture.sourceID) {
@@ -78,7 +114,7 @@ func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture,
 				}
 				req.Capture = capture.sourceID
 			}
-			if err := checkSnapshotScan(result, req, work); err != nil {
+			if err := checkSnapshotScan(result, *req, work); err != nil {
 				return err
 			}
 			n, err := response.appendRows(result.Rows, work)
@@ -97,7 +133,7 @@ func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture,
 			return nil
 		})
 		if err != nil {
-			return "", err
+			return false, err
 		}
 		if req.Limit == 0 || !more {
 			break
@@ -105,29 +141,13 @@ func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture,
 		// The source can return a short scan with lookahead. Fill the
 		// remaining row allowance using successive scans.
 		if err := work.Charge(1); err != nil {
-			return "", err
+			return false, err
 		}
 	}
 	if err := response.reserveDelivery(work); err != nil {
-		return "", err
+		return false, err
 	}
-	if !more {
-		return "", nil
-	}
-
-	// Start the replay plan at the actual byte/row cut, including when the
-	// source's first result already proved exhaustion beyond the cut.
-	req.Limit = maxQueryLimit
-	if err := a.certifyQuery(ctx, capture, req, work); err != nil {
-		return "", err
-	}
-	// A replay can validate one token and create another. It can hash the
-	// first anchor once, and certification already covers later positions.
-	if err := work.Charge(2*cursorTokenWork, uint64(len(filter.Contains)), cursorBlockWork(len(req.After))); err != nil {
-		return "", err
-	}
-	cursor := capture.cursor(a.filterDigest(filter), 0, 0, req.After)
-	return a.encodeCursor(cursor), nil
+	return more, nil
 }
 
 // Each replay visits a subset of the certified scans, at most once per

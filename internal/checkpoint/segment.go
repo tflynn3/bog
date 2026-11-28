@@ -156,11 +156,13 @@ func (l *Legacy) readPublished(keepRows bool) (p *Published, err error) {
 	if keepRows {
 		p.blocks = make([][]BlockRow, 0, len(m.Segments))
 	}
-	err = validateManifestBlocks(context.Background(), m, func(name string) (io.ReadCloser, error) { return l.openFile(name) }, func(rows []BlockRow) {
-		if keepRows {
-			p.blocks = append(p.blocks, rows)
-		}
-	})
+	var keep func([]BlockRow)
+	if keepRows {
+		keep = func(rows []BlockRow) { p.blocks = append(p.blocks, rows) }
+	}
+	err = validateManifestBlocks(context.Background(), m, func(name string) (io.ReadCloser, error) {
+		return l.openFile(name)
+	}, keep)
 	if err != nil {
 		return nil, err
 	}

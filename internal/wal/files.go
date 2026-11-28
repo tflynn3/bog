@@ -89,7 +89,11 @@ func (l *Log) commit(offset int64) (string, error) {
 	binary.LittleEndian.PutUint64(b[8:16], uint64(offset))
 	binary.LittleEndian.PutUint64(b[16:], ^uint64(offset))
 
-	name, err := l.writeStaged(markerStagePrefix, b[:])
+	return l.installMarker(b[:])
+}
+
+func (l *Log) installMarker(b []byte) (string, error) {
+	name, err := l.writeStaged(markerStagePrefix, b)
 	if err != nil {
 		return "marker_preparation", err
 	}

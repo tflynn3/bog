@@ -58,7 +58,7 @@ func TestParseFlags(t *testing.T) {
 			if tt.name == "explicit" && c != (config{dir: "data", addr: ":1234", maxResponseBytes: 1, queryConcurrency: 2, queryWorkBudget: 3}) {
 				t.Fatalf("explicit: %+v", c)
 			}
-			if tt.name == "defaults" && (c.dir != "." || c.addr != "127.0.0.1:8080" || c.maxResponseBytes != httpapi.DefaultQueryMaxResponseBytes || c.queryConcurrency != httpapi.DefaultQueryConcurrency || c.queryWorkBudget != httpapi.DefaultQueryWorkBudget) {
+			if tt.name == "defaults" && (c.dir != "." || c.addr != "127.0.0.1:8080" || c.maxResponseBytes != httpapi.DefaultQueryMaxResponseBytes || c.queryConcurrency != defaultServerQueryConcurrency || c.queryWorkBudget != httpapi.DefaultQueryWorkBudget) {
 				t.Fatalf("defaults: %+v", c)
 			}
 		})

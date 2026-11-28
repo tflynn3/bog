@@ -55,10 +55,31 @@ func (r *Replacement) Close() {
 // new captures. A populated Generation means installation succeeded even if
 // releasing the previous generation or closing the lock reports an error.
 func (r *Replacement) ReplacePinned(ctx context.Context, dir *os.File) (Generation, error) {
-	return r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+	return r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, "", nil)
 }
 
-func (r *Replacement) install(ctx context.Context, open directoryOpener) (_ Generation, err error) {
+// SelectLocked validates and pins the successor before calling selectDurably.
+// A successful selection installs the prepared generation even if ctx is then
+// canceled. The publisher holds the exclusive publication lock throughout.
+func (r *Replacement) SelectLocked(ctx context.Context, dir *os.File, id GenerationID, selectDurably func() error) (Generation, error) {
+	return r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, checkpoint.GenerationManifestName(id), selectDurably)
+}
+
+// ReplaceSelected opens the generation selected by the writable authority.
+// The command has already resolved any interrupted publication.
+func (r *Replacement) ReplaceSelected(ctx context.Context, dir *os.File, id GenerationID) (Generation, error) {
+	lock, err := checkpoint.LockPublication(dir, false)
+	if err != nil {
+		return Generation{}, err
+	}
+	if err := checkpoint.CheckPublication(dir); err != nil {
+		return Generation{}, errors.Join(err, lock.Close())
+	}
+	gen, err := r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, checkpoint.GenerationManifestName(id), nil)
+	return gen, errors.Join(err, lock.Close())
+}
+
+func (r *Replacement) install(ctx context.Context, open directoryOpener, selected string, selectDurably func() error) (_ Generation, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c := r.catalog
@@ -77,12 +98,18 @@ func (r *Replacement) install(ctx context.Context, open directoryOpener) (_ Gene
 	if err != nil {
 		return Generation{}, err
 	}
-	lock, err := checkpoint.LockPublication(dir, false)
-	if err != nil {
-		return Generation{}, errors.Join(err, dir.Close())
+	var next *generation
+	if selected == "" {
+		var lock *os.File
+		lock, err = checkpoint.LockPublication(dir, false)
+		if err != nil {
+			return Generation{}, errors.Join(err, dir.Close())
+		}
+		defer func() { err = errors.Join(err, lock.Close()) }()
+		next, err = loadAt(ctx, dir)
+	} else {
+		next, _, err = loadNamedAuthority(ctx, dir, selected)
 	}
-	defer func() { err = errors.Join(err, lock.Close()) }()
-	next, err := loadAt(ctx, dir)
 	if err != nil {
 		return Generation{}, errors.Join(err, dir.Close())
 	}
@@ -91,11 +118,15 @@ func (r *Replacement) install(ctx context.Context, open directoryOpener) (_ Gene
 		return Generation{}, errors.Join(err, dir.Close())
 	}
 	next.refs.Store(1)
-	c.mu.Lock()
 	if err := ctx.Err(); err != nil {
-		c.mu.Unlock()
 		return Generation{}, errors.Join(err, next.release())
 	}
+	if selectDurably != nil {
+		if err := selectDurably(); err != nil {
+			return Generation{}, errors.Join(err, next.release())
+		}
+	}
+	c.mu.Lock()
 	next.charge = r.charge
 	r.catalog, r.charge = nil, nil
 	prev := c.current

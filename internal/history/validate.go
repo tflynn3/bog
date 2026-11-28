@@ -28,6 +28,7 @@ func (g *generation) validate(ctx context.Context, m manifest, buf []byte) error
 			return err
 		}
 		total += uint64(count)
+		g.info.MaxLineBytes = max(g.info.MaxLineBytes, s.maxLine)
 		if s.last-s.first+1 == uint64(count) {
 			bits := localBits[:(count+7)/8]
 			clear(bits)
@@ -78,6 +79,7 @@ func (s *segment) index(b []byte, nextOrdinal uint64) (int, error) {
 		if i%step == 0 {
 			s.points = append(s.points, seekPoint{key: key, offset: p})
 		}
+		s.maxLine = max(s.maxLine, int(n))
 		s.first = min(s.first, key.Ordinal)
 		s.last = max(s.last, key.Ordinal)
 		prev = key

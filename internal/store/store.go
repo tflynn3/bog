@@ -35,6 +35,9 @@ type RecoveryBuilder struct {
 	ordered bool
 }
 
+// Len reports the number of recovered rows.
+func (b *RecoveryBuilder) Len() int { return len(b.rows) }
+
 func NewRecoveryBuilder() *RecoveryBuilder { return &RecoveryBuilder{ordered: true} }
 
 // Add appends decoded rows in WAL order and builds summaries of sealed blocks.

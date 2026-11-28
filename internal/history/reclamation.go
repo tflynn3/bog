@@ -60,15 +60,20 @@ func (c *Catalog) retiredIndex(info os.FileInfo) int {
 // A shared segment or one with live readers remains eligible for a later call.
 // It is safe to call after Close, including while retired readers are draining.
 func (c *Catalog) Reclaim(ctx context.Context, path string) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) }, "")
 }
 
 // ReclaimPinned is Reclaim using the caller's pinned directory.
 func (c *Catalog) ReclaimPinned(ctx context.Context, dir *os.File) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, "")
 }
 
-func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error) {
+// ReclaimSelected protects the manifest named by the writable selector.
+func (c *Catalog) ReclaimSelected(ctx context.Context, dir *os.File, id GenerationID) error {
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, checkpoint.GenerationManifestName(id))
+}
+
+func (c *Catalog) reclaim(ctx context.Context, open directoryOpener, selected string) (err error) {
 	c.replace.Lock()
 	defer c.replace.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -80,7 +85,7 @@ func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error)
 	}
 	defer func() { err = errors.Join(err, dir.Close()) }()
 	i := c.retiredIndex(info)
-	if i < 0 {
+	if i < 0 && selected == "" {
 		return nil
 	}
 	lock, err := checkpoint.LockPublication(dir, true)
@@ -88,7 +93,18 @@ func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error)
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	current, err := loadAt(ctx, dir)
+	if i < 0 {
+		return errors.Join(protectPinned(ctx, dir, nil, nil), dir.Sync())
+	}
+	var current *generation
+	if selected == "" {
+		current, err = loadAt(ctx, dir)
+	} else {
+		if err := checkpoint.CheckPublication(dir); err != nil {
+			return err
+		}
+		current, _, err = loadNamedAuthority(ctx, dir, selected)
+	}
 	if err != nil {
 		return err
 	}
@@ -164,4 +180,40 @@ func reclaimSegment(dir *os.File, name string, expected os.FileInfo) (complete b
 		return false, err
 	}
 	return true, nil
+}
+
+// RemoveDrainedManifest forgets a manifest which the owner has durably
+// superseded and whose final pin has drained. Verify its payload identity
+// before unlinking the name.
+func RemoveDrainedManifest(dir *os.File, root *os.Root, name string, id GenerationID, current *checkpoint.Manifest) (_ bool, err error) {
+	lock, err := checkpoint.LockPublication(dir, true)
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	m, actual, err := readManifest(dir, name)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, dir.Sync()
+	}
+	if err != nil {
+		return false, err
+	}
+	if actual != id {
+		return false, corrupt(name, "obsolete manifest changed")
+	}
+	reachable := make(map[string]bool, len(current.Segments))
+	for _, s := range current.Segments {
+		reachable[s.Name] = true
+	}
+	for _, s := range m.Segments {
+		if !reachable[s.Name] {
+			if _, err := root.Lstat(s.Name); !errors.Is(err, os.ErrNotExist) {
+				return false, err // Keep ownership evidence for remaining segments.
+			}
+		}
+	}
+	if err := root.Remove(name); err != nil {
+		return false, err
+	}
+	return true, dir.Sync()
 }

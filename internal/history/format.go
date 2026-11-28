@@ -51,11 +51,12 @@ type seekPoint struct {
 }
 
 type segment struct {
-	name   string
-	digest [sha256.Size]byte
-	stat   os.FileInfo
-	lo, hi time.Time // Inclusive verified timestamp bounds.
-	points []seekPoint
+	name    string
+	digest  [sha256.Size]byte
+	stat    os.FileInfo
+	lo, hi  time.Time // Inclusive verified timestamp bounds.
+	points  []seekPoint
+	maxLine int
 
 	// Used only while verifying that the manifest covers each ordinal once.
 	first, last uint64 // Inclusive ordinal bounds.
@@ -71,8 +72,8 @@ func parseDigest(s string) ([sha256.Size]byte, bool) {
 	return sum, err == nil
 }
 
-func readManifest(dir *os.File) (_ manifest, _ GenerationID, err error) {
-	f, info, err := openRegular(dir, manifestName)
+func readManifest(dir *os.File, name string) (_ manifest, _ GenerationID, err error) {
+	f, info, err := openRegular(dir, name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return manifest{}, GenerationID{}, err
@@ -90,26 +91,16 @@ func readManifest(dir *os.File) (_ manifest, _ GenerationID, err error) {
 	if int64(len(b)) != info.Size() {
 		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest size changed", ErrIntegrity)
 	}
-	var env envelope
-	if err := json.Unmarshal(b, &env); err != nil {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest envelope: %v", ErrIntegrity, err)
+	m, id, err := checkpoint.DecodeManifest(b)
+	if err != nil {
+		return manifest{}, GenerationID{}, errors.Join(ErrIntegrity, err)
 	}
-	id := sha256.Sum256(env.Payload)
-	if want, ok := parseDigest(env.SHA256); !ok || want != id {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest checksum", ErrIntegrity)
+	if name == manifestName && m.Version != version ||
+		name != manifestName && name != checkpoint.GenerationManifestName(id) {
+		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest name or version", ErrIntegrity)
 	}
-	var m manifest
-	if err := json.Unmarshal(env.Payload, &m); err != nil {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest payload: %v", ErrIntegrity, err)
-	}
-	empty := m.NextOrdinal == 0 && m.CoveredOffset == int64(walMagicSize)
-	populated := m.NextOrdinal > 0 && m.CoveredOffset >= int64(minWALEnd)
-	if m.Version != version || len(m.Segments) > checkpoint.MaxSegments || !(empty || populated) {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest version, segment count or boundary", ErrIntegrity)
-	}
-	return m, id, nil
+	return *m, id, nil
 }
-
 func openRegular(dir *os.File, name string) (*os.File, os.FileInfo, error) {
 	// All names are either constant or checked against the v1 basename format.
 	fd, err := openat(int(dir.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
@@ -187,15 +178,19 @@ func ValidatePinnedAuthority(ctx context.Context, dir *os.File) (*checkpoint.Man
 }
 
 func loadAuthority(ctx context.Context, dir *os.File) (*generation, *checkpoint.Manifest, error) {
+	return loadNamedAuthority(ctx, dir, manifestName)
+}
+
+func loadNamedAuthority(ctx context.Context, dir *os.File, name string) (*generation, *checkpoint.Manifest, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	m, id, err := readManifest(dir)
+	m, id, err := readManifest(dir, name)
 	if err != nil {
 		return nil, nil, err
 	}
 	source, ok := parseDigest(m.SourceSHA256)
-	if !ok {
+	if !ok && m.Version == version {
 		return nil, nil, fmt.Errorf("%w: invalid WAL prefix checksum", ErrIntegrity)
 	}
 	g := &generation{dir: dir, drained: make(chan struct{}), segments: make([]segment, len(m.Segments))}

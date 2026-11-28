@@ -13,21 +13,10 @@ type stagingDeclaration struct {
 	activation string
 }
 
-// Both Linux inventories at 74e56a7d2f46 leave the retained libraries outside
-// cmd/bog. Remove each #108 declaration with its role change when the reviewed
-// Storage revision shows reachability and satisfies ADR 0049.
 var stagedPackages = map[string]stagingDeclaration{
-	"bog/internal/checkpoint": {
-		owner:      "bog-storage",
-		activation: "#108 validates and durably selects a checkpoint successor under pinned storage authority before live activation at the requested cutoff.",
-	},
-	"bog/internal/history": {
-		owner:      "bog-storage",
-		activation: "#108 serves ordered checkpoint and suffix rows through the command-owned page source and proves a held cursor through replacement and acknowledged backfill, exact fresh and restarted walks, and final pin drain.",
-	},
 	"bog/internal/backup": {
 		owner:      "bog-storage",
-		activation: "#108 uses backup APIs in server composition and proves verified writable restore, an acknowledged append, and exact HTTP parity after restart.",
+		activation: "Verified writable restore composes backup APIs into server startup and proves an acknowledged append and exact HTTP parity after restart.",
 	},
 	"bog/internal/idempotency": {
 		owner:      "bog-storage",

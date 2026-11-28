@@ -2,16 +2,49 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"os"
 
 	"bog/internal/httpapi"
 	"bog/internal/readiness"
-	"bog/internal/store"
-	"bog/internal/wal"
 )
 
-func newReadyHandler(ctx context.Context, c config, s *store.Store, w *wal.Log) http.Handler {
-	return readiness.NewHandler(ctx, c.dir, w, func(appender readiness.Appender) http.Handler {
-		return httpapi.NewWithQueryLimits(s, appender, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget)
+func openProbe(s *storageOwner) (_ *os.File, err error) {
+	probe, err := s.root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, probe.Close())
+		}
+	}()
+	want, err := s.dir.Stat()
+	if err != nil {
+		return nil, err
+	}
+	got, err := probe.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(want, got) {
+		return nil, errors.New("readiness directory differs from WAL directory")
+	}
+	return probe, nil
+}
+
+func newReadyHandler(ctx context.Context, c config, s *storageOwner, probe *os.File) (http.Handler, *httpapi.API) {
+	var api *httpapi.API
+	handler := readiness.NewHandlerForDirectory(ctx, probe, s, func(appender readiness.Appender) http.Handler {
+		api = httpapi.NewWithPageSourceAndQueryResources(&pageSource{owner: s}, appender, c.maxResponseBytes,
+			c.queryConcurrency, c.queryWorkBudget, httpapi.QueryResourceLimits{
+				ResponseBytes: uint64(min(c.maxResponseBytes, httpapi.DefaultQueryMaxResponseBytes)),
+				ScanBytes:     52 << 20,
+				Captures:      64,
+			})
+		api.DrainOnUncertainAppend()
+		return api
 	})
+	return handler, api
 }

@@ -4,11 +4,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"bog/internal/store"
@@ -28,19 +31,25 @@ type file interface {
 	Close() error
 }
 type Log struct {
-	mu        sync.Mutex
-	cond      *sync.Cond
-	queue     []*appendRequest
-	running   bool
-	f         file
-	s         *store.Store
-	offset    int64
-	committed captureBoundary // protected by mu after recovery
-	captures  *captureFile
-	poisoned  error
-	closed    bool
-	closeDone bool
-	closeErr  error
+	mu               sync.Mutex
+	cond             *sync.Cond
+	queue            []*appendRequest
+	running          bool
+	f                file
+	s                *store.Store
+	offset           int64
+	committed        captureBoundary // protected by mu after recovery
+	captures         *captureFile
+	poisoned         error
+	closed           bool
+	closeDone        bool
+	closeErr         error
+	authority        *Authority
+	suffixHash       hash.Cloner
+	pendingAuthority *Authority
+	pendingHash      hash.Cloner
+	retired          []retiredFile
+	retirementErr    error
 
 	root            *os.Root
 	dir             *os.File
@@ -166,6 +175,10 @@ func (l *Log) run() {
 				l.committed.nextOrdinal += uint64(len(req.rows))
 			}
 		}
+		if err == nil && l.pendingAuthority != nil {
+			l.authority, l.suffixHash = l.pendingAuthority, l.pendingHash
+			l.pendingAuthority, l.pendingHash = nil, nil
+		}
 		l.lastOutcome.Store(&outcome)
 		if outcome.State == CommitUncertain {
 			l.poisoned = err
@@ -178,15 +191,40 @@ func (l *Log) run() {
 		if outcome.State == CommitRolledBack {
 			l.diagnoseRollback(outcome)
 		}
+		idle := len(l.queue) == 0
+		if idle {
+			l.running = false
+			l.cond.Broadcast()
+		}
 		for _, req := range group {
 			req.done <- err
 		}
 		l.mu.Unlock()
+		if idle {
+			return
+		}
 	}
 }
 
 func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 	next := l.offset
+	ordinal := l.committed.nextOrdinal
+	for _, req := range group {
+		size := int64(16 + len(req.payload))
+		if size > math.MaxInt64-next || uint64(len(req.rows)) > math.MaxUint64-ordinal {
+			return "wal_bounds", errors.New("WAL byte or ordinal overflow")
+		}
+		next += size
+		ordinal += uint64(len(req.rows))
+	}
+	var digest hash.Cloner
+	if l.suffixHash != nil {
+		var err error
+		digest, err = l.suffixHash.Clone()
+		if err != nil {
+			return "wal_digest", err
+		}
+	}
 	for _, req := range group {
 		var h [16]byte
 		n := uint32(len(req.payload))
@@ -200,13 +238,28 @@ func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 		if err := writeAll(l.f, req.payload); err != nil {
 			return "wal_write", l.rollback(err)
 		}
-		next += int64(len(h) + len(req.payload))
+		if digest != nil {
+			// SHA-256 Write always consumes the input and succeeds.
+			digest.Write(h[:])
+			digest.Write(req.payload)
+		}
 	}
 	if err := l.f.Sync(); err != nil {
 		return "wal_sync", l.rollback(err)
 	}
 	if l.root != nil {
-		operation, err := l.commit(next)
+		var operation string
+		var err error
+		if digest == nil {
+			operation, err = l.commit(next)
+		} else {
+			a := *l.authority
+			a.End, a.Next, a.Digest = next, ordinal, [32]byte(digest.Sum(nil))
+			operation, err = l.commitAuthority(a)
+			if err == nil {
+				l.pendingAuthority, l.pendingHash = &a, digest
+			}
+		}
 		if err != nil {
 			if !errors.Is(err, ErrUncertain) {
 				err = l.rollback(err)
@@ -215,20 +268,26 @@ func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 		}
 	}
 	l.offset = next
-	for _, req := range group {
-		l.s.Publish(req.rows)
+	if l.s != nil {
+		for _, req := range group {
+			l.s.Publish(req.rows)
+		}
 	}
 	return "commit", nil
 }
 
 func (l *Log) rollback(cause error) error {
-	if err := l.f.Truncate(l.offset); err != nil {
+	physical := l.offset
+	if l.authority != nil {
+		physical -= l.authority.Covered
+	}
+	if err := l.f.Truncate(physical); err != nil {
 		return errors.Join(ErrUncertain, cause, fmt.Errorf("truncate WAL: %w", err))
 	}
 	if err := l.f.Sync(); err != nil {
 		return errors.Join(ErrUncertain, cause, fmt.Errorf("sync truncated WAL: %w", err))
 	}
-	if _, err := l.f.Seek(l.offset, io.SeekStart); err != nil {
+	if _, err := l.f.Seek(physical, io.SeekStart); err != nil {
 		return errors.Join(ErrUncertain, cause, fmt.Errorf("seek truncated WAL: %w", err))
 	}
 	return cause
@@ -257,7 +316,7 @@ func (l *Log) Close() error {
 		err = errors.Join(err, l.captures.release())
 	}
 	if l.dir != nil {
-		err = errors.Join(err, l.dir.Close())
+		err = errors.Join(err, syscall.Flock(int(l.dir.Fd()), syscall.LOCK_UN), l.dir.Close())
 	}
 	if l.root != nil {
 		err = errors.Join(err, l.root.Close())

@@ -13,8 +13,8 @@ import (
 // FileIdentity identifies a pinned WAL inode. Compare identities while their
 // captures are live. The filesystem can reuse an inode after its last pin.
 type FileIdentity struct {
-	device uint64
-	inode  uint64
+	Device uint64
+	Inode  uint64
 }
 
 type captureBoundary struct {
@@ -29,14 +29,17 @@ type captureFile struct {
 	identity FileIdentity
 	mu       sync.Mutex
 	refs     int
+	base     int64
+	name     string
+	drained  chan struct{}
 }
 
-func openCaptureFile(dir, writer *os.File) (*captureFile, error) {
+func openCaptureFile(dir, writer *os.File, name string) (*captureFile, error) {
 	written, err := writer.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("stat WAL writer: %w", err)
 	}
-	f, err := openRegular(dir, walName, os.O_RDONLY)
+	f, err := openRegular(dir, name, os.O_RDONLY)
 	if err != nil {
 		return nil, fmt.Errorf("open WAL capture reader: %w", err)
 	}
@@ -48,7 +51,7 @@ func openCaptureFile(dir, writer *os.File) (*captureFile, error) {
 		return nil, errors.Join(errors.New("WAL identity changed during open"), f.Close())
 	}
 	st := readable.Sys().(*syscall.Stat_t) // checked by openRegular on this file
-	return &captureFile{f: f, identity: FileIdentity{uint64(st.Dev), st.Ino}, refs: 1}, nil
+	return &captureFile{f: f, identity: FileIdentity{uint64(st.Dev), st.Ino}, refs: 1, name: name, drained: make(chan struct{})}, nil
 }
 
 func (f *captureFile) release() error {
@@ -62,7 +65,9 @@ func (f *captureFile) releaseLocked() error {
 	last := f.refs == 0
 	f.mu.Unlock()
 	if last {
-		return f.f.Close()
+		err := f.f.Close()
+		close(f.drained)
+		return err
 	}
 	return nil
 }
@@ -114,7 +119,7 @@ func (c *Capture) CommittedEnd() int64 { return c.lease.boundary.end }
 // NextOrdinal is the zero-based append ordinal of the first row after the capture.
 func (c *Capture) NextOrdinal() uint64 { return c.lease.boundary.nextOrdinal }
 
-// ReadAt reads at an absolute offset, including the WAL header at offset zero.
+// ReadAt reads at a logical WAL offset. A rebased capture begins at its tail base.
 // Reads that cross CommittedEnd return the captured bytes and io.EOF.
 func (c *Capture) ReadAt(p []byte, off int64) (n int, err error) {
 	f := c.lease.file
@@ -123,7 +128,7 @@ func (c *Capture) ReadAt(p []byte, off int64) (n int, err error) {
 		f.mu.Unlock()
 		return 0, os.ErrClosed
 	}
-	if off < 0 {
+	if off < f.base {
 		f.mu.Unlock()
 		return 0, fmt.Errorf("WAL capture offset %d: %w", off, os.ErrInvalid)
 	}
@@ -145,13 +150,13 @@ func (c *Capture) ReadAt(p []byte, off int64) (n int, err error) {
 	}()
 
 	if remaining := end - off; int64(len(p)) > remaining {
-		n, err := f.f.ReadAt(p[:remaining], off)
+		n, err := f.f.ReadAt(p[:remaining], off-f.base)
 		if err == nil {
 			err = io.EOF
 		}
 		return n, err
 	}
-	return f.f.ReadAt(p, off)
+	return f.f.ReadAt(p, off-f.base)
 }
 
 // Release surrenders the pin. Reads already admitted can finish.

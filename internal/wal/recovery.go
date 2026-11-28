@@ -70,26 +70,30 @@ func openOwner(dir string, s *store.Store, recover func(*Log) error) (_ *Log, er
 
 	info, err := d.Stat()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("stat pinned data directory: %w", err)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || st.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0022 != 0 {
 		return nil, errors.New("data directory must be owned by the service user and not group- or world-writable")
 	}
+	var fs syscall.Statfs_t
+	if err := syscall.Fstatfs(int(d.Fd()), &fs); err != nil {
+		return nil, fmt.Errorf("probe pinned data filesystem: %w", err)
+	}
 	// Lock the pinned directory inode so replacing a pathname cannot bypass it.
 	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, fmt.Errorf("lock data directory: %w", err)
+		return nil, fmt.Errorf("lock data directory on filesystem %#x: %w", fs.Type, err)
 	}
 	l := &Log{s: s, root: root, dir: d, syncDir: d.Sync}
 	parent, err := openParent(d)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open parent of pinned data directory: %w", err)
 	}
 	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
 		return nil, fmt.Errorf("sync data directory parent: %w", err)
 	}
 	if err := recover(l); err != nil {
-		return nil, errors.Join(err, l.closeFiles())
+		return nil, errors.Join(fmt.Errorf("recover storage on filesystem %#x: %w", fs.Type, err), l.closeFiles())
 	}
 	if l.f == nil {
 		return nil, errors.New("missing writable WAL after recovery")
@@ -320,6 +324,15 @@ func (l *Log) cleanOrphans() error {
 	}
 	err = l.scanOrphans(dir)
 	return errors.Join(err, dir.Close())
+}
+
+// RecoverStaging durably removes abandoned WAL metadata staging files while
+// startup holds the directory lock and before inspecting an exact restore.
+func (l *Log) RecoverStaging() error {
+	if err := l.cleanOrphans(); err != nil {
+		return err
+	}
+	return l.dir.Sync()
 }
 
 func (l *Log) scanOrphans(dir *os.File) error {

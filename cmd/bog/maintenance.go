@@ -339,11 +339,14 @@ func (s *retained) finishPublicationCleanup(ctx context.Context) (err error) {
 }
 
 func (s *retained) removeRuntimeFile(name string) error {
-	err := s.root.Remove(name)
+	f, err := s.wal.ReadArtifact(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return errors.Join(s.root.Remove(name), f.Close())
 }
 
 func (s *retained) stopMaintenance() {

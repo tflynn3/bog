@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -96,38 +97,58 @@ func openRetained(path string) (_ *retained, err error) {
 }
 
 func (s *retained) recover(ctx context.Context) error {
-	a, err := s.wal.ReadAuthority()
+	a, authorityErr := s.wal.ReadAuthority()
+	if authorityErr != nil && !errors.Is(authorityErr, os.ErrNotExist) {
+		return fmt.Errorf("read retained authority: %w", authorityErr)
+	}
+	restored, err := s.anyEntries("bog.backup", "bog.wal.tail")
+	if err != nil {
+		return err
+	}
+	if restored {
+		mixed, err := s.anyEntries("bog.wal", "bog.commit")
+		if err != nil {
+			return err
+		}
+		if mixed {
+			return errors.New("mixed ordinary WAL and restore image")
+		}
+	}
 	switch {
-	case err == nil:
+	case authorityErr == nil:
 		if err := s.recoverSelected(ctx, a); err != nil {
 			return err
 		}
 		if err := s.recoverRetiredGenerations(ctx); err != nil {
 			return err
 		}
-	case !errors.Is(err, os.ErrNotExist):
-		return fmt.Errorf("read retained authority: %w", err)
-	default:
-		restored, err := s.anyEntries("bog.backup", "bog.wal.tail")
-		if err != nil {
-			return err
-		}
-		if restored {
-			mixed, err := s.anyEntries("bog.wal", "bog.commit")
-			if err != nil {
+		if !restored {
+			if err := s.recoverOrdinaryRetirement(); err != nil {
 				return err
 			}
-			if mixed {
-				return errors.New("mixed ordinary WAL and restore image")
-			}
-			if err := s.restore(ctx); err != nil {
-				return fmt.Errorf("verify and activate restore: %w", err)
-			}
-		} else if err := s.recoverOrdinary(ctx); err != nil {
+		}
+	case restored:
+		if err := s.restore(ctx); err != nil {
+			return fmt.Errorf("verify and activate restore: %w", err)
+		}
+	default:
+		if err := s.recoverOrdinary(ctx); err != nil {
 			return err
 		}
 	}
 	return s.wal.RecoverTails()
+}
+
+// A crash can leave the initial ordinary files behind after the selector
+// and its generation are durable. There are no live runtime pins at startup.
+// The canonical manifest of a restore belongs to the initial restore point.
+func (s *retained) recoverOrdinaryRetirement() error {
+	for _, name := range []string{"bog.wal", "bog.commit", ordinaryManifest} {
+		if err := s.removeRuntimeFile(name); err != nil {
+			return fmt.Errorf("retire ordinary artifact %q: %w", name, err)
+		}
+	}
+	return s.dir.Sync()
 }
 
 func (s *retained) recoverRetiredGenerations(ctx context.Context) error {
@@ -204,6 +225,9 @@ func (s *retained) recoverSelected(ctx context.Context, a wal.Authority) error {
 		case err != nil:
 			return err
 		}
+		if err := history.RecoverPins(ctx, s.dir); err != nil {
+			return fmt.Errorf("recover history pins: %w", err)
+		}
 		ticket, err := s.catalog.ReserveReplacement(ctx)
 		if err != nil {
 			return err
@@ -218,6 +242,9 @@ func (s *retained) recoverSelected(ctx context.Context, a wal.Authority) error {
 }
 
 func (s *retained) restore(ctx context.Context) (err error) {
+	if err := s.recoverRestorePreparation(); err != nil {
+		return err
+	}
 	var charge *checkpoint.Reservation
 	point, input, err := backup.VerifyPinnedRecovery(ctx, s.root, func(start, end int64) error {
 		var err error
@@ -237,6 +264,39 @@ func (s *retained) restore(ctx context.Context) (err error) {
 		CommittedOrdinal: point.CommittedOrdinal, SuffixSHA256: hex.EncodeToString(point.SuffixSHA256[:]),
 	}
 	return s.activate(ctx, sel, point.Generation, input)
+}
+
+// Without a selector, a byte-identical generation copy is evidence of an
+// interrupted activation. Remove its unselected output before re-verifying
+// the original restore directory, which has an exact file-set contract.
+func (s *retained) recoverRestorePreparation() error {
+	raw, id, err := s.readManifest(ordinaryManifest)
+	if err != nil {
+		return err
+	}
+	if err := s.wal.RecoverStaging(); err != nil {
+		return err
+	}
+	name := checkpoint.GenerationManifestName(id)
+	copied, _, err := s.readManifest(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(copied, raw) {
+		return errors.New("interrupted activation manifest differs from restore")
+	}
+	// Retire and sync tails first so a second interruption still has the
+	// generation copy to identify the attempt.
+	if err := s.wal.RecoverTails(); err != nil {
+		return err
+	}
+	if err := s.removeRuntimeFile(name); err != nil {
+		return err
+	}
+	return s.dir.Sync()
 }
 
 func (s *retained) recoverOrdinary(ctx context.Context) (err error) {
@@ -290,6 +350,9 @@ func (s *retained) recoverOrdinary(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	if err := history.RecoverPins(ctx, s.dir); err != nil {
+		return fmt.Errorf("recover history pins: %w", err)
+	}
 	c, err := s.wal.Capture(ctx)
 	if err != nil {
 		return err
@@ -337,6 +400,13 @@ func (s *retained) activate(ctx context.Context, a wal.Authority, id [32]byte, i
 	if actual != id {
 		return errors.New("activation manifest changed after verification")
 	}
+	m, _, err := checkpoint.DecodeManifest(raw)
+	if err != nil {
+		return err
+	}
+	if m.CoveredOffset != a.CoveredOffset || m.NextOrdinal != a.NextOrdinal {
+		return errors.New("activation manifest and WAL boundaries differ")
+	}
 	if err := s.wal.EnsureArtifact(checkpoint.GenerationManifestName(id), raw); err != nil {
 		return err
 	}
@@ -345,12 +415,6 @@ func (s *retained) activate(ctx context.Context, a wal.Authority, id [32]byte, i
 		return err
 	}
 	defer ticket.Close()
-	if err := s.install(ctx, ticket, id, false); err != nil {
-		return err
-	}
-	if err := s.checkBoundary(a.CoveredOffset, a.NextOrdinal); err != nil {
-		return err
-	}
 	if a.NextOrdinal != 0 {
 		a.Sequence = 1
 	}
@@ -359,7 +423,10 @@ func (s *retained) activate(ctx context.Context, a wal.Authority, id [32]byte, i
 	if tail.Drained != nil {
 		s.retired = append(s.retired, retiredGeneration{tail: tail, ordinary: true})
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return s.install(ctx, ticket, id, false)
 }
 
 func (s *retained) checkBoundary(at int64, ordinal uint64) error {

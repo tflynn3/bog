@@ -185,6 +185,9 @@ func (l *Log) selectAuthority(a Authority) (string, error) {
 // OpenSelected validates the exact selected tail before any suffix truncation.
 // validateGeneration is called after replay and before any recovery mutation.
 func (l *Log) OpenSelected(a Authority, validateGeneration func(*Capture) error) (err error) {
+	if err := a.validate(); err != nil {
+		return err
+	}
 	f, err := openRegular(l.dir, a.Tail, os.O_RDWR)
 	if err != nil {
 		return err

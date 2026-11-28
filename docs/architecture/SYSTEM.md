@@ -15,8 +15,9 @@ sync, and powersafe overwrite. The ingest and query listener has no built-in
 authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
-The Linux amd64 and arm64 production inventories agree on 21 root-module
-production packages and 30 direct imports. The server reaches checkpoint,
+The Linux amd64 and arm64 production inventories for the retained composition
+introduced in `8bbe8f0ada3d4d7341d82e0b22dd2f216b0e40f6` agree on 21
+root-module production packages and 30 direct imports. The server reaches checkpoint,
 history, backup, HTTP, readiness, store, and WAL. It validates and selects
 writable authority before listening, reads checkpoint rows and the committed
 suffix from disk, and advances checkpoints during normal ingest.
@@ -132,8 +133,9 @@ switch. The WAL owner reconciles all acknowledged appends above the cutoff
 while copying the new suffix. Old readers retain the precise generation and
 tail they captured. Reclamation follows durable selection and final pin
 release. A publication with uncertain authority fences new writes and views.
-Startup validates the selected files under the directory lock and resolves any
-unfinished checkpoint publication.
+Startup validates the selected files under the directory lock, resolves any
+unfinished checkpoint publication, and reclaims abandoned pins and superseded
+ordinary WAL artifacts.
 [Runtime storage composition](../adr/0007-runtime-storage-composition.md),
 [Pinned writable recovery](../adr/0005-pinned-writable-recovery-authority.md),
 [Tail-only recovery view](../adr/0035-tail-only-retained-recovery-contract.md),

@@ -3,16 +3,15 @@ package wal
 import (
 	"cmp"
 	"context"
-	"slices"
-	"sort"
-	"time"
-
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"sort"
 	"sync"
 	"syscall"
+	"time"
 
 	"bog/internal/store"
 )
@@ -129,6 +128,9 @@ func (l *Log) WithCapture(ctx context.Context, take func(*Capture, Authority) er
 	}
 	if err := l.admissionError(); err != nil {
 		return err
+	}
+	if l.captures == nil {
+		return os.ErrClosed
 	}
 	return take(l.captureLocked(), l.authority)
 }

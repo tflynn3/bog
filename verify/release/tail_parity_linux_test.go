@@ -504,6 +504,9 @@ func waitTailParityObservation(ctx context.Context, label string, observe func(c
 	for ctx.Err() == nil {
 		done, err := observe(ctx)
 		if err != nil {
+			if cause := ctx.Err(); cause != nil && errors.Is(err, cause) {
+				break
+			}
 			return fmt.Errorf("observe %s: %w", label, err)
 		}
 		if done && ctx.Err() == nil {

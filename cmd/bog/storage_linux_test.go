@@ -13,10 +13,98 @@ import (
 	"testing"
 	"time"
 
+	"bog/internal/backup"
 	"bog/internal/checkpoint"
+	"bog/internal/httpapi"
 	"bog/internal/store"
 	"bog/internal/wal"
 )
+
+type testBackupView struct{ *recoveryView }
+
+func (v testBackupView) Point() backup.RecoveryPoint {
+	return backup.RecoveryPoint(v.recoveryView.Point())
+}
+
+func TestWritableRestoreActivation(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	source, err := openRetained(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := source.close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	payload := []byte(`{"ts":"2025-01-01T00:00:00Z","line":"restored"}`)
+	rows, err := store.DecodeIngest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Append(payload, rows); err != nil {
+		t.Fatal(err)
+	}
+	view, err := source.pinLocked(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := view.close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	view.point.SuffixSHA256, err = rangeDigest(view.tail, view.point.CoveredOffset, view.point.CommittedEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(dir, "bundle")
+	if err := backup.ExportRecoveryView(ctx, testBackupView{&view.recoveryView}, bundle, wal.MaxTailBytes); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"fresh", "interrupted preparation"} {
+		t.Run(name, func(t *testing.T) {
+			restored := filepath.Join(t.TempDir(), "restored")
+			if err := backup.Restore(t.Context(), bundle, restored); err != nil {
+				t.Fatal(err)
+			}
+			const orphanTail = "bog.wal.tail-00000000000000000000000000000000"
+			if name == "interrupted preparation" {
+				data, err := os.ReadFile(filepath.Join(restored, ordinaryManifest))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(restored, checkpoint.GenerationManifestName(view.point.Generation)), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(restored, orphanTail), []byte("partial"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			active, err := openRetained(restored)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := active.close(context.Background()); err != nil {
+					t.Error(err)
+				}
+			}()
+			if _, err := os.Stat(filepath.Join(restored, orphanTail)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("interrupted tail remains: %v", err)
+			}
+			a, err := active.wal.ReadAuthority()
+			if err != nil || a.CommittedOrdinal != 1 || a.CommittedEnd != view.point.CommittedEnd {
+				t.Fatalf("restored authority = %+v, %v", a, err)
+			}
+			if err := active.Append(payload, rows); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestAutomaticCompactionDiskFull(t *testing.T) {
 	mount := os.Getenv("SLIPWAY_PARAM_ENOSPC_MOUNT")
@@ -228,9 +316,92 @@ func TestRecoverInterruptedFirstRetainedSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Release()
+	defer func() {
+		if err := c.Release(); err != nil {
+			t.Error(err)
+		}
+	}()
 	if c.NextOrdinal() != 1 {
 		t.Fatalf("acknowledged row lost: committed ordinal %d", c.NextOrdinal())
+	}
+}
+
+func TestRecoverFirstSelectionBeforeOrdinaryRetirement(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	s, err := openRetained(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendLine := func(line string) {
+		t.Helper()
+		payload := []byte(`{"ts":"2025-01-01T00:00:00Z","line":"` + line + `"}`)
+		rows, err := store.DecodeIngest(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Append(payload, rows); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		if s != nil {
+			if err := s.close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	appendLine("covered")
+	appendLine("carried")
+	if err := s.compact(ctx, compactionJob{cutoff: 1}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.wal.ReadAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stop immediately after durable publication, before runtime reclamation.
+	closeErr := errors.Join(s.catalog.Close(), s.wal.Close())
+	s = nil
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	names := []string{"bog.wal", "bog.commit", ordinaryManifest}
+	for _, name := range names {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s, err = openRetained(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("superseded %s remains: %v", name, err)
+		}
+	}
+	reopened, err := s.wal.ReadAuthority()
+	if err != nil || reopened != a || a.NextOrdinal != 1 || a.CommittedOrdinal != 2 {
+		t.Fatalf("selected authority = %+v, %v, want %+v at cutoff 1 with two commits", reopened, err, a)
+	}
+
+	appendLine("new")
+	from := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	page, err := s.Page(ctx, httpapi.PageRequest{
+		Filter: httpapi.PageFilter{Start: from, End: from.Add(time.Hour)},
+		Limit:  10,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Release(page.Capture); err != nil {
+		t.Fatal(err)
+	}
+	if page.More || len(page.Rows) != 3 ||
+		page.Rows[0].Row.Line != "covered" || page.Rows[1].Row.Line != "carried" || page.Rows[2].Row.Line != "new" {
+		t.Fatalf("query after restart and append: %+v", page)
 	}
 }
 

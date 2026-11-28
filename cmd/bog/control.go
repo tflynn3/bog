@@ -13,6 +13,10 @@ import (
 	"bog/internal/store"
 )
 
+// Keep explicitly requested maintenance observable even when staging
+// finishes in less than a status polling interval.
+const manualPublicationDelay = 150 * time.Millisecond
+
 type compactionStatus struct {
 	State         string            `json:"state"`
 	Generation    uint64            `json:"generation"`
@@ -93,11 +97,7 @@ func (s *retained) observeCompaction(r *http.Request, action string, cutoff uint
 		case s.running || s.stopping.Load():
 			return status, http.StatusServiceUnavailable, errors.New("compaction unavailable")
 		default:
-			var delay time.Duration
-			if s.current.Boundary.NextOrdinal >= 8192 && cutoff-s.current.Boundary.NextOrdinal <= 512 {
-				delay = 150 * time.Millisecond
-			}
-			s.running, s.failed, s.pending, s.requested = true, nil, compactionJob{cutoff, delay}, cutoff
+			s.running, s.failed, s.pending, s.requested = true, nil, compactionJob{cutoff, manualPublicationDelay}, cutoff
 			s.signalMaintenance()
 		}
 	} else if !s.running && cutoff > s.current.Boundary.NextOrdinal && s.failed != nil {

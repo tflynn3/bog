@@ -121,11 +121,13 @@ func TestInvalidAppendDoesNotReachWorker(t *testing.T) {
 }
 
 type readErrorFile struct {
-	file
+	recoveryFile
 	err error
 }
 
 func (f readErrorFile) Read([]byte) (int, error) { return 0, f.err }
+
+func (f readErrorFile) ReadAt([]byte, int64) (int, error) { return 0, f.err }
 
 func TestRecoveryReadErrorsKeepCauseAndReleaseOwnership(t *testing.T) {
 	dir := t.TempDir()
@@ -139,8 +141,7 @@ func TestRecoveryReadErrorsKeepCauseAndReleaseOwnership(t *testing.T) {
 	// Use the real WAL descriptor for seeks, but inject a read failure before
 	// recovery can validate the magic or expose its private recovery state.
 	f := l.f
-	l.f = readErrorFile{f, syscall.EIO}
-	if err := l.recover(); !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "WAL magic") {
+	if err := l.recoverOrdinary(readErrorFile{f.(recoveryFile), syscall.EIO}, nil); !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "WAL magic") {
 		t.Fatalf("WAL recovery error = %v", err)
 	}
 	if got := allTestRows(s); !slices.Equal(got, rows) {

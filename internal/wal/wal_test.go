@@ -1022,8 +1022,8 @@ type countedReplayFile struct {
 	bytes int
 }
 
-func (f *countedReplayFile) Read(p []byte) (int, error) {
-	n, err := f.File.Read(p)
+func (f *countedReplayFile) ReadAt(p []byte, off int64) (int, error) {
+	n, err := f.File.ReadAt(p, off)
 	f.reads++
 	f.bytes += n
 	return n, err
@@ -1062,9 +1062,9 @@ func TestReplayBufferedBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	l := &Log{f: f}
+	l := &Log{f: f, s: &store.Store{}}
 	builder := store.NewRecoveryBuilder()
-	if err := l.replay(int64(len(data)), builder); err != nil {
+	if _, err := l.scanRecovery(f, int64(len(magic)), int64(len(data)), 0, builder); err != nil {
 		t.Fatal(err)
 	}
 	s := &store.Store{}
@@ -1094,16 +1094,13 @@ func TestReplayBufferedReadAheadBound(t *testing.T) {
 	defer f.Close()
 	counted := &countedReplayFile{File: f}
 	l := &Log{f: counted}
-	if err := l.replay(int64(end), store.NewRecoveryBuilder()); err != nil {
+	if _, err := l.scanRecovery(counted, int64(len(magic)), int64(end), 0, store.NewRecoveryBuilder()); err != nil {
 		t.Fatal(err)
 	}
-	if counted.bytes != end || counted.reads >= frames {
+	if counted.bytes != end-len(magic) || counted.reads >= frames {
 		t.Fatalf("read %d bytes in %d reads; committed %d bytes across %d frames", counted.bytes, counted.reads, end, frames)
 	}
-	pos, err := f.Seek(0, io.SeekCurrent)
-	if err != nil || pos != int64(end) {
-		t.Fatalf("position = %d, err = %v", pos, err)
-	}
+
 }
 
 func TestMarkerInsidePayloadDoesNotMutate(t *testing.T) {

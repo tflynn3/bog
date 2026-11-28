@@ -157,6 +157,16 @@ func (s *queryCaptures) retireByID(id uint64) error {
 	return nil
 }
 
+// A transient capture is owned by an ordinary query through delivery.
+func (s *queryCaptures) releaseTransient(id string) {
+	if err := s.source.Release(id); err != nil {
+		log.Printf("release query capture: %v", err)
+		s.mu.Lock()
+		s.err = errors.Join(s.err, err)
+		s.mu.Unlock()
+	}
+}
+
 // release logs failures for callers without an error return and includes
 // failures during shutdown in the result of close.
 func (s *queryCaptures) release(c *queryCapture) error {

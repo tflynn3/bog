@@ -24,8 +24,10 @@ var (
 // More requires at least one returned row and proof of another match. Sources
 // may return fewer rows than requested, and HTTP will fill the response using
 // successive scans. After acquisition, results may omit Capture or repeat the
-// requested ID. Ordinary requests return at most Limit rows and need no
-// retained capture, positions, or lookahead.
+// requested ID. Ordinary requests return at most Limit rows. A source may return a
+// transient Capture and positions when it needs multiple scans to fill the
+// response. HTTP releases it after response delivery and never issues a
+// continuation cursor for it.
 // HTTP replays the same source anchor and limit even if the client changes
 // limits. The command injects the coordinated retained adapter for #53.
 type PageSource interface {
@@ -43,11 +45,12 @@ type PageFilter struct {
 }
 
 type PageRequest struct {
-	Filter   PageFilter
-	Limit    int
-	Snapshot bool
-	Capture  string       // empty for acquisition or ordinary queries
-	After    PagePosition // exclusive, empty at the beginning
+	Filter    PageFilter
+	Limit     int
+	Snapshot  bool
+	Capture   string       // empty for acquisition or ordinary queries
+	After     PagePosition // exclusive, empty at the beginning
+	ScanBytes uint64       // reservation passed to the source by the issuing API
 }
 
 // PagePosition identifies an emitted row within its capture, in timestamp

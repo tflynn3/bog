@@ -2,16 +2,42 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"os"
 
 	"bog/internal/httpapi"
 	"bog/internal/readiness"
-	"bog/internal/store"
-	"bog/internal/wal"
 )
 
-func newReadyHandler(ctx context.Context, c config, s *store.Store, w *wal.Log) http.Handler {
-	return readiness.NewHandler(ctx, c.dir, w, func(appender readiness.Appender) http.Handler {
-		return httpapi.NewWithQueryLimits(s, appender, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget)
+const (
+	queryScanLimit     = 48 << 20
+	queryResponseLimit = 32 << 20
+	ingestBodyLimit    = 8 << 20
+)
+
+func (s *retainedStorage) readyDirectory() (*os.File, error) {
+	d, err := s.owner.OpenDirectory()
+	if err != nil {
+		return nil, err
+	}
+	owner, ownerErr := s.dir.Stat()
+	opened, openedErr := d.Stat()
+	err = errors.Join(ownerErr, openedErr)
+	if err == nil && !os.SameFile(owner, opened) {
+		err = errors.New("readiness directory differs from the WAL owner")
+	}
+	if err != nil {
+		return nil, errors.Join(err, d.Close())
+	}
+	return d, nil
+}
+
+func newReadyHandler(ctx context.Context, c config, s *retainedStorage, dir *os.File) (http.Handler, *httpapi.API) {
+	api := httpapi.NewWithPageSourceAndQueryResources(s, s, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget, httpapi.QueryResourceLimits{
+		ResponseBytes: queryResponseLimit, ScanBytes: queryScanLimit, Captures: captureLimit,
 	})
+	api.LimitIngestBytes(ingestBodyLimit)
+	handler := readiness.NewHandlerForDirectory(ctx, dir, s, func(readiness.Appender) http.Handler { return api })
+	return s.capacityHandler(api, handler), api
 }

@@ -58,7 +58,7 @@ func checkSnapshotScan(result PageResult, req PageRequest, work *store.QueryWork
 	return nil
 }
 
-func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture, params queryParams, response *queryResponse, work *store.QueryWork) (string, error) {
+func (a *API) prepareRetainedPage(ctx context.Context, capture *queryCapture, params queryParams, response *queryResponse, work *store.QueryWork) (PageRequest, bool, error) {
 	filter := params.filter
 	req := PageRequest{Filter: filter, Limit: params.limit, Snapshot: true}
 	var more bool
@@ -97,7 +97,7 @@ func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture,
 			return nil
 		})
 		if err != nil {
-			return "", err
+			return req, false, err
 		}
 		if req.Limit == 0 || !more {
 			break
@@ -105,8 +105,16 @@ func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture,
 		// The source can return a short scan with lookahead. Fill the
 		// remaining row allowance using successive scans.
 		if err := work.Charge(1); err != nil {
-			return "", err
+			return req, false, err
 		}
+	}
+	return req, more, nil
+}
+
+func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture, params queryParams, response *queryResponse, work *store.QueryWork) (string, error) {
+	req, more, err := a.prepareRetainedPage(ctx, capture, params, response, work)
+	if err != nil {
+		return "", err
 	}
 	if err := response.reserveDelivery(work); err != nil {
 		return "", err
@@ -123,10 +131,10 @@ func (a *API) prepareRetainedOpening(ctx context.Context, capture *queryCapture,
 	}
 	// A replay can validate one token and create another. It can hash the
 	// first anchor once, and certification already covers later positions.
-	if err := work.Charge(2*cursorTokenWork, uint64(len(filter.Contains)), cursorBlockWork(len(req.After))); err != nil {
+	if err := work.Charge(2*cursorTokenWork, uint64(len(req.Filter.Contains)), cursorBlockWork(len(req.After))); err != nil {
 		return "", err
 	}
-	cursor := capture.cursor(a.filterDigest(filter), 0, 0, req.After)
+	cursor := capture.cursor(a.filterDigest(req.Filter), 0, 0, req.After)
 	return a.encodeCursor(cursor), nil
 }
 

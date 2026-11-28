@@ -11,12 +11,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	"bog/internal/httpapi"
-	"bog/internal/store"
-	"bog/internal/wal"
 )
 
 type config struct {
@@ -59,10 +58,18 @@ func parseFlags(args []string, output io.Writer) (config, error) {
 }
 
 func run(c config) error {
-	s := &store.Store{}
-	w, err := wal.Open(c.dir, s)
+	startup, cancelStartup := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancelStartup()
+	s, err := openRetained(startup, c.dir)
 	if err != nil {
 		return fmt.Errorf("open data directory %q: %w", c.dir, err)
+	}
+	closeUnstarted := func(err error) error {
+		return errors.Join(err, s.catalog.Close(), s.owner.Close())
+	}
+	probeDir, err := s.readyDirectory()
+	if err != nil {
+		return closeUnstarted(fmt.Errorf("open readiness directory: %w", err))
 	}
 	addr := c.addr
 	if addr == "" {
@@ -70,18 +77,13 @@ func run(c config) error {
 	}
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		if closeErr := w.Close(); closeErr != nil {
-			return errors.Join(fmt.Errorf("listen on %q: %w", addr, err), fmt.Errorf("close WAL: %w", closeErr))
-		}
-		return fmt.Errorf("listen on %q: %w", addr, err)
+		return closeUnstarted(errors.Join(fmt.Errorf("listen on %q: %w", addr, err), probeDir.Close()))
 	}
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
+	s.startMaintenance(os.Getenv("BOG_CAPACITY_CONTROL") == "1" && loopback(listener))
 	probeCtx, stopProbes := context.WithCancel(context.Background())
-	defer stopProbes()
+	handler, api := newReadyHandler(probeCtx, c, s, probeDir)
 	server := &http.Server{
-		Handler:           newReadyHandler(probeCtx, c, s, w),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -92,32 +94,40 @@ func run(c config) error {
 	go func() { served <- server.Serve(listener) }()
 	var serveErr error
 	select {
-	case <-signals:
+	case <-startup.Done():
 	case serveErr = <-served:
 	}
+	s.stopMaintenance()
 	stopProbes()
+	probeErr := probeDir.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
-		// Keep the WAL locked while handlers might still be using it.
-		return fmt.Errorf("shutdown HTTP server (WAL remains open until exit): %w", err)
+		return errors.Join(probeErr, fmt.Errorf("drain HTTP: %w (WAL lock held until exit)", err))
 	}
 	if serveErr == nil {
 		serveErr = <-served
 	}
 	if errors.Is(serveErr, http.ErrServerClosed) {
 		serveErr = nil
-	}
-	if serveErr != nil {
+	} else if serveErr != nil {
 		serveErr = fmt.Errorf("serve HTTP: %w", serveErr)
 	}
-	if err := w.Close(); err != nil {
-		return errors.Join(serveErr, fmt.Errorf("close WAL: %w", err))
+	if err := api.Close(ctx); err != nil {
+		return errors.Join(serveErr, probeErr, fmt.Errorf("drain query captures: %w (WAL lock held until exit)", err))
 	}
-	return serveErr
+	if err := s.drain(ctx); err != nil {
+		return errors.Join(serveErr, probeErr, fmt.Errorf("drain retained storage: %w (WAL lock held until exit)", err))
+	}
+	return errors.Join(serveErr, probeErr, s.owner.Close())
 }
 
 func main() {
+	// Keep transient decode and compaction garbage from accumulating near
+	// the deployment limit when the default Go GC targets a growing heap.
+	if _, set := os.LookupEnv("GOMEMLIMIT"); !set {
+		debug.SetMemoryLimit(88 << 20)
+	}
 	c, err := parseFlags(os.Args[1:], os.Stderr)
 	if errors.Is(err, flag.ErrHelp) {
 		return

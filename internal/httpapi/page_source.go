@@ -65,3 +65,10 @@ type PageResult struct {
 	More      bool      // a further match exists after the last returned row
 	ExpiresAt time.Time // optional on acquisition; HTTP caps it at 15 minutes
 }
+
+// ChunkedOrdinarySource opts into assembling ordinary (cursor-free) HTTP
+// responses from short scans of one temporary snapshot.
+type ChunkedOrdinarySource interface {
+	PageSource
+	ChunkedOrdinaryQueries()
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -280,4 +281,100 @@ func (p *Publisher) RecoverRecoveryView(ctx context.Context, selected func() (Re
 	}
 	p.stage.settle()
 	return nil
+}
+
+// BootstrapRecovery streams an ordinary WAL into its first immutable
+// generation. The empty checkpoint is useful when its suffix fits the budget.
+func (p *Publisher) BootstrapRecovery(ctx context.Context, input io.ReaderAt, end int64, next uint64, selectGeneration func(RecoveryPoint) error) (_ *Manifest, err error) {
+	if !p.mu.TryLock() {
+		return nil, syscall.EWOULDBLOCK
+	}
+	defer p.mu.Unlock()
+	if p.stage.pending {
+		return nil, ErrPublicationUncertain
+	}
+	pub, lock, err := lockOwnedPublication(p.root, p.dir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	if err := CheckPublication(p.dir); err != nil {
+		return nil, err
+	}
+	const start = int64(len("BOGWAL01"))
+	if input == nil || end < start || selectGeneration == nil {
+		return nil, fmt.Errorf("%w: invalid bootstrap bounds", ErrIntegrity)
+	}
+	pub.stage = &p.stage
+	h := sha256.New()
+	var magic [start]byte
+	if _, err := input.ReadAt(magic[:], 0); err != nil {
+		return nil, err
+	}
+	if string(magic[:]) != "BOGWAL01" {
+		return nil, fmt.Errorf("%w: invalid WAL magic", ErrIntegrity)
+	}
+	h.Write(magic[:])
+	m := newManifest(end, "")
+	return pub.publishGeneration(ctx, m, &next, func(visit func(uint64, []store.Row) error) error {
+		r := io.TeeReader(io.NewSectionReader(input, start, end-start), h)
+		err := scanFrames(ctx, r, start, end, 0, func(_, _ int64, ordinal uint64, rows []store.Row) error {
+			return visit(ordinal, rows)
+		})
+		m.SourceSHA256 = hex.EncodeToString(h.Sum(nil))
+		return err
+	}, func(id [32]byte) error {
+		return selectGeneration(RecoveryPoint{Generation: id, CoveredOffset: end, NextOrdinal: next,
+			CommittedEnd: end, CommittedOrdinal: next, SuffixSHA256: sha256.Sum256(nil)})
+	})
+}
+
+// RecoverUnselected discards a pending immutable bootstrap when the writable
+// selector is absent. An independently published legacy manifest is preserved.
+func (p *Publisher) RecoverUnselected(ctx context.Context, legacy func() (*Manifest, error)) (err error) {
+	if !p.mu.TryLock() {
+		return syscall.EWOULDBLOCK
+	}
+	defer p.mu.Unlock()
+	pub, lock, err := lockOwnedPublication(p.root, p.dir)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	pub.cleanupContext = ctx
+	info, err := p.root.Lstat(stageDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := checkStaging(info); err != nil {
+		return err
+	}
+	m, err := legacy()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := p.dir.Sync(); err != nil {
+		return err
+	}
+	if err := pub.recoverStaging(info, m, GenerationManifestName([32]byte{})); err != nil {
+		return err
+	}
+	p.stage.settle()
+	return nil
+}
+
+// EmptyRecoveryManifest is the deterministic, immutable generation of an
+// ordinary WAL before its first checkpoint. The ordinary commit marker
+// remains the single authority for its durable end.
+func EmptyRecoveryManifest() ([]byte, [32]byte, error) {
+	m := newManifest(8, digest([]byte("BOGWAL01")))
+	payload, err := json.Marshal(m)
+	if err != nil {
+		return nil, [32]byte{}, err
+	}
+	b, err := json.Marshal(manifestEnvelope{Payload: payload, SHA256: digest(payload)})
+	return b, sha256.Sum256(payload), err
 }

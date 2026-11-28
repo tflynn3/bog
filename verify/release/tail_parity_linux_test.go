@@ -653,6 +653,7 @@ func TestTailParityRetirementAndReclamation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
+			removed := t.TempDir()
 			root, err := os.OpenRoot(dir)
 			if err != nil {
 				t.Fatal(err)
@@ -678,8 +679,20 @@ func TestTailParityRetirementAndReclamation(t *testing.T) {
 			old := storage("old-manifest", "old-tail", "old-block")
 			active := storage("new-manifest", "new-tail", "new-block")
 			writeFixture(t, filepath.Join(dir, attempt), nil)
+			remove := func(name string) {
+				t.Helper()
+				// Preserve the fixture's inode outside the data directory so a
+				// parallel test cannot reuse it in a descriptor of this process.
+				// The deliberately leaked tail already has an open descriptor.
+				if !tc.leakTail || name != old.tail {
+					if err := os.Link(filepath.Join(dir, name), filepath.Join(removed, name)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				removeTailFixture(t, dir, name)
+			}
 			if tc.early {
-				removeTailFixture(t, dir, old.tail)
+				remove(old.tail)
 			}
 			calls := 0
 			raw := &http.Client{Transport: budgetRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -716,7 +729,7 @@ func TestTailParityRetirementAndReclamation(t *testing.T) {
 							if name == tc.keep || (tc.stageTail && name == old.tail) {
 								continue
 							}
-							removeTailFixture(t, dir, name)
+							remove(name)
 						}
 					}
 				default:

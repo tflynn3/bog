@@ -157,6 +157,17 @@ func (s *queryCaptures) retireByID(id uint64) error {
 	return nil
 }
 
+// releaseTransient handles compatibility sources that return a view from an
+// ordinary query without declaring their pin requirement before acquisition.
+func (s *queryCaptures) releaseTransient(id string) {
+	if err := s.source.Release(id); err != nil {
+		log.Printf("release query capture: %v", err)
+		s.mu.Lock()
+		s.err = errors.Join(s.err, err)
+		s.mu.Unlock()
+	}
+}
+
 // release logs failures for callers without an error return and includes
 // failures during shutdown in the result of close.
 func (s *queryCaptures) release(c *queryCapture) error {

@@ -6,6 +6,17 @@ import (
 	"testing"
 )
 
+// Register the retained serving composition from both Linux inventories.
+func init() {
+	registry[server] = rule{serverCommand, []string{
+		"bog/internal/backup", "bog/internal/checkpoint", "bog/internal/history",
+		"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal",
+	}}
+	registry["bog/internal/checkpoint"] = rule{runtimeLibrary, []string{"bog/internal/store"}}
+	registry["bog/internal/history"] = rule{runtimeLibrary, []string{"bog/internal/checkpoint", "bog/internal/store"}}
+	registry["bog/internal/backup"] = rule{runtimeLibrary, []string{"bog/internal/store"}}
+}
+
 func TestArchitectureRules(t *testing.T) {
 	const (
 		store      = "bog/internal/store"

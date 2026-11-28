@@ -5,10 +5,8 @@
 One Linux process, one HTTP listener, one WAL owner, and one pinned local
 data directory form Bog's deployment and consistency unit. `cmd/bog` opens
 the listener after the owner acquires the exclusive directory lock and
-recovers committed state. The owner holds the lock through HTTP drain. A
-drain failure leaves the WAL open and locked until process exit. The #108
-design adds retained recovery, paging, and maintenance within this same
-process and directory lock.
+recovers committed state. The owner holds the lock through HTTP, capture, and storage drain. A drain
+failure leaves the WAL open and locked until process exit.
 
 The WAL owner orders appends and decides when a complete batch becomes
 durable and query-visible. The service requires a trusted, service-owned
@@ -17,13 +15,11 @@ sync, and powersafe overwrite. The ingest and query listener has no built-in
 authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
-The Linux amd64 and arm64 production inventories at
-`c7582ec1b74d56cafd37a72f68c7ddccda5cf0e3` agree on the 21 root-module
-production packages and 27 direct imports between them shown below.
-The entire root-module closure of `cmd/bog` consists of the command plus
-HTTP, readiness, store, and WAL. The command recovers an ordinary WAL into
-an in-memory store. Writable restore, live replacement, and retained
-paging await the reviewed #108 Storage handoff.
+The Linux amd64 and arm64 production inventories agree on 21 root-module
+production packages and 30 direct imports. The server reaches checkpoint,
+history, backup, HTTP, readiness, store, and WAL. It validates and selects
+writable authority before listening, reads checkpoint rows and the committed
+suffix from disk, and advances checkpoints during normal ingest.
 [Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
 [Retained runtime promotion](../adr/0049-retained-runtime-promotion.md)
 
@@ -34,8 +30,7 @@ imports in the executable fitness registry. Arrows point from importer to
 direct dependency. Nodes with no outgoing arrows have zero direct
 root-module production imports. Test-only packages appear in the package
 table below. Runtime contains the registered production closure rooted at
-`cmd/bog`. Staged contains all libraries with the staged role, including
-backup, which the operator command imports. The architecture suite checks
+`cmd/bog`. Staged contains all libraries with the staged role. The architecture suite checks
 both memberships and the exact graph against the registry and checks the
 registry against both Linux production inventories.
 
@@ -54,6 +49,16 @@ flowchart TD
         Ready["internal/readiness"]
         WAL["internal/wal"]
         Store["internal/store"]
+        Checkpoint["internal/checkpoint"]
+        History["internal/history"]
+        Backup["internal/backup"]
+        Cmd --> Checkpoint
+        Cmd --> History
+        Cmd --> Backup
+        History --> Checkpoint
+        Checkpoint --> Store
+        History --> Store
+        Backup --> Store
         Cmd --> HTTP
         Cmd --> Ready
         Cmd --> WAL
@@ -67,17 +72,10 @@ flowchart TD
     Operator["cmd/bog-verify"]
     Export["cmd/bog-export"]
     subgraph Staged["Libraries awaiting server activation"]
-        Checkpoint["internal/checkpoint"]
-        History["internal/history"]
-        Backup["internal/backup (also used offline)"]
         Idempotency["internal/idempotency (staged keyed ingest)"]
         StreamPolicyEngine["internal/streampolicy"]
-        History --> Checkpoint
     end
     Client["internal/client (standalone)"]
-    Checkpoint --> Store
-    History --> Store
-    Backup --> Store
     Operator --> Backup
     Operator --> Client
     Operator --> Store
@@ -105,102 +103,54 @@ flowchart TD
 ```
 
 - **Ingest.** The WAL syncs whole validated NDJSON batches, syncs and installs
-  the commit marker over `bog.commit`, and syncs the directory. It publishes
+  the commit record over `bog.commit` or `bog.authority`, and syncs the directory. It publishes
   the durable rows before HTTP returns 204. A confirmed rollback returns 503
   with no rows published. An uncertain commit or rollback poisons the owner
   and terminates the served process.
-- **Query.** Results match a case-sensitive literal within a half-open
-  time range and are ordered by UTC timestamp and global append ordinal.
-  That order preserves ties, duplicates, and backfill. The measured
-  server builds the replayed store in `cmd/bog.run` and passes it through
-  `newReadyHandler` to `httpapi.NewWithQueryLimits`, which wraps it in the
-  legacy page source. Query concurrency, scan work, and encoded response
-  bytes have independent caps.
-- **Recovery.** The measured server validates and replays the committed
-  ordinary WAL before listening. Under the directory lock, it rejects
-  restored layouts containing `bog.backup` or `bog.wal.tail`. The offline
-  backup reader validates verified images. [Restored-image startup design](../adr/0003-wal-capture-and-restored-image-startup.md)
-- **Readiness.** `GET /healthz` reports listener liveness after startup.
-  `GET /ready` combines disk headroom and the terminal WAL group outcome.
-  A confirmed rollback reports `wal_rollback` until a later durable
-  outcome. An uncertain outcome reports `recovery_required` while the
-  process serves. The measured command passes `c.dir` to
-  `readiness.NewHandler`, which uses path-based `Statfs`. It cancels
-  probes before `http.Server.Shutdown` and calls `wal.Log.Close` after a
-  successful HTTP drain. WAL close waits for its running commit group
-  before closing the files and pinned directory.
-  [Readiness descriptor handoff](../adr/0005-pinned-writable-recovery-authority.md#readiness-descriptor-handoff-60)
+- **Query.** Results match a case-sensitive literal within a half-open time
+  range and sort by UTC timestamp and global append ordinal. `cmd/bog` pins the
+  selected generation and matching WAL inode and bounds under WAL publication
+  synchronization. HTTP uses `NewWithPageSourceAndQueryResources` and holds
+  the capture through the final response write. The adapter can replay the
+  same page after backfill or replacement.
+- **Recovery.** The owner streams ordinary WAL validation and builds a checkpoint
+  before serving a large legacy WAL. Restored v1 and v2 images use the backup
+  verifier. The v2 `bog.authority` record selects an immutable generation and an
+  identity-checked writable tail. Startup validates both and all committed
+  suffix frames before truncating incomplete trailing bytes.
+- **Readiness.** `GET /ready` combines disk headroom from an independent open
+  relative to the WAL directory with the most recent terminal commit outcome.
+  The probe continues sampling the active filesystem after path retargets.
+- **Shutdown.** The command stops scheduling maintenance and cancels probes,
+  drains HTTP, closes the issuing API, drains storage, and releases the WAL
+  directory lock last. A timed-out drain retains the lock through process exit.
 
-## Retained-history handoff
+## Retained-history runtime
 
-#108 must compose a command-local `httpapi.PageSource` and inject it through
-`httpapi.NewWithPageSource`. The source implements `Page` with the caller's
-query work budget and an idempotent `Release`. It reproduces ordered rows,
-positions, and exhaustion for the same captured request. Core Engineering
-owns HTTP admission, cursor authentication and expiry, fixed-budget
-certification through exhaustion or the first individually oversized
-match, and NDJSON framing. After successful acquisition, HTTP owns the
-capture release and calls the source after the final HTTP user drains.
-The adapter pins the validated generation and the matching durable,
-query-visible suffix with its WAL identity and exact byte and ordinal
-bounds under WAL owner synchronization. At the measured revision,
-`wal.Log.Capture` pins the published WAL prefix, its
-exclusive byte end, and next append ordinal under the WAL mutex. The
-reviewed wiring must show how the command selects the matching
-generation and suffix bounds in the same synchronization scope as append
-publication and activation. A held cursor
-keeps its original view across replacement while fresh walks see later
-commits. The earlier of the source expiry and HTTP deadline governs new
-resumes. Admitted paging and export operations keep their references to
-completion. [Runtime interfaces](../adr/0015-retained-history-runtime-cutover.md#runtime-interfaces),
-[Fixed-budget continuations](../adr/0006-fixed-budget-query-continuations.md)
-
-At cutover, `cmd/bog` must classify and validate ordinary WAL, retained
-checkpoint plus committed suffix, and verified restore under the same
-pinned directory. It establishes durable writable authority for restored
-images before listening. Checkpoint validates and durably publishes
-immutable generations. History owns generation scans, pins, and
-reclamation. Store owns decoded rows and their order. The command uses
-the WAL owner's synchronization to supply checkpoint and backup with a
-pinned recovery view of the generation and its exact committed suffix.
-The command and WAL owner coordinate append publication and activation.
-The durable selector must identify the validated successor before the WAL
-owner activates it. An uncertain publication fences new writes. Readers
-admitted on the old view can finish while reclamation waits for their pins.
-Command-local adapters implement the separate backup and checkpoint
-`RecoveryView` contracts. Backup validates its own view for export and
-offline verification. History may reuse checkpoint validation. The caller
-holds the operation pin through cleanup, and the consumers close their
-independent readers. Reclamation waits for durable selection and final
-reference drain.
+Checkpoints and writable tails are staged and synced before a single selector
+switch. The WAL owner reconciles all acknowledged appends above the cutoff
+while copying the new suffix. Old readers retain the precise generation and
+tail they captured. Reclamation follows durable selection and final pin
+release. A publication with uncertain authority fences new writes and views.
+Startup validates the selected files under the directory lock and resolves any
+unfinished checkpoint publication.
 [Runtime storage composition](../adr/0007-runtime-storage-composition.md),
 [Pinned writable recovery](../adr/0005-pinned-writable-recovery-authority.md),
 [Tail-only recovery view](../adr/0035-tail-only-retained-recovery-contract.md),
-[Independent recovery-view consumers](../adr/0037-independent-recovery-view-consumers.md)
+[Query delivery and shutdown](../adr/0039-query-delivery-and-retained-cutover.md)
 
-At cutover, the command passes an independently opened, unlocked handle
-to `readiness.NewHandlerForDirectory` and owns the probe handle's lifetime.
-Open it relative to the locked WAL directory so `Fstatfs` still samples
-the active filesystem after the configured path is retargeted. An
-independent open gives probes a separate file description from the
-locked one.
-
-The cutover's opt-in loopback capacity control uses the same publication path.
-Charge replay and whole-batch append reservations before reading or
-writing the tail. Charge capture, pin, and staging capacity before doing
-work. Credit reclaimed capacity after durable publication and activation
-and once references to the covered data drain. Stop admitting new work
-during shutdown, stop scheduling maintenance, and cancel readiness probes
-before draining HTTP. Keep an in-flight probe from delaying HTTP or storage
-drain. After HTTP drains, call `Close(ctx)` on the issuing API with a
-deadline to retire captures and wait for admitted readers and source
-releases. Drain admitted appends, publication, and exports and close the
-probe handle before closing the WAL owner and releasing the directory lock.
-Review startup failure cleanup. A failed drain keeps the WAL and lock held
-until process exit.
-[Query delivery and shutdown](../adr/0039-query-delivery-and-retained-cutover.md),
+The command budgets the disk-backed suffix, frame metadata, retained generations,
+query captures, scan buffers and encoded responses. The default maintenance
+trigger is 16 MiB or 4,096 uncovered batches. The disk-backed WAL suffix
+is capped at 384 MiB and 32,768 frames. When the cap blocks an append, the
+default server briefly waits for checkpoint selection before refusing it. The issuing API allows up to
+32 MiB of encoded responses, 72 MiB of scan reservations, and 64 captures across requests, including transient captures held through
+ordinary response delivery. The command defaults to a per-request work budget
+of 1,073,741,824 units.
+The capacity control opt-in uses the same publisher and exposes explicit
+cutoffs and pin observations on an IPv4 loopback listener.
 [Resource admission](../adr/0010-retained-resource-admission.md),
-[Storage budget interfaces](../../internal/history/LIMITS.md)
+[Retained query resource construction](../adr/0055-retained-query-resource-construction.md)
 
 ## Package registry
 
@@ -217,14 +167,14 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 
 | Package or entry point | Role | Responsibility |
 | --- | --- | --- |
-| `cmd/bog` | Server command | Ordinary WAL recovery, listener, and lifecycle. Owns retained composition at #108 cutover. |
+| `cmd/bog` | Server command | Retained recovery, publication, query composition, and lifecycle. |
 | `internal/httpapi` | Wired | HTTP validation, admission, cursors, and response framing |
 | `internal/readiness` | Wired | Disk headroom and write outcome observation |
 | `internal/wal` | Wired | Pinned directory locking, commit, replay, and published-prefix capture |
 | `internal/store` | Wired | Row decoding, publication, and ordered queries |
-| `internal/checkpoint` | Staged | Checkpoint format, bounded WAL scans, and durable generation publication |
-| `internal/history` | Staged | Generation validation, ordered scans, pins, and reclamation |
-| `internal/backup` | Staged | Pinned export, verification, restore, offline reads, and staging recovery. `cmd/bog-verify` keeps its direct offline dependency through promotion. |
+| `internal/checkpoint` | Wired | Checkpoint format, bounded WAL scans, and durable generation publication |
+| `internal/history` | Wired | Generation validation, ordered scans, pins, and reclamation |
+| `internal/backup` | Wired | Pinned export, verification, restore, offline reads, and staging recovery. `cmd/bog-verify` keeps its direct offline dependency through promotion. |
 | `internal/idempotency` | Staged | Keyed-ingest coordination and durable backend contract |
 | `internal/streampolicy` | Staged | Atomic policy activation, scoped grant decisions, query masking, and whole-batch ingest redaction |
 | `cmd/bog-verify` | Operator command | Read-only image verification and complete HTTP query parity |
@@ -244,11 +194,6 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `bench/segment-layout` | Nested-module benchmark | Checkpoint layout experiment outside the root module |
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
-`bog-storage` owns #108 activation for checkpoint, history, and backup.
-Both measured Linux closures leave all three staged. Promote each library
-in the command wiring PR once both Linux inventories of the reviewed
-Storage SHA confirm server reachability and Storage supplies the activation
-evidence required by ADR 0049.
 Idempotency remains staged under its own criteria. Keyed retries require
 the production WAL to commit and recover retry records atomically with
 their batches. Exercise concurrent same-key submissions, conflicting
@@ -272,7 +217,7 @@ Linux amd64 and arm64.
 | 2 | Exact queries | Preserve timestamp and append ordinal order in memory and through ordinary WAL replay. | Pin a generation and its exact committed suffix together. Merge by UTC timestamp and append ordinal through compaction and restart. Certification spends work before cursor issuance. Retiring a cursor stops new resumes, and admitted users can keep predecessor storage charged until the last reference drains. |
 | 3 | Bounded resources | Cap query work, response bytes, and concurrency. | Reserve replay, whole-batch ingest, capture, pin, and staging capacity before work. Capacity pressure can defer maintenance and refuse whole batches while admitted work drains. Verify both live scales under 128 MiB with swap disabled on each native architecture. |
 | 4 | Recovery time | Replay the full committed ordinary WAL before listening. | Validate the selected generation and writable authority, then replay its bounded committed suffix. Manifest, segment, and suffix validation adds startup I/O. |
-| 5 | Throughput | Group syncs across admitted commits. | Prune provably irrelevant scans and serialize activation with appends. Keeping and hashing the readable v1 WAL prefix costs disk space and I/O. A verified tail-only v1 restore has finite writable tail capacity. |
+| 5 | Throughput | Group syncs across admitted commits. | Prune irrelevant scans and serialize activation with appends. Checkpoint publication reads and validates segments and rebases the committed suffix. |
 
 ## Operator verification boundary
 
@@ -453,7 +398,7 @@ at dispatch and at the Storage handoff. At the reviewed Storage SHA,
 compare both Linux inventories and rerun the architecture suite. Verify the
 write leases cover the composition and architecture files before landing
 the combined change. The wiring PR updates
-`internal/archtest/architecture_test.go` with the exact
+`internal/archtest/rules_test.go` with the exact
 imports and roles, `internal/archtest/staged_packages_test.go` with the
 remaining staging declarations, and `docs/architecture/SYSTEM.md` with the
 measured revision, diagram, and role table. Preserve the operator backup
@@ -497,14 +442,14 @@ independently. The measured walk also follows external production imports.
   `readiness.NewHandlerForDirectory` and exclude every reference to
   `readiness.NewHandler`.
   When history meets either condition, `cmd/bog` must
-  also call `httpapi.NewWithPageSource` and exclude every reference to
-  `httpapi.New`, `httpapi.NewWithQueryMaxResponseBytes`, and
-  `httpapi.NewWithQueryLimits`.
+  also call `httpapi.NewWithPageSourceAndQueryResources` with a source that
+  implements both `PageSource` and `PageSourceScanBound`. The check excludes
+  `httpapi.NewWithPageSource` and the store-backed constructors.
   The typed scan checks the selected production Go files independently
   for Linux amd64 and arm64. Direct calls count inside command-local
   wrappers and through aliased or dot imports. The fully staged baseline
   may use the compatibility constructors.
-  [Constructor calls](../adr/0053-retained-serving-constructor-calls.md),
+  [Constructor calls](../adr/0055-retained-query-resource-construction.md),
   [Constructor fitness test](../../internal/archtest/retained_runtime_wiring_test.go)
 - HTTP owns the paging seam. It cannot reach checkpoint, history, or
   backup, even through a registered intermediary. Readiness can observe

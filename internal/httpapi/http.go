@@ -22,6 +22,7 @@ type API struct {
 	wal              appender
 	fatal            func()
 	slots            chan struct{}
+	ingestMemory     *queryByteBudget
 	maxResponseBytes int
 	queryWorkBudget  uint64
 	cursorKey        [32]byte
@@ -65,6 +66,13 @@ func NewWithPageSource(source PageSource, w appender, maxBytes, concurrency int,
 	a := newAPIForSource(source, w, maxBytes, workBudget)
 	a.routes = a.handler(concurrency)
 	return a
+}
+
+// LimitIngestMemory reserves aggregate request scratch through WAL completion.
+// Configure it before serving. Requests without a declared length reserve the
+// maximum batch size, and share the usual request slot limit.
+func (a *API) LimitIngestMemory(limit uint64) {
+	a.ingestMemory = &queryByteBudget{limit: limit, err: errors.New("ingest memory capacity exhausted")}
 }
 
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -139,7 +147,25 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	b, err := io.ReadAll(io.LimitReader(r.Body, store.MaxBatch+1))
+	scratch := queryReservation{budget: a.ingestMemory}
+	if a.ingestMemory != nil {
+		size := r.ContentLength
+		if size < 0 {
+			size = store.MaxBatch
+		}
+		// Include body growth, both decoded row arrays, escaped JSON
+		// scratch and the encoded bytes held while the WAL queues the batch.
+		if err := scratch.grow(12*uint64(size) + 8<<10); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		defer scratch.release()
+	}
+	readLimit := int64(store.MaxBatch)
+	if a.ingestMemory != nil && r.ContentLength >= 0 {
+		readLimit = r.ContentLength
+	}
+	b, err := io.ReadAll(io.LimitReader(r.Body, readLimit+1))
 	if len(b) > store.MaxBatch {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return

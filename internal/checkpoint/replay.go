@@ -110,3 +110,15 @@ func scanFrames(ctx context.Context, input io.Reader, pos, end int64, ordinal ui
 	}
 	return ctx.Err()
 }
+
+// WalkCapturedFrames streams a logical WAL range without retaining decoded
+// rows. For legacy migration the range can exceed the live replay budget.
+func WalkCapturedFrames(ctx context.Context, input io.ReaderAt, start, end int64, first uint64,
+	visit func(end int64, first uint64, rows []store.Row) error) error {
+	if start < 8 || end < start {
+		return fmt.Errorf("%w: invalid WAL frame range", ErrIntegrity)
+	}
+	return scanCapturedFrames(ctx, input, start, end, first, func(_, end int64, ordinal uint64, rows []store.Row) error {
+		return visit(end, ordinal, rows)
+	})
+}

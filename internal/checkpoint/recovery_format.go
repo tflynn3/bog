@@ -3,6 +3,7 @@ package checkpoint
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -147,12 +148,17 @@ func validateManifestBlocks(ctx context.Context, m Manifest, open func(string) (
 		if digest(b) != s.SHA256 {
 			return fmt.Errorf("%w: segment digest mismatch for %s", ErrIntegrity, s.Name)
 		}
-		rows, err := DecodeBlock(b)
+		n, err := validateBlock(b)
 		if err != nil {
 			return fmt.Errorf("%w: decode segment %s: %w", ErrIntegrity, s.Name, err)
 		}
-		for i, row := range rows {
-			if row.Ordinal >= m.NextOrdinal || (i > 0 && lessRow(row, rows[i-1])) {
+		pos := blockHeaderSize
+		var previous BlockRow
+		for i := uint32(0); i < n; i++ {
+			header := b[pos : pos+blockRowSize]
+			row := BlockRow{Ordinal: binary.LittleEndian.Uint64(header[12:20])}
+			row.Row.TS, _ = getBlockTime(header)
+			if row.Ordinal >= m.NextOrdinal || (i > 0 && lessRow(row, previous)) {
 				return fmt.Errorf("%w: invalid segment row order or ordinal in %s", ErrIntegrity, s.Name)
 			}
 			mask := byte(1 << (row.Ordinal % 8))
@@ -160,9 +166,15 @@ func validateManifestBlocks(ctx context.Context, m Manifest, open func(string) (
 				return fmt.Errorf("%w: duplicate segment ordinal %d", ErrIntegrity, row.Ordinal)
 			}
 			ordinals[row.Ordinal/8] |= mask
+			pos += blockRowSize + int(binary.LittleEndian.Uint32(header[20:24]))
+			previous = row
 		}
-		count += uint64(len(rows))
+		count += uint64(n)
 		if keep != nil {
+			rows, err := DecodeBlock(b)
+			if err != nil {
+				return err
+			}
 			keep(rows)
 		}
 	}

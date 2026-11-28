@@ -71,16 +71,53 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	response := a.newQueryResponse()
 	defer response.release()
 	req := PageRequest{Filter: params.filter, Limit: params.limit}
-	if err := a.withPage(ctx, req, work, func(result PageResult) error {
-		if len(result.Rows) > params.limit {
-			return errPageSourceContract
+	source, declaresCapture := a.captures.source.(PageSourceOrdinaryCapture)
+	needsCapture := declaresCapture && source.CapturesOrdinaryQueries()
+	var capture *queryCapture
+	defer func() {
+		if capture != nil {
+			a.captures.done(capture, true)
 		}
-		_, err := response.appendRows(result.Rows, work)
+	}()
+	admit := func() error {
+		if capture != nil || !needsCapture {
+			return nil
+		}
+		var err error
+		capture, err = a.captures.reserve(a.initResources().captures)
 		return err
-	}); err != nil {
-		response.release()
-		writeQueryError(w, err)
-		return
+	}
+	for req.Limit > 0 {
+		var more bool
+		err := a.withPageAdmission(ctx, req, work, admit, func(result PageResult) error {
+			if capture == nil && result.Capture != "" {
+				return errors.Join(errPageSourceContract, a.captures.source.Release(result.Capture))
+			}
+			if capture != nil && req.Capture == "" {
+				capture.sourceID, req.Capture = result.Capture, result.Capture
+			}
+			if len(result.Rows) > req.Limit || (req.Capture != "" && result.More && len(result.Rows) == 0) {
+				return errPageSourceContract
+			}
+			n, err := response.appendRows(result.Rows, work)
+			req.Limit -= n
+			more = req.Capture != "" && result.More && n == len(result.Rows)
+			if more {
+				req.After = result.Rows[n-1].Position
+				if !validOpaque(string(req.After)) {
+					return errPageSourceContract
+				}
+			}
+			return err
+		})
+		if err != nil {
+			response.release()
+			writeQueryError(w, err)
+			return
+		}
+		if !more {
+			break
+		}
 	}
 	if err := response.reserveDelivery(work); err != nil {
 		response.release()

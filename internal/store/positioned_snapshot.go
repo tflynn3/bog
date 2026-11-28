@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"time"
+	"unsafe"
+)
 
 // PositionedSnapshot freezes the published rows and their scan indexes together.
 // Appends only write beyond the captured slice lengths and replace run levels,
@@ -12,6 +15,21 @@ type PositionedSnapshot struct {
 // CapturePositionedSnapshot takes an immutable view of the published prefix.
 func (s *Store) CapturePositionedSnapshot() *PositionedSnapshot {
 	return &PositionedSnapshot{view: s.queryView()}
+}
+
+// MetadataBytes bounds the backing arrays held by this snapshot. The owner
+// accounts separately for shared line strings and immutable block filters.
+func (s *PositionedSnapshot) MetadataBytes() uint64 {
+	v := s.view
+	const intBytes = uint64(unsafe.Sizeof(int(0)))
+	bytes := uint64(cap(v.rows))*uint64(unsafe.Sizeof(Row{})) +
+		uint64(cap(v.blocks))*uint64(unsafe.Sizeof((*blockFilter)(nil))) +
+		uint64(cap(v.levels))*uint64(unsafe.Sizeof(indexRun{})) +
+		uint64(cap(v.restored.ordinals)+cap(v.restored.blockMins))*intBytes
+	for _, run := range v.levels {
+		bytes += uint64(cap(run.ordinals)+cap(run.blockMins)) * intBytes
+	}
+	return bytes
 }
 
 // Page scans the whole captured prefix, with global ordinals starting at

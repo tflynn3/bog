@@ -12,11 +12,12 @@ import (
 )
 
 const (
-	stageDir       = ".bog-checkpoint-stage"
-	stagedManifest = stageDir + "/manifest"
-	stagedIntent   = stageDir + "/intent"
-	intentBase     = "installed-v1"
-	intentName     = stageDir + "/" + intentBase
+	canonicalRecoveryName = "bog.checkpoint"
+	stageDir              = ".bog-checkpoint-stage"
+	stagedManifest        = stageDir + "/manifest"
+	stagedIntent          = stageDir + "/intent"
+	intentBase            = "installed-v1"
+	intentName            = stageDir + "/" + intentBase
 )
 
 type ownedSegment struct {
@@ -116,7 +117,7 @@ func recoverCapturedWithBudget(root *os.Root, dir *os.File, authoritative func()
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	err = p.resolve(authoritative)
+	err = p.resolve(authoritative, false)
 	if err == nil || err == os.ErrNotExist {
 		stage.settle()
 	}
@@ -133,7 +134,7 @@ func (l *Legacy) resolvePublication(keepRows bool) (*Published, error) {
 			return nil, err
 		}
 		return &published.manifest, nil
-	})
+	}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +143,7 @@ func (l *Legacy) resolvePublication(keepRows bool) (*Published, error) {
 
 // resolve validates the authoritative namespace and makes it durable before
 // deleting losing outputs. Missing is a valid first-publication outcome.
-func (p *publication) resolve(load func() (*Manifest, error)) error {
+func (p *publication) resolve(load func() (*Manifest, error), ordinary bool) error {
 	info, err := p.root.Lstat(stageDir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -170,7 +171,13 @@ func (p *publication) resolve(load func() (*Manifest, error)) error {
 		return fmt.Errorf("sync checkpoint directory: %w", err)
 	}
 	if info != nil {
-		if err := p.recoverStaging(info, m, ""); err != nil {
+		name := ""
+		if ordinary && m != nil {
+			// The WAL owner established that there is no retained selector.
+			// Losing v2 outputs cannot be authoritative in this layout.
+			name = canonicalRecoveryName
+		}
+		if err := p.recoverStaging(info, m, name); err != nil {
 			return err
 		}
 	}

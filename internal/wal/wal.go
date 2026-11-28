@@ -1,7 +1,6 @@
 package wal
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -188,19 +187,10 @@ func (l *Log) run() {
 func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 	next := l.offset
 	for _, req := range group {
-		var h [16]byte
-		n := uint32(len(req.payload))
-		binary.LittleEndian.PutUint32(h[:], n)
-		binary.LittleEndian.PutUint32(h[4:], ^n)
-		binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(req.payload, table))
-		binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
-		if err := writeAll(l.f, h[:]); err != nil {
+		if _, err := WriteFrame(l.f, nil, req.payload); err != nil {
 			return "wal_write", l.rollback(err)
 		}
-		if err := writeAll(l.f, req.payload); err != nil {
-			return "wal_write", l.rollback(err)
-		}
-		next += int64(len(h) + len(req.payload))
+		next += int64(FrameHeaderSize + len(req.payload))
 	}
 	if err := l.f.Sync(); err != nil {
 		return "wal_sync", l.rollback(err)
@@ -222,16 +212,7 @@ func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 }
 
 func (l *Log) rollback(cause error) error {
-	if err := l.f.Truncate(l.offset); err != nil {
-		return errors.Join(ErrUncertain, cause, fmt.Errorf("truncate WAL: %w", err))
-	}
-	if err := l.f.Sync(); err != nil {
-		return errors.Join(ErrUncertain, cause, fmt.Errorf("sync truncated WAL: %w", err))
-	}
-	if _, err := l.f.Seek(l.offset, io.SeekStart); err != nil {
-		return errors.Join(ErrUncertain, cause, fmt.Errorf("seek truncated WAL: %w", err))
-	}
-	return cause
+	return RollbackFrame(l.f, l.offset, cause)
 }
 
 func (l *Log) Close() error {
@@ -252,15 +233,20 @@ func (l *Log) Close() error {
 	}
 	l.mu.Unlock()
 
-	err := l.f.Close()
+	var err error
+	if f, ok := l.f.(*os.File); ok {
+		err = closeLockedFile(f)
+	} else {
+		err = l.f.Close()
+	}
 	if l.captures != nil {
 		err = errors.Join(err, l.captures.release())
 	}
-	if l.dir != nil {
-		err = errors.Join(err, l.dir.Close())
-	}
 	if l.root != nil {
 		err = errors.Join(err, l.root.Close())
+	}
+	if l.dir != nil {
+		err = errors.Join(err, closeLockedFile(l.dir))
 	}
 	l.mu.Lock()
 	l.closeErr = err

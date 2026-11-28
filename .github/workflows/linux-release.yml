@@ -346,6 +346,21 @@ jobs:
           done 3<<< "$RELEASE_PRODUCERS"
           exit "$failed"
 
+      - name: Qualify O1 history under 256 MiB on both starts
+        if: steps.preflight.outcome == 'success'
+        timeout-minutes: 3
+        run: |
+          read -r digest _ < "$EVIDENCE/binary.sha256"
+          sha256sum --check "$EVIDENCE/binary.sha256"
+          python=$(command -v python3)
+          sudo -n systemd-run --quiet --wait --pipe --collect --expand-environment=no \
+            --uid="$(id -u)" --gid="$(id -g)" -p Delegate=memory -p DelegateSubgroup=runner \
+            -p KillMode=control-group -p RuntimeMaxSec=125s -p TimeoutStopSec=5s \
+            "$python" "$GITHUB_WORKSPACE/candidate/verify/release/o1_journey.py" "$BINARY" \
+            --revision "$REVISION" --sha256 "$digest" --work-dir "$RUNNER_TEMP" |
+            tee "$EVIDENCE/o1-journey.json"
+          sha256sum --check "$EVIDENCE/binary.sha256"
+
       - name: Race-test candidate runtime and release verifier lifecycle
         if: always() && steps.build.outcome == 'success'
         timeout-minutes: 30

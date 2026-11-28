@@ -56,6 +56,14 @@ func (b *Budget) ReplayCapturedTail(ctx context.Context, input io.ReaderAt, star
 	return tail, nil
 }
 
+// ScanFrames streams a fixed, logical WAL interval in whole validated frames.
+func ScanFrames(ctx context.Context, input io.Reader, start, end int64, first uint64, visit func(start, end int64, ordinal uint64, rows []store.Row) error) error {
+	if start < 8 || end < start {
+		return fmt.Errorf("%w: invalid committed frame bounds", ErrIntegrity)
+	}
+	return scanFrames(ctx, input, start, end, first, visit)
+}
+
 // scanCapturedFrames reads an owner-pinned suffix at absolute WAL offsets.
 // It never reads the omitted prefix of a restored WAL.
 func scanCapturedFrames(ctx context.Context, input io.ReaderAt, pos, end int64, ordinal uint64, visit func(int64, int64, uint64, []store.Row) error) error {

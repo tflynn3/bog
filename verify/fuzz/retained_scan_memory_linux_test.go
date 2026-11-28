@@ -66,7 +66,9 @@ func runScanMemoryProcess(t *testing.T, path string, count int) scanMemoryReport
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^TestRetainedScanMemoryWorker$", "-test.count=1")
 	cmd.WaitDelay = time.Second
-	cmd.Env = append(cmd.Environ(), scanMemoryWorkerEnv+"="+strconv.Itoa(count), scanMemoryCgroupEnv+"="+group)
+	// Keep libc's per-thread arenas from consuming the worker's virtual
+	// address budget under -race. All scan workers still run concurrently.
+	cmd.Env = append(cmd.Environ(), scanMemoryWorkerEnv+"="+strconv.Itoa(count), scanMemoryCgroupEnv+"="+group, "MALLOC_ARENA_MAX=2")
 	cmd.Dir = path
 	output, err := cmd.CombinedOutput()
 	if err != nil || ctx.Err() != nil {
@@ -100,7 +102,9 @@ func TestRetainedScanMemoryWorker(t *testing.T) {
 	if group != "" {
 		must(t, enterScanMemoryCgroup(group))
 	}
-	setWorkerLimits(t)
+	// ThreadSanitizer lazily maps shadow memory as concurrent readers
+	// start. Allow that virtual space independently of the RSS assertions.
+	setWorkerLimitsWithHeadroom(t, addressHeadroom+(256<<20))
 	report := runRetainedScanMemory(t, path, group, count)
 	data, err := json.Marshal(report)
 	must(t, err)

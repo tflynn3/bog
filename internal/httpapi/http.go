@@ -22,6 +22,7 @@ type API struct {
 	wal              appender
 	fatal            func()
 	slots            chan struct{}
+	ingestBytes      *queryByteBudget
 	maxResponseBytes int
 	queryWorkBudget  uint64
 	cursorKey        [32]byte
@@ -66,6 +67,14 @@ func NewWithPageSource(source PageSource, w appender, maxBytes, concurrency int,
 	a.routes = a.handler(concurrency)
 	return a
 }
+
+// SetIngestMemoryLimit bounds aggregate body and decoder working memory.
+// Set it before serving. Unknown-length bodies reserve a full batch.
+func (a *API) SetIngestMemoryLimit(bytes uint64) {
+	a.ingestBytes = &queryByteBudget{limit: bytes, err: errIngestBusy}
+}
+
+var errIngestBusy = errors.New("busy")
 
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.routes.ServeHTTP(w, r)
@@ -138,6 +147,20 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > store.MaxBatch {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
+	}
+	if a.ingestBytes != nil {
+		size := r.ContentLength
+		if size < 0 {
+			size = store.MaxBatch
+		}
+		reservation := queryReservation{budget: a.ingestBytes}
+		// Allow for ReadAll growth, decoder scratch, and decoded backing
+		// until a whole batch is handed off to durable storage.
+		if err := reservation.grow(max(4<<10, 6*uint64(size))); err != nil {
+			http.Error(w, errIngestBusy.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		defer reservation.release()
 	}
 	b, err := io.ReadAll(io.LimitReader(r.Body, store.MaxBatch+1))
 	if len(b) > store.MaxBatch {

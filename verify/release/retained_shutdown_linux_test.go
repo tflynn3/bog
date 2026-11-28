@@ -609,6 +609,17 @@ func TestReapedShutdownStorage(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if tc.replace {
+				// Keep unlinked predecessor inodes from being reused for the
+				// deliberately substituted successor in this fixture.
+				for _, name := range retired {
+					f, err := root.Open(name)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { closeTailFixture(t, f) })
+				}
+			}
 			for _, name := range retired {
 				if name != tc.keep && !(tc.move && name == "old-tail") {
 					if err := root.Remove(name); err != nil {

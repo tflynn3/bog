@@ -48,6 +48,10 @@ type PageRequest struct {
 	Snapshot bool
 	Capture  string       // empty for acquisition or ordinary queries
 	After    PagePosition // exclusive, empty at the beginning
+	// ScanBytes is the reservation obtained by HTTP for this call. A source
+	// that sizes scans from changing metadata can refuse before scanning when
+	// its acquired view requires a larger reservation.
+	ScanBytes uint64
 }
 
 // PagePosition identifies an emitted row within its capture, in timestamp

@@ -100,7 +100,10 @@ func TestRetainedScanMemoryWorker(t *testing.T) {
 	if group != "" {
 		must(t, enterScanMemoryCgroup(group))
 	}
-	setWorkerLimits(t)
+	// Concurrent scanners can grow more than one Go arena. The race shadow
+	// mappings consume virtual address space outside the measured live heap.
+	// Keep the independent heap, RSS and cgroup ceilings unchanged.
+	setWorkerAddressLimit(t, 1<<30)
 	report := runRetainedScanMemory(t, path, group, count)
 	data, err := json.Marshal(report)
 	must(t, err)

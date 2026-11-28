@@ -55,10 +55,15 @@ func (r *Replacement) Close() {
 // new captures. A populated Generation means installation succeeded even if
 // releasing the previous generation or closing the lock reports an error.
 func (r *Replacement) ReplacePinned(ctx context.Context, dir *os.File) (Generation, error) {
-	return r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+	return r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, nil)
 }
 
-func (r *Replacement) install(ctx context.Context, open directoryOpener) (_ Generation, err error) {
+// ReplaceSelectedPinned installs the immutable manifest named by a durable selector.
+func (r *Replacement) ReplaceSelectedPinned(ctx context.Context, dir *os.File, id GenerationID) (Generation, error) {
+	return r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, &id)
+}
+
+func (r *Replacement) install(ctx context.Context, open directoryOpener, selected *GenerationID) (_ Generation, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c := r.catalog
@@ -82,7 +87,10 @@ func (r *Replacement) install(ctx context.Context, open directoryOpener) (_ Gene
 		return Generation{}, errors.Join(err, dir.Close())
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	next, err := loadAt(ctx, dir)
+	if err := checkpoint.CheckPublication(dir); err != nil {
+		return Generation{}, errors.Join(err, dir.Close())
+	}
+	next, _, err := loadAuthority(ctx, dir, selected)
 	if err != nil {
 		return Generation{}, errors.Join(err, dir.Close())
 	}

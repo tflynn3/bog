@@ -3,12 +3,14 @@ package checkpoint
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // RecoveryPoint fixes one generation and its committed WAL suffix. Offsets
@@ -147,22 +149,34 @@ func validateManifestBlocks(ctx context.Context, m Manifest, open func(string) (
 		if digest(b) != s.SHA256 {
 			return fmt.Errorf("%w: segment digest mismatch for %s", ErrIntegrity, s.Name)
 		}
-		rows, err := DecodeBlock(b)
+		n, err := validateBlock(b)
 		if err != nil {
 			return fmt.Errorf("%w: decode segment %s: %w", ErrIntegrity, s.Name, err)
 		}
-		for i, row := range rows {
-			if row.Ordinal >= m.NextOrdinal || (i > 0 && lessRow(row, rows[i-1])) {
+		pos := blockHeaderSize
+		var prevTime time.Time
+		var prevOrdinal uint64
+		for i := uint32(0); i < n; i++ {
+			ts, _ := getBlockTime(b[pos : pos+12])
+			ord := binary.LittleEndian.Uint64(b[pos+12 : pos+20])
+			size := int(binary.LittleEndian.Uint32(b[pos+20 : pos+24]))
+			if ord >= m.NextOrdinal || (i > 0 && (ts.Before(prevTime) || ts.Equal(prevTime) && ord <= prevOrdinal)) {
 				return fmt.Errorf("%w: invalid segment row order or ordinal in %s", ErrIntegrity, s.Name)
 			}
-			mask := byte(1 << (row.Ordinal % 8))
-			if ordinals[row.Ordinal/8]&mask != 0 {
-				return fmt.Errorf("%w: duplicate segment ordinal %d", ErrIntegrity, row.Ordinal)
+			mask := byte(1 << (ord % 8))
+			if ordinals[ord/8]&mask != 0 {
+				return fmt.Errorf("%w: duplicate segment ordinal %d", ErrIntegrity, ord)
 			}
-			ordinals[row.Ordinal/8] |= mask
+			ordinals[ord/8] |= mask
+			prevTime, prevOrdinal = ts, ord
+			pos += blockRowSize + size
 		}
-		count += uint64(len(rows))
+		count += uint64(n)
 		if keep != nil {
+			rows, err := DecodeBlock(b)
+			if err != nil {
+				return err
+			}
 			keep(rows)
 		}
 	}

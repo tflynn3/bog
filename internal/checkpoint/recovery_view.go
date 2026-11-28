@@ -13,6 +13,10 @@ import (
 	"bog/internal/store"
 )
 
+// ErrSelectionRefused indicates the selector stopped before attempting to
+// replace authority and disposed of any private successor tail.
+var ErrSelectionRefused = errors.New("checkpoint selection refused before authority update")
+
 const generationPrefix = "bog-checkpoint-"
 
 // GenerationManifestName is the immutable data-directory name for a new v2
@@ -167,7 +171,7 @@ func scanView(ctx context.Context, view RecoveryView, point RecoveryPoint, cutof
 // It checks that the predecessor remains selected, reconciles any later
 // commits, and durably selects a manifest and tail together. The point it
 // receives describes the remainder of the captured suffix at the new boundary.
-// Any selector error is uncertain. RecoverRecoveryView resolves that outcome.
+// A selector error is uncertain unless it wraps ErrSelectionRefused. RecoverRecoveryView resolves that outcome.
 // A returned manifest means selection succeeded, even if cleanup failed.
 func (p *Publisher) PublishRecoveryView(ctx context.Context, view RecoveryView, cutoff int64, ordinal uint64,
 	selectSuccessor func(context.Context, RecoveryPoint) error) (_ *Manifest, err error) {

@@ -73,6 +73,7 @@ func (s *queryCaptures) reserve(maxCaptures uint64) (*queryCapture, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.next == math.MaxUint64 || len(s.live) >= maxQueryCaptures {
+		log.Printf("debug query capture refusal: %d", len(s.live))
 		return nil, ErrQueryCapacityExhausted
 	}
 	if uint64(len(s.live)) >= maxCaptures {

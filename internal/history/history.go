@@ -106,7 +106,7 @@ func (c *Catalog) replaceWith(ctx context.Context, open directoryOpener) (Genera
 		return Generation{}, err
 	}
 	defer ticket.Close()
-	return ticket.install(ctx, open)
+	return ticket.install(ctx, open, nil)
 }
 
 // Acquire pins id if it is current. Already acquired readers keep their

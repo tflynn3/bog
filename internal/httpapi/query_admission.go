@@ -1,6 +1,9 @@
 package httpapi
 
-import "net/http"
+import (
+	"log"
+	"net/http"
+)
 
 // queryAdmission limits concurrent calls to a query handler without waiting.
 // The limit must be positive. Each wrapper owns its own admission slots.
@@ -18,6 +21,7 @@ func queryAdmission(limit int, next http.Handler) http.Handler {
 		case slots <- struct{}{}:
 			defer func() { <-slots }()
 		default:
+			log.Print("debug query concurrency refusal")
 			http.Error(w, "query capacity exhausted", http.StatusServiceUnavailable)
 			return
 		}

@@ -107,6 +107,11 @@ func TestCorpusWorker(t *testing.T) {
 
 func setWorkerLimits(t *testing.T) {
 	t.Helper()
+	setWorkerAddressLimit(t, addressHeadroom)
+}
+
+func setWorkerAddressLimit(t *testing.T, headroom uint64) {
+	t.Helper()
 	// The Go runtime, especially with -race, reserves substantial virtual
 	// address space before TestMain. Budget further address-space growth
 	// relative to the process's existing Linux mappings.
@@ -123,7 +128,7 @@ func setWorkerLimits(t *testing.T) {
 		}
 		kib, err := strconv.ParseUint(fields[0], 10, 64)
 		must(t, err)
-		setHardLimit(t, syscall.RLIMIT_AS, kib*1024+addressHeadroom)
+		setHardLimit(t, syscall.RLIMIT_AS, kib*1024+headroom)
 		setHardLimit(t, syscall.RLIMIT_FSIZE, maxOutputFile)
 		return
 	}

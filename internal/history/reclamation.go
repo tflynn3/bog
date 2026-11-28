@@ -60,15 +60,20 @@ func (c *Catalog) retiredIndex(info os.FileInfo) int {
 // A shared segment or one with live readers remains eligible for a later call.
 // It is safe to call after Close, including while retired readers are draining.
 func (c *Catalog) Reclaim(ctx context.Context, path string) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) }, nil)
 }
 
 // ReclaimPinned is Reclaim using the caller's pinned directory.
 func (c *Catalog) ReclaimPinned(ctx context.Context, dir *os.File) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, nil)
 }
 
-func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error) {
+// ReclaimSelectedPinned protects the generation identified by the durable selector.
+func (c *Catalog) ReclaimSelectedPinned(ctx context.Context, dir *os.File, id GenerationID) error {
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, &id)
+}
+
+func (c *Catalog) reclaim(ctx context.Context, open directoryOpener, selected *GenerationID) (err error) {
 	c.replace.Lock()
 	defer c.replace.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -88,7 +93,10 @@ func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error)
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	current, err := loadAt(ctx, dir)
+	if err := checkpoint.CheckPublication(dir); err != nil {
+		return err
+	}
+	current, _, err := loadAuthority(ctx, dir, selected)
 	if err != nil {
 		return err
 	}

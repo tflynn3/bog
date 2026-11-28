@@ -1,22 +1,15 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
+	"runtime/debug"
 
 	"bog/internal/httpapi"
-	"bog/internal/store"
-	"bog/internal/wal"
 )
 
 type config struct {
@@ -58,65 +51,6 @@ func parseFlags(args []string, output io.Writer) (config, error) {
 	return c, nil
 }
 
-func run(c config) error {
-	s := &store.Store{}
-	w, err := wal.Open(c.dir, s)
-	if err != nil {
-		return fmt.Errorf("open data directory %q: %w", c.dir, err)
-	}
-	addr := c.addr
-	if addr == "" {
-		addr = ":http"
-	}
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		if closeErr := w.Close(); closeErr != nil {
-			return errors.Join(fmt.Errorf("listen on %q: %w", addr, err), fmt.Errorf("close WAL: %w", closeErr))
-		}
-		return fmt.Errorf("listen on %q: %w", addr, err)
-	}
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
-	probeCtx, stopProbes := context.WithCancel(context.Background())
-	defer stopProbes()
-	server := &http.Server{
-		Handler:           newReadyHandler(probeCtx, c, s, w),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
-	served := make(chan error, 1)
-	go func() { served <- server.Serve(listener) }()
-	var serveErr error
-	select {
-	case <-signals:
-	case serveErr = <-served:
-	}
-	stopProbes()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		// Keep the WAL locked while handlers might still be using it.
-		return fmt.Errorf("shutdown HTTP server (WAL remains open until exit): %w", err)
-	}
-	if serveErr == nil {
-		serveErr = <-served
-	}
-	if errors.Is(serveErr, http.ErrServerClosed) {
-		serveErr = nil
-	}
-	if serveErr != nil {
-		serveErr = fmt.Errorf("serve HTTP: %w", serveErr)
-	}
-	if err := w.Close(); err != nil {
-		return errors.Join(serveErr, fmt.Errorf("close WAL: %w", err))
-	}
-	return serveErr
-}
-
 func main() {
 	c, err := parseFlags(os.Args[1:], os.Stderr)
 	if errors.Is(err, flag.ErrHelp) {
@@ -125,6 +59,9 @@ func main() {
 	if err != nil {
 		log.Print(err)
 		os.Exit(2)
+	}
+	if _, configured := os.LookupEnv("GOMEMLIMIT"); !configured {
+		debug.SetMemoryLimit(80 << 20)
 	}
 	err = run(c)
 	if err != nil {

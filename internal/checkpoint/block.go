@@ -89,37 +89,55 @@ func getBlockTime(b []byte) (time.Time, bool) {
 
 // DecodeBlock verifies the complete block before returning any rows.
 func DecodeBlock(b []byte) ([]BlockRow, error) {
+	count, err := validateBlock(b)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]BlockRow, int(count))
+	p := blockHeaderSize
+	for i := range rows {
+		t, _ := getBlockTime(b[p : p+12])
+		ordinal := binary.LittleEndian.Uint64(b[p+12 : p+20])
+		n := int(binary.LittleEndian.Uint32(b[p+20 : p+24]))
+		p += blockRowSize
+		rows[i] = BlockRow{Row: store.Row{TS: t, Line: string(b[p : p+n])}, Ordinal: ordinal}
+		p += n
+	}
+	return rows, nil
+}
+
+func validateBlock(b []byte) (uint32, error) {
 	if len(b) < blockHeaderSize || len(b) > MaxBlockSize || binary.LittleEndian.Uint32(b[:4]) != 1 || crc32.Checksum(b[:40], castagnoli) != binary.LittleEndian.Uint32(b[40:44]) {
-		return nil, errBlock
+		return 0, errBlock
 	}
 	count := binary.LittleEndian.Uint32(b[4:8])
 	payload := binary.LittleEndian.Uint32(b[8:12])
 	if count == 0 || uint64(payload) != uint64(len(b)-blockHeaderSize) || uint64(count)*blockRowSize > uint64(payload) || crc32.Checksum(b[blockHeaderSize:], castagnoli) != binary.LittleEndian.Uint32(b[36:40]) {
-		return nil, errBlock
+		return 0, errBlock
 	}
 	lo, ok := getBlockTime(b[12:24])
 	if !ok {
-		return nil, errBlock
+		return 0, errBlock
 	}
 	hi, ok := getBlockTime(b[24:36])
 	if !ok || hi.Before(lo) {
-		return nil, errBlock
+		return 0, errBlock
 	}
 	// Validate every field before allocating the result or exposing any row.
 	p := blockHeaderSize
 	var actualLo, actualHi time.Time
 	for i := uint32(0); i < count; i++ {
 		if len(b)-p < blockRowSize {
-			return nil, errBlock
+			return 0, errBlock
 		}
 		t, valid := getBlockTime(b[p : p+12])
 		if !valid {
-			return nil, errBlock
+			return 0, errBlock
 		}
 		n := binary.LittleEndian.Uint32(b[p+20 : p+24])
 		p += blockRowSize
 		if uint64(n) > uint64(len(b)-p) || !utf8.Valid(b[p:p+int(n)]) {
-			return nil, errBlock
+			return 0, errBlock
 		}
 		p += int(n)
 		if i == 0 || t.Before(actualLo) {
@@ -130,17 +148,7 @@ func DecodeBlock(b []byte) ([]BlockRow, error) {
 		}
 	}
 	if p != len(b) || !lo.Equal(actualLo) || !hi.Equal(actualHi) {
-		return nil, errBlock
+		return 0, errBlock
 	}
-	rows := make([]BlockRow, int(count))
-	p = blockHeaderSize
-	for i := range rows {
-		t, _ := getBlockTime(b[p : p+12])
-		ordinal := binary.LittleEndian.Uint64(b[p+12 : p+20])
-		n := int(binary.LittleEndian.Uint32(b[p+20 : p+24]))
-		p += blockRowSize
-		rows[i] = BlockRow{Row: store.Row{TS: t, Line: string(b[p : p+n])}, Ordinal: ordinal}
-		p += n
-	}
-	return rows, nil
+	return count, nil
 }

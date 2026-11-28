@@ -110,3 +110,11 @@ func scanFrames(ctx context.Context, input io.Reader, pos, end int64, ordinal ui
 	}
 	return ctx.Err()
 }
+
+// ScanCapturedFrames validates a logical range and streams whole decoded frames.
+func ScanCapturedFrames(ctx context.Context, input io.ReaderAt, start, end int64, first uint64, visit func(int64, int64, uint64, []store.Row) error) error {
+	if input == nil || start < 8 || end < start {
+		return fmt.Errorf("%w: invalid committed replay range", ErrIntegrity)
+	}
+	return scanCapturedFrames(ctx, input, start, end, first, visit)
+}

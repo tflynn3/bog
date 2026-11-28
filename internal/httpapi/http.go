@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -139,7 +140,12 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	b, err := io.ReadAll(io.LimitReader(r.Body, store.MaxBatch+1))
+	var body bytes.Buffer
+	if r.ContentLength > 0 {
+		body.Grow(int(r.ContentLength) + bytes.MinRead)
+	}
+	_, err := body.ReadFrom(io.LimitReader(r.Body, store.MaxBatch+1))
+	b := body.Bytes()
 	if len(b) > store.MaxBatch {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return

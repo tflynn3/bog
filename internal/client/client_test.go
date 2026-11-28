@@ -309,7 +309,7 @@ func TestIngestOutcomes(t *testing.T) {
 		status int
 		body   string
 		want   IngestOutcome
-	}{{204, "", IngestCommitted}, {400, "bad\n", IngestRejected}, {413, "large\n", IngestRejected}, {503, "busy\n", IngestUncommitted}, {503, "WAL unavailable\n", IngestUncommitted}, {503, "proxy\n", IngestUnknown}} {
+	}{{204, "", IngestCommitted}, {400, "bad\n", IngestRejected}, {413, "large\n", IngestRejected}, {503, "busy\n", IngestUncommitted}, {503, "WAL unavailable\n", IngestUncommitted}, {503, "disk full\n", IngestUncommitted}, {503, "disk full", IngestUnknown}, {503, "disk full\nextra", IngestUnknown}, {503, "proxy\n", IngestUnknown}} {
 		t.Run(fmt.Sprint(tc.status, tc.body), func(t *testing.T) {
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(tc.status)
@@ -440,3 +440,39 @@ func TestDuplicateTimestampOrder(t *testing.T) {
 		t.Fatalf("rows %+v", p.Rows)
 	}
 }
+
+func TestIngestDiskFullResponseFraming(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		length     int64
+		readErr    error
+		want       IngestOutcome
+	}{
+		{"complete", "disk full\n", 10, nil, IngestUncommitted},
+		{"short body", "disk full", 10, nil, IngestUnknown},
+		{"truncated after exact bytes", "disk full\n", 11, io.ErrUnexpectedEOF, IngestUnknown},
+		{"unframed", "disk full\n", -1, nil, IngestUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := New("http://example.test", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.http.Transport = queryRoundTripper(func(r *http.Request) (*http.Response, error) {
+				var body io.Reader = strings.NewReader(tc.body)
+				if tc.readErr != nil {
+					body = io.MultiReader(body, errorReader{tc.readErr})
+				}
+				return &http.Response{StatusCode: 503, ProtoMajor: 1, ContentLength: tc.length, Body: io.NopCloser(body), Header: make(http.Header)}, nil
+			})
+			got, err := c.Ingest(context.Background(), []byte("batch"))
+			if got != tc.want || err == nil {
+				t.Fatalf("outcome=%v error=%v", got, err)
+			}
+		})
+	}
+}
+
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }

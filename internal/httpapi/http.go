@@ -3,9 +3,11 @@ package httpapi
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net/http"
 	"os"
+	"syscall"
 
 	"bog/internal/store"
 )
@@ -154,6 +156,10 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 	err = a.wal.Append(b, rows)
 	if isUncertainAppend(err) {
 		a.fatal()
+		return
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		http.Error(w, "disk full", http.StatusServiceUnavailable)
 		return
 	}
 	if err != nil {

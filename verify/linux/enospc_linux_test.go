@@ -55,8 +55,8 @@ func TestRetargetDiagnosticsBeforeReconciliation(t *testing.T) {
 		failed    bool
 	}{
 		{"healthy directory still writable", healthyToFull, diskReady, 204, "", diskReadiness{}, ingestAcknowledged, false},
-		{"full directory rolls back", fullToHealthy, diskLow, 503, "WAL unavailable\n", diskRollback, ingestRolledBack, false},
-		{"full directory readiness fails after refusal", fullToHealthy, diskLow, 503, "WAL unavailable\n", diskLow, ingestWALRefused, true},
+		{"full directory rolls back", fullToHealthy, diskLow, 503, "disk full\n", diskRollback, ingestRolledBack, false},
+		{"full directory readiness fails after refusal", fullToHealthy, diskLow, 503, "disk full\n", diskLow, ingestWALRefused, true},
 		{"ingest drops and readiness reports uncertainty", fullToHealthy, diskLow, 0, "", diskReadiness{reason: "recovery_required", category: "eio"}, ingestTransportAmbiguous, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -316,7 +316,7 @@ func TestRetargetRecoveryEvidence(t *testing.T) {
 						return nil, tc.ingestErr
 					}
 					if ingestStatus == http.StatusServiceUnavailable {
-						return response(ingestStatus, "WAL unavailable\n"), nil
+						return response(ingestStatus, "disk full\n"), nil
 					}
 					return response(ingestStatus, ""), nil
 				case "/healthz":

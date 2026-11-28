@@ -167,7 +167,7 @@ func (c *Client) Ingest(ctx context.Context, batch []byte) (outcome IngestOutcom
 	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
 		return IngestRejected, e
 	case http.StatusServiceUnavailable:
-		if framed(resp) && e.Cause == nil && (e.Body == "busy\n" || e.Body == "WAL unavailable\n") {
+		if framed(resp) && e.Cause == nil && (resp.ContentLength < 0 || int64(len(e.Body)) == resp.ContentLength) && (e.Body == "busy\n" || e.Body == "WAL unavailable\n" || e.Body == "disk full\n") {
 			return IngestUncommitted, e
 		}
 	}

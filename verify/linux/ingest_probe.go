@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -51,7 +50,7 @@ func probeIngest(ctx context.Context, client *http.Client, addr string, payload 
 	switch {
 	case status == http.StatusNoContent:
 		obs.Outcome = ingestAcknowledged
-	case status == http.StatusServiceUnavailable && result.bodyAt != nil && strings.TrimSpace(string(result.body)) == "WAL unavailable":
+	case status == http.StatusServiceUnavailable && result.bodyAt != nil && string(result.body) == "disk full\n":
 		obs.Outcome = ingestWALRefused
 	case status >= 400 && status < 500 || status == http.StatusServiceUnavailable:
 		obs.Outcome = ingestHTTPRejected

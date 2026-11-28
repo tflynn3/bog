@@ -1,8 +1,11 @@
 package httpapi
 
 import (
+	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 
 	"bog/internal/store"
@@ -167,5 +170,39 @@ func TestSnapshotPagination(t *testing.T) {
 	fresh := query(bounds + "&page=1&limit=10")
 	if fresh.Code != 200 || strings.Count(fresh.Body.String(), "\n") != 5 || fresh.Header().Get("Bog-Next-Cursor") != "" {
 		t.Fatal(fresh.Code, fresh.Body.String())
+	}
+}
+
+type failingAppend struct{ err error }
+
+func (f failingAppend) Append([]byte, []store.Row) error { return f.err }
+
+func TestIngestAppendFailureClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		body  string
+		fatal bool
+	}{
+		{"wrapped disk full", fmt.Errorf("write: %w", syscall.ENOSPC), "disk full\n", false},
+		{"unrelated", fmt.Errorf("write: %w", syscall.EIO), "WAL unavailable\n", false},
+		{"uncertain disk full", errors.Join(wal.ErrUncertain, syscall.ENOSPC), "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &store.Store{}
+			h := New(s, failingAppend{tc.err}).(*API)
+			fatal := false
+			h.fatal = func() { fatal = true }
+			out := httptest.NewRecorder()
+			h.ServeHTTP(out, httptest.NewRequest("POST", "/ingest", strings.NewReader(`{"ts":"2025-01-01T00:00:00Z","line":"x"}`)))
+			if fatal != tc.fatal || out.Body.String() != tc.body || (!tc.fatal && out.Code != 503) {
+				t.Fatalf("fatal=%v status=%d body=%q", fatal, out.Code, out.Body.String())
+			}
+			query := httptest.NewRecorder()
+			h.ServeHTTP(query, httptest.NewRequest("GET", "/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z", nil))
+			if query.Code != 200 || query.Body.Len() != 0 {
+				t.Fatalf("query: %d %q", query.Code, query.Body.String())
+			}
+		})
 	}
 }

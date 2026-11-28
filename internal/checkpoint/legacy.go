@@ -228,13 +228,13 @@ func (l *Legacy) Close() error {
 
 	l.active.Wait()
 	if l.wal != nil {
-		l.closeErr = l.wal.Close()
+		l.closeErr = errors.Join(syscall.Flock(int(l.wal.Fd()), syscall.LOCK_UN), l.wal.Close())
 	}
 	if l.root != nil {
 		l.closeErr = errors.Join(l.closeErr, l.root.Close())
 	}
 	if l.dir != nil {
-		l.closeErr = errors.Join(l.closeErr, l.dir.Close())
+		l.closeErr = errors.Join(l.closeErr, syscall.Flock(int(l.dir.Fd()), syscall.LOCK_UN), l.dir.Close())
 	}
 	close(done)
 	return l.closeErr

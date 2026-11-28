@@ -1,11 +1,10 @@
 package wal
 
 import (
-	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"strings"
@@ -26,6 +25,27 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if s == nil {
 		return nil, errors.New("WAL requires a store")
 	}
+	return openOwner(dir, s, func(l *Log) error {
+		if _, err := l.root.Lstat(AuthorityName); !errors.Is(err, os.ErrNotExist) {
+			if err != nil {
+				return err
+			}
+			return errors.New("retained writable authority requires checkpoint-aware recovery")
+		}
+		if err := rejectRestoreImage(l.root); err != nil {
+			return err
+		}
+		return l.OpenOrdinary(nil)
+	})
+}
+
+// OpenRuntime holds the owner lock through recovery and until Close. The
+// callback must install one writable file before returning successfully.
+func OpenRuntime(dir string, recover func(*Log) error) (*Log, error) {
+	return openOwner(dir, nil, recover)
+}
+
+func openOwner(dir string, s *store.Store, recover func(*Log) error) (_ *Log, err error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
@@ -57,37 +77,55 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("lock data directory: %w", err)
 	}
-	if err := rejectRestoreImage(root); err != nil {
-		return nil, err
-	}
 	l := &Log{s: s, root: root, dir: d, syncDir: d.Sync}
-	f, err := l.openWAL()
+	parent, err := openParent(d)
 	if err != nil {
 		return nil, err
+	}
+	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
+		return nil, fmt.Errorf("sync data directory parent: %w", err)
+	}
+	if err := recover(l); err != nil {
+		return nil, errors.Join(err, l.closeFiles())
+	}
+	if l.f == nil {
+		return nil, errors.New("missing writable WAL after recovery")
+	}
+	return l, nil
+}
+
+// Directory returns the borrowed handles held for the owner's lifetime.
+func (l *Log) Directory() (*os.Root, *os.File) { return l.root, l.dir }
+
+// OpenOrdinary recovers the ordinary WAL during initialization. check can
+// validate an existing checkpoint against the committed file before truncation.
+func (l *Log) OpenOrdinary(check func(*os.File, int64, uint64) error) (err error) {
+	f, err := l.openWAL()
+	if err != nil {
+		return err
 	}
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, f.Close())
 		}
 	}()
-	// Keep the inode lock for compatibility with existing owners.
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, fmt.Errorf("lock WAL: %w", err)
+		return fmt.Errorf("lock WAL: %w", err)
 	}
-	l.captures, err = openCaptureFile(d, f)
+	capture, err := openCaptureFile(l.dir, f, walName)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() {
 		if err != nil {
-			err = errors.Join(err, l.captures.release())
+			err = errors.Join(err, capture.release())
 		}
 	}()
-	l.f = f
-	if err := l.recover(); err != nil {
-		return nil, err
+	if err := l.recoverOrdinary(f, check); err != nil {
+		return err
 	}
-	return l, nil
+	l.f, l.captures = f, capture
+	return nil
 }
 
 func rejectRestoreImage(root *os.Root) error {
@@ -134,45 +172,51 @@ func (l *Log) openWAL() (*os.File, error) {
 	return openRegular(l.dir, walName, os.O_RDWR)
 }
 
-func (l *Log) recover() error {
-	// Persist the data directory's own entry, using the pinned directory's
-	// parent even if the caller opened it through a symlink.
-	parent, err := openParent(l.dir)
+type recoveryFile interface {
+	file
+	io.ReaderAt
+	Stat() (os.FileInfo, error)
+}
+
+func (l *Log) recoverOrdinary(f recoveryFile, check func(*os.File, int64, uint64) error) error {
+	info, err := f.Stat()
 	if err != nil {
 		return err
 	}
-	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
-		return fmt.Errorf("sync data directory parent: %w", err)
-	}
-
-	size, err := l.f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return fmt.Errorf("size WAL: %w", err)
-	}
+	size := info.Size()
 	end, hasMarker, err := l.committedEnd(size)
 	if err != nil {
 		return err
 	}
-	builder := store.NewRecoveryBuilder()
-	if err := l.replay(end, builder); err != nil {
+	var header [len(magic)]byte
+	if _, err := f.ReadAt(header[:], 0); err != nil {
+		return fmt.Errorf("read WAL magic: %w", err)
+	}
+	if string(header[:]) != magic {
+		return errors.New("invalid WAL magic")
+	}
+
+	var builder *store.RecoveryBuilder
+	if l.s != nil {
+		builder = store.NewRecoveryBuilder()
+	}
+	next, err := l.scanRecovery(f, int64(len(magic)), end, 0, builder)
+	if err != nil {
 		return err
 	}
-	if hasMarker && size > end {
-		if err := l.f.Truncate(end); err != nil {
-			return fmt.Errorf("discard uncommitted WAL suffix: %w", err)
-		}
-		if err := l.f.Sync(); err != nil {
-			return fmt.Errorf("sync recovered WAL: %w", err)
+	if check != nil {
+		if err := check(f.(*os.File), end, next); err != nil {
+			return err
 		}
 	}
-	// The final names and every committed frame have been validated. Staging
-	// entries cannot be referenced by the marker and no writer owns them.
+	if err := finishReplay(f, size, end); err != nil {
+		return err
+	}
 	if err := l.cleanOrphans(); err != nil {
 		return err
 	}
 	if !hasMarker {
-		// Also repairs a magic-only WAL left before first marker publication.
-		if err := l.f.Sync(); err != nil {
+		if err := f.Sync(); err != nil {
 			return fmt.Errorf("sync bootstrap WAL: %w", err)
 		}
 		if err := l.syncDir(); err != nil {
@@ -182,15 +226,55 @@ func (l *Log) recover() error {
 			return err
 		}
 	} else if err := l.syncDir(); err != nil {
-		// Persist directory metadata without allocating a new marker.
 		return fmt.Errorf("sync recovered data directory: %w", err)
 	}
-	builder.Install(l.s)
-	// QueryPage with a zero row limit captures the installed row count
-	// without scanning or decoding the recovered prefix again.
-	_, count, _, _ := l.s.QueryPage(time.Time{}, time.Time{}, "", 0, nil, nil)
-	l.committed = captureBoundary{end: end, nextOrdinal: uint64(count)}
+	if builder != nil {
+		builder.Install(l.s)
+	}
+	l.offset = end
+	l.committed = captureBoundary{end: end, nextOrdinal: next}
 	return nil
+}
+
+func finishReplay(f file, size, end int64) error {
+	if size > end {
+		if err := f.Truncate(end); err != nil {
+			return fmt.Errorf("discard uncommitted WAL suffix: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("sync recovered WAL: %w", err)
+		}
+	}
+	if _, err := f.Seek(end, io.SeekStart); err != nil {
+		return fmt.Errorf("seek committed WAL boundary: %w", err)
+	}
+	return nil
+}
+
+func (l *Log) scanRecovery(f io.ReaderAt, start, end int64, ordinal uint64, builder *store.RecoveryBuilder) (uint64, error) {
+	next := ordinal
+	var visit func([]byte) error
+	if builder != nil {
+		visit = builder.DecodeFrame
+	}
+	err := scanFrames(context.Background(), f, start, end, ordinal, visit, func(frame Frame) error {
+		next = frame.NextOrdinal
+		if l.s == nil && len(l.frames) <= MaxLiveFrames {
+			frame.last = time.Time{}
+			l.addFrame(frame)
+		}
+		return nil
+	})
+	return next, err
+}
+
+func (l *Log) addFrame(frame Frame) {
+	var previous *Frame
+	if len(l.frames) != 0 {
+		previous = &l.frames[len(l.frames)-1]
+	}
+	l.bounds.add(frame, previous)
+	l.frames = append(l.frames, frame)
 }
 
 func (l *Log) committedEnd(size int64) (int64, bool, error) {
@@ -222,62 +306,6 @@ func readCommitMarker(r io.Reader, size int64) (int64, error) {
 		return 0, errors.New("invalid committed offset")
 	}
 	return int64(end), nil
-}
-
-func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
-	if _, err := l.f.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek WAL header: %w", err)
-	}
-	reader := bufio.NewReaderSize(io.LimitReader(l.f, end), 64*1024)
-	var header [len(magic)]byte
-	if _, err := io.ReadFull(reader, header[:]); err != nil {
-		return fmt.Errorf("read WAL magic: %w", err)
-	}
-	if string(header[:]) != magic {
-		return errors.New("invalid WAL magic")
-	}
-
-	var payload []byte
-	var h [16]byte
-	for pos := int64(len(magic)); pos < end; {
-		if end-pos < int64(len(h)) {
-			return fmt.Errorf("incomplete committed frame header at %d", pos)
-		}
-		if _, err := io.ReadFull(reader, h[:]); err != nil {
-			return fmt.Errorf("read committed frame header at %d: %w", pos, err)
-		}
-		if crc32.Checksum(h[:12], table) != binary.LittleEndian.Uint32(h[12:]) {
-			return fmt.Errorf("invalid WAL header checksum at %d", pos)
-		}
-		n := binary.LittleEndian.Uint32(h[:])
-		if n == 0 || n > store.MaxBatch || binary.LittleEndian.Uint32(h[4:]) != ^n {
-			return fmt.Errorf("invalid WAL header at %d", pos)
-		}
-		if int64(n) > end-pos-int64(len(h)) {
-			return fmt.Errorf("incomplete committed frame payload at %d", pos)
-		}
-		if cap(payload) < int(n) {
-			capacity := min(store.MaxBatch, max(int(n), 2*cap(payload)))
-			payload = make([]byte, n, capacity)
-		} else {
-			payload = payload[:n]
-		}
-		if _, err := io.ReadFull(reader, payload); err != nil {
-			return fmt.Errorf("read committed frame payload at %d: %w", pos, err)
-		}
-		if crc32.Checksum(payload, table) != binary.LittleEndian.Uint32(h[8:]) {
-			return fmt.Errorf("invalid WAL checksum at %d", pos)
-		}
-		if err := builder.DecodeFrame(payload); err != nil {
-			return fmt.Errorf("invalid WAL payload at %d: %w", pos, err)
-		}
-		pos += int64(len(h)) + int64(n)
-	}
-	if _, err := l.f.Seek(end, io.SeekStart); err != nil {
-		return fmt.Errorf("seek committed WAL boundary: %w", err)
-	}
-	l.offset = end
-	return nil
 }
 
 func (l *Log) cleanOrphans() error {

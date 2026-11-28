@@ -53,18 +53,35 @@ func decodeAppend(rows []Row, data []byte) ([]Row, error) {
 }
 
 func decodeBatch(rows []Row, data []byte, ingest bool) ([]Row, error) {
+	err := visitBatch(data, ingest, func(row Row) error {
+		rows = append(rows, row)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// VisitDecoded validates and visits the rows in a committed WAL payload.
+// The caller discards partial results if validation or the visitor fails.
+func VisitDecoded(data []byte, visit func(Row) error) error {
+	return visitBatch(data, false, visit)
+}
+
+func visitBatch(data []byte, ingest bool, visit func(Row) error) error {
 	if len(data) > MaxBatch {
-		return nil, errors.New("batch too large")
+		return errors.New("batch too large")
 	}
 	if !ingest && !utf8.Valid(data) {
-		return nil, errors.New("invalid UTF-8")
+		return errors.New("invalid UTF-8")
 	}
-	initialLen := len(rows)
+	seen := false
 	for number := 1; len(data) > 0; number++ {
 		line, rest, _ := bytes.Cut(data, []byte{'\n'})
 		data = rest
 		if ingest && !utf8.Valid(line) {
-			return nil, fmt.Errorf("line %d: invalid UTF-8", number)
+			return fmt.Errorf("line %d: invalid UTF-8", number)
 		}
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
@@ -72,16 +89,19 @@ func decodeBatch(rows []Row, data []byte, ingest bool) ([]Row, error) {
 		row, err := decodeRow(line, ingest)
 		if err != nil {
 			if ingest {
-				return nil, fmt.Errorf("line %d: %w", number, err)
+				return fmt.Errorf("line %d: %w", number, err)
 			}
-			return nil, err
+			return err
 		}
-		rows = append(rows, row)
+		if err := visit(row); err != nil {
+			return err
+		}
+		seen = true
 	}
-	if len(rows) == initialLen {
-		return nil, errors.New("empty batch")
+	if !seen {
+		return errors.New("empty batch")
 	}
-	return rows, nil
+	return nil
 }
 
 func decodeRow(line []byte, ingest bool) (Row, error) {

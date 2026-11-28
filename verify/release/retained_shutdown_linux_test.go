@@ -419,6 +419,9 @@ func awaitShutdownListenerClosed(ctx context.Context, addr string) error {
 			if errors.Is(err, syscall.ECONNREFUSED) {
 				return true, nil
 			}
+			if errors.Is(err, syscall.ECONNRESET) {
+				return false, nil
+			}
 			return false, err
 		}
 		return false, conn.Close()
@@ -609,6 +612,16 @@ func TestReapedShutdownStorage(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if tc.replace {
+				// Allocate before unlinking observed files so the fixture
+				// cannot reuse a predecessor inode for the replacement.
+				if err := root.WriteFile("replacement-block", []byte("replacement"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := root.Rename("replacement-block", tailTestSegment); err != nil {
+					t.Fatal(err)
+				}
+			}
 			for _, name := range retired {
 				if name != tc.keep && !(tc.move && name == "old-tail") {
 					if err := root.Remove(name); err != nil {
@@ -616,12 +629,7 @@ func TestReapedShutdownStorage(t *testing.T) {
 					}
 				}
 			}
-			if tc.replace {
-				if err := root.Rename(tailTestSegment, "original-block"); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if tc.change || tc.replace {
+			if tc.change {
 				if err := root.WriteFile(tailTestSegment, []byte("replacement"), 0600); err != nil {
 					t.Fatal(err)
 				}

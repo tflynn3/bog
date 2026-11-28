@@ -274,6 +274,9 @@ func (p *publication) publishGeneration(ctx context.Context, m *Manifest, next *
 		if manifestPending {
 			return
 		}
+		// Cancellation stops building and selection. Settling a definitive
+		// outcome still runs under the publication lock.
+		p.cleanupContext = context.WithoutCancel(ctx)
 		if published == nil && a.installing {
 			// Leave the durable intent available if cleanup fails.
 			if cleanupErr := p.removeOwned(a.ownedFiles(), nil); cleanupErr != nil {

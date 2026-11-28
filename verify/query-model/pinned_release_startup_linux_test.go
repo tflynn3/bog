@@ -231,10 +231,12 @@ func (p *pinnedQueryCandidate) awaitHealth(ctx context.Context, raw *http.Client
 
 func (p *pinnedQueryCandidate) possibleBindCollision(err error) bool {
 	var pathErr *os.PathError
-	// OwnsBind can race reaping when a foreign socket is still present.
+	// OwnsBind can race exec or reaping when a foreign socket is present.
+	// A temporarily inaccessible descriptor directory cannot prove ownership.
 	fdDir := filepath.Join("/proc", strconv.Itoa(p.cmd.Process.Pid), "fd")
 	return strings.HasPrefix(err.Error(), fmt.Sprintf("foreign listener on IPv4 loopback port %d (", p.addr.Port)) ||
-		(errors.Is(err, os.ErrNotExist) && errors.As(err, &pathErr) && pathErr.Path == fdDir)
+		((errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission)) &&
+			errors.As(err, &pathErr) && pathErr.Path == fdDir)
 }
 
 func (p *pinnedQueryCandidate) confirmedBindCollision(diagnostic string) bool {

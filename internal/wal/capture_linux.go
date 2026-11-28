@@ -165,3 +165,14 @@ func (c *Capture) Release() error {
 	c.lease.released = true
 	return f.releaseLocked()
 }
+
+// OpenDirectory opens an independent descriptor relative to the pinned WAL
+// directory. The caller owns it; unlike dup, it does not share the lock.
+func (l *Log) OpenDirectory() (*os.File, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.admissionError(); err != nil {
+		return nil, err
+	}
+	return l.root.Open(".")
+}

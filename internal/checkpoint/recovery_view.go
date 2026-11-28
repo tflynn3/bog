@@ -161,13 +161,18 @@ func scanView(ctx context.Context, view RecoveryView, point RecoveryPoint, cutof
 	return consumed, [32]byte(part.Sum(nil)), ctx.Err()
 }
 
+// ErrSelectionUnchanged marks a selector refusal that left the predecessor
+// authoritative. The publisher can remove the unselected successor.
+var ErrSelectionUnchanged = errors.New("checkpoint selector left authority unchanged")
+
 // PublishRecoveryView advances to a strict whole-frame cutoff and stages a
 // v2 generation. The caller holds the WAL directory lock and view pin. The
 // selector runs with the publication lock held after the files are durable.
 // It checks that the predecessor remains selected, reconciles any later
 // commits, and durably selects a manifest and tail together. The point it
 // receives describes the remainder of the captured suffix at the new boundary.
-// Any selector error is uncertain. RecoverRecoveryView resolves that outcome.
+// Selector errors are uncertain unless they wrap ErrSelectionUnchanged.
+// RecoverRecoveryView resolves uncertain selection or interrupted cleanup.
 // A returned manifest means selection succeeded, even if cleanup failed.
 func (p *Publisher) PublishRecoveryView(ctx context.Context, view RecoveryView, cutoff int64, ordinal uint64,
 	selectSuccessor func(context.Context, RecoveryPoint) error) (_ *Manifest, err error) {

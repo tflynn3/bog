@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"os"
 
 	"bog/internal/httpapi"
 	"bog/internal/readiness"
@@ -10,8 +11,8 @@ import (
 	"bog/internal/wal"
 )
 
-func newReadyHandler(ctx context.Context, c config, s *store.Store, w *wal.Log) http.Handler {
-	return readiness.NewHandler(ctx, c.dir, w, func(appender readiness.Appender) http.Handler {
+func newReadyHandler(ctx context.Context, c config, s *store.Store, w *wal.Log, dir *os.File) http.Handler {
+	return readiness.NewHandlerForDirectory(ctx, dir, w, func(appender readiness.Appender) http.Handler {
 		return httpapi.NewWithQueryLimits(s, appender, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget)
 	})
 }

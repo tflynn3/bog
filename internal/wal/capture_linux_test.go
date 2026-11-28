@@ -392,3 +392,46 @@ func TestCaptureCancellationDropsAcquiredPin(t *testing.T) {
 		t.Fatalf("cancelled acquisition leaked a reference: %v", err)
 	}
 }
+
+func TestOpenDirectoryPinsOriginalAndDoesNotShareLock(t *testing.T) {
+	parent := t.TempDir()
+	path := filepath.Join(parent, "data")
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	l := openCaptureTestLog(t, path)
+	d, err := l.OpenDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, path+"-old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Stat(path + "-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(got, original) {
+		t.Fatal("descriptor did not retain original directory")
+	}
+	// A separate open file description cannot acquire the owner's lock.
+	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("independent lock = %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.OpenDirectory(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("open after close = %v", err)
+	}
+}

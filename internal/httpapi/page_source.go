@@ -27,7 +27,7 @@ var (
 // requested ID. Ordinary requests return at most Limit rows and need no
 // retained capture, positions, or lookahead.
 // HTTP replays the same source anchor and limit even if the client changes
-// limits. The command injects the coordinated retained adapter for #53.
+// limits. Sources that pin ordinary queries declare PageSourceOrdinaryCapture.
 type PageSource interface {
 	Page(context.Context, PageRequest, *store.QueryWork) (PageResult, error)
 	// Release is idempotent. It bars new operations while admitted operations
@@ -35,6 +35,13 @@ type PageSource interface {
 	// acquisition, after its final user drains. Releases of different captures
 	// may run concurrently with one another and with Page calls.
 	Release(capture string) error
+}
+
+// PageSourceOrdinaryCapture allows a source to pin one view across the scans
+// of an ordinary response. HTTP reserves a capture slot before calling Page
+// and releases the capture and slot after response delivery.
+type PageSourceOrdinaryCapture interface {
+	CapturesOrdinaryQueries() bool
 }
 
 type PageFilter struct {

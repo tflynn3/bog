@@ -26,22 +26,47 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if s == nil {
 		return nil, errors.New("WAL requires a store")
 	}
+	return openOwner(dir, func(l *Log) error {
+		if _, err := l.root.Lstat(authorityName); !errors.Is(err, os.ErrNotExist) {
+			if err != nil {
+				return err
+			}
+			return errors.New("retained WAL authority requires checkpoint-aware recovery")
+		}
+		if err := rejectRestoreImage(l.root); err != nil {
+			return err
+		}
+		l.s = s
+		if err := l.openLegacy(); err != nil {
+			return err
+		}
+		return l.recover()
+	})
+}
+
+// OpenOwner runs recovery under the exclusive pinned-directory lock. The
+// callback must recover and install one writable backing before returning.
+func OpenOwner(dir string, recover func(*Log, *os.Root, *os.File) error) (*Log, error) {
+	return openOwner(dir, func(l *Log) error {
+		l.runtime = &runtimeState{}
+		return recover(l, l.root, l.dir)
+	})
+}
+
+func openOwner(dir string, recover func(*Log) error) (_ *Log, err error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, root.Close())
-		}
-	}()
+
 	d, err := root.Open(".")
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, root.Close())
 	}
+	l := &Log{root: root, dir: d, syncDir: d.Sync}
 	defer func() {
 		if err != nil {
-			err = errors.Join(err, d.Close())
+			err = errors.Join(err, l.Close())
 		}
 	}()
 
@@ -57,37 +82,40 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("lock data directory: %w", err)
 	}
-	if err := rejectRestoreImage(root); err != nil {
-		return nil, err
-	}
-	l := &Log{s: s, root: root, dir: d, syncDir: d.Sync}
-	f, err := l.openWAL()
+	parent, err := openParent(d)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, f.Close())
-		}
-	}()
-	// Keep the inode lock for compatibility with existing owners.
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, fmt.Errorf("lock WAL: %w", err)
+	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
+		return nil, fmt.Errorf("sync data directory parent: %w", err)
 	}
-	l.captures, err = openCaptureFile(d, f)
-	if err != nil {
+	if err := recover(l); err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, l.captures.release())
-		}
-	}()
-	l.f = f
-	if err := l.recover(); err != nil {
-		return nil, err
+	if l.f == nil {
+		return nil, errors.New("WAL recovery did not install a writer")
 	}
 	return l, nil
+}
+
+func (l *Log) openLegacy() error {
+	f, err := l.openWAL()
+	if err != nil {
+		return err
+	}
+	return l.installWriter(f, walName)
+}
+
+func (l *Log) installWriter(f *os.File, name string) error {
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return errors.Join(fmt.Errorf("lock WAL: %w", err), f.Close())
+	}
+	capture, err := openCaptureFile(l.dir, f, name)
+	if err != nil {
+		return errors.Join(err, f.Close())
+	}
+	l.f, l.captures = f, capture
+	return nil
 }
 
 func rejectRestoreImage(root *os.Root) error {
@@ -135,16 +163,6 @@ func (l *Log) openWAL() (*os.File, error) {
 }
 
 func (l *Log) recover() error {
-	// Persist the data directory's own entry, using the pinned directory's
-	// parent even if the caller opened it through a symlink.
-	parent, err := openParent(l.dir)
-	if err != nil {
-		return err
-	}
-	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
-		return fmt.Errorf("sync data directory parent: %w", err)
-	}
-
 	size, err := l.f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return fmt.Errorf("size WAL: %w", err)
@@ -157,6 +175,18 @@ func (l *Log) recover() error {
 	if err := l.replay(end, builder); err != nil {
 		return err
 	}
+	if err := l.finishLegacy(size, end, hasMarker); err != nil {
+		return err
+	}
+	builder.Install(l.s)
+	// QueryPage with a zero row limit captures the installed row count
+	// without scanning or decoding the recovered prefix again.
+	_, count, _, _ := l.s.QueryPage(time.Time{}, time.Time{}, "", 0, nil, nil)
+	l.committed = captureBoundary{end: end, nextOrdinal: uint64(count)}
+	return nil
+}
+
+func (l *Log) finishLegacy(size, end int64, hasMarker bool) error {
 	if hasMarker && size > end {
 		if err := l.f.Truncate(end); err != nil {
 			return fmt.Errorf("discard uncommitted WAL suffix: %w", err)
@@ -185,11 +215,6 @@ func (l *Log) recover() error {
 		// Persist directory metadata without allocating a new marker.
 		return fmt.Errorf("sync recovered data directory: %w", err)
 	}
-	builder.Install(l.s)
-	// QueryPage with a zero row limit captures the installed row count
-	// without scanning or decoding the recovered prefix again.
-	_, count, _, _ := l.s.QueryPage(time.Time{}, time.Time{}, "", 0, nil, nil)
-	l.committed = captureBoundary{end: end, nextOrdinal: uint64(count)}
 	return nil
 }
 

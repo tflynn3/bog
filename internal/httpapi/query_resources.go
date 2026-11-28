@@ -181,6 +181,10 @@ func (*legacyPageSource) PageScanBytes(req PageRequest) uint64 {
 // storage. Successful acquisition is handed to consume even after cancellation
 // so that the capture owner can register its ID for release.
 func (a *API) withPage(ctx context.Context, req PageRequest, work *store.QueryWork, consume func(PageResult) error) error {
+	return a.withPageAdmission(ctx, req, work, nil, consume)
+}
+
+func (a *API) withPageAdmission(ctx context.Context, req PageRequest, work *store.QueryWork, admit func() error, consume func(PageResult) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -204,6 +208,11 @@ func (a *API) withPage(ctx context.Context, req PageRequest, work *store.QueryWo
 	defer scan.release()
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if admit != nil {
+		if err := admit(); err != nil {
+			return err
+		}
 	}
 	result, err := source.Page(ctx, req, work)
 	if err != nil {

@@ -22,6 +22,21 @@ type captureBoundary struct {
 	nextOrdinal uint64
 }
 
+// OpenDirectory returns an independent, unlocked handle to the directory
+// pinned by the owner. The caller must close it before closing the owner.
+func (l *Log) OpenDirectory() (*os.File, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.admissionError(); err != nil {
+		return nil, err
+	}
+	fd, err := openat(int(l.dir.Fd()), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), "WAL directory probe"), nil
+}
+
 // captureFile owns one read-only descriptor shared by the Log, its captures,
 // and their in-flight reads. Its mutex protects reference counts and releases.
 type captureFile struct {

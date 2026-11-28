@@ -16,6 +16,45 @@ import (
 	"bog/internal/store"
 )
 
+func TestOpenDirectoryPinsOwnerDirectory(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "data")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	l := openCaptureTestLog(t, dir)
+	probe, err := l.OpenDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := probe.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(dir, filepath.Join(parent, "moved")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, current) {
+		t.Fatal("probe followed the replaced path")
+	}
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if other, err := Open(filepath.Join(parent, "moved"), &store.Store{}); err == nil {
+		if err := other.Close(); err != nil {
+			t.Error(err)
+		}
+		t.Fatal("closing probe released WAL lock")
+	}
+}
+
 func mustCapture(t *testing.T, l *Log) *Capture {
 	t.Helper()
 	c, err := l.Capture(t.Context())

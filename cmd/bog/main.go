@@ -64,13 +64,17 @@ func run(c config) error {
 	if err != nil {
 		return fmt.Errorf("open data directory %q: %w", c.dir, err)
 	}
+	probeDir, err := w.OpenDirectory()
+	if err != nil {
+		return errors.Join(fmt.Errorf("open readiness directory: %w", err), w.Close())
+	}
 	addr := c.addr
 	if addr == "" {
 		addr = ":http"
 	}
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		if closeErr := w.Close(); closeErr != nil {
+		if closeErr := errors.Join(probeDir.Close(), w.Close()); closeErr != nil {
 			return errors.Join(fmt.Errorf("listen on %q: %w", addr, err), fmt.Errorf("close WAL: %w", closeErr))
 		}
 		return fmt.Errorf("listen on %q: %w", addr, err)
@@ -80,8 +84,9 @@ func run(c config) error {
 	defer signal.Stop(signals)
 	probeCtx, stopProbes := context.WithCancel(context.Background())
 	defer stopProbes()
+	api := httpapi.NewWithQueryLimits(s, w, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget).(*httpapi.API)
 	server := &http.Server{
-		Handler:           newReadyHandler(probeCtx, c, s, w),
+		Handler:           newReadyHandler(probeCtx, probeDir, w, api),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -110,6 +115,12 @@ func run(c config) error {
 	}
 	if serveErr != nil {
 		serveErr = fmt.Errorf("serve HTTP: %w", serveErr)
+	}
+	if err := api.Close(ctx); err != nil {
+		return errors.Join(serveErr, fmt.Errorf("drain query captures (WAL remains open until exit): %w", err))
+	}
+	if err := probeDir.Close(); err != nil {
+		return errors.Join(serveErr, fmt.Errorf("close readiness directory (WAL remains open until exit): %w", err))
 	}
 	if err := w.Close(); err != nil {
 		return errors.Join(serveErr, fmt.Errorf("close WAL: %w", err))

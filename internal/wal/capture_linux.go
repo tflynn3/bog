@@ -1,13 +1,19 @@
 package wal
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"sort"
 	"sync"
 	"syscall"
+	"time"
+
+	"bog/internal/store"
 )
 
 // FileIdentity identifies a pinned WAL inode. Compare identities while their
@@ -27,16 +33,18 @@ type captureBoundary struct {
 type captureFile struct {
 	f        *os.File
 	identity FileIdentity
+	base     int64
+	drained  chan struct{}
 	mu       sync.Mutex
 	refs     int
 }
 
-func openCaptureFile(dir, writer *os.File) (*captureFile, error) {
+func openCaptureFile(dir, writer *os.File, name string) (*captureFile, error) {
 	written, err := writer.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("stat WAL writer: %w", err)
 	}
-	f, err := openRegular(dir, walName, os.O_RDONLY)
+	f, err := openRegular(dir, name, os.O_RDONLY)
 	if err != nil {
 		return nil, fmt.Errorf("open WAL capture reader: %w", err)
 	}
@@ -47,8 +55,12 @@ func openCaptureFile(dir, writer *os.File) (*captureFile, error) {
 	if !os.SameFile(written, readable) {
 		return nil, errors.Join(errors.New("WAL identity changed during open"), f.Close())
 	}
-	st := readable.Sys().(*syscall.Stat_t) // checked by openRegular on this file
-	return &captureFile{f: f, identity: FileIdentity{uint64(st.Dev), st.Ino}, refs: 1}, nil
+	return &captureFile{f: f, identity: fileIdentity(readable), refs: 1, drained: make(chan struct{})}, nil
+}
+
+func fileIdentity(info os.FileInfo) FileIdentity {
+	st := info.Sys().(*syscall.Stat_t)
+	return FileIdentity{uint64(st.Dev), st.Ino}
 }
 
 func (f *captureFile) release() error {
@@ -62,7 +74,9 @@ func (f *captureFile) releaseLocked() error {
 	last := f.refs == 0
 	f.mu.Unlock()
 	if last {
-		return f.f.Close()
+		err := f.f.Close()
+		close(f.drained)
+		return err
 	}
 	return nil
 }
@@ -74,6 +88,8 @@ type Capture struct{ lease *captureLease }
 type captureLease struct {
 	file     *captureFile
 	boundary captureBoundary
+	frames   []Frame
+	bounds   frameBounds
 	released bool // protected by file.mu
 }
 
@@ -89,20 +105,86 @@ func (l *Log) Capture(ctx context.Context) (*Capture, error) {
 		l.mu.Unlock()
 		return nil, err
 	}
-	f := l.captures
-	if f == nil {
+	if l.captures == nil {
 		l.mu.Unlock()
 		return nil, os.ErrClosed
 	}
-	f.mu.Lock()
-	f.refs++
-	f.mu.Unlock()
-	c := &Capture{lease: &captureLease{file: f, boundary: l.committed}}
+	c := l.captureLocked()
 	l.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, errors.Join(err, c.Release())
 	}
 	return c, nil
+}
+
+// WithCapture pairs a committed file and its bounds with caller-owned state
+// under the same mutex used for append publication and WAL replacement.
+// The callback owns the capture even when it returns an error.
+func (l *Log) WithCapture(ctx context.Context, take func(*Capture, Authority) error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := l.admissionError(); err != nil {
+		return err
+	}
+	if l.captures == nil {
+		return os.ErrClosed
+	}
+	return take(l.captureLocked(), l.authority)
+}
+
+func (l *Log) captureLocked() *Capture {
+	f := l.captures
+	f.mu.Lock()
+	f.refs++
+	f.mu.Unlock()
+	return &Capture{lease: &captureLease{file: f, boundary: l.committed, frames: l.frames, bounds: l.bounds}}
+}
+
+// Cutoff locates an exact whole-frame boundary in the captured tail.
+func (c *Capture) Cutoff(ordinal uint64) (int64, bool) {
+	i, found := slices.BinarySearchFunc(c.lease.frames, ordinal, func(f Frame, n uint64) int {
+		return cmp.Compare(f.NextOrdinal, n)
+	})
+	if !found {
+		return 0, false
+	}
+	return c.lease.frames[i].End, true
+}
+
+// Scan visits the captured frames selected by allow, in append order.
+func (c *Capture) Scan(start, end time.Time, allow func(Frame) (bool, error), visit func(uint64, store.Row) error) error {
+	frames := c.lease.frames
+	if !c.lease.bounds.unordered {
+		lo := sort.Search(len(frames), func(i int) bool { return !frames[i].MaxTime.Before(start) })
+		hi := lo + sort.Search(len(frames)-lo, func(i int) bool { return !frames[lo+i].MinTime.Before(end) })
+		frames = frames[lo:hi]
+	}
+	var header [frameHeader]byte
+	var payload []byte
+	for _, frame := range frames {
+		selected, err := allow(frame)
+		if err != nil {
+			return err
+		}
+		if !selected {
+			continue
+		}
+		if err := readFrame(io.NewSectionReader(c, frame.Start, frame.End-frame.Start), frame.Start, frame.End, &header, &payload); err != nil {
+			return err
+		}
+		next := frame.FirstOrdinal
+		if err := store.VisitDecoded(payload, func(row store.Row) error {
+			err := visit(next, row)
+			next++
+			return err
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Identity returns the identity of the pinned file.
@@ -123,7 +205,7 @@ func (c *Capture) ReadAt(p []byte, off int64) (n int, err error) {
 		f.mu.Unlock()
 		return 0, os.ErrClosed
 	}
-	if off < 0 {
+	if off < f.base {
 		f.mu.Unlock()
 		return 0, fmt.Errorf("WAL capture offset %d: %w", off, os.ErrInvalid)
 	}
@@ -145,13 +227,13 @@ func (c *Capture) ReadAt(p []byte, off int64) (n int, err error) {
 	}()
 
 	if remaining := end - off; int64(len(p)) > remaining {
-		n, err := f.f.ReadAt(p[:remaining], off)
+		n, err := f.f.ReadAt(p[:remaining], off-f.base)
 		if err == nil {
 			err = io.EOF
 		}
 		return n, err
 	}
-	return f.f.ReadAt(p, off)
+	return f.f.ReadAt(p, off-f.base)
 }
 
 // Release surrenders the pin. Reads already admitted can finish.
@@ -165,3 +247,12 @@ func (c *Capture) Release() error {
 	c.lease.released = true
 	return f.releaseLocked()
 }
+
+// ScanBounds observes the current index bounds without taking a file pin.
+func (l *Log) ScanBounds() (frameBytes, lineBytes int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.bounds.frameBytes, l.bounds.lineBytes
+}
+
+func (c *Capture) Ordered() bool { return !c.lease.bounds.unordered }

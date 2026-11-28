@@ -109,6 +109,26 @@ func isPinName(name, prefix string) bool {
 	return ok && len(token) == pinTokenSize && strings.Trim(token, "0123456789abcdef") == ""
 }
 
+// RecoverPins removes records abandoned by interrupted processes. It leaves
+// active cross-process pins in place and runs before the runtime allocates its
+// first pin so a full filesystem can reuse space from the previous process.
+func RecoverPins(ctx context.Context, pinned *os.File) (err error) {
+	dir, _, err := openPinnedDirectory(pinned)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, dir.Close()) }()
+	lock, err := checkpoint.LockPublication(dir, true)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	if err := protectPinned(ctx, dir, nil, nil); err != nil {
+		return err
+	}
+	return dir.Sync()
+}
+
 // protectPinned holds the publication lock exclusively. New pins and graceful
 // unlinks cannot race the directory walk. A pin that drains during the walk
 // can only cause a segment to be conservatively retained until the next call.

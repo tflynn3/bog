@@ -15,6 +15,10 @@ import (
 type appender interface {
 	Append([]byte, []store.Row) error
 }
+
+type contextualAppender interface {
+	AppendContext(context.Context, []byte, []store.Row) error
+}
 type API struct {
 	captures         queryCaptures
 	legacy           *legacyPageSource
@@ -22,6 +26,7 @@ type API struct {
 	wal              appender
 	fatal            func()
 	slots            chan struct{}
+	ingestBytes      *queryByteBudget
 	maxResponseBytes int
 	queryWorkBudget  uint64
 	cursorKey        [32]byte
@@ -139,7 +144,17 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	b, err := io.ReadAll(io.LimitReader(r.Body, store.MaxBatch+1))
+	limit := int64(store.MaxBatch + 1)
+	if r.ContentLength >= 0 {
+		limit = min(limit, r.ContentLength+1)
+	}
+	reserved := queryReservation{budget: a.ingestBytes}
+	if err := reserved.grow(uint64(limit)); err != nil {
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer reserved.release()
+	b, err := io.ReadAll(io.LimitReader(r.Body, limit))
 	if len(b) > store.MaxBatch {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
@@ -153,7 +168,11 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	err = a.wal.Append(b, rows)
+	if w, ok := a.wal.(contextualAppender); ok {
+		err = w.AppendContext(r.Context(), b, rows)
+	} else {
+		err = a.wal.Append(b, rows)
+	}
 	if isUncertainAppend(err) {
 		a.fatal()
 		return

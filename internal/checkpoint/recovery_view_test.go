@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"syscall"
 	"testing"
 )
 
@@ -174,6 +175,29 @@ func TestRecoveryViewInterruptedCleanup(t *testing.T) {
 				t.Fatalf("owned leftovers: %v, want %v", got, before)
 			}
 		})
+	}
+}
+
+func TestRecoveryViewSelectorRefusalCleansUp(t *testing.T) {
+	dir, l, pub, view := newRecoveryFixture(t, Limits{StagingBytes: 1 << 20, ReplayTailBytes: 1 << 20})
+	before := checkpointNames(t, dir)
+	m, err := pub.PublishRecoveryView(t.Context(), view, view.point.CommittedEnd, view.point.CommittedOrdinal,
+		func(context.Context, RecoveryPoint) error { return errors.Join(ErrSelectionUnchanged, syscall.ENOSPC) })
+	if m != nil || !errors.Is(err, syscall.ENOSPC) || errors.Is(err, ErrPublicationUncertain) {
+		t.Fatalf("publication = %v, %v", m, err)
+	}
+	requirePublicationOK(t, CheckPublication(l.dir))
+	if got := checkpointNames(t, dir); !slices.Equal(got, before) {
+		t.Fatalf("refused selection left files: %v, want %v", got, before)
+	}
+	if used := pub.stage.budget.Usage().InUse[StagingBytes]; used != 0 {
+		t.Fatalf("refused selection kept %d bytes charged", used)
+	}
+	m, err = pub.PublishRecoveryView(t.Context(), view, view.point.CommittedEnd, view.point.CommittedOrdinal,
+		func(context.Context, RecoveryPoint) error { return nil })
+	requirePublicationOK(t, err)
+	if m == nil {
+		t.Fatal("retry did not publish a checkpoint")
 	}
 }
 

@@ -52,6 +52,18 @@ func (r *Reader) Scan(ctx context.Context, q Query, visit func(checkpoint.BlockR
 // the visitor requests by continuing the scan. A nil meter allows unlimited
 // work. On error, the caller decides whether to discard rows already visited.
 func (r *Reader) ScanWithWork(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error, work *store.QueryWork) (err error) {
+	var borrowed func(Position, []byte) error
+	if visit != nil {
+		borrowed = func(pos Position, line []byte) error {
+			return visit(checkpoint.BlockRow{Row: store.Row{TS: pos.Time, Line: string(line)}, Ordinal: pos.Ordinal})
+		}
+	}
+	return r.ScanBorrowedWithWork(ctx, q, borrowed, work)
+}
+
+// ScanBorrowedWithWork visits ordered matches using reusable line storage.
+// The line is read-only and remains valid only during its visitor call.
+func (r *Reader) ScanBorrowedWithWork(ctx context.Context, q Query, visit func(Position, []byte) error, work *store.QueryWork) (err error) {
 	r.mu.Lock()
 	if !r.deadline.IsZero() && !time.Now().Before(r.deadline) {
 		r.mu.Unlock()
@@ -91,7 +103,7 @@ func (r *Reader) ScanWithWork(ctx context.Context, q Query, visit func(checkpoin
 	return g.scan(ctx, q, visit, work)
 }
 
-func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error, work *store.QueryWork) error {
+func (g *generation) scan(ctx context.Context, q Query, visit func(Position, []byte) error, work *store.QueryWork) error {
 	lower := Position{Time: q.Start.UTC()}
 	strict := false
 	if q.After != nil {
@@ -147,8 +159,7 @@ func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.Bl
 			return err
 		}
 		if bytes.Contains(line, needle) {
-			row := checkpoint.BlockRow{Row: store.Row{TS: c.key.Time, Line: string(line)}, Ordinal: c.key.Ordinal}
-			if err := visit(row); err != nil {
+			if err := visit(c.key, line); err != nil {
 				return err
 			}
 		}
@@ -243,7 +254,12 @@ func (c *cursor) line(dir *os.File, overflow *[]byte) ([]byte, error) {
 	} else {
 		n := int(c.lineLen)
 		if cap(*overflow) < n {
-			*overflow = make([]byte, n)
+			const smallRead = 32 << 10
+			capacity := smallRead
+			if n > smallRead {
+				capacity = store.MaxBatch
+			}
+			*overflow = make([]byte, capacity)
 		}
 		b = (*overflow)[:n]
 		if err := c.seg.readAt(dir, b, offset); err != nil {

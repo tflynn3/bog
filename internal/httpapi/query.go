@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 
 	"bog/internal/store"
@@ -70,14 +71,17 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	}
 	response := a.newQueryResponse()
 	defer response.release()
-	req := PageRequest{Filter: params.filter, Limit: params.limit}
-	if err := a.withPage(ctx, req, work, func(result PageResult) error {
-		if len(result.Rows) > params.limit {
-			return errPageSourceContract
+	var finish func() error
+	defer func() {
+		if finish != nil {
+			if err := finish(); err != nil {
+				log.Printf("release ordinary query: %v", err)
+			}
 		}
-		_, err := response.appendRows(result.Rows, work)
-		return err
-	}); err != nil {
+	}()
+	req := PageRequest{Filter: params.filter, Limit: params.limit}
+	finish, err = a.prepareOrdinaryQuery(ctx, req, work, &response)
+	if err != nil {
 		response.release()
 		writeQueryError(w, err)
 		return
@@ -88,6 +92,31 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.write(w, "")
+}
+
+func (a *API) prepareOrdinaryQuery(ctx context.Context, req PageRequest, work *store.QueryWork, response *queryResponse) (finish func() error, err error) {
+	if source, ok := a.captures.source.(QueryVisitorSource); ok {
+		err = a.withScanReservation(ctx, source.QueryVisitScanBytes(), func() error {
+			finish, err = source.VisitQuery(ctx, req, work, func(row store.Row) (bool, error) {
+				fits, required, err := response.appendRow(row, work)
+				if err == nil && !fits && response.size == 0 {
+					err = &oversizedQueryRecord{response.maxBytes, required}
+				}
+				return fits, err
+			})
+			return err
+		})
+		return finish, err
+	}
+	err = a.withPage(ctx, req, work, func(result PageResult) error {
+		finish = result.Finish
+		if len(result.Rows) > req.Limit {
+			return errPageSourceContract
+		}
+		_, err := response.appendRows(result.Rows, work)
+		return err
+	})
+	return finish, err
 }
 
 func (a *API) openQuery(w http.ResponseWriter, ctx context.Context, params queryParams, work *store.QueryWork) {

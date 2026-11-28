@@ -40,20 +40,18 @@ type rule struct {
 
 // Record the observed direct production imports within the root module.
 // Update roles and edges in the same change as the wiring that requires them.
-// At ADR 0052 adoption, cmd/bog reaches HTTP, readiness, store, and WAL on both
-// Linux targets. Promote retained libraries with measured #108 wiring and
-// activation evidence. The operator's direct backup import is independent
-// of server reachability.
+// The retained command composes checkpoint and history with the WAL owner.
+// The operator retains its direct backup import.
 var registry = map[string]rule{
 	exportCommand:                {verifier, []string{goClient}},
 	operatorCommand:              {verifier, []string{"bog/internal/backup", goClient, "bog/internal/store"}},
-	server:                       {serverCommand, []string{"bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
+	server:                       {serverCommand, []string{"bog/internal/checkpoint", "bog/internal/history", "bog/internal/httpapi", "bog/internal/readiness", "bog/internal/store", "bog/internal/wal"}},
 	"bog/internal/httpapi":       {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
 	"bog/internal/readiness":     {runtimeLibrary, []string{"bog/internal/store", "bog/internal/wal"}},
 	"bog/internal/wal":           {runtimeLibrary, []string{"bog/internal/store"}},
 	"bog/internal/store":         {runtimeLibrary, nil},
-	"bog/internal/checkpoint":    {staged, []string{"bog/internal/store"}},
-	"bog/internal/history":       {staged, []string{"bog/internal/checkpoint", "bog/internal/store"}},
+	"bog/internal/checkpoint":    {runtimeLibrary, []string{"bog/internal/store"}},
+	"bog/internal/history":       {runtimeLibrary, []string{"bog/internal/checkpoint", "bog/internal/store"}},
 	"bog/internal/backup":        {staged, []string{"bog/internal/store"}},
 	"bog/internal/idempotency":   {staged, nil},
 	streamPolicyEngine:           {staged, nil},

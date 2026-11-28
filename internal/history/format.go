@@ -60,6 +60,7 @@ type segment struct {
 	// Used only while verifying that the manifest covers each ordinal once.
 	first, last uint64 // Inclusive ordinal bounds.
 	dense       bool
+	count       int
 }
 
 func parseDigest(s string) ([sha256.Size]byte, bool) {
@@ -71,13 +72,10 @@ func parseDigest(s string) ([sha256.Size]byte, bool) {
 	return sum, err == nil
 }
 
-func readManifest(dir *os.File) (_ manifest, _ GenerationID, err error) {
-	f, info, err := openRegular(dir, manifestName)
+func readManifest(dir *os.File, name string) (_ manifest, _ GenerationID, err error) {
+	f, info, err := openRegular(dir, name)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return manifest{}, GenerationID{}, err
-		}
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest open: %w", ErrIntegrity, err)
+		return manifest{}, GenerationID{}, err
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
 	if info.Size() <= 0 || info.Size() > manifestMax {
@@ -90,24 +88,11 @@ func readManifest(dir *os.File) (_ manifest, _ GenerationID, err error) {
 	if int64(len(b)) != info.Size() {
 		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest size changed", ErrIntegrity)
 	}
-	var env envelope
-	if err := json.Unmarshal(b, &env); err != nil {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest envelope: %v", ErrIntegrity, err)
+	m, id, err := checkpoint.DecodeManifest(b)
+	if err != nil {
+		return manifest{}, GenerationID{}, errors.Join(ErrIntegrity, err)
 	}
-	id := sha256.Sum256(env.Payload)
-	if want, ok := parseDigest(env.SHA256); !ok || want != id {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest checksum", ErrIntegrity)
-	}
-	var m manifest
-	if err := json.Unmarshal(env.Payload, &m); err != nil {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest payload: %v", ErrIntegrity, err)
-	}
-	empty := m.NextOrdinal == 0 && m.CoveredOffset == int64(walMagicSize)
-	populated := m.NextOrdinal > 0 && m.CoveredOffset >= int64(minWALEnd)
-	if m.Version != version || len(m.Segments) > checkpoint.MaxSegments || !(empty || populated) {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest version, segment count or boundary", ErrIntegrity)
-	}
-	return m, id, nil
+	return *m, id, nil
 }
 
 func openRegular(dir *os.File, name string) (*os.File, os.FileInfo, error) {
@@ -190,12 +175,16 @@ func loadAuthority(ctx context.Context, dir *os.File) (*generation, *checkpoint.
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	m, id, err := readManifest(dir)
+	return loadNamedAuthority(ctx, dir, manifestName, nil)
+}
+
+func loadNamedAuthority(ctx context.Context, dir *os.File, name string, previous *generation) (*generation, *checkpoint.Manifest, error) {
+	m, id, err := readManifest(dir, name)
 	if err != nil {
 		return nil, nil, err
 	}
 	source, ok := parseDigest(m.SourceSHA256)
-	if !ok {
+	if m.Version == 1 && !ok {
 		return nil, nil, fmt.Errorf("%w: invalid WAL prefix checksum", ErrIntegrity)
 	}
 	g := &generation{dir: dir, drained: make(chan struct{}), segments: make([]segment, len(m.Segments))}
@@ -223,7 +212,7 @@ func loadAuthority(ctx context.Context, dir *os.File) (*generation, *checkpoint.
 	if m.NextOrdinal < uint64(len(m.Segments)) || m.NextOrdinal > maxRows {
 		return nil, nil, fmt.Errorf("%w: impossible checkpoint row count", ErrIntegrity)
 	}
-	if err := g.validate(ctx, m, make([]byte, maxSize)); err != nil {
+	if err := g.validate(ctx, m, make([]byte, maxSize), previous); err != nil {
 		return nil, nil, err
 	}
 	return g, &m, nil
@@ -303,4 +292,11 @@ func segmentError(name string, err error) error {
 		return corrupt(name, "referenced segment is missing")
 	}
 	return fmt.Errorf("%w: %s: %w", ErrIntegrity, name, err)
+}
+
+// OpenArtifact opens an immutable checkpoint file relative to the pinned
+// directory. The caller supplies a name from its validated recovery point.
+func OpenArtifact(dir *os.File, name string) (*os.File, error) {
+	f, _, err := openRegular(dir, name)
+	return f, err
 }

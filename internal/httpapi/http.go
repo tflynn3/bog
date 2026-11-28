@@ -22,6 +22,7 @@ type API struct {
 	wal              appender
 	fatal            func()
 	slots            chan struct{}
+	ingestBytes      *queryByteBudget
 	maxResponseBytes int
 	queryWorkBudget  uint64
 	cursorKey        [32]byte
@@ -65,6 +66,12 @@ func NewWithPageSource(source PageSource, w appender, maxBytes, concurrency int,
 	a := newAPIForSource(source, w, maxBytes, workBudget)
 	a.routes = a.handler(concurrency)
 	return a
+}
+
+// SetIngestByteLimit bounds the total declared body bytes of admitted
+// ingest requests, including those waiting to commit. Configure before serving.
+func (a *API) SetIngestByteLimit(limit uint64) {
+	a.ingestBytes = &queryByteBudget{limit: limit, err: errors.New("ingest byte capacity exhausted")}
 }
 
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -139,7 +146,17 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	b, err := io.ReadAll(io.LimitReader(r.Body, store.MaxBatch+1))
+	bodyBytes := uint64(store.MaxBatch + 1)
+	if r.ContentLength >= 0 {
+		bodyBytes = uint64(r.ContentLength + 1)
+	}
+	reservation := queryReservation{budget: a.ingestBytes}
+	if err := reservation.grow(bodyBytes); err != nil {
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer reservation.release()
+	b, err := readIngestBody(r)
 	if len(b) > store.MaxBatch {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
@@ -167,4 +184,32 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func readIngestBody(r *http.Request) ([]byte, error) {
+	length := r.ContentLength
+	if length < 0 {
+		length = store.MaxBatch
+	}
+	// Use one bounded allocation, including the extra byte used to detect an
+	// oversized chunked request.
+	b := make([]byte, length+1)
+	n := 0
+	for n < len(b) {
+		m, err := r.Body.Read(b[n:])
+		n += m
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return b[:n], err
+		}
+		if m == 0 {
+			return b[:n], io.ErrNoProgress
+		}
+	}
+	if r.ContentLength >= 0 && int64(n) > r.ContentLength {
+		return b[:n], errors.New("body exceeds content length")
+	}
+	return b[:n], nil
 }

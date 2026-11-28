@@ -32,7 +32,7 @@ func NewHandler(ctx context.Context, dir string, log Appender, newAPI func(Appen
 //
 // Cancel ctx before closing dir. Cancellation stops subsequent samples and
 // discards an in-flight result without waiting for the syscall. The probe
-// holds a reference to dir's descriptor until the syscall returns.
+// holds a duplicate of the probe descriptor until the syscall returns.
 func NewHandlerForDirectory(ctx context.Context, dir *os.File, log Appender, newAPI func(Appender) http.Handler) http.Handler {
 	return newHandler(ctx, func(fs *syscall.Statfs_t) error { return statOpenDirectory(dir, fs) }, log, newAPI)
 }
@@ -62,11 +62,20 @@ func statOpenDirectory(dir *os.File, fs *syscall.Statfs_t) error {
 	if err != nil {
 		return err
 	}
-	var statErr error
-	if err := conn.Control(func(fd uintptr) { statErr = syscall.Fstatfs(int(fd), fs) }); err != nil {
+	// Hold an independent reference while entering the syscall. Release the
+	// original descriptor's Control reference first so Close can complete
+	// even when statfs itself is blocked.
+	var duplicate uintptr
+	var dupErr syscall.Errno
+	if err := conn.Control(func(fd uintptr) {
+		duplicate, _, dupErr = syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_DUPFD_CLOEXEC, 0)
+	}); err != nil {
 		return err
 	}
-	return statErr
+	if dupErr != 0 {
+		return dupErr
+	}
+	return errors.Join(syscall.Fstatfs(int(duplicate), fs), syscall.Close(int(duplicate)))
 }
 
 func hasHeadroom(fs syscall.Statfs_t) bool {

@@ -89,11 +89,15 @@ func (l *Log) commit(offset int64) (string, error) {
 	binary.LittleEndian.PutUint64(b[8:16], uint64(offset))
 	binary.LittleEndian.PutUint64(b[16:], ^uint64(offset))
 
-	name, err := l.writeStaged(markerStagePrefix, b[:])
+	return l.installRecord(markerName, b[:])
+}
+
+func (l *Log) installRecord(target string, data []byte) (string, error) {
+	name, err := l.writeStaged(markerStagePrefix, data)
 	if err != nil {
 		return "marker_preparation", err
 	}
-	if err := l.root.Rename(name, markerName); err != nil {
+	if err := l.root.Rename(name, target); err != nil {
 		return "marker_rename", errors.Join(ErrUncertain, err)
 	}
 	if err := l.syncDir(); err != nil {

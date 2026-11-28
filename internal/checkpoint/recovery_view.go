@@ -13,6 +13,9 @@ import (
 	"bog/internal/store"
 )
 
+// ErrSelectionRefused attests that the selector was never attempted.
+var ErrSelectionRefused = errors.New("checkpoint selection refused before installation")
+
 const generationPrefix = "bog-checkpoint-"
 
 // GenerationManifestName is the immutable data-directory name for a new v2
@@ -167,10 +170,28 @@ func scanView(ctx context.Context, view RecoveryView, point RecoveryPoint, cutof
 // It checks that the predecessor remains selected, reconciles any later
 // commits, and durably selects a manifest and tail together. The point it
 // receives describes the remainder of the captured suffix at the new boundary.
-// Any selector error is uncertain. RecoverRecoveryView resolves that outcome.
+// Selector errors are uncertain unless they carry ErrSelectionRefused.
+// RecoverRecoveryView resolves an uncertain outcome.
 // A returned manifest means selection succeeded, even if cleanup failed.
 func (p *Publisher) PublishRecoveryView(ctx context.Context, view RecoveryView, cutoff int64, ordinal uint64,
 	selectSuccessor func(context.Context, RecoveryPoint) error) (_ *Manifest, err error) {
+	return p.publishRecoveryView(ctx, view, cutoff, ordinal, nil, selectSuccessor)
+}
+
+// PublishPinnedRecoveryView reuses validation of immutable predecessor files.
+// checkPredecessor verifies the identity of every segment against the pinned,
+// previously validated generation. selectSuccessor validates the installed
+// generation, including exact ordinal coverage, before selecting it.
+func (p *Publisher) PublishPinnedRecoveryView(ctx context.Context, view RecoveryView, cutoff int64, ordinal uint64,
+	checkPredecessor func(context.Context, [32]byte) error, selectSuccessor func(context.Context, RecoveryPoint) error) (*Manifest, error) {
+	if checkPredecessor == nil {
+		return nil, errors.New("checkpoint publication requires a predecessor check")
+	}
+	return p.publishRecoveryView(ctx, view, cutoff, ordinal, checkPredecessor, selectSuccessor)
+}
+
+func (p *Publisher) publishRecoveryView(ctx context.Context, view RecoveryView, cutoff int64, ordinal uint64,
+	checkPredecessor func(context.Context, [32]byte) error, selectSuccessor func(context.Context, RecoveryPoint) error) (_ *Manifest, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -200,7 +221,15 @@ func (p *Publisher) PublishRecoveryView(ctx context.Context, view RecoveryView, 
 	if err := CheckPublication(p.dir); err != nil {
 		return nil, err
 	}
-	old, err := pub.validateViewGeneration(ctx, view, point)
+	var old *Manifest
+	if checkPredecessor == nil {
+		old, err = pub.validateViewGeneration(ctx, view, point)
+	} else {
+		old, err = readViewManifest(ctx, view, point)
+		if err == nil {
+			err = checkPredecessor(ctx, point.Generation)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +244,11 @@ func (p *Publisher) PublishRecoveryView(ctx context.Context, view RecoveryView, 
 		successor.SuffixSHA256 = remaining
 		return err
 	}, func(id [32]byte) error {
+		if checkPredecessor == nil {
+			if err := pub.validateInstalledGeneration(ctx, id); err != nil {
+				return errors.Join(ErrSelectionRefused, err)
+			}
+		}
 		successor.Generation = id
 		return selectSuccessor(ctx, successor)
 	})

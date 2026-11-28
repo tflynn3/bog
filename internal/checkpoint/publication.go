@@ -322,11 +322,12 @@ func (p *publication) publishGeneration(ctx context.Context, m *Manifest, next *
 		return nil, err
 	}
 	if selectGeneration != nil {
-		if err := p.validateInstalledGeneration(ctx, id); err != nil {
-			return nil, err
-		}
 		manifestPending = true
 		if err := selectGeneration(id); err != nil {
+			if errors.Is(err, ErrSelectionRefused) {
+				manifestPending = false
+				return nil, err
+			}
 			return nil, fmt.Errorf("%w: select checkpoint generation: %w", ErrPublicationUncertain, err)
 		}
 		manifestPending = false

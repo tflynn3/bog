@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
+
+	"bog/internal/store"
 )
 
 // RecoveryPoint fixes one generation and its committed WAL suffix. Offsets
@@ -147,21 +150,37 @@ func validateManifestBlocks(ctx context.Context, m Manifest, open func(string) (
 		if digest(b) != s.SHA256 {
 			return fmt.Errorf("%w: segment digest mismatch for %s", ErrIntegrity, s.Name)
 		}
-		rows, err := DecodeBlock(b)
+		blockCount, err := validateBlock(b)
 		if err != nil {
 			return fmt.Errorf("%w: decode segment %s: %w", ErrIntegrity, s.Name, err)
 		}
-		for i, row := range rows {
-			if row.Ordinal >= m.NextOrdinal || (i > 0 && lessRow(row, rows[i-1])) {
+		var rows []BlockRow
+		if keep != nil {
+			rows = make([]BlockRow, 0, blockCount)
+		}
+		var previous BlockRow
+		first := true
+		err = visitBlock(b, blockCount, func(t time.Time, ordinal uint64, line []byte) error {
+			row := BlockRow{Row: store.Row{TS: t}, Ordinal: ordinal}
+			if ordinal >= m.NextOrdinal || (!first && !lessRow(previous, row)) {
 				return fmt.Errorf("%w: invalid segment row order or ordinal in %s", ErrIntegrity, s.Name)
 			}
-			mask := byte(1 << (row.Ordinal % 8))
-			if ordinals[row.Ordinal/8]&mask != 0 {
-				return fmt.Errorf("%w: duplicate segment ordinal %d", ErrIntegrity, row.Ordinal)
+			first, previous = false, row
+			mask := byte(1 << (ordinal % 8))
+			if ordinals[ordinal/8]&mask != 0 {
+				return fmt.Errorf("%w: duplicate segment ordinal %d", ErrIntegrity, ordinal)
 			}
-			ordinals[row.Ordinal/8] |= mask
+			ordinals[ordinal/8] |= mask
+			if keep != nil {
+				row.Row.Line = string(line)
+				rows = append(rows, row)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
-		count += uint64(len(rows))
+		count += uint64(blockCount)
 		if keep != nil {
 			keep(rows)
 		}

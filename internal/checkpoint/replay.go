@@ -110,3 +110,35 @@ func scanFrames(ctx context.Context, input io.Reader, pos, end int64, ordinal ui
 	}
 	return ctx.Err()
 }
+
+// ScanFrames streams the declared committed range without keeping decoded rows
+// between visits. The reader begins at the logical start offset.
+func ScanFrames(ctx context.Context, r io.Reader, start, end int64, ordinal uint64, visit func(int64, int64, uint64, []store.Row) error) error {
+	if start < 8 || end < start {
+		return fmt.Errorf("%w: invalid WAL frame range", ErrIntegrity)
+	}
+	return scanFrames(ctx, r, start, end, ordinal, visit)
+}
+
+// ReplayTail admits the entire encoded range before decoding. Each successful
+// visit takes ownership of the reservation for that frame. On a visit error
+// ReplayTail releases that frame, and the caller owns any earlier frames.
+func (b *Budget) ReplayTail(ctx context.Context, r io.Reader, start, end int64, first uint64,
+	visit func(int64, int64, uint64, []store.Row, *Reservation) error) (uint64, error) {
+	charge, err := b.ReserveReplayTail(ctx, start, end)
+	if err != nil {
+		return 0, err
+	}
+	defer charge.Release()
+	next := first
+	err = ScanFrames(ctx, r, start, end, first, func(start, end int64, ordinal uint64, rows []store.Row) error {
+		part := charge.split(uint64(end - start))
+		if err := visit(start, end, ordinal, rows, part); err != nil {
+			part.Release()
+			return err
+		}
+		next = ordinal + uint64(len(rows))
+		return nil
+	})
+	return next, err
+}

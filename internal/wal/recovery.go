@@ -26,37 +26,15 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if s == nil {
 		return nil, errors.New("WAL requires a store")
 	}
-	root, err := os.OpenRoot(dir)
+	root, d, err := lockDirectory(dir)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if err != nil {
-			err = errors.Join(err, root.Close())
+			err = errors.Join(err, d.Close(), root.Close())
 		}
 	}()
-	d, err := root.Open(".")
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, d.Close())
-		}
-	}()
-
-	info, err := d.Stat()
-	if err != nil {
-		return nil, err
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || st.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0022 != 0 {
-		return nil, errors.New("data directory must be owned by the service user and not group- or world-writable")
-	}
-	// Lock the pinned directory inode so replacing a pathname cannot bypass it.
-	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, fmt.Errorf("lock data directory: %w", err)
-	}
 	if err := rejectRestoreImage(root); err != nil {
 		return nil, err
 	}
@@ -93,7 +71,7 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 func rejectRestoreImage(root *os.Root) error {
 	// These names are reserved by the v1 backup format. A checkpoint alone
 	// can coexist with a complete legacy WAL and is not a restore indicator.
-	for _, name := range []string{"bog.backup", "bog.wal.tail"} {
+	for _, name := range []string{"bog.backup", "bog.wal.tail", authorityName} {
 		if _, err := root.Lstat(name); err == nil {
 			return fmt.Errorf("found %s: backup/restore image requires checkpoint-aware recovery; use a restore-capable Bog reader", name)
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -137,12 +115,8 @@ func (l *Log) openWAL() (*os.File, error) {
 func (l *Log) recover() error {
 	// Persist the data directory's own entry, using the pinned directory's
 	// parent even if the caller opened it through a symlink.
-	parent, err := openParent(l.dir)
-	if err != nil {
+	if err := syncParent(l.dir); err != nil {
 		return err
-	}
-	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
-		return fmt.Errorf("sync data directory parent: %w", err)
 	}
 
 	size, err := l.f.Seek(0, io.SeekEnd)
@@ -336,4 +310,50 @@ func isStageName(name string) bool {
 		return true
 	}
 	return false
+}
+
+func lockDirectory(dir string) (_ *os.Root, _ *os.File, err error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, root.Close())
+		}
+	}()
+	d, err := root.Open(".")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, d.Close())
+		}
+	}()
+
+	info, err := d.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0022 != 0 {
+		return nil, nil, errors.New("data directory must be owned by the service user and not group- or world-writable")
+	}
+	// Lock the pinned directory inode so replacing a pathname cannot bypass it.
+	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil, nil, fmt.Errorf("lock data directory: %w", err)
+	}
+	return root, d, nil
+}
+
+func syncParent(dir *os.File) error {
+	parent, err := openParent(dir)
+	if err != nil {
+		return err
+	}
+	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
+		return fmt.Errorf("sync data directory parent: %w", err)
+	}
+	return nil
 }

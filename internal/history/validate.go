@@ -3,22 +3,39 @@ package history
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
+	"os"
 	"sort"
 	"unicode/utf8"
 )
 
-func (g *generation) validate(ctx context.Context, m manifest, buf []byte) error {
+func (g *generation) validate(ctx context.Context, m manifest, buf []byte, previous *generation) error {
 	// Each v1 publisher run normally covers a contiguous append interval.
 	// Reuse this bitmap to prove contiguity even when timestamps are shuffled.
 	localBits := make([]byte, (len(buf)/rowHeaderSize+7)/8)
 	var total uint64
+	old := make(map[string]segment)
+	if previous != nil {
+		for _, s := range previous.segments {
+			old[s.name] = s
+		}
+	}
 	for i := range g.segments {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		s := &g.segments[i]
+		if prior, ok := old[s.name]; ok && prior.digest == s.digest &&
+			prior.stat.Size() == m.Segments[i].Size && prior.last < m.NextOrdinal {
+			if err := prior.checkIdentity(g.dir); err != nil {
+				return err
+			}
+			*s = prior
+			total += uint64(s.count)
+			continue
+		}
 		b := buf[:int(m.Segments[i].Size)]
 		if err := s.readVerified(g.dir, b); err != nil {
 			return err
@@ -27,6 +44,7 @@ func (g *generation) validate(ctx context.Context, m manifest, buf []byte) error
 		if err != nil {
 			return err
 		}
+		s.count = count
 		total += uint64(count)
 		if s.last-s.first+1 == uint64(count) {
 			bits := localBits[:(count+7)/8]
@@ -44,6 +62,17 @@ func (g *generation) validate(ctx context.Context, m manifest, buf []byte) error
 		return fmt.Errorf("%w: checkpoint row count differs from manifest", ErrIntegrity)
 	}
 	return g.validateOrdinals(ctx, buf, total)
+}
+
+func (s segment) checkIdentity(dir *os.File) error {
+	f, info, err := openRegular(dir, s.name)
+	if err != nil {
+		return err
+	}
+	if !sameSegment(s.stat, info) {
+		return errors.Join(corrupt(s.name, "segment file changed"), f.Close())
+	}
+	return f.Close()
 }
 
 func (s *segment) index(b []byte, nextOrdinal uint64) (int, error) {

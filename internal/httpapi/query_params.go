@@ -71,9 +71,13 @@ func parseQuery(r *http.Request, tokenSize int) (queryParams, error) {
 	if (page && (q.Get("page") != "1" || continuation)) || (continuation && cursor == "") {
 		return params, errors.New("invalid pagination")
 	}
-	// Reserve room for the largest cursor and ordinary headers within the
-	// server's 1 MiB header limit, using the original request target.
-	if page && len(r.RequestURI)+tokenSize+4096 > 1<<20 {
+	// Reserve room for the cursor and the continuation's headers within the
+	// serving listener's configured limit.
+	headerLimit := http.DefaultMaxHeaderBytes
+	if server, ok := r.Context().Value(http.ServerContextKey).(*http.Server); ok && server.MaxHeaderBytes > 0 {
+		headerLimit = server.MaxHeaderBytes
+	}
+	if page && len(r.RequestURI)+tokenSize+4096 > headerLimit {
 		return params, errors.New("query too large for continuation")
 	}
 	return queryParams{PageFilter{start, end, q.Get("contains")}, limit, page, cursor}, nil

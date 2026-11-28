@@ -194,9 +194,20 @@ func (a *API) withPage(ctx context.Context, req PageRequest, work *store.QueryWo
 	}
 	// Existing NewWithPageSource callers without a bound retain their prior
 	// scan behavior. There is no safe estimate for arbitrary adapter buffers.
+	return a.withScanReservation(ctx, bound, func() error {
+		result, err := source.Page(ctx, req, work)
+		if err != nil {
+			return err
+		}
+		return consume(result)
+	})
+}
+
+func (a *API) withScanReservation(ctx context.Context, bound uint64, scanRows func() error) error {
 	if bound == math.MaxUint64 {
 		return ErrQueryScanCapacityExhausted
 	}
+	resources := a.initResources()
 	scan := queryReservation{budget: &resources.scan}
 	if err := scan.grow(bound); err != nil {
 		return err
@@ -205,9 +216,5 @@ func (a *API) withPage(ctx context.Context, req PageRequest, work *store.QueryWo
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	result, err := source.Page(ctx, req, work)
-	if err != nil {
-		return err
-	}
-	return consume(result)
+	return scanRows()
 }

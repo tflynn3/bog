@@ -188,19 +188,10 @@ func (l *Log) run() {
 func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 	next := l.offset
 	for _, req := range group {
-		var h [16]byte
-		n := uint32(len(req.payload))
-		binary.LittleEndian.PutUint32(h[:], n)
-		binary.LittleEndian.PutUint32(h[4:], ^n)
-		binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(req.payload, table))
-		binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
-		if err := writeAll(l.f, h[:]); err != nil {
+		if err := writeFrame(l.f, req.payload); err != nil {
 			return "wal_write", l.rollback(err)
 		}
-		if err := writeAll(l.f, req.payload); err != nil {
-			return "wal_write", l.rollback(err)
-		}
-		next += int64(len(h) + len(req.payload))
+		next += FrameOverhead + int64(len(req.payload))
 	}
 	if err := l.f.Sync(); err != nil {
 		return "wal_sync", l.rollback(err)
@@ -268,4 +259,19 @@ func (l *Log) Close() error {
 	l.cond.Broadcast()
 	l.mu.Unlock()
 	return err
+}
+
+const FrameOverhead = 16
+
+func writeFrame(w io.Writer, payload []byte) error {
+	var h [FrameOverhead]byte
+	n := uint32(len(payload))
+	binary.LittleEndian.PutUint32(h[:], n)
+	binary.LittleEndian.PutUint32(h[4:], ^n)
+	binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(payload, table))
+	binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
+	if err := writeAll(w, h[:]); err != nil {
+		return err
+	}
+	return writeAll(w, payload)
 }

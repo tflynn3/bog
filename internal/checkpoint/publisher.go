@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -79,4 +80,38 @@ func (s *stagingAccount) settle() {
 	}
 	s.charges = nil
 	s.pending = false
+}
+
+// InstallInitialManifest installs a copy of the validated canonical restore
+// manifest under its digest name. The caller holds the publication lock.
+// An interrupted copy can be retried without changing the canonical input.
+func (p *Publisher) InstallInitialManifest(name string, b []byte) error {
+	_, id, err := DecodeManifest(b)
+	if err != nil || name != GenerationManifestName(id) {
+		return errors.Join(ErrIntegrity, err)
+	}
+	existing, err := readPublicationFile(p.dir, name, maxManifestSize)
+	if err == nil {
+		if !bytes.Equal(b, existing) {
+			return ErrIntegrity
+		}
+		return p.dir.Sync()
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	// The deterministic private stage is exclusively owned by the caller
+	// under the publication and data-directory locks.
+	const stage = ".bog-checkpoint-activation"
+	pub := publication{root: p.root, dir: p.dir}
+	if err := p.root.Remove(stage); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := pub.writeNew(stage, b); err != nil {
+		return err
+	}
+	if err := p.root.Rename(stage, name); err != nil {
+		return err
+	}
+	return p.dir.Sync()
 }

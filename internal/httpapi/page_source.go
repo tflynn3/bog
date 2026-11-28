@@ -64,4 +64,16 @@ type PageResult struct {
 	Rows      []PageRow
 	More      bool      // a further match exists after the last returned row
 	ExpiresAt time.Time // optional on acquisition; HTTP caps it at 15 minutes
+	// Finish transfers an ordinary query's source pin through response
+	// delivery. Snapshot sources use Release instead.
+	Finish func() error
+}
+
+// QueryVisitorSource optionally delivers ordinary query rows directly to the
+// response encoder. VisitQuery stops successfully when visit returns false.
+// Its returned release keeps the storage view pinned through delivery.
+type QueryVisitorSource interface {
+	PageSourceScanBound
+	QueryVisitScanBytes() uint64
+	VisitQuery(context.Context, PageRequest, *store.QueryWork, func(store.Row) (bool, error)) (func() error, error)
 }

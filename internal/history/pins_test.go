@@ -202,6 +202,32 @@ func TestReclaimFailsClosedOnMalformedLivePin(t *testing.T) {
 	assertSegment(t, dir, next.Segments[0].Name, true)
 }
 
+func TestRecoverPinsPreservesLiveGeneration(t *testing.T) {
+	dir, manifest := segmentFixture(t, [][]checkpoint.BlockRow{{row(epoch, 0, "live")}})
+	var catalog Catalog
+	cleanup(t, catalog.Close)
+	_, err := catalog.Replace(t.Context(), dir)
+	requireOK(t, err)
+	live := catalog.current.pin.Name()
+	dead := pinPrefix + strings.Repeat("a", pinTokenSize)
+	staged := pinStagePrefix + strings.Repeat("b", pinTokenSize)
+	for _, name := range []string{dead, staged, "unrelated"} {
+		writeFile(t, filepath.Join(dir, name), []byte("interrupted"))
+	}
+	pinned, _, err := openDirectory(dir)
+	requireOK(t, err)
+	cleanup(t, pinned.Close)
+
+	for range 2 {
+		requireOK(t, RecoverPins(t.Context(), pinned))
+		assertSegment(t, dir, live, true)
+		assertSegment(t, dir, manifest.Segments[0].Name, true)
+		assertSegment(t, dir, "unrelated", true)
+		assertSegment(t, dir, dead, false)
+		assertSegment(t, dir, staged, false)
+	}
+}
+
 func TestReleaseDuringExclusivePublicationDefersPinCleanup(t *testing.T) {
 	ctx := context.Background()
 	dir, first := segmentFixture(t, [][]checkpoint.BlockRow{{row(epoch, 0, "old")}})

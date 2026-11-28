@@ -75,6 +75,7 @@ func (s *segment) index(b []byte, nextOrdinal uint64) (int, error) {
 			!utf8.Valid(b[p+rowHeaderSize:p+rowHeaderSize+n]) {
 			return 0, corrupt(s.name, "invalid row data or row order")
 		}
+		s.maxLineBytes = max(s.maxLineBytes, int(n))
 		if i%step == 0 {
 			s.points = append(s.points, seekPoint{key: key, offset: p})
 		}

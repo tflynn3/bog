@@ -11,12 +11,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	"bog/internal/httpapi"
-	"bog/internal/store"
-	"bog/internal/wal"
 )
 
 type config struct {
@@ -24,6 +23,11 @@ type config struct {
 	maxResponseBytes, queryConcurrency int
 	queryWorkBudget                    uint64
 }
+
+const defaultRetainedQueryWork = 1 << 30
+
+// Leave time for the process to exit and be reaped within four seconds.
+const shutdownTimeout = 3 * time.Second
 
 func parseFlags(args []string, output io.Writer) (config, error) {
 	var c config
@@ -33,7 +37,7 @@ func parseFlags(args []string, output io.Writer) (config, error) {
 	fs.StringVar(&c.addr, "addr", "127.0.0.1:8080", "HTTP listen address")
 	fs.IntVar(&c.maxResponseBytes, "query-max-response-bytes", httpapi.DefaultQueryMaxResponseBytes, "maximum encoded NDJSON query response bytes")
 	fs.IntVar(&c.queryConcurrency, "query-concurrency", httpapi.DefaultQueryConcurrency, "maximum concurrent GET /query requests (503 when full)")
-	fs.Uint64Var(&c.queryWorkBudget, "query-work-budget", httpapi.DefaultQueryWorkBudget, "maximum work units per query, including scans, encoding, and response bytes (503 on exhaustion)")
+	fs.Uint64Var(&c.queryWorkBudget, "query-work-budget", defaultRetainedQueryWork, "maximum work units per query, including scans, encoding, and response bytes (503 on exhaustion)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fs.SetOutput(output)
@@ -59,29 +63,46 @@ func parseFlags(args []string, output io.Writer) (config, error) {
 }
 
 func run(c config) error {
-	s := &store.Store{}
-	w, err := wal.Open(c.dir, s)
+	storage, err := openRetained(c.dir)
 	if err != nil {
 		return fmt.Errorf("open data directory %q: %w", c.dir, err)
 	}
+	closeStartup := func(cause error) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return errors.Join(cause, storage.close(ctx))
+	}
+	probe, err := storage.root.Open(".")
+	if err != nil {
+		return closeStartup(fmt.Errorf("open readiness directory: %w", err))
+	}
+	ownerInfo, ownerErr := storage.dir.Stat()
+	probeInfo, probeErr := probe.Stat()
+	if err := errors.Join(ownerErr, probeErr); err != nil {
+		return closeStartup(errors.Join(fmt.Errorf("stat readiness directory: %w", err), probe.Close()))
+	}
+	if !os.SameFile(ownerInfo, probeInfo) {
+		return closeStartup(errors.Join(errors.New("readiness directory differs from WAL directory"), probe.Close()))
+	}
+
 	addr := c.addr
 	if addr == "" {
 		addr = ":http"
 	}
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		if closeErr := w.Close(); closeErr != nil {
-			return errors.Join(fmt.Errorf("listen on %q: %w", addr, err), fmt.Errorf("close WAL: %w", closeErr))
-		}
-		return fmt.Errorf("listen on %q: %w", addr, err)
-	}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return closeStartup(errors.Join(fmt.Errorf("listen on %q: %w", addr, err), probe.Close()))
+	}
+	capacity := capacityEnabled(listener)
 	probeCtx, stopProbes := context.WithCancel(context.Background())
 	defer stopProbes()
+	handler, api := newReadyHandler(probeCtx, c, storage, probe, capacity)
+	storage.startMaintenance(capacity)
 	server := &http.Server{
-		Handler:           newReadyHandler(probeCtx, c, s, w),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -90,31 +111,45 @@ func run(c config) error {
 	}
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
-	var serveErr error
+	var serveErr, storageErr error
 	select {
 	case <-signals:
 	case serveErr = <-served:
+	case storageErr = <-storage.fatal:
 	}
-	stopProbes()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		// Keep the WAL locked while handlers might still be using it.
-		return fmt.Errorf("shutdown HTTP server (WAL remains open until exit): %w", err)
+	storage.stopMaintenance()
+	stopProbes()
+	drain := func() error {
+		if err := server.Shutdown(ctx); err != nil {
+			return errors.Join(storageErr, fmt.Errorf("shutdown HTTP server (WAL remains open until exit): %w", err), probe.Close())
+		}
+		if serveErr == nil {
+			serveErr = <-served
+		}
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		}
+		if serveErr != nil {
+			serveErr = fmt.Errorf("serve HTTP: %w", serveErr)
+		}
+		apiErr := api.Close(ctx)
+		probeErr := probe.Close()
+		if apiErr != nil || ctx.Err() != nil {
+			return errors.Join(serveErr, storageErr, apiErr, probeErr, ctx.Err())
+		}
+		return errors.Join(serveErr, storageErr, probeErr, storage.close(ctx))
 	}
-	if serveErr == nil {
-		serveErr = <-served
+	// Bound the wait even if filesystem cleanup blocks in a syscall.
+	finished := make(chan error, 1)
+	go func() { finished <- drain() }()
+	select {
+	case err := <-finished:
+		return err
+	case <-ctx.Done():
+		return errors.Join(storageErr, fmt.Errorf("shutdown (WAL remains open until exit): %w", ctx.Err()))
 	}
-	if errors.Is(serveErr, http.ErrServerClosed) {
-		serveErr = nil
-	}
-	if serveErr != nil {
-		serveErr = fmt.Errorf("serve HTTP: %w", serveErr)
-	}
-	if err := w.Close(); err != nil {
-		return errors.Join(serveErr, fmt.Errorf("close WAL: %w", err))
-	}
-	return serveErr
 }
 
 func main() {
@@ -125,6 +160,12 @@ func main() {
 	if err != nil {
 		log.Print(err)
 		os.Exit(2)
+	}
+	// Leave resident headroom for sockets, stacks and filesystem activity.
+	// An operator-supplied lower Go heap target still takes precedence.
+	const heapTarget = 72 << 20
+	if debug.SetMemoryLimit(-1) > heapTarget {
+		debug.SetMemoryLimit(heapTarget)
 	}
 	err = run(c)
 	if err != nil {

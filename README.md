@@ -19,11 +19,37 @@ Ingest accepts at most 4 MiB of UTF-8 NDJSON. Each nonblank line must be an obje
 
 Query requires `start` and `end` timestamps and accepts a literal case-sensitive `contains` and decimal `limit` (default 500, range 1–1000). The interval is `[start,end)`; equal bounds return no rows. Output is UTF-8 `application/x-ndjson`, in UTC, ordered by timestamp then commit and row order. Duplicate records remain distinct. Queries see complete batches.
 
-A single append-only `bog.wal` and its `bog.commit` marker are the source of truth; keep them together. Create the data directory on a local filesystem before starting the service, and ensure its parent directory is itself durably established (including any newly created ancestors). After the eight-byte `BOGWAL01` magic, each batch has a 16-byte little-endian header: payload length, its bitwise complement, payload CRC32C, and CRC32C of the first 12 header bytes, followed by the original NDJSON payload. The 24-byte marker contains `BOGCMT01`, the little-endian committed offset, and its bitwise complement. Concurrent admitted batches can share a WAL sync and one atomically replaced and directory-synced commit marker; each retains its own frame and is published as a whole in admission order. Successful responses follow the durable marker and in-memory publication. Recovery discards any bytes beyond the committed offset; corruption within the committed prefix prevents startup. Startup rebuilds memory from the committed WAL. A missing or invalid marker on a populated WAL, or a marker without a WAL, prevents startup; only a new store or a magic-only WAL may bootstrap without a marker.
+Bog validates and opens writable storage before serving. Existing ordinary
+directories use `bog.wal` and its `bog.commit` marker. Startup streams validation
+of the committed frames, and larger ordinary WALs migrate to retained history
+before listening. Each frame preserves the original NDJSON payload. The marker
+records the durable byte boundary. A populated ordinary WAL requires a valid
+marker.
 
-Decoded rows and a derived index of immutable sorted ordinal runs remain in memory, so retained data is bounded by available RAM. Each published batch is sorted by UTC timestamp and append order, then merged into runs by batch count. Queries seek within each run and merge matching rows in order, including across wide time ranges. On startup, recovery represents a timestamp-ordered WAL prefix as an implicit run without an ordinal array; otherwise it builds one explicitly sorted ordinal run; live batches remain in separate merge levels. The index does not change the on-disk format. Up to 16 ingest requests can be processed concurrently, and additional requests receive 503. A failed append returns 503 only after rollback is synced and publishes no rows. If a commit or rollback cannot be confirmed, the process terminates and the request outcome is unknown. Once admitted, an append completes even if its client disconnects. A lost response leaves the outcome unknown and retrying can produce duplicates. The data directory must be owned by the service user and must not be group- or world-writable; existing WAL and marker files must also be owned by that user, not group- or world-writable, and have exactly one link. All parent directories must be trusted against replacement or renaming by other principals. The local filesystem and storage stack must support exclusive advisory locks, atomic rename, file sync, directory sync, and powersafe overwrite: a write interrupted by power loss must not damage bytes outside the written range, even within the same sector. Consecutive WAL frames may share a sector, so this guarantee is required to preserve previously acknowledged batches.
+During normal ingest, Bog advances checkpoints once the uncovered suffix reaches
+16 MiB or 4,096 batches. The durable `bog.authority` record selects the checkpoint
+generation and its writable WAL tail together. Queries read the selected
+checkpoint segments and committed tail from disk. Keep the entire directory
+together. Restart verifies the selected files and committed frames before
+discarding uncommitted trailing bytes. Previous generations and tails can stay
+on disk until their readers drain.
 
-Sealed groups of 128 append ordinals also have derived Bloom filters over overlapping four-byte grams of each decoded line. Each bitmap uses 4 KiB (about 32 bytes per row, plus small metadata); blocks with more than 64 KiB of decoded text and the unsealed tail remain unfiltered. Wide literal searches may use these filters to skip blocks, but always check candidate lines exactly. Filters are rebuilt on replay and do not alter durable files or snapshot pagination.
+Concurrent admitted batches can share a WAL sync and one durable commit record
+update. Bog makes each complete batch visible in admission order before returning
+204. Up to 16 requests can ingest concurrently, subject to aggregate memory
+admission. An append refused for disk exhaustion returns 503 with `disk full`
+after rollback and sync. Health and queries remain available, and ingest can
+resume when space is freed. An unconfirmed commit or rollback terminates the
+process with the request outcome unknown. An admitted append can complete after
+the client disconnects, and retrying a lost response can produce duplicates.
+
+The data directory and storage files must be owned by the service user and must
+be protected from writes by other users. Writable storage files must be regular
+files with exactly one link. Use a trusted local filesystem and parent directory.
+The storage stack must support exclusive advisory locks, atomic rename, file and
+directory sync, and powersafe overwrite. Establish the directory durably before
+startup. On SIGTERM the server drains HTTP, releases query captures, and drains
+storage maintenance before releasing the lock.
 
 For a stable walk, add `page=1` to the first query. If another matching row exists, the response includes `Bog-Next-Cursor`; send its value as `cursor` on the next request, repeating `start`, `end`, and `contains`. For example:
 
@@ -32,14 +58,11 @@ curl -i 'localhost:8080/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00
 curl -i 'localhost:8080/query?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&cursor=TOKEN&limit=20'
 ```
 
-The cursor captures published rows at the first request; later appends do not appear in that walk. Rows with identical timestamps retain append order, including duplicates. Bounds may use equivalent time zones, `contains` must be identical (omission means empty), and `limit` may change between requests. The final page has no cursor header. Cursors are authenticated, expire when the process restarts, and invalid or mismatched cursors return 400. `page` accepts only `1`, and cannot be combined with `cursor`; an empty cursor is invalid. First-page requests must leave room within the 1 MiB request header limit for a continuation cursor and ordinary headers; oversized queries return 400. The encoded NDJSON body is limited to 32 MiB by default; set `-query-max-response-bytes` to change it. The limit includes JSON escaping and each record’s newline. An ordinary query may return a short 200 response without a cursor when the byte limit is reached. If the first matching record cannot fit, the server returns 422; increase the limit to retrieve it. Use `page=1` and follow `Bog-Next-Cursor` as shown above to retrieve the full snapshot. See [query response limits](docs/query-response-limits.md).
+The cursor captures published rows at the first request; later appends do not appear in that walk. Rows with identical timestamps retain append order, including duplicates. Bounds may use equivalent time zones, `contains` must be identical (omission means empty), and `limit` may change between requests. The final page has no cursor header. Cursors are authenticated, expire when the process restarts, and invalid or mismatched cursors return 400. `page` accepts only `1`, and cannot be combined with `cursor`; an empty cursor is invalid. First-page requests must leave room within the 1 MiB request header limit for a continuation cursor and ordinary headers; oversized queries return 400. The encoded NDJSON body is limited to 32 MiB by default. Set `-query-max-response-bytes` to lower the per-response cap. Queries share an aggregate 32 MiB encoded-response budget. The limit includes JSON escaping and each record’s newline. An ordinary query may return a short 200 response without a cursor when the byte limit is reached. If the first matching record cannot fit, the server returns 422; increase the limit to retrieve it. Use `page=1` and follow `Bog-Next-Cursor` as shown above to retrieve the full snapshot. See [query response limits](docs/query-response-limits.md).
 
 ## Retained-history cutover
 
-The [cutover decision](docs/adr/0004-retained-history-cutover.md) specifies
-the operating contract for the integrated release. Use a qualified
-cutover binary for the steps below. The legacy binary rejects restored
-images before opening the legacy WAL.
+The default Linux server supports the [retained-history operating contract](docs/adr/0035-tail-only-retained-recovery-contract.md).
 
 ### Activate a verified restore
 
@@ -47,8 +70,7 @@ Use the backup engine's `Verify` and `Restore` operations to check the
 bundle and publish a separate, service-owned directory on a trusted local
 filesystem. Keep the original bundle for recovery. The restored directory
 contains `bog.backup`, `bog.checkpoint`, its referenced segments, and
-`bog.wal.tail`. Point a cutover-capable binary at that directory using the
-usual startup command. See the [backup format](internal/backup/FORMAT.md).
+`bog.wal.tail`. Point Bog at that directory using the usual startup command. See the [backup format](internal/backup/FORMAT.md).
 
 ```sh
 ./bog -data-dir /path/to/restored-data -addr 127.0.0.1:8080
@@ -76,9 +98,8 @@ larger server work budget.
 
 ### Opt in to capacity verification
 
-Set `BOG_CAPACITY_CONTROL=1` on a cutover binary to enable
-`/_capacity/compaction` on a loopback-bound listener. The control defaults
-to off. Use a disposable local data directory for the Linux capacity fixture.
+Set `BOG_CAPACITY_CONTROL=1` to enable `/_capacity/compaction` on an IPv4
+loopback listener. In this mode the fixture drives checkpoint cutoffs explicitly. Use a disposable local data directory for the Linux capacity fixture.
 
 ```sh
 BOG_CAPACITY_CONTROL=1 ./bog -data-dir /path/to/disposable-data -addr 127.0.0.1:8080

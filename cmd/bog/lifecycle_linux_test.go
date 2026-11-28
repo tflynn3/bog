@@ -182,11 +182,12 @@ func TestLifecycle(t *testing.T) {
 	start(dir, addr)
 	start(unsafe, addr)
 	t.Run("acknowledged_batch_crash", func(t *testing.T) { testAcknowledgedBatchCrash(t, binary) })
-	t.Run("drain", func(t *testing.T) { testShutdownDrainsInFlightIngest(t, binary) })
+	t.Run("drain", func(t *testing.T) { testShutdownWithInFlightIngest(t, binary, true) })
+	t.Run("drain_deadline", func(t *testing.T) { testShutdownWithInFlightIngest(t, binary, false) })
 	t.Run("ready_enospc", func(t *testing.T) { testReadyWithKernelENOSPC(t, binary, addr) })
 }
 
-func testShutdownDrainsInFlightIngest(t *testing.T, binary string) {
+func testShutdownWithInFlightIngest(t *testing.T, binary string, finishRequest bool) {
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +240,13 @@ func testShutdownDrainsInFlightIngest(t *testing.T, binary string) {
 	}
 	if interim.StatusCode != 100 {
 		t.Fatalf("interim status: %s", interim.Status)
+	}
+	if !finishRequest {
+		err := p.signalAndWait(t, syscall.SIGTERM, 4*time.Second)
+		if err == nil || !strings.Contains(logs.String(), "WAL remains open until exit): context deadline exceeded") {
+			t.Fatalf("stalled ingest shutdown: %v: %s", err, logs.String())
+		}
+		return
 	}
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)

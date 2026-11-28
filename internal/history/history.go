@@ -1,4 +1,4 @@
-// Package history serves immutable, published v1 checkpoints from disk.
+// Package history serves immutable, published checkpoints from disk.
 package history
 
 import (
@@ -44,9 +44,10 @@ type Boundary struct {
 // and release of every reader and active scan. A reclaimer must also check
 // the authoritative manifest and any other generations that share its files.
 type Generation struct {
-	ID       GenerationID
-	Boundary Boundary
-	Drained  <-chan struct{}
+	ID                         GenerationID
+	Boundary                   Boundary
+	Drained                    <-chan struct{}
+	SegmentCount, MaxLineBytes int
 }
 
 // Catalog owns the current generation. Its zero value is ready for use. It
@@ -106,7 +107,7 @@ func (c *Catalog) replaceWith(ctx context.Context, open directoryOpener) (Genera
 		return Generation{}, err
 	}
 	defer ticket.Close()
-	return ticket.install(ctx, open)
+	return ticket.install(ctx, open, nil)
 }
 
 // Acquire pins id if it is current. Already acquired readers keep their

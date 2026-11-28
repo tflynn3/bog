@@ -51,11 +51,12 @@ type seekPoint struct {
 }
 
 type segment struct {
-	name   string
-	digest [sha256.Size]byte
-	stat   os.FileInfo
-	lo, hi time.Time // Inclusive verified timestamp bounds.
-	points []seekPoint
+	name         string
+	digest       [sha256.Size]byte
+	stat         os.FileInfo
+	lo, hi       time.Time // Inclusive verified timestamp bounds.
+	points       []seekPoint
+	maxLineBytes int
 
 	// Used only while verifying that the manifest covers each ordinal once.
 	first, last uint64 // Inclusive ordinal bounds.
@@ -71,8 +72,12 @@ func parseDigest(s string) ([sha256.Size]byte, bool) {
 	return sum, err == nil
 }
 
-func readManifest(dir *os.File) (_ manifest, _ GenerationID, err error) {
-	f, info, err := openRegular(dir, manifestName)
+func readManifest(dir *os.File, selected *GenerationID) (_ manifest, _ GenerationID, err error) {
+	name := manifestName
+	if selected != nil {
+		name = checkpoint.GenerationManifestName(*selected)
+	}
+	f, info, err := openRegular(dir, name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return manifest{}, GenerationID{}, err
@@ -89,6 +94,16 @@ func readManifest(dir *os.File) (_ manifest, _ GenerationID, err error) {
 	}
 	if int64(len(b)) != info.Size() {
 		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest size changed", ErrIntegrity)
+	}
+	if selected != nil {
+		m, id, err := checkpoint.DecodeManifest(b)
+		if err != nil {
+			return manifest{}, GenerationID{}, errors.Join(ErrIntegrity, err)
+		}
+		if id != *selected {
+			return manifest{}, GenerationID{}, fmt.Errorf("%w: selected manifest digest mismatch", ErrIntegrity)
+		}
+		return *m, id, nil
 	}
 	var env envelope
 	if err := json.Unmarshal(b, &env); err != nil {
@@ -164,14 +179,14 @@ func checkDirectory(dir *os.File) (*os.File, os.FileInfo, error) {
 }
 
 // loadAt requires the publication lock and does not take ownership of dir.
-func loadAt(ctx context.Context, dir *os.File) (*generation, error) {
+func loadAt(ctx context.Context, dir *os.File, selected *GenerationID) (*generation, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if err := checkpoint.CheckPublication(dir); err != nil {
 		return nil, err
 	}
-	g, _, err := loadAuthority(ctx, dir)
+	g, _, err := loadAuthority(ctx, dir, selected)
 	return g, err
 }
 
@@ -182,26 +197,26 @@ func ValidatePinnedAuthority(ctx context.Context, dir *os.File) (*checkpoint.Man
 	if dir == nil {
 		return nil, errors.New("missing pinned history directory")
 	}
-	_, m, err := loadAuthority(ctx, dir)
+	_, m, err := loadAuthority(ctx, dir, nil)
 	return m, err
 }
 
-func loadAuthority(ctx context.Context, dir *os.File) (*generation, *checkpoint.Manifest, error) {
+func loadAuthority(ctx context.Context, dir *os.File, selected *GenerationID) (*generation, *checkpoint.Manifest, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	m, id, err := readManifest(dir)
+	m, id, err := readManifest(dir, selected)
 	if err != nil {
 		return nil, nil, err
 	}
 	source, ok := parseDigest(m.SourceSHA256)
-	if !ok {
+	if !ok && m.Version == 1 {
 		return nil, nil, fmt.Errorf("%w: invalid WAL prefix checksum", ErrIntegrity)
 	}
 	g := &generation{dir: dir, drained: make(chan struct{}), segments: make([]segment, len(m.Segments))}
 	g.info = Generation{
 		ID: id, Boundary: Boundary{SourceSHA256: source, CoveredOffset: m.CoveredOffset, NextOrdinal: m.NextOrdinal},
-		Drained: g.drained,
+		Drained: g.drained, SegmentCount: len(m.Segments),
 	}
 	seen := make(map[string]bool, len(m.Segments))
 	var maxRows uint64

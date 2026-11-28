@@ -205,6 +205,7 @@ func (a *API) withPage(ctx context.Context, req PageRequest, work *store.QueryWo
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	req.ScanBytes = bound
 	result, err := source.Page(ctx, req, work)
 	if err != nil {
 		return err

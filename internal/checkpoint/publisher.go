@@ -52,6 +52,26 @@ func (p *Publisher) RecoverCaptured(authoritative func() (*Manifest, error)) err
 	return recoverCapturedWithBudget(p.root, p.dir, authoritative, &p.stage)
 }
 
+// RecoverOrdinary settles an interrupted attempt after the owner has
+// established absence of a retained selector under the WAL directory lock.
+func (p *Publisher) RecoverOrdinary(ctx context.Context, authoritative func() (*Manifest, error)) (err error) {
+	if !p.mu.TryLock() {
+		return syscall.EWOULDBLOCK
+	}
+	defer p.mu.Unlock()
+	pub, lock, err := lockOwnedPublication(p.root, p.dir)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	pub.cleanupContext = ctx
+	err = pub.resolve(authoritative, true)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		p.stage.settle()
+	}
+	return err
+}
+
 type stagingAccount struct {
 	budget  *Budget
 	charges []*Reservation

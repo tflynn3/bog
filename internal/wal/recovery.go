@@ -26,16 +26,7 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if s == nil {
 		return nil, errors.New("WAL requires a store")
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, root.Close())
-		}
-	}()
-	d, err := root.Open(".")
+	d, err := LockDirectory(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -44,23 +35,11 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 			err = errors.Join(err, d.Close())
 		}
 	}()
-
-	info, err := d.Stat()
-	if err != nil {
-		return nil, err
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || st.Uid != uint32(os.Geteuid()) || info.Mode().Perm()&0022 != 0 {
-		return nil, errors.New("data directory must be owned by the service user and not group- or world-writable")
-	}
-	// Lock the pinned directory inode so replacing a pathname cannot bypass it.
-	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, fmt.Errorf("lock data directory: %w", err)
-	}
+	root := d.Root
 	if err := rejectRestoreImage(root); err != nil {
 		return nil, err
 	}
-	l := &Log{s: s, root: root, dir: d, syncDir: d.Sync}
+	l := &Log{s: s, root: root, dir: d.File, syncDir: d.File.Sync}
 	f, err := l.openWAL()
 	if err != nil {
 		return nil, err
@@ -74,7 +53,7 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("lock WAL: %w", err)
 	}
-	l.captures, err = openCaptureFile(d, f)
+	l.captures, err = openCaptureFile(d.File, f)
 	if err != nil {
 		return nil, err
 	}
@@ -135,14 +114,8 @@ func (l *Log) openWAL() (*os.File, error) {
 }
 
 func (l *Log) recover() error {
-	// Persist the data directory's own entry, using the pinned directory's
-	// parent even if the caller opened it through a symlink.
-	parent, err := openParent(l.dir)
-	if err != nil {
+	if err := syncParent(l.dir); err != nil {
 		return err
-	}
-	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
-		return fmt.Errorf("sync data directory parent: %w", err)
 	}
 
 	size, err := l.f.Seek(0, io.SeekEnd)

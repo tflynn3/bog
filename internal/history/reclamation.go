@@ -2,6 +2,7 @@ package history
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"syscall"
@@ -60,15 +61,20 @@ func (c *Catalog) retiredIndex(info os.FileInfo) int {
 // A shared segment or one with live readers remains eligible for a later call.
 // It is safe to call after Close, including while retired readers are draining.
 func (c *Catalog) Reclaim(ctx context.Context, path string) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) }, nil)
 }
 
 // ReclaimPinned is Reclaim using the caller's pinned directory.
 func (c *Catalog) ReclaimPinned(ctx context.Context, dir *os.File) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, nil)
 }
 
-func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error) {
+// ReclaimSelected uses the exact manifest selected by the directory owner.
+func (c *Catalog) ReclaimSelected(ctx context.Context, dir *os.File, id GenerationID) error {
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, &id)
+}
+
+func (c *Catalog) reclaim(ctx context.Context, open directoryOpener, selected *GenerationID) (err error) {
 	c.replace.Lock()
 	defer c.replace.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -88,7 +94,7 @@ func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error)
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	current, err := loadAt(ctx, dir)
+	current, err := loadAt(ctx, dir, selected)
 	if err != nil {
 		return err
 	}
@@ -164,4 +170,85 @@ func reclaimSegment(dir *os.File, name string, expected os.FileInfo) (complete b
 		return false, err
 	}
 	return true, nil
+}
+
+// ReclaimObsolete reclaims predecessor segments using the manifest preserved by
+// the owner's durable retirement record. It returns the byte count actually
+// unlinked and whether every obsolete file has drained. The caller serializes
+// this operation with changes to selected authority.
+func ReclaimObsolete(ctx context.Context, dir *os.File, selected GenerationID, predecessor *checkpoint.Manifest) (removed uint64, complete bool, err error) {
+	lock, err := checkpoint.LockPublication(dir, true)
+	if err != nil {
+		return 0, false, err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	current, _, err := readManifest(dir, &selected)
+	if err != nil {
+		return 0, false, err
+	}
+	names := make(map[string]bool, len(current.Segments))
+	for _, seg := range current.Segments {
+		names[seg.Name] = true
+	}
+	candidates := make(map[string]os.FileInfo)
+	var scratch []byte
+	for _, seg := range predecessor.Segments {
+		if err := ctx.Err(); err != nil {
+			return 0, false, err
+		}
+		if names[seg.Name] {
+			continue
+		}
+		expected, ok := parseDigest(seg.SHA256)
+		if !validSegmentName(seg.Name) || !ok || seg.Size < 0 || seg.Size > checkpoint.MaxBlockSize {
+			return 0, false, corrupt(seg.Name, "invalid retired segment metadata")
+		}
+		f, info, err := openRegular(dir, seg.Name)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		if info.Size() != seg.Size {
+			return 0, false, errors.Join(corrupt(seg.Name, "retired segment size changed"), f.Close())
+		}
+		if int64(cap(scratch)) < seg.Size {
+			scratch = make([]byte, seg.Size)
+		}
+		b := scratch[:seg.Size]
+		if err := errors.Join(readExactAt(f, b, 0), f.Close()); err != nil {
+			return 0, false, err
+		}
+		if sha256.Sum256(b) != expected {
+			return 0, false, corrupt(seg.Name, "retired segment digest changed")
+		}
+		candidates[seg.Name] = info
+	}
+	protected := make(map[string]bool)
+	if len(candidates) != 0 {
+		if err := protectPinned(ctx, dir, candidates, protected); err != nil {
+			return 0, false, err
+		}
+	}
+	complete = true
+	for name, info := range candidates {
+		if protected[name] {
+			complete = false
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return removed, false, errors.Join(err, dir.Sync())
+		}
+		done, err := reclaimSegment(dir, name, info)
+		if err != nil {
+			return removed, false, errors.Join(err, dir.Sync())
+		}
+		if done {
+			removed += uint64(info.Size())
+		} else {
+			complete = false
+		}
+	}
+	return removed, complete, dir.Sync()
 }

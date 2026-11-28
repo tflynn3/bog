@@ -37,6 +37,12 @@ func serviceResponse(t *testing.T, resp *http.Response) []byte {
 
 func (c serviceClient) expect(t *testing.T, method, path, input string, code int) []byte {
 	t.Helper()
+	_, body := c.expectResponse(t, method, path, input, code)
+	return body
+}
+
+func (c serviceClient) expectResponse(t *testing.T, method, path, input string, code int) (http.Header, []byte) {
+	t.Helper()
 	req, err := http.NewRequest(method, c.base+path, strings.NewReader(input))
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +55,7 @@ func (c serviceClient) expect(t *testing.T, method, path, input string, code int
 	if resp.StatusCode != code {
 		t.Fatalf("%s %s = %d %s, want %d", method, path, resp.StatusCode, body, code)
 	}
-	return body
+	return resp.Header, body
 }
 
 func (c serviceClient) waitReady(t *testing.T, p *child) {

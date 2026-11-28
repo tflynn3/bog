@@ -44,7 +44,7 @@ func startChild(t *testing.T, binary, dir, addr, cwd string) *child {
 			}
 			select {
 			case <-p.done:
-			case <-time.After(10 * time.Second):
+			case <-time.After(5 * time.Second):
 				t.Error("reap timed out")
 			}
 		}
@@ -54,17 +54,25 @@ func startChild(t *testing.T, binary, dir, addr, cwd string) *child {
 
 func (p *child) stop(t *testing.T) {
 	t.Helper()
-	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
+	if err := p.signalAndWait(t, syscall.SIGTERM, 10*time.Second); err != nil {
+		t.Fatalf("SIGTERM: %v: %s", err, p.logs.String())
 	}
+}
+
+func (p *child) signalAndWait(t *testing.T, signal syscall.Signal, timeout time.Duration) error {
+	t.Helper()
+	if err := p.cmd.Process.Signal(signal); err != nil {
+		t.Fatalf("send %s: %v", signal, err)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case err := <-p.done:
 		p.reaped = true
-		if err != nil {
-			t.Fatalf("SIGTERM: %v: %s", err, p.logs.String())
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("exit timed out")
+		return err
+	case <-timer.C:
+		t.Fatalf("reap after %s timed out after %s", signal, timeout)
+		return nil
 	}
 }
 
@@ -173,6 +181,7 @@ func TestLifecycle(t *testing.T) {
 	empty(other)
 	start(dir, addr)
 	start(unsafe, addr)
+	t.Run("acknowledged_batch_crash", func(t *testing.T) { testAcknowledgedBatchCrash(t, binary) })
 	t.Run("drain", func(t *testing.T) { testShutdownDrainsInFlightIngest(t, binary) })
 	t.Run("ready_enospc", func(t *testing.T) { testReadyWithKernelENOSPC(t, binary, addr) })
 }

@@ -60,15 +60,20 @@ func (c *Catalog) retiredIndex(info os.FileInfo) int {
 // A shared segment or one with live readers remains eligible for a later call.
 // It is safe to call after Close, including while retired readers are draining.
 func (c *Catalog) Reclaim(ctx context.Context, path string) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) }, nil)
 }
 
 // ReclaimPinned is Reclaim using the caller's pinned directory.
 func (c *Catalog) ReclaimPinned(ctx context.Context, dir *os.File) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, nil)
 }
 
-func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error) {
+// ReclaimSelected protects the durable generation and all registered pins.
+func (c *Catalog) ReclaimSelected(ctx context.Context, dir *os.File, selected Selection) error {
+	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, &selected)
+}
+
+func (c *Catalog) reclaim(ctx context.Context, open directoryOpener, selected *Selection) (err error) {
 	c.replace.Lock()
 	defer c.replace.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -80,7 +85,7 @@ func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error)
 	}
 	defer func() { err = errors.Join(err, dir.Close()) }()
 	i := c.retiredIndex(info)
-	if i < 0 {
+	if i < 0 && selected == nil {
 		return nil
 	}
 	lock, err := checkpoint.LockPublication(dir, true)
@@ -88,11 +93,21 @@ func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error)
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	current, err := loadAt(ctx, dir)
+	var candidates map[string]os.FileInfo
+	if i >= 0 {
+		candidates = c.retired[i].segments
+	}
+	if len(candidates) == 0 {
+		return errors.Join(protectPinned(ctx, dir, nil, nil), dir.Sync())
+	}
+	var previous *generation
+	if selected != nil && c.current != nil && os.SameFile(info, c.current.dirInfo) {
+		previous = c.current
+	}
+	current, err := loadAt(ctx, dir, selected, previous)
 	if err != nil {
 		return err
 	}
-	candidates := c.retired[i].segments
 	protected := make(map[string]bool, len(current.segments))
 	for _, s := range current.segments {
 		if _, retired := candidates[s.name]; retired {
@@ -164,4 +179,65 @@ func reclaimSegment(dir *os.File, name string, expected os.FileInfo) (complete b
 		return false, err
 	}
 	return true, nil
+}
+
+// RegisterRetired restores the obsolete segment inventory after interruption.
+// The caller supplies a generation named by the durable transition journal.
+// Missing segments are expected if reclamation completed only in part.
+func (c *Catalog) RegisterRetired(ctx context.Context, dir *os.File, id GenerationID) (err error) {
+	c.replace.Lock()
+	defer c.replace.Unlock()
+	info, err := dir.Stat()
+	if err != nil {
+		return err
+	}
+	selected := Selection{ID: id}
+	m, _, err := readManifest(dir, &selected)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if c.current == nil {
+		return os.ErrClosed
+	}
+	current := make(map[string]bool, len(c.current.segments))
+	for _, s := range c.current.segments {
+		current[s.name] = true
+	}
+	index := c.retiredIndex(info)
+	var buf []byte
+	for _, entry := range m.Segments {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if current[entry.Name] {
+			continue
+		}
+		f, st, err := openRegular(dir, entry.Name)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		if cap(buf) < int(entry.Size) {
+			buf = make([]byte, entry.Size)
+		}
+		sum, _ := parseDigest(entry.SHA256)
+		s := segment{name: entry.Name, digest: sum, stat: st}
+		if err := s.readVerified(dir, buf[:entry.Size]); err != nil {
+			return err
+		}
+		if index < 0 {
+			index = len(c.retired)
+			c.retired = append(c.retired, retiredDirectory{info: info, segments: make(map[string]os.FileInfo)})
+		}
+		c.retired[index].segments[s.name] = s.stat
+	}
+	return nil
 }

@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"bog/internal/httpapi"
-	"bog/internal/store"
 	"bog/internal/wal"
 )
 
@@ -87,7 +86,7 @@ func TestRunClosesWALOnListenFailure(t *testing.T) {
 	if err := run(c); !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("listen error: %v", err)
 	}
-	w, err := wal.Open(dir, &store.Store{})
+	w, err := wal.LockDirectory(dir)
 	if err != nil {
 		t.Fatalf("reopen WAL: %v", err)
 	}

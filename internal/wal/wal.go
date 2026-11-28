@@ -4,11 +4,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"bog/internal/store"
@@ -28,19 +31,21 @@ type file interface {
 	Close() error
 }
 type Log struct {
-	mu        sync.Mutex
-	cond      *sync.Cond
-	queue     []*appendRequest
-	running   bool
-	f         file
-	s         *store.Store
-	offset    int64
-	committed captureBoundary // protected by mu after recovery
-	captures  *captureFile
-	poisoned  error
-	closed    bool
-	closeDone bool
-	closeErr  error
+	mu                          sync.Mutex
+	cond                        *sync.Cond
+	queue                       []*appendRequest
+	running                     bool
+	f                           file
+	s                           *store.Store
+	offset                      int64
+	committed                   captureBoundary // protected by mu after recovery
+	captures                    *captureFile
+	authority, pendingAuthority Authority
+	suffixHash                  hash.Hash
+	poisoned                    error
+	closed                      bool
+	closeDone                   bool
+	closeErr                    error
 
 	root            *os.Root
 	dir             *os.File
@@ -161,6 +166,9 @@ func (l *Log) run() {
 		outcome := newCommitOutcome(operation, err)
 		l.mu.Lock()
 		if err == nil {
+			if l.pendingAuthority.Revision != 0 {
+				l.authority, l.pendingAuthority = l.pendingAuthority, Authority{}
+			}
 			l.committed.end = l.offset
 			for _, req := range group {
 				l.committed.nextOrdinal += uint64(len(req.rows))
@@ -187,6 +195,22 @@ func (l *Log) run() {
 
 func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 	next := l.offset
+	ordinal := l.committed.nextOrdinal
+	for _, req := range group {
+		if int64(len(req.payload))+16 > math.MaxInt64-next || uint64(len(req.rows)) > math.MaxUint64-ordinal {
+			return "wal_bounds", errors.New("WAL append boundary overflow")
+		}
+		next += int64(len(req.payload)) + 16
+		ordinal += uint64(len(req.rows))
+	}
+	var digest hash.Hash
+	if l.suffixHash != nil {
+		cloned, err := l.suffixHash.(hash.Cloner).Clone()
+		if err != nil {
+			return "authority_preparation", err
+		}
+		digest = cloned
+	}
 	for _, req := range group {
 		var h [16]byte
 		n := uint32(len(req.payload))
@@ -200,13 +224,22 @@ func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 		if err := writeAll(l.f, req.payload); err != nil {
 			return "wal_write", l.rollback(err)
 		}
-		next += int64(len(h) + len(req.payload))
+		if digest != nil {
+			digest.Write(h[:])
+			digest.Write(req.payload)
+		}
 	}
 	if err := l.f.Sync(); err != nil {
 		return "wal_sync", l.rollback(err)
 	}
 	if l.root != nil {
-		operation, err := l.commit(next)
+		var operation string
+		var err error
+		if digest != nil {
+			operation, err = l.appendAuthority(next, group, digest)
+		} else {
+			operation, err = l.commit(next)
+		}
 		if err != nil {
 			if !errors.Is(err, ErrUncertain) {
 				err = l.rollback(err)
@@ -215,20 +248,22 @@ func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 		}
 	}
 	l.offset = next
-	for _, req := range group {
-		l.s.Publish(req.rows)
+	if l.s != nil {
+		for _, req := range group {
+			l.s.Publish(req.rows)
+		}
 	}
 	return "commit", nil
 }
 
 func (l *Log) rollback(cause error) error {
-	if err := l.f.Truncate(l.offset); err != nil {
+	if err := l.f.Truncate(l.offset - l.authority.Base); err != nil {
 		return errors.Join(ErrUncertain, cause, fmt.Errorf("truncate WAL: %w", err))
 	}
 	if err := l.f.Sync(); err != nil {
 		return errors.Join(ErrUncertain, cause, fmt.Errorf("sync truncated WAL: %w", err))
 	}
-	if _, err := l.f.Seek(l.offset, io.SeekStart); err != nil {
+	if _, err := l.f.Seek(l.offset-l.authority.Base, io.SeekStart); err != nil {
 		return errors.Join(ErrUncertain, cause, fmt.Errorf("seek truncated WAL: %w", err))
 	}
 	return cause
@@ -252,15 +287,20 @@ func (l *Log) Close() error {
 	}
 	l.mu.Unlock()
 
-	err := l.f.Close()
+	var err error
+	if l.f != nil {
+		err = l.f.Close()
+	}
 	if l.captures != nil {
 		err = errors.Join(err, l.captures.release())
 	}
-	if l.dir != nil {
-		err = errors.Join(err, l.dir.Close())
-	}
 	if l.root != nil {
 		err = errors.Join(err, l.root.Close())
+	}
+	if l.dir != nil {
+		// Release after draining and closing storage. A concurrent fork can
+		// transiently retain an inherited CLOEXEC reference after Close.
+		err = errors.Join(err, syscall.Flock(int(l.dir.Fd()), syscall.LOCK_UN), l.dir.Close())
 	}
 	l.mu.Lock()
 	l.closeErr = err

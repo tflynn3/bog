@@ -27,16 +27,17 @@ type captureBoundary struct {
 type captureFile struct {
 	f        *os.File
 	identity FileIdentity
+	base     int64
 	mu       sync.Mutex
 	refs     int
 }
 
-func openCaptureFile(dir, writer *os.File) (*captureFile, error) {
+func openCaptureFile(dir, writer *os.File, name string, base int64) (*captureFile, error) {
 	written, err := writer.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("stat WAL writer: %w", err)
 	}
-	f, err := openRegular(dir, walName, os.O_RDONLY)
+	f, err := openRegular(dir, name, os.O_RDONLY)
 	if err != nil {
 		return nil, fmt.Errorf("open WAL capture reader: %w", err)
 	}
@@ -48,7 +49,7 @@ func openCaptureFile(dir, writer *os.File) (*captureFile, error) {
 		return nil, errors.Join(errors.New("WAL identity changed during open"), f.Close())
 	}
 	st := readable.Sys().(*syscall.Stat_t) // checked by openRegular on this file
-	return &captureFile{f: f, identity: FileIdentity{uint64(st.Dev), st.Ino}, refs: 1}, nil
+	return &captureFile{f: f, identity: FileIdentity{uint64(st.Dev), st.Ino}, base: base, refs: 1}, nil
 }
 
 func (f *captureFile) release() error {
@@ -80,29 +81,37 @@ type captureLease struct {
 // Capture selects the latest fully published group without waiting for WAL or
 // store I/O. Once acquired, the caller owns the pin and must call Release.
 func (l *Log) Capture(ctx context.Context) (*Capture, error) {
+	c, _, err := l.CaptureSelected(ctx)
+	return c, err
+}
+
+// CaptureSelected acquires the active file, committed bounds and authority
+// under the same WAL owner synchronization.
+func (l *Log) CaptureSelected(ctx context.Context) (*Capture, Authority, error) {
 	l.mu.Lock()
 	if err := ctx.Err(); err != nil {
 		l.mu.Unlock()
-		return nil, err
+		return nil, Authority{}, err
 	}
 	if err := l.admissionError(); err != nil {
 		l.mu.Unlock()
-		return nil, err
+		return nil, Authority{}, err
 	}
 	f := l.captures
 	if f == nil {
 		l.mu.Unlock()
-		return nil, os.ErrClosed
+		return nil, Authority{}, os.ErrClosed
 	}
 	f.mu.Lock()
 	f.refs++
 	f.mu.Unlock()
 	c := &Capture{lease: &captureLease{file: f, boundary: l.committed}}
+	a := l.authority
 	l.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return nil, errors.Join(err, c.Release())
+		return nil, Authority{}, errors.Join(err, c.Release())
 	}
-	return c, nil
+	return c, a, nil
 }
 
 // Identity returns the identity of the pinned file.
@@ -128,7 +137,7 @@ func (c *Capture) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, fmt.Errorf("WAL capture offset %d: %w", off, os.ErrInvalid)
 	}
 	end := c.CommittedEnd()
-	if off > end || off == end && len(p) != 0 {
+	if off < f.base || off > end || off == end && len(p) != 0 {
 		f.mu.Unlock()
 		return 0, io.EOF
 	}
@@ -145,13 +154,13 @@ func (c *Capture) ReadAt(p []byte, off int64) (n int, err error) {
 	}()
 
 	if remaining := end - off; int64(len(p)) > remaining {
-		n, err := f.f.ReadAt(p[:remaining], off)
+		n, err := f.f.ReadAt(p[:remaining], off-f.base)
 		if err == nil {
 			err = io.EOF
 		}
 		return n, err
 	}
-	return f.f.ReadAt(p, off)
+	return f.f.ReadAt(p, off-f.base)
 }
 
 // Release surrenders the pin. Reads already admitted can finish.

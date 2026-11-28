@@ -3,7 +3,9 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
+	"time"
 
 	"bog/internal/store"
 )
@@ -70,14 +72,7 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	}
 	response := a.newQueryResponse()
 	defer response.release()
-	req := PageRequest{Filter: params.filter, Limit: params.limit}
-	if err := a.withPage(ctx, req, work, func(result PageResult) error {
-		if len(result.Rows) > params.limit {
-			return errPageSourceContract
-		}
-		_, err := response.appendRows(result.Rows, work)
-		return err
-	}); err != nil {
+	if err := a.prepareOrdinary(ctx, params, &response, work); err != nil {
 		response.release()
 		writeQueryError(w, err)
 		return
@@ -88,6 +83,29 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.write(w, "")
+}
+
+func (a *API) prepareOrdinary(ctx context.Context, params queryParams, response *queryResponse, work *store.QueryWork) error {
+	if _, ok := a.captures.source.(ChunkedOrdinarySource); ok {
+		capture := queryCapture{deadline: time.Now().Add(queryCaptureLifetime)}
+		_, _, err := a.prepareRetainedPage(ctx, &capture, params, response, work)
+		if capture.sourceID != "" {
+			releaseErr := a.captures.source.Release(capture.sourceID)
+			if releaseErr != nil {
+				log.Printf("release ordinary query snapshot: %v", releaseErr)
+			}
+			err = errors.Join(err, releaseErr)
+		}
+		return err
+	}
+	req := PageRequest{Filter: params.filter, Limit: params.limit}
+	return a.withPage(ctx, req, work, func(result PageResult) error {
+		if len(result.Rows) > params.limit {
+			return errPageSourceContract
+		}
+		_, err := response.appendRows(result.Rows, work)
+		return err
+	})
 }
 
 func (a *API) openQuery(w http.ResponseWriter, ctx context.Context, params queryParams, work *store.QueryWork) {

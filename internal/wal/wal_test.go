@@ -1064,7 +1064,7 @@ func TestReplayBufferedBoundaries(t *testing.T) {
 	defer f.Close()
 	l := &Log{f: f}
 	builder := store.NewRecoveryBuilder()
-	if err := l.replay(int64(len(data)), builder); err != nil {
+	if _, err := l.replay(int64(len(data)), func(_, _ int64, rows []store.Row) error { builder.Add(rows); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	s := &store.Store{}
@@ -1094,7 +1094,7 @@ func TestReplayBufferedReadAheadBound(t *testing.T) {
 	defer f.Close()
 	counted := &countedReplayFile{File: f}
 	l := &Log{f: counted}
-	if err := l.replay(int64(end), store.NewRecoveryBuilder()); err != nil {
+	if _, err := l.replay(int64(end), nil); err != nil {
 		t.Fatal(err)
 	}
 	if counted.bytes != end || counted.reads >= frames {

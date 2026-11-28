@@ -107,3 +107,65 @@ func (r *Replacement) install(ctx context.Context, open directoryOpener) (_ Gene
 	}
 	return next.info, err
 }
+
+// PreparedGeneration owns a validated pin until activation or close.
+// The caller holds the exclusive publication lock during preparation.
+type PreparedGeneration struct {
+	catalog *Catalog
+	next    *generation
+}
+
+func (r *Replacement) PrepareSelected(ctx context.Context, dir *os.File, id GenerationID) (*PreparedGeneration, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.catalog == nil {
+		return nil, os.ErrClosed
+	}
+	opened, info, err := openPinnedDirectory(dir)
+	if err != nil {
+		return nil, err
+	}
+	next, _, err := loadAuthority(ctx, opened, checkpoint.GenerationManifestName(id))
+	if err != nil {
+		return nil, errors.Join(err, opened.Close())
+	}
+	next.dirInfo = info
+	if err := next.registerPin(ctx); err != nil {
+		return nil, errors.Join(err, opened.Close())
+	}
+	next.refs.Store(1)
+	next.charge = r.charge
+	prepared := &PreparedGeneration{catalog: r.catalog, next: next}
+	r.catalog, r.charge = nil, nil
+	return prepared, nil
+}
+
+// Activate transfers the pin to the catalog. The owner calls this only after
+// durable selection, while capture acquisition is excluded.
+func (p *PreparedGeneration) Activate() (Generation, error) {
+	c, next := p.catalog, p.next
+	c.replace.Lock()
+	defer c.replace.Unlock()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return Generation{}, os.ErrClosed
+	}
+	prev := c.current
+	c.current, p.next = next, nil
+	c.mu.Unlock()
+	if prev != nil {
+		c.trackSuperseded(prev, next)
+		return next.info, prev.release()
+	}
+	return next.info, nil
+}
+
+func (p *PreparedGeneration) Close() error {
+	if p.next == nil {
+		return nil
+	}
+	next := p.next
+	p.next = nil
+	return next.release()
+}

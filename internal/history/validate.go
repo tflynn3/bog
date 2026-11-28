@@ -9,7 +9,7 @@ import (
 	"unicode/utf8"
 )
 
-func (g *generation) validate(ctx context.Context, m manifest, buf []byte) error {
+func (g *generation) validate(ctx context.Context, m manifest, buf []byte, streaming bool) error {
 	// Each v1 publisher run normally covers a contiguous append interval.
 	// Reuse this bitmap to prove contiguity even when timestamps are shuffled.
 	localBits := make([]byte, (len(buf)/rowHeaderSize+7)/8)
@@ -20,7 +20,7 @@ func (g *generation) validate(ctx context.Context, m manifest, buf []byte) error
 		}
 		s := &g.segments[i]
 		b := buf[:int(m.Segments[i].Size)]
-		if err := s.readVerified(g.dir, b); err != nil {
+		if err := s.readVerified(g.dir, b, streaming); err != nil {
 			return err
 		}
 		count, err := s.index(b, m.NextOrdinal)
@@ -43,7 +43,7 @@ func (g *generation) validate(ctx context.Context, m manifest, buf []byte) error
 	if total != m.NextOrdinal {
 		return fmt.Errorf("%w: checkpoint row count differs from manifest", ErrIntegrity)
 	}
-	return g.validateOrdinals(ctx, buf, total)
+	return g.validateOrdinals(ctx, buf, total, streaming)
 }
 
 func (s *segment) index(b []byte, nextOrdinal uint64) (int, error) {
@@ -106,7 +106,7 @@ func markOrdinal(bits []byte, ordinal uint64) bool {
 
 const ordinalsPerPage = 1 << 24 // 2 MiB bitmap, independent of history length.
 
-func (g *generation) validateOrdinals(ctx context.Context, buf []byte, total uint64) error {
+func (g *generation) validateOrdinals(ctx context.Context, buf []byte, total uint64, streaming bool) error {
 	byOrdinal := make([]*segment, len(g.segments))
 	for i := range g.segments {
 		byOrdinal[i] = &g.segments[i]
@@ -115,7 +115,7 @@ func (g *generation) validateOrdinals(ctx context.Context, buf []byte, total uin
 	var next uint64
 	for _, s := range byOrdinal {
 		if !s.dense || s.first != next {
-			return g.validateOrdinalPages(ctx, buf, total, byOrdinal)
+			return g.validateOrdinalPages(ctx, buf, total, byOrdinal, streaming)
 		}
 		next = s.last + 1
 	}
@@ -125,7 +125,7 @@ func (g *generation) validateOrdinals(ctx context.Context, buf []byte, total uin
 // v1 also permits runs with noncontiguous append ordinals. Validate these
 // exactly using bounded ordinal windows and reread only sparse runs intersecting
 // each window. Since the overall count is known, uniqueness implies coverage.
-func (g *generation) validateOrdinalPages(ctx context.Context, buf []byte, total uint64, ordered []*segment) error {
+func (g *generation) validateOrdinalPages(ctx context.Context, buf []byte, total uint64, ordered []*segment, streaming bool) error {
 	bits := make([]byte, (min(total, ordinalsPerPage)+7)/8)
 	for lo := uint64(0); lo < total; lo += ordinalsPerPage {
 		clear(bits)
@@ -149,7 +149,7 @@ func (g *generation) validateOrdinalPages(ctx context.Context, buf []byte, total
 				continue
 			}
 			b := buf[:int(s.stat.Size())]
-			if err := s.readVerified(g.dir, b); err != nil {
+			if err := s.readVerified(g.dir, b, streaming); err != nil {
 				return err
 			}
 			for p := headerSize; p < len(b); p = nextRow(b, p) {

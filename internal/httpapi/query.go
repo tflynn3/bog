@@ -68,16 +68,19 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		a.openQuery(w, ctx, params, work)
 		return
 	}
+	var capture *queryCapture
+	if source, ok := a.captures.source.(PageSourceOrdinaryCapture); ok && source.OrdinaryQueriesMayCapture() {
+		capture, err = a.captures.reserve(a.initResources().captures)
+		if err != nil {
+			writeQueryError(w, err)
+			return
+		}
+		defer a.captures.done(capture, true)
+	}
 	response := a.newQueryResponse()
 	defer response.release()
 	req := PageRequest{Filter: params.filter, Limit: params.limit}
-	if err := a.withPage(ctx, req, work, func(result PageResult) error {
-		if len(result.Rows) > params.limit {
-			return errPageSourceContract
-		}
-		_, err := response.appendRows(result.Rows, work)
-		return err
-	}); err != nil {
+	if err := a.prepareOrdinary(ctx, req, capture, &response, work); err != nil {
 		response.release()
 		writeQueryError(w, err)
 		return
@@ -125,4 +128,45 @@ func (a *API) openQuery(w http.ResponseWriter, ctx context.Context, params query
 		return
 	}
 	response.writeOpening(w, token, &cursorMayHaveReached)
+}
+
+// Ordinary queries can fill a response with bounded scans of one capture.
+func (a *API) prepareOrdinary(ctx context.Context, req PageRequest, capture *queryCapture, response *queryResponse, work *store.QueryWork) error {
+	for req.Limit > 0 {
+		var more bool
+		if err := a.withPage(ctx, req, work, func(result PageResult) error {
+			if req.Capture == "" {
+				req.Capture = result.Capture
+				if result.Capture != "" {
+					if capture == nil {
+						return errors.Join(errPageSourceContract, a.captures.source.Release(result.Capture))
+					}
+					capture.sourceID = result.Capture
+				}
+			}
+			if len(result.Rows) > req.Limit || (result.Capture != "" && result.Capture != req.Capture) {
+				return errPageSourceContract
+			}
+			n, err := response.appendRows(result.Rows, work)
+			if err != nil {
+				return err
+			}
+			req.Limit -= n
+			more = result.More && n == len(result.Rows) && req.Limit > 0
+			if more {
+				if n == 0 || !validOpaque(req.Capture) || !validOpaque(string(result.Rows[n-1].Position)) ||
+					req.After == result.Rows[n-1].Position {
+					return errPageSourceContract
+				}
+				req.After = result.Rows[n-1].Position
+			}
+			return nil
+		}); err != nil || !more {
+			return err
+		}
+		if err := work.Charge(1); err != nil {
+			return err
+		}
+	}
+	return nil
 }

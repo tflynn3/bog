@@ -15,6 +15,7 @@ const (
 	ReplayTailBytes
 	PinnedGenerations
 	LiveCaptures
+	CaptureBytes
 	resourceCount
 )
 
@@ -28,6 +29,8 @@ func (r Resource) String() string {
 		return "pinned generations"
 	case LiveCaptures:
 		return "live captures"
+	case CaptureBytes:
+		return "capture bytes"
 	default:
 		return "unknown resource"
 	}

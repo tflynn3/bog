@@ -74,7 +74,10 @@ func writeManifest(t testing.TB, dir string, m manifest) {
 	t.Helper()
 	p, err := json.Marshal(m)
 	requireOK(t, err)
-	b, err := json.Marshal(envelope{Payload: p, SHA256: hashText(p)})
+	b, err := json.Marshal(struct {
+		Payload json.RawMessage `json:"payload"`
+		SHA256  string          `json:"sha256"`
+	}{Payload: p, SHA256: hashText(p)})
 	requireOK(t, err)
 	writeFile(t, filepath.Join(dir, manifestName), b)
 }

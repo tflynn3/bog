@@ -62,11 +62,19 @@ func statOpenDirectory(dir *os.File, fs *syscall.Statfs_t) error {
 	if err != nil {
 		return err
 	}
-	var statErr error
-	if err := conn.Control(func(fd uintptr) { statErr = syscall.Fstatfs(int(fd), fs) }); err != nil {
+	// Only the duplicate is held during the filesystem call. The
+	// caller can close its handle without waiting on a stalled sample.
+	var dup uintptr
+	var dupErr syscall.Errno
+	if err := conn.Control(func(fd uintptr) {
+		dup, _, dupErr = syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_DUPFD_CLOEXEC, 0)
+	}); err != nil {
 		return err
 	}
-	return statErr
+	if dupErr != 0 {
+		return syscall.Errno(dupErr)
+	}
+	return errors.Join(syscall.Fstatfs(int(dup), fs), syscall.Close(int(dup)))
 }
 
 func hasHeadroom(fs syscall.Statfs_t) bool {

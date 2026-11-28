@@ -56,6 +56,15 @@ func (b *Budget) ReplayCapturedTail(ctx context.Context, input io.ReaderAt, star
 	return tail, nil
 }
 
+// ScanFrames validates a logical range with one frame of scratch. The input
+// starts at start. Use this for streaming migration of a full legacy WAL.
+func ScanFrames(ctx context.Context, input io.Reader, start, end int64, first uint64, visit func(int64, int64, uint64, []store.Row) error) error {
+	if start < 8 || end < start {
+		return fmt.Errorf("%w: invalid scan range", ErrIntegrity)
+	}
+	return scanFrames(ctx, input, start, end, first, visit)
+}
+
 // scanCapturedFrames reads an owner-pinned suffix at absolute WAL offsets.
 // It never reads the omitted prefix of a restored WAL.
 func scanCapturedFrames(ctx context.Context, input io.ReaderAt, pos, end int64, ordinal uint64, visit func(int64, int64, uint64, []store.Row) error) error {

@@ -504,6 +504,9 @@ func waitTailParityObservation(ctx context.Context, label string, observe func(c
 	for ctx.Err() == nil {
 		done, err := observe(ctx)
 		if err != nil {
+			if canceled := ctx.Err(); canceled != nil && errors.Is(err, canceled) {
+				break
+			}
 			return fmt.Errorf("observe %s: %w", label, err)
 		}
 		if done && ctx.Err() == nil {
@@ -677,6 +680,15 @@ func TestTailParityRetirementAndReclamation(t *testing.T) {
 			}
 			old := storage("old-manifest", "old-tail", "old-block")
 			active := storage("new-manifest", "new-tail", "new-block")
+			// Keep fixture inode numbers allocated outside the scanned tree.
+			// Parallel tests in this process can otherwise open a reused inode
+			// and be misidentified as holding a predecessor descriptor.
+			inodes := t.TempDir()
+			for _, name := range []string{old.manifest, old.tail, "old-block"} {
+				if err := os.Link(filepath.Join(dir, name), filepath.Join(inodes, name)); err != nil {
+					t.Fatal(err)
+				}
+			}
 			writeFixture(t, filepath.Join(dir, attempt), nil)
 			if tc.early {
 				removeTailFixture(t, dir, old.tail)

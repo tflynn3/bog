@@ -74,3 +74,11 @@ func (s *PositionedMatches) At(offset int) PositionedRow {
 	row := s.rows[ordinal]
 	return PositionedRow{row, TailPosition{row.TS.UTC(), uint64(ordinal)}}
 }
+
+// CaptureDetachedPositionedSnapshot copies the row headers so the capture
+// retains only strings in its published prefix, even as the store appends.
+func (s *Store) CaptureDetachedPositionedSnapshot() *PositionedSnapshot {
+	view := s.queryView()
+	view.rows = append([]Row(nil), view.rows...)
+	return &PositionedSnapshot{view: view}
+}

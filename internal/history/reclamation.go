@@ -60,19 +60,30 @@ func (c *Catalog) retiredIndex(info os.FileInfo) int {
 // A shared segment or one with live readers remains eligible for a later call.
 // It is safe to call after Close, including while retired readers are draining.
 func (c *Catalog) Reclaim(ctx context.Context, path string) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
+	return c.reclaim(ctx, manifestName, func() (*os.File, os.FileInfo, error) { return openDirectory(path) })
 }
 
 // ReclaimPinned is Reclaim using the caller's pinned directory.
 func (c *Catalog) ReclaimPinned(ctx context.Context, dir *os.File) error {
-	return c.reclaim(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+	return c.reclaim(ctx, manifestName, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
 }
 
-func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error) {
+// ReclaimSelectedPinned reclaims retired segments against the owner's durable
+// selection. The command serializes this with generation replacement.
+func (c *Catalog) ReclaimSelectedPinned(ctx context.Context, dir *os.File, id GenerationID) error {
+	return c.reclaim(ctx, checkpoint.GenerationManifestName(id), func() (*os.File, os.FileInfo, error) {
+		return openPinnedDirectory(dir)
+	})
+}
+
+func (c *Catalog) reclaim(ctx context.Context, name string, open directoryOpener) (err error) {
 	c.replace.Lock()
 	defer c.replace.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if len(c.retired) == 0 {
+		return nil
 	}
 	dir, info, err := open()
 	if err != nil {
@@ -88,15 +99,18 @@ func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error)
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	current, err := loadAt(ctx, dir)
+	if err := checkpoint.CheckPublication(dir); err != nil {
+		return err
+	}
+	current, _, err := readManifest(dir, name)
 	if err != nil {
 		return err
 	}
 	candidates := c.retired[i].segments
-	protected := make(map[string]bool, len(current.segments))
-	for _, s := range current.segments {
-		if _, retired := candidates[s.name]; retired {
-			protected[s.name] = true
+	protected := make(map[string]bool, len(current.Segments))
+	for _, s := range current.Segments {
+		if _, retired := candidates[s.Name]; retired {
+			protected[s.Name] = true
 		}
 	}
 	if err := protectPinned(ctx, dir, candidates, protected); err != nil {

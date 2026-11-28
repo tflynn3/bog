@@ -51,7 +51,17 @@ func (r *Reader) Scan(ctx context.Context, q Query, visit func(checkpoint.BlockR
 // eligible for literal matching. This includes nonmatches and any lookahead
 // the visitor requests by continuing the scan. A nil meter allows unlimited
 // work. On error, the caller decides whether to discard rows already visited.
-func (r *Reader) ScanWithWork(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error, work *store.QueryWork) (err error) {
+func (r *Reader) ScanWithWork(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error, work *store.QueryWork) error {
+	if visit == nil {
+		return r.ScanBytesWithWork(ctx, q, nil, work)
+	}
+	return r.ScanBytesWithWork(ctx, q, func(pos Position, line []byte) error {
+		return visit(checkpoint.BlockRow{Row: store.Row{TS: pos.Time, Line: string(line)}, Ordinal: pos.Ordinal})
+	}, work)
+}
+
+// ScanBytesWithWork borrows a matching line for the duration of its callback.
+func (r *Reader) ScanBytesWithWork(ctx context.Context, q Query, visit func(Position, []byte) error, work *store.QueryWork) (err error) {
 	r.mu.Lock()
 	if !r.deadline.IsZero() && !time.Now().Before(r.deadline) {
 		r.mu.Unlock()
@@ -91,7 +101,7 @@ func (r *Reader) ScanWithWork(ctx context.Context, q Query, visit func(checkpoin
 	return g.scan(ctx, q, visit, work)
 }
 
-func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.BlockRow) error, work *store.QueryWork) error {
+func (g *generation) scan(ctx context.Context, q Query, visit func(Position, []byte) error, work *store.QueryWork) error {
 	lower := Position{Time: q.Start.UTC()}
 	strict := false
 	if q.After != nil {
@@ -147,8 +157,7 @@ func (g *generation) scan(ctx context.Context, q Query, visit func(checkpoint.Bl
 			return err
 		}
 		if bytes.Contains(line, needle) {
-			row := checkpoint.BlockRow{Row: store.Row{TS: c.key.Time, Line: string(line)}, Ordinal: c.key.Ordinal}
-			if err := visit(row); err != nil {
+			if err := visit(c.key, line); err != nil {
 				return err
 			}
 		}
@@ -243,7 +252,7 @@ func (c *cursor) line(dir *os.File, overflow *[]byte) ([]byte, error) {
 	} else {
 		n := int(c.lineLen)
 		if cap(*overflow) < n {
-			*overflow = make([]byte, n)
+			*overflow = make([]byte, n, min(checkpoint.MaxBlockSize, max(n, 2*cap(*overflow))))
 		}
 		b = (*overflow)[:n]
 		if err := c.seg.readAt(dir, b, offset); err != nil {

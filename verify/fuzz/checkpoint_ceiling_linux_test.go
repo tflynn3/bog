@@ -36,7 +36,7 @@ const (
 
 func TestCheckpointSegmentCeiling(t *testing.T) {
 	if os.Getenv(ceilingWorkerEnv) == ceilingSeed {
-		setWorkerLimits(t)
+		setRetainedWorkerLimits(t)
 		runCheckpointCeiling(t)
 		return
 	}

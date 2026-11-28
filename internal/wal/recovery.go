@@ -26,6 +26,50 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if s == nil {
 		return nil, errors.New("WAL requires a store")
 	}
+	l, err := lockDirectory(dir)
+	if err != nil {
+		return nil, err
+	}
+	l.s = s
+	root, d := l.root, l.dir
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, d.Close(), root.Close())
+		}
+	}()
+	if err := rejectRestoreImage(root); err != nil {
+		return nil, err
+	}
+	f, err := l.openWAL()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, f.Close())
+		}
+	}()
+	// Keep the inode lock for compatibility with existing owners.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil, fmt.Errorf("lock WAL: %w", err)
+	}
+	l.captures, err = openCaptureFile(d, f)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, l.captures.release())
+		}
+	}()
+	l.f = f
+	if err := l.recover(); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+func lockDirectory(dir string) (_ *Log, err error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
@@ -57,43 +101,13 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("lock data directory: %w", err)
 	}
-	if err := rejectRestoreImage(root); err != nil {
-		return nil, err
-	}
-	l := &Log{s: s, root: root, dir: d, syncDir: d.Sync}
-	f, err := l.openWAL()
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, f.Close())
-		}
-	}()
-	// Keep the inode lock for compatibility with existing owners.
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil, fmt.Errorf("lock WAL: %w", err)
-	}
-	l.captures, err = openCaptureFile(d, f)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, l.captures.release())
-		}
-	}()
-	l.f = f
-	if err := l.recover(); err != nil {
-		return nil, err
-	}
-	return l, nil
+	return &Log{root: root, dir: d, syncDir: d.Sync}, nil
 }
 
 func rejectRestoreImage(root *os.Root) error {
-	// These names are reserved by the v1 backup format. A checkpoint alone
-	// can coexist with a complete legacy WAL and is not a restore indicator.
-	for _, name := range []string{"bog.backup", "bog.wal.tail"} {
+	// A checkpoint alone may coexist with a complete legacy WAL. A restore
+	// or a writable selector requires the retained command's recovery path.
+	for _, name := range []string{"bog.backup", "bog.wal.tail", "bog.authority"} {
 		if _, err := root.Lstat(name); err == nil {
 			return fmt.Errorf("found %s: backup/restore image requires checkpoint-aware recovery; use a restore-capable Bog reader", name)
 		} else if !errors.Is(err, os.ErrNotExist) {

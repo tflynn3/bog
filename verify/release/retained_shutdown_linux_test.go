@@ -187,8 +187,14 @@ func verifyRetainedShutdown(ctx context.Context, binary, dir string, client *htt
 	if err := checkIdentity(); err != nil {
 		return err
 	}
-	err = serveDirectory(ctx, binary, dir, client, flags, func(ctx context.Context, base string) error {
-		pager, err := newReleasePager(base, client, shutdownPageCap)
+	// Serialize the replay on one keep-alive connection. A client on a
+	// second socket can receive all bytes before the previous handler
+	// returns its single query slot.
+	replayTransport := &http.Transport{MaxConnsPerHost: 1}
+	defer replayTransport.CloseIdleConnections()
+	replayClient := &http.Client{Transport: replayTransport, Timeout: client.Timeout, CheckRedirect: client.CheckRedirect}
+	err = serveDirectory(ctx, binary, dir, replayClient, flags, func(ctx context.Context, base string) error {
+		pager, err := newReleasePager(base, replayClient, shutdownPageCap)
 		if err != nil {
 			return err
 		}
@@ -419,6 +425,11 @@ func awaitShutdownListenerClosed(ctx context.Context, addr string) error {
 			if errors.Is(err, syscall.ECONNREFUSED) {
 				return true, nil
 			}
+			// Closing the listener can reset a connection already in its
+			// backlog. Keep polling until a new connection is refused.
+			if errors.Is(err, syscall.ECONNRESET) {
+				return false, nil
+			}
 			return false, err
 		}
 		return false, conn.Close()
@@ -608,6 +619,18 @@ func TestReapedShutdownStorage(t *testing.T) {
 				if err := root.Rename("old-tail", "stage/tail"); err != nil {
 					t.Fatal(err)
 				}
+			}
+			// Hold predecessor inodes so a filesystem cannot reuse a
+			// retired identity for a replacement created by this fixture.
+			for _, name := range retired {
+				f, err := root.Open(name)
+				if err != nil && tc.move && name == "old-tail" {
+					f, err = root.Open("stage/tail")
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { closeTailFixture(t, f) })
 			}
 			for _, name := range retired {
 				if name != tc.keep && !(tc.move && name == "old-tail") {

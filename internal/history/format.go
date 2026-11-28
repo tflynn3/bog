@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -37,11 +36,6 @@ var (
 	maxTime  = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
 )
 
-type envelope struct {
-	Payload json.RawMessage `json:"payload"`
-	SHA256  string          `json:"sha256"`
-}
-
 type manifest = checkpoint.Manifest
 type segmentMeta = checkpoint.Segment
 
@@ -51,11 +45,12 @@ type seekPoint struct {
 }
 
 type segment struct {
-	name   string
-	digest [sha256.Size]byte
-	stat   os.FileInfo
-	lo, hi time.Time // Inclusive verified timestamp bounds.
-	points []seekPoint
+	name         string
+	digest       [sha256.Size]byte
+	stat         os.FileInfo
+	lo, hi       time.Time // Inclusive verified timestamp bounds.
+	points       []seekPoint
+	maxLineBytes int
 
 	// Used only while verifying that the manifest covers each ordinal once.
 	first, last uint64 // Inclusive ordinal bounds.
@@ -71,8 +66,8 @@ func parseDigest(s string) ([sha256.Size]byte, bool) {
 	return sum, err == nil
 }
 
-func readManifest(dir *os.File) (_ manifest, _ GenerationID, err error) {
-	f, info, err := openRegular(dir, manifestName)
+func readManifest(dir *os.File, name string) (_ manifest, _ GenerationID, err error) {
+	f, info, err := openRegular(dir, name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return manifest{}, GenerationID{}, err
@@ -90,24 +85,11 @@ func readManifest(dir *os.File) (_ manifest, _ GenerationID, err error) {
 	if int64(len(b)) != info.Size() {
 		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest size changed", ErrIntegrity)
 	}
-	var env envelope
-	if err := json.Unmarshal(b, &env); err != nil {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest envelope: %v", ErrIntegrity, err)
+	m, id, err := checkpoint.DecodeManifest(b)
+	if err != nil {
+		return manifest{}, GenerationID{}, errors.Join(ErrIntegrity, err)
 	}
-	id := sha256.Sum256(env.Payload)
-	if want, ok := parseDigest(env.SHA256); !ok || want != id {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest checksum", ErrIntegrity)
-	}
-	var m manifest
-	if err := json.Unmarshal(env.Payload, &m); err != nil {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest payload: %v", ErrIntegrity, err)
-	}
-	empty := m.NextOrdinal == 0 && m.CoveredOffset == int64(walMagicSize)
-	populated := m.NextOrdinal > 0 && m.CoveredOffset >= int64(minWALEnd)
-	if m.Version != version || len(m.Segments) > checkpoint.MaxSegments || !(empty || populated) {
-		return manifest{}, GenerationID{}, fmt.Errorf("%w: manifest version, segment count or boundary", ErrIntegrity)
-	}
-	return m, id, nil
+	return *m, id, nil
 }
 
 func openRegular(dir *os.File, name string) (*os.File, os.FileInfo, error) {
@@ -171,7 +153,7 @@ func loadAt(ctx context.Context, dir *os.File) (*generation, error) {
 	if err := checkpoint.CheckPublication(dir); err != nil {
 		return nil, err
 	}
-	g, _, err := loadAuthority(ctx, dir)
+	g, _, err := loadAuthority(ctx, dir, nil)
 	return g, err
 }
 
@@ -182,26 +164,30 @@ func ValidatePinnedAuthority(ctx context.Context, dir *os.File) (*checkpoint.Man
 	if dir == nil {
 		return nil, errors.New("missing pinned history directory")
 	}
-	_, m, err := loadAuthority(ctx, dir)
+	_, m, err := loadAuthority(ctx, dir, nil)
 	return m, err
 }
 
-func loadAuthority(ctx context.Context, dir *os.File) (*generation, *checkpoint.Manifest, error) {
+func loadAuthority(ctx context.Context, dir *os.File, selected *GenerationID) (*generation, *checkpoint.Manifest, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	m, id, err := readManifest(dir)
+	name := manifestName
+	if selected != nil {
+		name = checkpoint.GenerationManifestName(*selected)
+	}
+	m, id, err := readManifest(dir, name)
 	if err != nil {
 		return nil, nil, err
 	}
-	source, ok := parseDigest(m.SourceSHA256)
-	if !ok {
-		return nil, nil, fmt.Errorf("%w: invalid WAL prefix checksum", ErrIntegrity)
+	if selected != nil && id != *selected {
+		return nil, nil, fmt.Errorf("%w: selected manifest digest differs", ErrIntegrity)
 	}
+	source, _ := parseDigest(m.SourceSHA256)
 	g := &generation{dir: dir, drained: make(chan struct{}), segments: make([]segment, len(m.Segments))}
 	g.info = Generation{
 		ID: id, Boundary: Boundary{SourceSHA256: source, CoveredOffset: m.CoveredOffset, NextOrdinal: m.NextOrdinal},
-		Drained: g.drained,
+		Drained: g.drained, Segments: len(m.Segments),
 	}
 	seen := make(map[string]bool, len(m.Segments))
 	var maxRows uint64

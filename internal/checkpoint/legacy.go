@@ -19,9 +19,10 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // Legacy is a read-only, exclusively locked view of a stopped legacy WAL and
 // its commit marker. Close it before starting a writer on the same directory.
 type Legacy struct {
-	root     *os.Root
-	dir, wal *os.File
-	end      int64
+	root                 *os.Root
+	dir, wal             *os.File
+	end                  int64
+	dirLocked, walLocked bool
 
 	mu        sync.Mutex
 	active    sync.WaitGroup
@@ -65,6 +66,7 @@ func OpenLegacy(path string) (_ *Legacy, err error) {
 	if err = syscall.Flock(int(l.dir.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, err
 	}
+	l.dirLocked = true
 	l.wal, err = l.openFile("bog.wal")
 	if err != nil {
 		return nil, err
@@ -72,6 +74,7 @@ func OpenLegacy(path string) (_ *Legacy, err error) {
 	if err = syscall.Flock(int(l.wal.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, err
 	}
+	l.walLocked = true
 	info, err = l.wal.Stat()
 	if err != nil {
 		return nil, err
@@ -228,12 +231,18 @@ func (l *Legacy) Close() error {
 
 	l.active.Wait()
 	if l.wal != nil {
-		l.closeErr = l.wal.Close()
+		if l.walLocked {
+			l.closeErr = syscall.Flock(int(l.wal.Fd()), syscall.LOCK_UN)
+		}
+		l.closeErr = errors.Join(l.closeErr, l.wal.Close())
 	}
 	if l.root != nil {
 		l.closeErr = errors.Join(l.closeErr, l.root.Close())
 	}
 	if l.dir != nil {
+		if l.dirLocked {
+			l.closeErr = errors.Join(l.closeErr, syscall.Flock(int(l.dir.Fd()), syscall.LOCK_UN))
+		}
 		l.closeErr = errors.Join(l.closeErr, l.dir.Close())
 	}
 	close(done)

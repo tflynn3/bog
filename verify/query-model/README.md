@@ -251,10 +251,10 @@ producer.
 ## Selective query admission beside live cursors (#136)
 
 `TestPinnedQueryModelSelectiveAdmission` uses the pinned candidate launcher
-and the ordinary legacy pagination issuer. It records the full candidate
+and the default retained pagination issuer. It records the full candidate
 revision, binary SHA-256, architecture, and workload settings. The launcher
 sets four query slots, 16,777,216 work units per request, and a 256-byte
-response cap. The legacy issuer supplies the 24 MiB aggregate scan budget and
+response cap. The retained issuer supplies the 64 MiB aggregate scan budget and
 64-capture ceiling by default.
 
 - **Alongside cursor.** A broad opening over 400,000 acknowledged rows leaves
@@ -262,18 +262,18 @@ response cap. The legacy issuer supplies the 24 MiB aggregate scan budget and
   sparse walk with three matches, and the next broad page. The sparse walk
   includes tied duplicates, a changed row limit, and byte-identical
   terminal replay. The independent ledger checks every accepted page.
-- **Scan exhaustion.** A fresh issuer opens broad cursors over a separate
-  65,536-row seed. The workload reaches the aggregate scan limit with capture
-  slots still free and no concurrent requests. It requires an exact, complete
-  `503 query scan capacity exhausted` response twice, with no rows or
-  cursor header or trailer. It then verifies a live cursor still resumes.
-  Slot, response, and per-request work refusals fail this check.
+- **Capture exhaustion.** A fresh retained issuer opens 64 broad cursors
+  over a separate 65,536-row seed. Each completed scan releases its scan
+  reservation while the cursor keeps its capture slot. Two further
+  openings must return a framed 503 with no rows or cursor. The first
+  cursor must still resume. The legacy fixture continues to check exhaustion
+  of aggregate scan bytes from live materialized match plans.
 - **Cancellation and expiry.** The portable race fixture sets a smaller scan
   budget and pauses an opening during allocation. A competing broad opening
   must get the scan-capacity refusal while selective requests and a resume fit.
   The fixture cancels the paused request, verifies its clean 408, joins the
   handler, and requires the same broad opening to succeed. Its virtual-clock
-  expiry test exercises the real issuer timer. The separate pinned expiry run
+  expiry test exercises the real issuer timer. The separate legacy pinned expiry run
   waits for the real 15-minute deadline, verifies the cursor and scan pressure
   shortly before it, and requires a new broad opening before probing the
   expired cursor for a clean 410. Recovery before the stale lookup witnesses

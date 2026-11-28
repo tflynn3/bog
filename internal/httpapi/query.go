@@ -71,13 +71,7 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	response := a.newQueryResponse()
 	defer response.release()
 	req := PageRequest{Filter: params.filter, Limit: params.limit}
-	if err := a.withPage(ctx, req, work, func(result PageResult) error {
-		if len(result.Rows) > params.limit {
-			return errPageSourceContract
-		}
-		_, err := response.appendRows(result.Rows, work)
-		return err
-	}); err != nil {
+	if err := a.prepareOrdinary(ctx, req, &response, work); err != nil {
 		response.release()
 		writeQueryError(w, err)
 		return
@@ -88,6 +82,53 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.write(w, "")
+}
+
+// chunkedOrdinaryPageSource uses a short-lived storage capture to assemble
+// one ordinary response from bounded scans. It issues no client cursor and
+// uses no persistent cursor slot.
+type chunkedOrdinaryPageSource interface {
+	ChunkOrdinaryQueries()
+}
+
+func (a *API) prepareOrdinary(ctx context.Context, req PageRequest, response *queryResponse, work *store.QueryWork) (err error) {
+	source := a.captures.source
+	_, req.Snapshot = source.(chunkedOrdinaryPageSource)
+	if req.Snapshot {
+		defer func() {
+			if req.Capture != "" {
+				err = errors.Join(err, source.Release(req.Capture))
+			}
+		}()
+	}
+	for {
+		var more bool
+		err := a.withPage(ctx, req, work, func(result PageResult) error {
+			if req.Snapshot {
+				if req.Capture == "" {
+					req.Capture = result.Capture
+					if !validOpaque(req.Capture) {
+						return errPageSourceContract
+					}
+				}
+				if err := checkSnapshotScan(result, req, work); err != nil {
+					return err
+				}
+			} else if len(result.Rows) > req.Limit {
+				return errPageSourceContract
+			}
+			n, err := response.appendRows(result.Rows, work)
+			if err == nil && req.Snapshot && result.More && n == len(result.Rows) && n < req.Limit {
+				req.After = result.Rows[n-1].Position
+				req.Limit -= n
+				more = true
+			}
+			return err
+		})
+		if err != nil || !more {
+			return err
+		}
+	}
 }
 
 func (a *API) openQuery(w http.ResponseWriter, ctx context.Context, params queryParams, work *store.QueryWork) {

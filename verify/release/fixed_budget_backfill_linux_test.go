@@ -622,13 +622,23 @@ func TestFixedBudgetBackfillPublication(t *testing.T) {
 				if err != nil || result.Outcome != querymodel.FixedBudgetExhausted {
 					t.Fatalf("result=%+v error=%v", result, err)
 				}
-			} else if err == nil || !strings.Contains(err.Error(), tc.want) {
+			} else if !backfillErrorContains(err, tc.want) {
 				t.Fatalf("error=%v, want %q", err, tc.want)
 			} else if tc.lastFreshRow == "" && (result.Outcome != querymodel.FixedBudgetIssuedCursor || result.Page != 1) {
 				t.Fatalf("unexpected progress on publication failure: %+v", result)
 			}
 		})
 	}
+}
+
+func backfillErrorContains(err error, want string) bool {
+	for err != nil {
+		if strings.Contains(err.Error(), want) {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 // freshBackfillScript replays the seed and both writes with the same

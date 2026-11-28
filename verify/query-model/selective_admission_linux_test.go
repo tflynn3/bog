@@ -12,7 +12,7 @@ import (
 
 func TestPinnedQueryModelSelectiveAdmission(t *testing.T) {
 	binary := pinnedQueryTestBinary(t)
-	for _, scenario := range []model.SelectiveAdmissionScenario{model.SelectiveAlongsideCursor, model.SelectiveScanExhaustion} {
+	for _, scenario := range []model.SelectiveAdmissionScenario{model.SelectiveAlongsideCursor, model.SelectiveRetainedCaptures} {
 		t.Run(string(scenario), func(t *testing.T) {
 			runPinnedSelectiveAdmission(t, binary, scenario, 45*time.Second)
 		})
@@ -36,13 +36,17 @@ func runPinnedSelectiveAdmission(t *testing.T, binary string, scenario model.Sel
 		// budget beside a cursor this large, even for an empty result.
 		cfg.SeedRows = 400_000
 	}
-	cfg.ScanBytes = 24 << 20 // Documented ordinary issuer default, with no CLI override.
+	if scenario == model.SelectiveScanExpiry {
+		cfg.ScanBytes = 24 << 20 // Legacy compatibility issuer.
+	} else {
+		cfg.ScanBytes = 64 << 20 // Default retained issuer.
+	}
 	cfg.ExpiryGrace = 5 * time.Second
 	cfg.Limits.Timeout = timeout
 
 	ctx, cancel := context.WithTimeout(t.Context(), timeout)
 	defer cancel()
-	t.Logf("selective admission issuer=ordinary arch=%s scan_limit_source=issuer_default capture_slots=64", runtime.GOARCH)
+	t.Logf("selective admission arch=%s scan_limit_source=issuer_default capture_slots=64", runtime.GOARCH)
 	logQueryReport(t, "selective_admission_settings", cfg)
 	err := withConfiguredPinnedQueryEndpoint(t, ctx, binary, t.TempDir(), int(cfg.WorkBudget), cfg.QueryConcurrency, false, func(f model.CaptureDeliveryFixture) error {
 		report, err := model.VerifySelectiveAdmission(ctx, cfg, scenario, model.SelectiveAdmissionAdapter{

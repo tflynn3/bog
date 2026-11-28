@@ -13,6 +13,9 @@ var (
 	ErrQueryResponseCapacityExhausted = errors.New("query response capacity exhausted")
 	ErrQueryScanCapacityExhausted     = errors.New("query scan capacity exhausted")
 	ErrQueryCaptureCapacityExhausted  = errors.New("query capture capacity exhausted")
+	// ErrPageScanReservationChanged requests a fresh preflight when the
+	// source's selected view outgrew its estimate before acquisition.
+	ErrPageScanReservationChanged = errors.New("query scan reservation changed")
 )
 
 // QueryResourceLimits limits aggregate resources for one issuing API. Bytes
@@ -56,6 +59,16 @@ func DefaultQueryResourceLimits() QueryResourceLimits {
 // Use math.MaxUint64 when a safe bound cannot be expressed.
 type PageSourceScanBound interface {
 	PageScanBytes(PageRequest) uint64
+}
+
+type pageScanReservationKey struct{}
+
+// PageScanReservation returns the bytes admitted before calling a bounded
+// source. A source with view-dependent estimates can verify the reservation
+// against the acquired view before allocating its scan or capture backing.
+func PageScanReservation(ctx context.Context) (uint64, bool) {
+	n, ok := ctx.Value(pageScanReservationKey{}).(uint64)
+	return n, ok
 }
 
 // NewWithPageSourceAndQueryResources configures aggregate resources for one
@@ -181,6 +194,17 @@ func (*legacyPageSource) PageScanBytes(req PageRequest) uint64 {
 // storage. Successful acquisition is handed to consume even after cancellation
 // so that the capture owner can register its ID for release.
 func (a *API) withPage(ctx context.Context, req PageRequest, work *store.QueryWork, consume func(PageResult) error) error {
+	err := a.scanPage(ctx, req, work, consume)
+	if errors.Is(err, ErrPageScanReservationChanged) {
+		err = a.scanPage(ctx, req, work, consume)
+	}
+	if errors.Is(err, ErrPageScanReservationChanged) {
+		return ErrQueryScanCapacityExhausted
+	}
+	return err
+}
+
+func (a *API) scanPage(ctx context.Context, req PageRequest, work *store.QueryWork, consume func(PageResult) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -189,6 +213,7 @@ func (a *API) withPage(ctx context.Context, req PageRequest, work *store.QueryWo
 	var bound uint64
 	if bounded, ok := source.(PageSourceScanBound); ok {
 		bound = bounded.PageScanBytes(req)
+		ctx = context.WithValue(ctx, pageScanReservationKey{}, bound)
 	} else if resources.requireScanBound {
 		return ErrQueryScanCapacityExhausted
 	}

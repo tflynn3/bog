@@ -18,6 +18,7 @@ const (
 	SelectiveScanExhaustion   SelectiveAdmissionScenario = "scan-exhaustion"
 	SelectiveScanCancellation SelectiveAdmissionScenario = "scan-cancellation"
 	SelectiveScanExpiry       SelectiveAdmissionScenario = "scan-expiry"
+	SelectiveRetainedCaptures SelectiveAdmissionScenario = "retained-capture-exhaustion"
 )
 
 // SelectiveScanCapacityBody is the exact aggregate scan-byte refusal on the wire.
@@ -70,6 +71,7 @@ type SelectiveAdmissionReport struct {
 	Empty, Sparse             WireStats
 	SparseTerminalReplay      bool
 	ScanRefusals              int
+	CaptureRefusals           int
 	Cancelled, Reused         bool
 	LiveBeforeExpiry, Expired bool
 	ExpiryRecoveryAfter       time.Duration
@@ -92,6 +94,10 @@ func VerifySelectiveAdmission(ctx context.Context, cfg SelectiveAdmissionConfig,
 	}
 	switch scenario {
 	case SelectiveAlongsideCursor, SelectiveScanExhaustion:
+	case SelectiveRetainedCaptures:
+		if f.Refuse == nil {
+			return report, errors.New("retained capture exhaustion requires a wire refusal witness")
+		}
 	case SelectiveScanCancellation:
 		if f.CancelScan == nil {
 			return report, errors.New("scan cancellation requires a paused opening and joined cancellation witness")
@@ -128,6 +134,8 @@ func (t *selectiveAdmissionTrial) run(ctx context.Context) error {
 	switch t.report.Scenario {
 	case SelectiveAlongsideCursor:
 		err = t.selective(ctx, first)
+	case SelectiveRetainedCaptures:
+		err = t.saturateRetainedCaptures(ctx, first)
 	case SelectiveScanCancellation:
 		err = t.cancelScan(ctx, first)
 	case SelectiveScanExhaustion, SelectiveScanExpiry:
@@ -311,6 +319,21 @@ func (t *selectiveAdmissionTrial) saturate(ctx context.Context, first string) er
 		}
 	}
 	return errors.New("scan-byte budget did not saturate with capture slots still available")
+}
+
+func (t *selectiveAdmissionTrial) saturateRetainedCaptures(ctx context.Context, first string) error {
+	for t.report.BroadOpens < 64 {
+		if _, err := t.openBroad(ctx); err != nil {
+			return fmt.Errorf("retained opening %d of 64: %w", t.report.BroadOpens+1, err)
+		}
+	}
+	for range 2 {
+		if err := t.f.Refuse(ctx, t.open, http.StatusServiceUnavailable, "query capacity exhausted\n"); err != nil {
+			return fmt.Errorf("require retained capture capacity refusal: %w", err)
+		}
+		t.report.CaptureRefusals++
+	}
+	return t.resumeBroad(ctx, first)
 }
 
 func (t *selectiveAdmissionTrial) cancelScan(ctx context.Context, first string) error {

@@ -19,11 +19,33 @@ Ingest accepts at most 4 MiB of UTF-8 NDJSON. Each nonblank line must be an obje
 
 Query requires `start` and `end` timestamps and accepts a literal case-sensitive `contains` and decimal `limit` (default 500, range 1–1000). The interval is `[start,end)`; equal bounds return no rows. Output is UTF-8 `application/x-ndjson`, in UTC, ordered by timestamp then commit and row order. Duplicate records remain distinct. Queries see complete batches.
 
-A single append-only `bog.wal` and its `bog.commit` marker are the source of truth; keep them together. Create the data directory on a local filesystem before starting the service, and ensure its parent directory is itself durably established (including any newly created ancestors). After the eight-byte `BOGWAL01` magic, each batch has a 16-byte little-endian header: payload length, its bitwise complement, payload CRC32C, and CRC32C of the first 12 header bytes, followed by the original NDJSON payload. The 24-byte marker contains `BOGCMT01`, the little-endian committed offset, and its bitwise complement. Concurrent admitted batches can share a WAL sync and one atomically replaced and directory-synced commit marker; each retains its own frame and is published as a whole in admission order. Successful responses follow the durable marker and in-memory publication. Recovery discards any bytes beyond the committed offset; corruption within the committed prefix prevents startup. Startup rebuilds memory from the committed WAL. A missing or invalid marker on a populated WAL, or a marker without a WAL, prevents startup; only a new store or a magic-only WAL may bootstrap without a marker.
+Bog stores older rows in immutable checkpoint segments and keeps a bounded,
+decoded WAL suffix for new appends. It advances the checkpoint automatically
+and reclaims covered WAL files after their final query capture drains. The
+writable selector `bog.authority` binds the selected generation to the
+exact committed suffix. A new or small store may still use `bog.wal`
+and `bog.commit`. Keep the data directory together when moving or backing
+up storage. On startup Bog streams legacy WAL migration, validates the
+selected generation and suffix, and discards bytes beyond the committed
+boundary only after validation.
 
-Decoded rows and a derived index of immutable sorted ordinal runs remain in memory, so retained data is bounded by available RAM. Each published batch is sorted by UTC timestamp and append order, then merged into runs by batch count. Queries seek within each run and merge matching rows in order, including across wide time ranges. On startup, recovery represents a timestamp-ordered WAL prefix as an implicit run without an ordinal array; otherwise it builds one explicitly sorted ordinal run; live batches remain in separate merge levels. The index does not change the on-disk format. Up to 16 ingest requests can be processed concurrently, and additional requests receive 503. A failed append returns 503 only after rollback is synced and publishes no rows. If a commit or rollback cannot be confirmed, the process terminates and the request outcome is unknown. Once admitted, an append completes even if its client disconnects. A lost response leaves the outcome unknown and retrying can produce duplicates. The data directory must be owned by the service user and must not be group- or world-writable; existing WAL and marker files must also be owned by that user, not group- or world-writable, and have exactly one link. All parent directories must be trusted against replacement or renaming by other principals. The local filesystem and storage stack must support exclusive advisory locks, atomic rename, file sync, directory sync, and powersafe overwrite: a write interrupted by power loss must not damage bytes outside the written range, even within the same sector. Consecutive WAL frames may share a sector, so this guarantee is required to preserve previously acknowledged batches.
+Bog acknowledges a batch after the WAL and commit record are durable and
+the rows are visible to queries. A full disk returns 503 and a confirmed
+rollback leaves all acknowledged rows intact. Make space on the active data
+filesystem to resume ingest. `GET /ready` reports disk headroom and the
+last WAL outcome. If Bog cannot confirm a commit or rollback, it exits and
+checks durable authority on restart. A lost response leaves the outcome
+unknown, and retrying can produce duplicates.
 
-Sealed groups of 128 append ordinals also have derived Bloom filters over overlapping four-byte grams of each decoded line. Each bitmap uses 4 KiB (about 32 bytes per row, plus small metadata); blocks with more than 64 KiB of decoded text and the unsealed tail remain unfiltered. Wide literal searches may use these filters to skip blocks, but always check candidate lines exactly. Filters are rebuilt on replay and do not alter durable files or snapshot pagination.
+The default server admits up to 16 concurrent queries. It also limits
+aggregate scan reservations to 64 MiB and encoded responses to 32 MiB
+with the default response settings.
+
+Create the data directory and durably establish its parent before starting
+Bog. The directory must be owned by the service user with no group or world
+write permission. The storage stack must support exclusive advisory locks,
+atomic rename, file and directory sync, and powersafe overwrite. Bog holds
+the pinned directory lock through HTTP, capture, and storage drain.
 
 For a stable walk, add `page=1` to the first query. If another matching row exists, the response includes `Bog-Next-Cursor`; send its value as `cursor` on the next request, repeating `start`, `end`, and `contains`. For example:
 
@@ -36,19 +58,13 @@ The cursor captures published rows at the first request; later appends do not ap
 
 ## Retained-history cutover
 
-The [cutover decision](docs/adr/0004-retained-history-cutover.md) specifies
-the operating contract for the integrated release. Use a qualified
-cutover binary for the steps below. The legacy binary rejects restored
-images before opening the legacy WAL.
-
 ### Activate a verified restore
 
 Use the backup engine's `Verify` and `Restore` operations to check the
 bundle and publish a separate, service-owned directory on a trusted local
 filesystem. Keep the original bundle for recovery. The restored directory
 contains `bog.backup`, `bog.checkpoint`, its referenced segments, and
-`bog.wal.tail`. Point a cutover-capable binary at that directory using the
-usual startup command. See the [backup format](internal/backup/FORMAT.md).
+`bog.wal.tail`. Start Bog with the restored directory. See the [backup format](internal/backup/FORMAT.md).
 
 ```sh
 ./bog -data-dir /path/to/restored-data -addr 127.0.0.1:8080
@@ -76,8 +92,8 @@ larger server work budget.
 
 ### Opt in to capacity verification
 
-Set `BOG_CAPACITY_CONTROL=1` on a cutover binary to enable
-`/_capacity/compaction` on a loopback-bound listener. The control defaults
+Set `BOG_CAPACITY_CONTROL=1` to enable
+`/_capacity/compaction` on an IPv4 loopback listener. The control defaults
 to off. Use a disposable local data directory for the Linux capacity fixture.
 
 ```sh

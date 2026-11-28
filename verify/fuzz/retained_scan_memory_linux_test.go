@@ -100,7 +100,7 @@ func TestRetainedScanMemoryWorker(t *testing.T) {
 	if group != "" {
 		must(t, enterScanMemoryCgroup(group))
 	}
-	setWorkerLimits(t)
+	setRetainedWorkerLimits(t)
 	report := runRetainedScanMemory(t, path, group, count)
 	data, err := json.Marshal(report)
 	must(t, err)

@@ -1,7 +1,6 @@
 package wal
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -9,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"bog/internal/store"
@@ -188,12 +188,7 @@ func (l *Log) run() {
 func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 	next := l.offset
 	for _, req := range group {
-		var h [16]byte
-		n := uint32(len(req.payload))
-		binary.LittleEndian.PutUint32(h[:], n)
-		binary.LittleEndian.PutUint32(h[4:], ^n)
-		binary.LittleEndian.PutUint32(h[8:], crc32.Checksum(req.payload, table))
-		binary.LittleEndian.PutUint32(h[12:], crc32.Checksum(h[:12], table))
+		h := FrameHeader(req.payload)
 		if err := writeAll(l.f, h[:]); err != nil {
 			return "wal_write", l.rollback(err)
 		}
@@ -252,12 +247,16 @@ func (l *Log) Close() error {
 	}
 	l.mu.Unlock()
 
-	err := l.f.Close()
+	var err error
+	if f, ok := l.f.(*os.File); ok && l.dir != nil {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	}
+	err = errors.Join(err, l.f.Close())
 	if l.captures != nil {
 		err = errors.Join(err, l.captures.release())
 	}
 	if l.dir != nil {
-		err = errors.Join(err, l.dir.Close())
+		err = errors.Join(err, syscall.Flock(int(l.dir.Fd()), syscall.LOCK_UN), l.dir.Close())
 	}
 	if l.root != nil {
 		err = errors.Join(err, l.root.Close())

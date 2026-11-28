@@ -104,10 +104,10 @@ func (a *publicationAttempt) install() error {
 // must validate the manifest, every referenced segment, and the owner's WAL
 // boundary, or return os.ErrNotExist if the manifest itself is absent.
 func RecoverCaptured(root *os.Root, dir *os.File, authoritative func() (*Manifest, error)) error {
-	return recoverCapturedWithBudget(root, dir, authoritative, nil)
+	return recoverCapturedWithBudget(root, dir, authoritative, nil, false)
 }
 
-func recoverCapturedWithBudget(root *os.Root, dir *os.File, authoritative func() (*Manifest, error), stage *stagingAccount) (err error) {
+func recoverCapturedWithBudget(root *os.Root, dir *os.File, authoritative func() (*Manifest, error), stage *stagingAccount, unselected bool) (err error) {
 	if authoritative == nil {
 		return errors.New("missing authoritative checkpoint validator")
 	}
@@ -116,7 +116,7 @@ func recoverCapturedWithBudget(root *os.Root, dir *os.File, authoritative func()
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	err = p.resolve(authoritative)
+	err = p.resolve(authoritative, unselected)
 	if err == nil || err == os.ErrNotExist {
 		stage.settle()
 	}
@@ -133,7 +133,7 @@ func (l *Legacy) resolvePublication(keepRows bool) (*Published, error) {
 			return nil, err
 		}
 		return &published.manifest, nil
-	})
+	}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +142,7 @@ func (l *Legacy) resolvePublication(keepRows bool) (*Published, error) {
 
 // resolve validates the authoritative namespace and makes it durable before
 // deleting losing outputs. Missing is a valid first-publication outcome.
-func (p *publication) resolve(load func() (*Manifest, error)) error {
+func (p *publication) resolve(load func() (*Manifest, error), unselected bool) error {
 	info, err := p.root.Lstat(stageDir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -170,7 +170,7 @@ func (p *publication) resolve(load func() (*Manifest, error)) error {
 		return fmt.Errorf("sync checkpoint directory: %w", err)
 	}
 	if info != nil {
-		if err := p.recoverStaging(info, m, ""); err != nil {
+		if err := p.recoverStaging(info, m, "", unselected); err != nil {
 			return err
 		}
 	}
@@ -180,7 +180,7 @@ func (p *publication) resolve(load func() (*Manifest, error)) error {
 	return nil
 }
 
-func (p *publication) recoverStaging(info os.FileInfo, m *Manifest, generationName string) error {
+func (p *publication) recoverStaging(info os.FileInfo, m *Manifest, generationName string, unselected bool) error {
 	if info.Mode().Perm() != 0700 {
 		return p.removeEmptyStaging()
 	}
@@ -188,7 +188,7 @@ func (p *publication) recoverStaging(info os.FileInfo, m *Manifest, generationNa
 	if err != nil {
 		return err
 	}
-	if intent.Generation != nil && generationName == "" {
+	if intent.Generation != nil && generationName == "" && !unselected {
 		return fmt.Errorf("%w: recovery view required for pending generation", ErrPublicationUncertain)
 	}
 	if intent.Generation != nil && intent.Generation.Name == generationName {

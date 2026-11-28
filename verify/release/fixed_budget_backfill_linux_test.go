@@ -210,17 +210,20 @@ func checkFixedBudgetBackfill(ctx context.Context, t *testing.T, raw *http.Clien
 		return page, nil
 	}
 	var hook querymodel.AfterCapture
+	var publicationErr error
 	if trial == heldBackfill {
 		hook = func(ctx context.Context, _ string) error {
 			replacement, err := publishBackfillGeneration(ctx, raw, base, committed, &predecessor)
 			if err != nil {
-				return fmt.Errorf("publish replacement with cursor held: %w", err)
+				publicationErr = fmt.Errorf("publish replacement with cursor held: %w", err)
+				return publicationErr
 			}
 			t.Logf("trial=%s replacement_generation=%+v", trial, replacement)
 			return nil
 		}
 	}
-	return querymodel.RunStrictFixedBudgetCase(ctx, tc, acknowledge, fetch, hook)
+	result, err := querymodel.RunStrictFixedBudgetCase(ctx, tc, acknowledge, fetch, hook)
+	return result, errors.Join(err, publicationErr)
 }
 
 func checkFreshBackfill(ctx context.Context, t *testing.T, raw *http.Client, base string, tc querymodel.FixedBudgetCase, augmented backfillCapture) (querymodel.WireStats, error) {

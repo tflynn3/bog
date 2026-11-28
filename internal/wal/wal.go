@@ -2,13 +2,17 @@ package wal
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"bog/internal/store"
@@ -28,6 +32,12 @@ type file interface {
 	Close() error
 }
 type Log struct {
+	ioMu      sync.Mutex // group disk commit and retained replacement
+	authority Authority  // writes under ioMu and mu
+	suffix    hash.Cloner
+	frames    []Frame // immutable through each capture
+	bounds    frameBounds
+
 	mu        sync.Mutex
 	cond      *sync.Cond
 	queue     []*appendRequest
@@ -90,7 +100,7 @@ func (l *Log) Append(payload []byte, rows []store.Row) error {
 	if err != nil {
 		return err
 	}
-	decoded, err := matchBatch(payload, rows)
+	decoded, err := l.matchBatch(payload, rows)
 	if err != nil {
 		return err
 	}
@@ -115,18 +125,30 @@ func (l *Log) Append(payload []byte, rows []store.Row) error {
 }
 
 // Use the same canonical rows for live publication and recovery.
-func matchBatch(payload []byte, rows []store.Row) ([]store.Row, error) {
-	decoded, err := store.Decode(payload)
+func (l *Log) matchBatch(payload []byte, rows []store.Row) ([]store.Row, error) {
+	i := 0
+	var decoded []store.Row
+	err := store.VisitDecoded(payload, func(row store.Row) error {
+		if i >= len(rows) {
+			return errors.New("WAL batch row count differs from payload")
+		}
+		if !row.TS.Equal(rows[i].TS) || row.Line != rows[i].Line {
+			return fmt.Errorf("WAL batch row %d differs from payload", i)
+		}
+		i++
+		if l.s != nil {
+			decoded = append(decoded, row)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("invalid WAL batch: %w", err)
 	}
-	if len(decoded) != len(rows) {
+	if i != len(rows) {
 		return nil, errors.New("WAL batch row count differs from payload")
 	}
-	for i, row := range decoded {
-		if !row.TS.Equal(rows[i].TS) || row.Line != rows[i].Line {
-			return nil, fmt.Errorf("WAL batch row %d differs from payload", i)
-		}
+	if l.s == nil {
+		return rows, nil
 	}
 	return decoded, nil
 }
@@ -157,16 +179,13 @@ func (l *Log) run() {
 		l.cond.Broadcast()
 		l.mu.Unlock()
 
+		l.ioMu.Lock()
 		operation, err := l.appendGroup(group)
 		outcome := newCommitOutcome(operation, err)
 		l.mu.Lock()
-		if err == nil {
-			l.committed.end = l.offset
-			for _, req := range group {
-				l.committed.nextOrdinal += uint64(len(req.rows))
-			}
+		if !errors.Is(err, ErrCapacity) {
+			l.lastOutcome.Store(&outcome)
 		}
-		l.lastOutcome.Store(&outcome)
 		if outcome.State == CommitUncertain {
 			l.poisoned = err
 			for _, req := range l.queue {
@@ -175,20 +194,56 @@ func (l *Log) run() {
 			l.queue = nil
 			l.cond.Broadcast()
 		}
-		if outcome.State == CommitRolledBack {
+		if outcome.State == CommitRolledBack && !errors.Is(err, ErrCapacity) {
 			l.diagnoseRollback(outcome)
 		}
 		for _, req := range group {
 			req.done <- err
 		}
 		l.mu.Unlock()
+		l.ioMu.Unlock()
 	}
 }
 
 func (l *Log) appendGroup(group []*appendRequest) (string, error) {
-	next := l.offset
+	l.mu.Lock()
+	poisoned := l.poisoned
+	l.mu.Unlock()
+	if poisoned != nil {
+		return "authority", poisoned
+	}
+	a := l.authority
+	next, ordinal := l.offset+a.TailBase, l.committed.nextOrdinal
+	var prepared [maxGroup]Frame
+	for i, req := range group {
+		length := int64(frameHeader + len(req.payload))
+		if next > math.MaxInt64-length || uint64(len(req.rows)) > math.MaxUint64-ordinal {
+			return "admission", ErrCapacity
+		}
+		f := Frame{Start: next, End: next + length, FirstOrdinal: ordinal, NextOrdinal: ordinal}
+		for _, row := range req.rows {
+			if err := f.add(row); err != nil {
+				return "admission", err
+			}
+		}
+		f.last = time.Time{}
+		prepared[i] = f
+		next, ordinal = f.End, f.NextOrdinal
+	}
+	if l.s == nil && (next-max(int64(len(magic)), a.CoveredOffset) > MaxTailBytes ||
+		len(l.frames)+len(group) > MaxLiveFrames) {
+		return "admission", ErrCapacity
+	}
+	var digest hash.Cloner
+	if l.suffix != nil {
+		var err error
+		digest, err = l.suffix.Clone()
+		if err != nil {
+			return "authority_preparation", err
+		}
+	}
 	for _, req := range group {
-		var h [16]byte
+		var h [frameHeader]byte
 		n := uint32(len(req.payload))
 		binary.LittleEndian.PutUint32(h[:], n)
 		binary.LittleEndian.PutUint32(h[4:], ^n)
@@ -200,13 +255,25 @@ func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 		if err := writeAll(l.f, req.payload); err != nil {
 			return "wal_write", l.rollback(err)
 		}
-		next += int64(len(h) + len(req.payload))
+		if digest != nil {
+			if err := errors.Join(writeAll(digest, h[:]), writeAll(digest, req.payload)); err != nil {
+				return "authority_preparation", l.rollback(err)
+			}
+		}
 	}
 	if err := l.f.Sync(); err != nil {
 		return "wal_sync", l.rollback(err)
 	}
 	if l.root != nil {
-		operation, err := l.commit(next)
+		var operation string
+		var err error
+		if digest != nil {
+			a.CommittedEnd, a.CommittedOrdinal = next, ordinal
+			a.SuffixSHA256 = hex.EncodeToString(digest.Sum(nil))
+			operation, err = l.selectAuthority(a)
+		} else {
+			operation, err = l.commit(next)
+		}
 		if err != nil {
 			if !errors.Is(err, ErrUncertain) {
 				err = l.rollback(err)
@@ -214,10 +281,20 @@ func (l *Log) appendGroup(group []*appendRequest) (string, error) {
 			return operation, err
 		}
 	}
-	l.offset = next
-	for _, req := range group {
-		l.s.Publish(req.rows)
+	if l.s != nil {
+		for _, req := range group {
+			l.s.Publish(req.rows)
+		}
 	}
+	l.mu.Lock()
+	l.offset, l.suffix, l.authority = next-a.TailBase, digest, a
+	l.committed = captureBoundary{next, ordinal}
+	if l.s == nil {
+		for _, frame := range prepared[:len(group)] {
+			l.addFrame(frame)
+		}
+	}
+	l.mu.Unlock()
 	return "commit", nil
 }
 
@@ -252,20 +329,36 @@ func (l *Log) Close() error {
 	}
 	l.mu.Unlock()
 
-	err := l.f.Close()
-	if l.captures != nil {
-		err = errors.Join(err, l.captures.release())
-	}
-	if l.dir != nil {
-		err = errors.Join(err, l.dir.Close())
-	}
+	l.ioMu.Lock()
+	err := l.closeFiles()
 	if l.root != nil {
 		err = errors.Join(err, l.root.Close())
 	}
+	if l.dir != nil {
+		// Unlock explicitly so a concurrently forked child cannot keep
+		// this lock alive between fork and exec.
+		err = errors.Join(err, syscall.Flock(int(l.dir.Fd()), syscall.LOCK_UN), l.dir.Close())
+	}
+	l.ioMu.Unlock()
 	l.mu.Lock()
 	l.closeErr = err
 	l.closeDone = true
 	l.cond.Broadcast()
 	l.mu.Unlock()
+	return err
+}
+
+// closeFiles releases the WAL descriptors before the directory owner lock.
+func (l *Log) closeFiles() error {
+	var err error
+	if l.f != nil {
+		if ordinary, ok := l.f.(*os.File); ok && l.authority.Version == 0 {
+			err = syscall.Flock(int(ordinary.Fd()), syscall.LOCK_UN)
+		}
+		err = errors.Join(err, l.f.Close())
+	}
+	if l.captures != nil {
+		err = errors.Join(err, l.captures.release())
+	}
 	return err
 }

@@ -2,16 +2,32 @@ package main
 
 import (
 	"context"
+	"net"
 	"net/http"
+	"os"
 
 	"bog/internal/httpapi"
 	"bog/internal/readiness"
-	"bog/internal/store"
-	"bog/internal/wal"
 )
 
-func newReadyHandler(ctx context.Context, c config, s *store.Store, w *wal.Log) http.Handler {
-	return readiness.NewHandler(ctx, c.dir, w, func(appender readiness.Appender) http.Handler {
-		return httpapi.NewWithQueryLimits(s, appender, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget)
+func capacityEnabled(listener net.Listener) bool {
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	return os.Getenv("BOG_CAPACITY_CONTROL") == "1" && ok && addr.IP.To4() != nil && addr.IP.IsLoopback()
+}
+
+func newReadyHandler(ctx context.Context, c config, s *retained, probe *os.File, capacity bool) (http.Handler, *httpapi.API) {
+	var api *httpapi.API
+	handler := readiness.NewHandlerForDirectory(ctx, probe, s, func(appender readiness.Appender) http.Handler {
+		api = httpapi.NewWithPageSourceAndQueryResources(s, appender, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget,
+			httpapi.QueryResourceLimits{ResponseBytes: 32 << 20, ScanBytes: aggregateScanBytes, Captures: 64})
+		api.SetUncertainAppendHandler(func() { panic(http.ErrAbortHandler) })
+		if !capacity {
+			return api
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("/_capacity/compaction", s.compactionHandler(api))
+		mux.Handle("/", api)
+		return mux
 	})
+	return handler, api
 }

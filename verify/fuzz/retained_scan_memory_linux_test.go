@@ -66,7 +66,10 @@ func runScanMemoryProcess(t *testing.T, path string, count int) scanMemoryReport
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^TestRetainedScanMemoryWorker$", "-test.count=1")
 	cmd.WaitDelay = time.Second
-	cmd.Env = append(cmd.Environ(), scanMemoryWorkerEnv+"="+strconv.Itoa(count), scanMemoryCgroupEnv+"="+group)
+	// Keep race-runtime thread stacks within the worker's virtual-address
+	// allowance independently of the number of concurrent scans.
+	cmd.Env = append(cmd.Environ(), "GOMAXPROCS=4", "MALLOC_ARENA_MAX=2",
+		scanMemoryWorkerEnv+"="+strconv.Itoa(count), scanMemoryCgroupEnv+"="+group)
 	cmd.Dir = path
 	output, err := cmd.CombinedOutput()
 	if err != nil || ctx.Err() != nil {

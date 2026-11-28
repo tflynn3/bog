@@ -274,6 +274,9 @@ func (p *publication) publishGeneration(ctx context.Context, m *Manifest, next *
 		if manifestPending {
 			return
 		}
+		// Cancellation stops building and selection. Settling a definitive
+		// outcome still runs under the publication lock.
+		p.cleanupContext = context.WithoutCancel(ctx)
 		if published == nil && a.installing {
 			// Leave the durable intent available if cleanup fails.
 			if cleanupErr := p.removeOwned(a.ownedFiles(), nil); cleanupErr != nil {
@@ -327,6 +330,10 @@ func (p *publication) publishGeneration(ctx context.Context, m *Manifest, next *
 		}
 		manifestPending = true
 		if err := selectGeneration(id); err != nil {
+			if errors.Is(err, ErrSelectionUnchanged) {
+				manifestPending = false
+				return nil, err
+			}
 			return nil, fmt.Errorf("%w: select checkpoint generation: %w", ErrPublicationUncertain, err)
 		}
 		manifestPending = false

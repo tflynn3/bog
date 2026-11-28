@@ -92,6 +92,31 @@ func TestRecoveryViewRejectsInvalidCapture(t *testing.T) {
 	}
 }
 
+func TestRecoveryBeforeFirstSelection(t *testing.T) {
+	dir, l, pub, view := newRecoveryFixture(t, Limits{StagingBytes: 1 << 20, ReplayTailBytes: 1 << 20})
+	before := checkpointNames(t, dir)
+	cutoff := view.point.CoveredOffset + int64(len(view.suffix)/2)
+	ordinal := view.point.NextOrdinal * 2
+	m, err := pub.PublishRecoveryView(t.Context(), view, cutoff, ordinal, func(context.Context, RecoveryPoint) error {
+		return errors.New("interrupted before first selection")
+	})
+	if m != nil || !errors.Is(err, ErrPublicationUncertain) {
+		t.Fatalf("publication = %v, %v", m, err)
+	}
+	load := func() (*Manifest, error) {
+		m, _, err := DecodeManifest(readFixture(t, dir, manifestName))
+		return m, err
+	}
+	if err := pub.RecoverCaptured(load); !errors.Is(err, ErrPublicationUncertain) {
+		t.Fatalf("recovery without selector evidence = %v", err)
+	}
+	requirePublicationOK(t, pub.RecoverBeforeSelection(load))
+	requirePublicationOK(t, CheckPublication(l.dir))
+	if got := checkpointNames(t, dir); !slices.Equal(got, before) {
+		t.Fatalf("owned leftovers: %v, want %v", got, before)
+	}
+}
+
 func TestRecoveryViewInterruptedCleanup(t *testing.T) {
 	for _, successorWon := range []bool{false, true} {
 		name := "predecessor selected"

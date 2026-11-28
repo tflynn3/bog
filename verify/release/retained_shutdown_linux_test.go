@@ -187,8 +187,13 @@ func verifyRetainedShutdown(ctx context.Context, binary, dir string, client *htt
 	if err := checkIdentity(); err != nil {
 		return err
 	}
-	err = serveDirectory(ctx, binary, dir, client, flags, func(ctx context.Context, base string) error {
-		pager, err := newReleasePager(base, client, shutdownPageCap)
+	// Reuse a connection for the serial replay so that each request starts
+	// after the previous handler has released the single query slot.
+	replayTransport := &http.Transport{MaxConnsPerHost: 1}
+	defer replayTransport.CloseIdleConnections()
+	replay := &http.Client{Transport: replayTransport, Timeout: client.Timeout, CheckRedirect: client.CheckRedirect}
+	err = serveDirectory(ctx, binary, dir, replay, flags, func(ctx context.Context, base string) error {
+		pager, err := newReleasePager(base, replay, shutdownPageCap)
 		if err != nil {
 			return err
 		}
@@ -419,6 +424,11 @@ func awaitShutdownListenerClosed(ctx context.Context, addr string) error {
 			if errors.Is(err, syscall.ECONNREFUSED) {
 				return true, nil
 			}
+			if errors.Is(err, syscall.ECONNRESET) {
+				// A connection racing listener closure can be reset.
+				// Keep polling until a new connection is refused.
+				return false, nil
+			}
 			return false, err
 		}
 		return false, conn.Close()
@@ -609,13 +619,6 @@ func TestReapedShutdownStorage(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			for _, name := range retired {
-				if name != tc.keep && !(tc.move && name == "old-tail") {
-					if err := root.Remove(name); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
 			if tc.replace {
 				if err := root.Rename(tailTestSegment, "original-block"); err != nil {
 					t.Fatal(err)
@@ -624,6 +627,13 @@ func TestReapedShutdownStorage(t *testing.T) {
 			if tc.change || tc.replace {
 				if err := root.WriteFile(tailTestSegment, []byte("replacement"), 0600); err != nil {
 					t.Fatal(err)
+				}
+			}
+			for _, name := range retired {
+				if name != tc.keep && !(tc.move && name == "old-tail") {
+					if err := root.Remove(name); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			if tc.missing {

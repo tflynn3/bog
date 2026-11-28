@@ -45,11 +45,22 @@ func (p *Publisher) PublishCaptured(ctx context.Context, input io.ReaderAt, end 
 // RecoverCaptured validates and syncs the authority, reclaims losing outputs,
 // and settles staging charges. The validator runs under the publication lock.
 func (p *Publisher) RecoverCaptured(authoritative func() (*Manifest, error)) error {
+	return p.recoverCaptured(authoritative, false)
+}
+
+// RecoverBeforeSelection resolves a publication when the WAL owner has
+// established that no writable retained selector exists. A staged v2
+// generation is unreachable in this case.
+func (p *Publisher) RecoverBeforeSelection(authoritative func() (*Manifest, error)) error {
+	return p.recoverCaptured(authoritative, true)
+}
+
+func (p *Publisher) recoverCaptured(authoritative func() (*Manifest, error), unselected bool) error {
 	if !p.mu.TryLock() {
 		return syscall.EWOULDBLOCK
 	}
 	defer p.mu.Unlock()
-	return recoverCapturedWithBudget(p.root, p.dir, authoritative, &p.stage)
+	return recoverCapturedWithBudget(p.root, p.dir, authoritative, &p.stage, unselected)
 }
 
 type stagingAccount struct {

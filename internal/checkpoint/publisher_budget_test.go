@@ -721,7 +721,7 @@ func TestStagedBlockSlotCapAndReuse(t *testing.T) {
 		t.Fatalf("interrupted slot changed selection or accounting: %+v", budget.Usage())
 	}
 	err = recoverCapturedWithBudget(legacy.root, legacy.dir,
-		func() (*Manifest, error) { return nil, os.ErrNotExist }, p.stage)
+		func() (*Manifest, error) { return nil, os.ErrNotExist }, p.stage, false)
 	if !errors.Is(err, os.ErrNotExist) || budget.Usage().InUse[StagingBytes] != 0 {
 		t.Fatalf("interrupted overlap did not settle: %v, %+v", err, budget.Usage())
 	}

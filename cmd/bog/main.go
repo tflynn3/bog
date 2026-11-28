@@ -80,8 +80,9 @@ func run(c config) error {
 	defer signal.Stop(signals)
 	probeCtx, stopProbes := context.WithCancel(context.Background())
 	defer stopProbes()
+	handler, api := newReadyHandlerWithAPI(probeCtx, c, s, w)
 	server := &http.Server{
-		Handler:           newReadyHandler(probeCtx, c, s, w),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -101,6 +102,9 @@ func run(c config) error {
 	if err := server.Shutdown(ctx); err != nil {
 		// Keep the WAL locked while handlers might still be using it.
 		return fmt.Errorf("shutdown HTTP server (WAL remains open until exit): %w", err)
+	}
+	if err := api.Close(ctx); err != nil {
+		return fmt.Errorf("drain query captures (WAL remains open until exit): %w", err)
 	}
 	if serveErr == nil {
 		serveErr = <-served

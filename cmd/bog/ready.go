@@ -11,7 +11,15 @@ import (
 )
 
 func newReadyHandler(ctx context.Context, c config, s *store.Store, w *wal.Log) http.Handler {
-	return readiness.NewHandler(ctx, c.dir, w, func(appender readiness.Appender) http.Handler {
-		return httpapi.NewWithQueryLimits(s, appender, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget)
+	h, _ := newReadyHandlerWithAPI(ctx, c, s, w)
+	return h
+}
+
+func newReadyHandlerWithAPI(ctx context.Context, c config, s *store.Store, w *wal.Log) (http.Handler, *httpapi.API) {
+	var api *httpapi.API
+	h := readiness.NewHandler(ctx, c.dir, w, func(appender readiness.Appender) http.Handler {
+		api = httpapi.NewWithQueryLimits(s, appender, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget).(*httpapi.API)
+		return api
 	})
+	return h, api
 }

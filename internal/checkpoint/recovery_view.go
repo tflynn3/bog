@@ -13,6 +13,9 @@ import (
 	"bog/internal/store"
 )
 
+// ErrSelectionRefused attests that the selector was never attempted.
+var ErrSelectionRefused = errors.New("checkpoint selection refused before installation")
+
 const generationPrefix = "bog-checkpoint-"
 
 // GenerationManifestName is the immutable data-directory name for a new v2
@@ -167,7 +170,8 @@ func scanView(ctx context.Context, view RecoveryView, point RecoveryPoint, cutof
 // It checks that the predecessor remains selected, reconciles any later
 // commits, and durably selects a manifest and tail together. The point it
 // receives describes the remainder of the captured suffix at the new boundary.
-// Any selector error is uncertain. RecoverRecoveryView resolves that outcome.
+// Selector errors are uncertain unless they carry ErrSelectionRefused.
+// RecoverRecoveryView resolves an uncertain outcome.
 // A returned manifest means selection succeeded, even if cleanup failed.
 func (p *Publisher) PublishRecoveryView(ctx context.Context, view RecoveryView, cutoff int64, ordinal uint64,
 	selectSuccessor func(context.Context, RecoveryPoint) error) (_ *Manifest, err error) {

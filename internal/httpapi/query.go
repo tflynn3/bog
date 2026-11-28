@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 
 	"bog/internal/store"
@@ -70,8 +71,17 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	}
 	response := a.newQueryResponse()
 	defer response.release()
+	var finish func() error
+	defer func() {
+		if finish != nil {
+			if err := finish(); err != nil {
+				log.Printf("release ordinary query: %v", err)
+			}
+		}
+	}()
 	req := PageRequest{Filter: params.filter, Limit: params.limit}
 	if err := a.withPage(ctx, req, work, func(result PageResult) error {
+		finish = result.Finish
 		if len(result.Rows) > params.limit {
 			return errPageSourceContract
 		}

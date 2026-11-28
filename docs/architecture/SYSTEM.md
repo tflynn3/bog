@@ -17,13 +17,11 @@ sync, and powersafe overwrite. The ingest and query listener has no built-in
 authentication. Deploy it on a trusted network or behind an authenticated
 access layer. [Single-writer decision](../adr/0001-single-writer-retained-history.md)
 
-The Linux amd64 and arm64 production inventories at
-`c7582ec1b74d56cafd37a72f68c7ddccda5cf0e3` agree on the 21 root-module
-production packages and 27 direct imports between them shown below.
-The entire root-module closure of `cmd/bog` consists of the command plus
-HTTP, readiness, store, and WAL. The command recovers an ordinary WAL into
-an in-memory store. Writable restore, live replacement, and retained
-paging await the reviewed #108 Storage handoff.
+The Linux amd64 and arm64 production inventories register 21 root-module
+production packages and 29 direct imports. The closure of `cmd/bog`
+includes HTTP, readiness, store, WAL, checkpoint, and history.
+The command recovers ordinary WALs, retained selectors, and verified
+restore images under the same pinned directory lock.
 [Retained-history runtime cutover](../adr/0015-retained-history-runtime-cutover.md),
 [Retained runtime promotion](../adr/0049-retained-runtime-promotion.md)
 
@@ -54,6 +52,10 @@ flowchart TD
         Ready["internal/readiness"]
         WAL["internal/wal"]
         Store["internal/store"]
+        Checkpoint["internal/checkpoint"]
+        History["internal/history"]
+        Cmd --> Checkpoint
+        Cmd --> History
         Cmd --> HTTP
         Cmd --> Ready
         Cmd --> WAL
@@ -63,20 +65,18 @@ flowchart TD
         Ready --> WAL
         Ready --> Store
         WAL --> Store
+        Checkpoint --> Store
+        History --> Store
+        History --> Checkpoint
     end
     Operator["cmd/bog-verify"]
     Export["cmd/bog-export"]
     subgraph Staged["Libraries awaiting server activation"]
-        Checkpoint["internal/checkpoint"]
-        History["internal/history"]
         Backup["internal/backup (also used offline)"]
         Idempotency["internal/idempotency (staged keyed ingest)"]
         StreamPolicyEngine["internal/streampolicy"]
-        History --> Checkpoint
     end
     Client["internal/client (standalone)"]
-    Checkpoint --> Store
-    History --> Store
     Backup --> Store
     Operator --> Backup
     Operator --> Client
@@ -104,37 +104,33 @@ flowchart TD
     Admission --> Client
 ```
 
-- **Ingest.** The WAL syncs whole validated NDJSON batches, syncs and installs
-  the commit marker over `bog.commit`, and syncs the directory. It publishes
-  the durable rows before HTTP returns 204. A confirmed rollback returns 503
-  with no rows published. An uncertain commit or rollback poisons the owner
-  and terminates the served process.
-- **Query.** Results match a case-sensitive literal within a half-open
-  time range and are ordered by UTC timestamp and global append ordinal.
-  That order preserves ties, duplicates, and backfill. The measured
-  server builds the replayed store in `cmd/bog.run` and passes it through
-  `newReadyHandler` to `httpapi.NewWithQueryLimits`, which wraps it in the
-  legacy page source. Query concurrency, scan work, and encoded response
-  bytes have independent caps.
-- **Recovery.** The measured server validates and replays the committed
-  ordinary WAL before listening. Under the directory lock, it rejects
-  restored layouts containing `bog.backup` or `bog.wal.tail`. The offline
-  backup reader validates verified images. [Restored-image startup design](../adr/0003-wal-capture-and-restored-image-startup.md)
-- **Readiness.** `GET /healthz` reports listener liveness after startup.
-  `GET /ready` combines disk headroom and the terminal WAL group outcome.
-  A confirmed rollback reports `wal_rollback` until a later durable
-  outcome. An uncertain outcome reports `recovery_required` while the
-  process serves. The measured command passes `c.dir` to
-  `readiness.NewHandler`, which uses path-based `Statfs`. It cancels
-  probes before `http.Server.Shutdown` and calls `wal.Log.Close` after a
-  successful HTTP drain. WAL close waits for its running commit group
-  before closing the files and pinned directory.
+- **Ingest.** The WAL syncs complete NDJSON frames and installs and
+  syncs the commit marker or writable selector. The command publishes
+  the durable rows under owner synchronization before HTTP returns 204.
+  Confirmed rollback returns 503. Uncertain durability fences mutation
+  and new captures.
+- **Query.** The command merges the pinned generation and the committed
+  suffix by UTC timestamp and global append ordinal. It preserves ties,
+  duplicates, and case-sensitive literal matching in half-open time
+  ranges. The API admits query work, scan backing, captures, and encoded
+  response backing independently.
+- **Recovery.** The command streams ordinary WALs, activates verified
+  v1 and v2 restores, and validates the generation, tail identity, and
+  exact committed suffix named by a retained selector. A legacy WAL can
+  serve with a bounded suffix and its existing marker until advancement
+  durably selects a rebased tail.
+  [Writable authority verification](../adr/0038-writable-authority-verification.md)
+- **Readiness.** `GET /healthz` reports listener liveness after recovery.
+  `GET /ready` samples disk headroom through a fresh open of the pinned
+  directory and observes the latest WAL outcome. A confirmed rollback
+  reports `wal_rollback` until a later durable write. Uncertain authority
+  reports `recovery_required`.
   [Readiness descriptor handoff](../adr/0005-pinned-writable-recovery-authority.md#readiness-descriptor-handoff-60)
 
 ## Retained-history handoff
 
-#108 must compose a command-local `httpapi.PageSource` and inject it through
-`httpapi.NewWithPageSource`. The source implements `Page` with the caller's
+The command composes a local `httpapi.PageSource` and injects it through
+`httpapi.NewWithPageSourceAndQueryResources`. The source implements `Page` with the caller's
 query work budget and an idempotent `Release`. It reproduces ordered rows,
 positions, and exhaustion for the same captured request. Core Engineering
 owns HTTP admission, cursor authentication and expiry, fixed-budget
@@ -143,12 +139,8 @@ match, and NDJSON framing. After successful acquisition, HTTP owns the
 capture release and calls the source after the final HTTP user drains.
 The adapter pins the validated generation and the matching durable,
 query-visible suffix with its WAL identity and exact byte and ordinal
-bounds under WAL owner synchronization. At the measured revision,
-`wal.Log.Capture` pins the published WAL prefix, its
-exclusive byte end, and next append ordinal under the WAL mutex. The
-reviewed wiring must show how the command selects the matching
-generation and suffix bounds in the same synchronization scope as append
-publication and activation. A held cursor
+bounds under WAL owner synchronization. The owner mutex serializes suffix publication,
+generation activation, and capture acquisition. A held cursor
 keeps its original view across replacement while fresh walks see later
 commits. The earlier of the source expiry and HTTP deadline governs new
 resumes. Admitted paging and export operations keep their references to
@@ -167,9 +159,7 @@ The command and WAL owner coordinate append publication and activation.
 The durable selector must identify the validated successor before the WAL
 owner activates it. An uncertain publication fences new writes. Readers
 admitted on the old view can finish while reclamation waits for their pins.
-Command-local adapters implement the separate backup and checkpoint
-`RecoveryView` contracts. Backup validates its own view for export and
-offline verification. History may reuse checkpoint validation. The caller
+The command implements the checkpoint `RecoveryView` contract. The offline operator consumes backup independently. History may reuse checkpoint validation. The caller
 holds the operation pin through cleanup, and the consumers close their
 independent readers. Reclamation waits for durable selection and final
 reference drain.
@@ -185,7 +175,15 @@ the active filesystem after the configured path is retargeted. An
 independent open gives probes a separate file description from the
 locked one.
 
-The cutover's opt-in loopback capacity control uses the same publication path.
+Opt-in loopback capacity control and automatic advancement use the same
+publication path. The default runtime begins advancement at 15 MiB or
+384 suffix frames and admits at most 40 MiB and 2,048 frames in the active
+suffix. Shared active and retired replay reservations cap encoded suffix
+backing at 56 MiB. The issuer admits up to 16 ingest requests against a shared 12 MiB body
+budget, 64 snapshot captures, 56 MiB in aggregate scan reservations, and 32 MiB in aggregate
+response backing. Storage admits at most four generation pins spanning
+active, retired, and staged generations. One background worker stages
+and selects successors, then reclaims after reference drain.
 Charge replay and whole-batch append reservations before reading or
 writing the tail. Charge capture, pin, and staging capacity before doing
 work. Credit reclaimed capacity after durable publication and activation
@@ -217,13 +215,13 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 
 | Package or entry point | Role | Responsibility |
 | --- | --- | --- |
-| `cmd/bog` | Server command | Ordinary WAL recovery, listener, and lifecycle. Owns retained composition at #108 cutover. |
+| `cmd/bog` | Server command | Retained recovery, listener, storage composition, and lifecycle. |
 | `internal/httpapi` | Wired | HTTP validation, admission, cursors, and response framing |
 | `internal/readiness` | Wired | Disk headroom and write outcome observation |
 | `internal/wal` | Wired | Pinned directory locking, commit, replay, and published-prefix capture |
 | `internal/store` | Wired | Row decoding, publication, and ordered queries |
-| `internal/checkpoint` | Staged | Checkpoint format, bounded WAL scans, and durable generation publication |
-| `internal/history` | Staged | Generation validation, ordered scans, pins, and reclamation |
+| `internal/checkpoint` | Wired | Checkpoint format, bounded WAL scans, and durable generation publication |
+| `internal/history` | Wired | Generation validation, ordered scans, pins, and reclamation |
 | `internal/backup` | Staged | Pinned export, verification, restore, offline reads, and staging recovery. `cmd/bog-verify` keeps its direct offline dependency through promotion. |
 | `internal/idempotency` | Staged | Keyed-ingest coordination and durable backend contract |
 | `internal/streampolicy` | Staged | Atomic policy activation, scoped grant decisions, query masking, and whole-batch ingest redaction |
@@ -244,11 +242,8 @@ production files. [Command root boundaries](../adr/0012-command-root-boundaries.
 | `bench/segment-layout` | Nested-module benchmark | Checkpoint layout experiment outside the root module |
 | `.github/workflows/linux-release.yml` | Release workflow | Pins the candidate, runs both native jobs, and publishes evidence |
 
-`bog-storage` owns #108 activation for checkpoint, history, and backup.
-Both measured Linux closures leave all three staged. Promote each library
-in the command wiring PR once both Linux inventories of the reviewed
-Storage SHA confirm server reachability and Storage supplies the activation
-evidence required by ADR 0049.
+The `bog-storage` wiring promotes checkpoint and history.
+The backup library retains its offline operator edge.
 Idempotency remains staged under its own criteria. Keyed retries require
 the production WAL to commit and recover retry records atomically with
 their batches. Exercise concurrent same-key submissions, conflicting
@@ -497,9 +492,9 @@ independently. The measured walk also follows external production imports.
   `readiness.NewHandlerForDirectory` and exclude every reference to
   `readiness.NewHandler`.
   When history meets either condition, `cmd/bog` must
-  also call `httpapi.NewWithPageSource` and exclude every reference to
-  `httpapi.New`, `httpapi.NewWithQueryMaxResponseBytes`, and
-  `httpapi.NewWithQueryLimits`.
+  also call `httpapi.NewWithPageSourceAndQueryResources` with a source
+  implementing both paging interfaces. The wired command excludes
+  compatibility paging constructors.
   The typed scan checks the selected production Go files independently
   for Linux amd64 and arm64. Direct calls count inside command-local
   wrappers and through aliased or dot imports. The fully staged baseline

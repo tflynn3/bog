@@ -64,4 +64,7 @@ type PageResult struct {
 	Rows      []PageRow
 	More      bool      // a further match exists after the last returned row
 	ExpiresAt time.Time // optional on acquisition; HTTP caps it at 15 minutes
+	// Finish transfers an ordinary query's source pin through response
+	// delivery. Snapshot sources use Release instead.
+	Finish func() error
 }

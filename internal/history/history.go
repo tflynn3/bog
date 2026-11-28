@@ -1,4 +1,4 @@
-// Package history serves immutable, published v1 checkpoints from disk.
+// Package history serves immutable, published checkpoints from disk.
 package history
 
 import (
@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,7 @@ type generation struct {
 	refs     atomic.Int64
 	dir      *os.File
 	dirInfo  os.FileInfo
+	manifest string
 	pin      *os.File
 	charge   *checkpoint.Reservation
 	segments []segment
@@ -106,7 +108,7 @@ func (c *Catalog) replaceWith(ctx context.Context, open directoryOpener) (Genera
 		return Generation{}, err
 	}
 	defer ticket.Close()
-	return ticket.install(ctx, open)
+	return ticket.install(ctx, open, nil)
 }
 
 // Acquire pins id if it is current. Already acquired readers keep their
@@ -199,4 +201,35 @@ func (r *Reader) Close() error {
 		return g.release()
 	}
 	return nil
+}
+
+// OpenManifest opens an independent reader on the pinned manifest. Keep the
+// generation pin for the lifetime of the returned reader.
+func (r *Reader) OpenManifest() (io.ReadCloser, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.gen == nil {
+		return nil, os.ErrClosed
+	}
+	f, _, err := openRegular(r.gen.dir, r.gen.manifest)
+	return f, err
+}
+
+// OpenSegment opens only an immutable segment referenced by the pinned manifest.
+func (r *Reader) OpenSegment(name string) (io.ReadCloser, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.gen == nil {
+		return nil, os.ErrClosed
+	}
+	for _, segment := range r.gen.segments {
+		if segment.name == name {
+			f, info, err := openRegular(r.gen.dir, name)
+			if err == nil && !sameSegment(segment.stat, info) {
+				return nil, errors.Join(corrupt(name, "segment file changed"), f.Close())
+			}
+			return f, err
+		}
+	}
+	return nil, os.ErrNotExist
 }

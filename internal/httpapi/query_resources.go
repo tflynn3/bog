@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"sync"
+	"time"
 
 	"bog/internal/store"
 )
@@ -25,6 +26,7 @@ type QueryResourceLimits struct {
 	ResponseBytes uint64
 	ScanBytes     uint64
 	Captures      uint64
+	AdmissionWait time.Duration // Maximum queue time when active slots are full.
 }
 
 // DefaultQueryResourceLimits returns the compatibility issuer's limits. Allow
@@ -145,14 +147,16 @@ type queryResources struct {
 	response         queryByteBudget
 	scan             queryByteBudget
 	captures         uint64
+	admissionWait    time.Duration
 	requireScanBound bool
 }
 
 func newQueryResources(limits QueryResourceLimits) *queryResources {
 	return &queryResources{
-		response: queryByteBudget{limit: limits.ResponseBytes, err: ErrQueryResponseCapacityExhausted},
-		scan:     queryByteBudget{limit: limits.ScanBytes, err: ErrQueryScanCapacityExhausted},
-		captures: limits.Captures,
+		response:      queryByteBudget{limit: limits.ResponseBytes, err: ErrQueryResponseCapacityExhausted},
+		scan:          queryByteBudget{limit: limits.ScanBytes, err: ErrQueryScanCapacityExhausted},
+		captures:      limits.Captures,
+		admissionWait: limits.AdmissionWait,
 	}
 }
 

@@ -367,7 +367,7 @@ func TestQueryResourceCaptureChargeThroughRelease(t *testing.T) {
 		source.expires = time.Now().Add(time.Second)
 		source.release = newResourceTestGate(t)
 		defer source.release.unblock()
-		a := NewWithPageSourceAndQueryResources(source, nil, 256, 3, 32768, QueryResourceLimits{256, fixtureScanBytes, 1})
+		a := NewWithPageSourceAndQueryResources(source, nil, 256, 3, 32768, QueryResourceLimits{ResponseBytes: 256, ScanBytes: fixtureScanBytes, Captures: 1})
 		token := issueCapture(t, a)
 
 		// Expiry retires the capture, but the source still holds its pin.
@@ -395,7 +395,7 @@ func TestQueryResourceCaptureChargeThroughRelease(t *testing.T) {
 func TestQueryResourceScanChargeThroughConsumption(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		source := newResourcePageSource()
-		a := NewWithPageSourceAndQueryResources(source, nil, 256, 2, 32768, QueryResourceLimits{256, fixtureScanBytes, 1})
+		a := NewWithPageSourceAndQueryResources(source, nil, 256, 2, 32768, QueryResourceLimits{ResponseBytes: 256, ScanBytes: fixtureScanBytes, Captures: 1})
 		closeRetirementTestAPI(t, a)
 		gate := newResourceTestGate(t)
 		defer gate.unblock()
@@ -426,7 +426,7 @@ func TestQueryResourceScanChargeThroughConsumption(t *testing.T) {
 func TestQueryResourcesCloseDrainsOrdinaryDelivery(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		source := newResourcePageSource()
-		limits := QueryResourceLimits{256, fixtureScanBytes, 1}
+		limits := QueryResourceLimits{ResponseBytes: 256, ScanBytes: fixtureScanBytes, Captures: 1}
 		a := NewWithPageSourceAndQueryResources(source, nil, 256, 2, 32768, limits)
 		other := NewWithPageSourceAndQueryResources(source, nil, 256, 2, 32768, limits)
 		closeRetirementTestAPI(t, other)

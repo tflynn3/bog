@@ -22,6 +22,7 @@ type API struct {
 	wal              appender
 	fatal            func()
 	slots            chan struct{}
+	ingestBytes      *queryByteBudget
 	maxResponseBytes int
 	queryWorkBudget  uint64
 	cursorKey        [32]byte
@@ -67,6 +68,14 @@ func NewWithPageSource(source PageSource, w appender, maxBytes, concurrency int,
 	return a
 }
 
+// LimitIngestBytes bounds simultaneously admitted encoded bodies. Configure
+// it before serving. Requests without a declared length reserve a full batch.
+func (a *API) LimitIngestBytes(limit uint64) {
+	a.ingestBytes = &queryByteBudget{limit: limit, err: errIngestCapacity}
+}
+
+var errIngestCapacity = errors.New("ingest body capacity exhausted")
+
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.routes.ServeHTTP(w, r)
 }
@@ -102,7 +111,7 @@ func (a *API) handler(concurrency int) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.health)
 	mux.HandleFunc("/ingest", a.ingest)
-	query := queryAdmission(concurrency, http.HandlerFunc(a.query))
+	query := queryAdmission(concurrency, a.initResources().admissionWait, http.HandlerFunc(a.query))
 	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -139,6 +148,16 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	reserved := queryReservation{budget: a.ingestBytes}
+	size := r.ContentLength
+	if size < 0 {
+		size = store.MaxBatch
+	}
+	if err := reserved.grow(uint64(size)); err != nil {
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer reserved.release()
 	b, err := io.ReadAll(io.LimitReader(r.Body, store.MaxBatch+1))
 	if len(b) > store.MaxBatch {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)

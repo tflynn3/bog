@@ -163,7 +163,7 @@ func TestLiveQueryCancellationBeforeCommit(t *testing.T) {
 
 func TestQueryAdmissionCancelledAndInvalidLimit(t *testing.T) {
 	called := false
-	h := queryAdmission(1, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	h := queryAdmission(1, 0, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	out := httptest.NewRecorder()
@@ -183,7 +183,7 @@ func TestQueryAdmissionCancelledAndInvalidLimit(t *testing.T) {
 					t.Errorf("limit %d did not panic", limit)
 				}
 			}()
-			queryAdmission(limit, h)
+			queryAdmission(limit, 0, h)
 		}()
 	}
 }

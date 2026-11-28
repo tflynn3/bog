@@ -140,7 +140,7 @@ func TestRecoveryReadErrorsKeepCauseAndReleaseOwnership(t *testing.T) {
 	// recovery can validate the magic or expose its private recovery state.
 	f := l.f
 	l.f = readErrorFile{f, syscall.EIO}
-	if err := l.recover(); !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "WAL magic") {
+	if err := l.recover(nil); !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "WAL magic") {
 		t.Fatalf("WAL recovery error = %v", err)
 	}
 	if got := allTestRows(s); !slices.Equal(got, rows) {

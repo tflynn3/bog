@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 
 	"bog/internal/store"
@@ -70,6 +71,30 @@ func (a *API) query(w http.ResponseWriter, r *http.Request) {
 	}
 	response := a.newQueryResponse()
 	defer response.release()
+	if source, ok := a.captures.source.(PinnedPageSource); ok {
+		id, err := source.CapturePage(ctx)
+		if err != nil {
+			writeQueryError(w, err)
+			return
+		}
+		if !validOpaque(id) {
+			writeQueryError(w, errors.Join(errPageSourceContract, a.captures.source.Release(id)))
+			return
+		}
+		defer func() {
+			if err := a.captures.source.Release(id); err != nil {
+				log.Printf("release ordinary query capture: %v", err)
+			}
+		}()
+		req := PageRequest{Filter: params.filter, Limit: params.limit, Capture: id}
+		if _, err := a.prepareRetainedPage(ctx, nil, &req, &response, work); err != nil {
+			response.release()
+			writeQueryError(w, err)
+			return
+		}
+		response.write(w, "")
+		return
+	}
 	req := PageRequest{Filter: params.filter, Limit: params.limit}
 	if err := a.withPage(ctx, req, work, func(result PageResult) error {
 		if len(result.Rows) > params.limit {

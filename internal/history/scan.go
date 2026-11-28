@@ -17,6 +17,12 @@ import (
 
 const readPageSize = 4 << 10
 
+// ScanScratchBytes bounds seek pages, cursor heap backing, spill buffers,
+// and a copy of the literal for one call on the pinned generation.
+func ScanScratchBytes(segments, maxLine, literalBytes int) uint64 {
+	return uint64(segments)*(readPageSize+256) + 2*uint64(maxLine) + uint64(literalBytes)
+}
+
 // Position is a row's timestamp and zero-based append ordinal.
 type Position struct {
 	Time    time.Time

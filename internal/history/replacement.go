@@ -55,10 +55,30 @@ func (r *Replacement) Close() {
 // new captures. A populated Generation means installation succeeded even if
 // releasing the previous generation or closing the lock reports an error.
 func (r *Replacement) ReplacePinned(ctx context.Context, dir *os.File) (Generation, error) {
-	return r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) })
+	return r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, "")
 }
 
-func (r *Replacement) install(ctx context.Context, open directoryOpener) (_ Generation, err error) {
+// ReplaceSelectedLocked installs the named generation while the caller holds
+// the exclusive publication lock. Use it during the publisher's selector.
+func (r *Replacement) ReplaceSelectedLocked(ctx context.Context, dir *os.File, id GenerationID) (Generation, error) {
+	return r.install(ctx, func() (*os.File, os.FileInfo, error) { return openPinnedDirectory(dir) }, checkpoint.GenerationManifestName(id))
+}
+
+// ReplaceSelected opens the generation selected by the writable authority.
+// The command has already resolved any interrupted publication.
+func (r *Replacement) ReplaceSelected(ctx context.Context, dir *os.File, id GenerationID) (Generation, error) {
+	lock, err := checkpoint.LockPublication(dir, false)
+	if err != nil {
+		return Generation{}, err
+	}
+	if err := checkpoint.CheckPublication(dir); err != nil {
+		return Generation{}, errors.Join(err, lock.Close())
+	}
+	gen, err := r.ReplaceSelectedLocked(ctx, dir, id)
+	return gen, errors.Join(err, lock.Close())
+}
+
+func (r *Replacement) install(ctx context.Context, open directoryOpener, selected string) (_ Generation, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c := r.catalog
@@ -77,12 +97,18 @@ func (r *Replacement) install(ctx context.Context, open directoryOpener) (_ Gene
 	if err != nil {
 		return Generation{}, err
 	}
-	lock, err := checkpoint.LockPublication(dir, false)
-	if err != nil {
-		return Generation{}, errors.Join(err, dir.Close())
+	var next *generation
+	if selected == "" {
+		var lock *os.File
+		lock, err = checkpoint.LockPublication(dir, false)
+		if err != nil {
+			return Generation{}, errors.Join(err, dir.Close())
+		}
+		defer func() { err = errors.Join(err, lock.Close()) }()
+		next, err = loadAt(ctx, dir)
+	} else {
+		next, _, err = loadNamedAuthority(ctx, dir, selected)
 	}
-	defer func() { err = errors.Join(err, lock.Close()) }()
-	next, err := loadAt(ctx, dir)
 	if err != nil {
 		return Generation{}, errors.Join(err, dir.Close())
 	}

@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,7 +11,6 @@ import (
 	"os"
 	"strings"
 	"syscall"
-	"time"
 
 	"bog/internal/store"
 )
@@ -26,6 +26,16 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if s == nil {
 		return nil, errors.New("WAL requires a store")
 	}
+	return open(dir, s, 0)
+}
+
+// OpenStreaming validates the WAL without materializing legacy history. The
+// caller keeps the returned owner exclusive and admits its own tail replay.
+func OpenStreaming(dir string, maxTail int64) (*Log, error) {
+	return open(dir, nil, maxTail)
+}
+
+func open(dir string, s *store.Store, maxTail int64) (_ *Log, err error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
@@ -61,7 +71,24 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 		return nil, err
 	}
 	l := &Log{s: s, root: root, dir: d, syncDir: d.Sync}
-	f, err := l.openWAL()
+	if err := syncParent(d); err != nil {
+		return nil, err
+	}
+	name := walName
+	if s == nil {
+		if err := l.readAuthority(maxTail); err != nil {
+			return nil, err
+		}
+		if l.authority != nil {
+			name = l.authority.Tail
+		}
+	}
+	var f *os.File
+	if l.authority != nil {
+		f, err = openRegular(d, name, os.O_RDWR)
+	} else {
+		f, err = l.openWAL()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +101,7 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("lock WAL: %w", err)
 	}
-	l.captures, err = openCaptureFile(d, f)
+	l.captures, err = openCaptureFile(d, f, name)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +111,12 @@ func Open(dir string, s *store.Store) (_ *Log, err error) {
 		}
 	}()
 	l.f = f
-	if err := l.recover(); err != nil {
+	if l.authority == nil {
+		err = l.recover()
+	} else {
+		err = l.recoverRetained(maxTail)
+	}
+	if err != nil {
 		return nil, err
 	}
 	return l, nil
@@ -134,17 +166,18 @@ func (l *Log) openWAL() (*os.File, error) {
 	return openRegular(l.dir, walName, os.O_RDWR)
 }
 
-func (l *Log) recover() error {
-	// Persist the data directory's own entry, using the pinned directory's
-	// parent even if the caller opened it through a symlink.
-	parent, err := openParent(l.dir)
+func syncParent(dir *os.File) error {
+	parent, err := openParent(dir)
 	if err != nil {
 		return err
 	}
 	if err := errors.Join(parent.Sync(), parent.Close()); err != nil {
 		return fmt.Errorf("sync data directory parent: %w", err)
 	}
+	return nil
+}
 
+func (l *Log) recover() error {
 	size, err := l.f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return fmt.Errorf("size WAL: %w", err)
@@ -153,7 +186,10 @@ func (l *Log) recover() error {
 	if err != nil {
 		return err
 	}
-	builder := store.NewRecoveryBuilder()
+	var builder *store.RecoveryBuilder
+	if l.s != nil {
+		builder = store.NewRecoveryBuilder()
+	}
 	if err := l.replay(end, builder); err != nil {
 		return err
 	}
@@ -185,11 +221,9 @@ func (l *Log) recover() error {
 		// Persist directory metadata without allocating a new marker.
 		return fmt.Errorf("sync recovered data directory: %w", err)
 	}
-	builder.Install(l.s)
-	// QueryPage with a zero row limit captures the installed row count
-	// without scanning or decoding the recovered prefix again.
-	_, count, _, _ := l.s.QueryPage(time.Time{}, time.Time{}, "", 0, nil, nil)
-	l.committed = captureBoundary{end: end, nextOrdinal: uint64(count)}
+	if builder != nil {
+		builder.Install(l.s)
+	}
 	return nil
 }
 
@@ -237,9 +271,40 @@ func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
 		return errors.New("invalid WAL magic")
 	}
 
+	var ordinal uint64
+	err := scanFrames(context.Background(), reader, int64(len(magic)), end, func(payload []byte, _ int64) error {
+		if builder != nil {
+			return builder.DecodeFrame(payload)
+		}
+		rows, err := store.Decode(payload)
+		if uint64(len(rows)) > ^uint64(0)-ordinal {
+			return errors.New("WAL ordinal overflow")
+		}
+		ordinal += uint64(len(rows))
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if builder != nil {
+		// Traditional recovery publishes the builder after filesystem checks.
+		ordinal = uint64(builder.Len())
+	}
+	if _, err := l.f.Seek(end, io.SeekStart); err != nil {
+		return fmt.Errorf("seek committed WAL boundary: %w", err)
+	}
+	l.offset = end
+	l.committed = captureBoundary{end: end, nextOrdinal: ordinal}
+	return nil
+}
+
+func scanFrames(ctx context.Context, reader io.Reader, start, end int64, visit func([]byte, int64) error) error {
 	var payload []byte
 	var h [16]byte
-	for pos := int64(len(magic)); pos < end; {
+	for pos := start; pos < end; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if end-pos < int64(len(h)) {
 			return fmt.Errorf("incomplete committed frame header at %d", pos)
 		}
@@ -268,15 +333,11 @@ func (l *Log) replay(end int64, builder *store.RecoveryBuilder) error {
 		if crc32.Checksum(payload, table) != binary.LittleEndian.Uint32(h[8:]) {
 			return fmt.Errorf("invalid WAL checksum at %d", pos)
 		}
-		if err := builder.DecodeFrame(payload); err != nil {
-			return fmt.Errorf("invalid WAL payload at %d: %w", pos, err)
-		}
 		pos += int64(len(h)) + int64(n)
+		if err := visit(payload, pos); err != nil {
+			return fmt.Errorf("invalid WAL payload ending at %d: %w", pos, err)
+		}
 	}
-	if _, err := l.f.Seek(end, io.SeekStart); err != nil {
-		return fmt.Errorf("seek committed WAL boundary: %w", err)
-	}
-	l.offset = end
 	return nil
 }
 

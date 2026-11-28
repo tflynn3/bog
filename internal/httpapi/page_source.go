@@ -65,3 +65,10 @@ type PageResult struct {
 	More      bool      // a further match exists after the last returned row
 	ExpiresAt time.Time // optional on acquisition; HTTP caps it at 15 minutes
 }
+
+// PinnedPageSource can acquire a view before scan admission, so the scan
+// bound may use immutable properties of that exact view. HTTP also uses
+// this capture for ordinary queries and holds it through response delivery.
+type PinnedPageSource interface {
+	CapturePage(context.Context) (string, error)
+}

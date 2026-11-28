@@ -22,6 +22,7 @@ type API struct {
 	wal              appender
 	fatal            func()
 	slots            chan struct{}
+	ingestBytes      queryByteBudget
 	maxResponseBytes int
 	queryWorkBudget  uint64
 	cursorKey        [32]byte
@@ -138,6 +139,18 @@ func (a *API) ingest(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength > store.MaxBatch {
 		http.Error(w, "batch too large", http.StatusRequestEntityTooLarge)
 		return
+	}
+	if a.ingestBytes.limit != 0 {
+		size := r.ContentLength
+		if size < 0 {
+			size = store.MaxBatch
+		}
+		body := queryReservation{budget: &a.ingestBytes}
+		if err := body.grow(uint64(size)); err != nil {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		defer body.release()
 	}
 	b, err := io.ReadAll(io.LimitReader(r.Body, store.MaxBatch+1))
 	if len(b) > store.MaxBatch {

@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -161,13 +162,18 @@ func scanView(ctx context.Context, view RecoveryView, point RecoveryPoint, cutof
 	return consumed, [32]byte(part.Sum(nil)), ctx.Err()
 }
 
+// ErrSelectionRejected means the owner conclusively refused before starting
+// the selector rename. It permits immediate cleanup of the losing outputs.
+var ErrSelectionRejected = errors.New("checkpoint selection rejected before rename")
+
 // PublishRecoveryView advances to a strict whole-frame cutoff and stages a
 // v2 generation. The caller holds the WAL directory lock and view pin. The
 // selector runs with the publication lock held after the files are durable.
 // It checks that the predecessor remains selected, reconciles any later
 // commits, and durably selects a manifest and tail together. The point it
 // receives describes the remainder of the captured suffix at the new boundary.
-// Any selector error is uncertain. RecoverRecoveryView resolves that outcome.
+// Selector errors other than ErrSelectionRejected are uncertain.
+// RecoverRecoveryView resolves that outcome.
 // A returned manifest means selection succeeded, even if cleanup failed.
 func (p *Publisher) PublishRecoveryView(ctx context.Context, view RecoveryView, cutoff int64, ordinal uint64,
 	selectSuccessor func(context.Context, RecoveryPoint) error) (_ *Manifest, err error) {
@@ -280,4 +286,56 @@ func (p *Publisher) RecoverRecoveryView(ctx context.Context, selected func() (Re
 	}
 	p.stage.settle()
 	return nil
+}
+
+// InstallCanonicalGeneration installs the already-verified canonical manifest
+// at its immutable name before the owner can select it for writable recovery.
+func (p *Publisher) InstallCanonicalGeneration(ctx context.Context, id [32]byte) (err error) {
+	pub, lock, err := lockOwnedPublication(p.root, p.dir)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	data, err := readPublicationFile(p.dir, manifestName, maxManifestSize)
+	if err != nil {
+		return err
+	}
+	_, actual, err := DecodeManifest(data)
+	if err != nil || actual != id {
+		return errors.Join(fmt.Errorf("%w: canonical generation identity mismatch", ErrIntegrity), err)
+	}
+	name := GenerationManifestName(id)
+	installed, err := readPublicationFile(p.dir, name, maxManifestSize)
+	switch {
+	case err == nil:
+		if !bytes.Equal(data, installed) {
+			return fmt.Errorf("%w: immutable manifest differs from canonical generation", ErrIntegrity)
+		}
+		return p.dir.Sync()
+	case err != syscall.ENOENT:
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	const stage = ".bog-generation-init"
+	// The private staging name can survive interruption before install.
+	if f, err := openPublicationFile(p.dir, stage); err == nil {
+		if err := errors.Join(f.Close(), p.root.Remove(stage)); err != nil {
+			return err
+		}
+	} else if err != syscall.ENOENT {
+		return err
+	}
+	if err := pub.writeNew(stage, data); err != nil {
+		cleanup := p.root.Remove(stage)
+		if errors.Is(cleanup, os.ErrNotExist) {
+			cleanup = nil
+		}
+		return errors.Join(err, cleanup)
+	}
+	if err := p.root.Rename(stage, name); err != nil {
+		return err
+	}
+	return p.dir.Sync()
 }

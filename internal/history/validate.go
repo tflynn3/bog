@@ -3,23 +3,46 @@ package history
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"sort"
 	"unicode/utf8"
 )
 
-func (g *generation) validate(ctx context.Context, m manifest, buf []byte) error {
+func (g *generation) validate(ctx context.Context, m manifest, buf []byte, previous *generation) error {
 	// Each v1 publisher run normally covers a contiguous append interval.
 	// Reuse this bitmap to prove contiguity even when timestamps are shuffled.
 	localBits := make([]byte, (len(buf)/rowHeaderSize+7)/8)
 	var total uint64
+	known := make(map[string]*segment)
+	if previous != nil {
+		for i := range previous.segments {
+			s := &previous.segments[i]
+			known[s.name] = s
+		}
+	}
 	for i := range g.segments {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		s := &g.segments[i]
 		b := buf[:int(m.Segments[i].Size)]
+		if old := known[s.name]; old != nil && old.digest == s.digest && old.stat.Size() == int64(len(b)) {
+			f, info, err := openRegular(g.dir, s.name)
+			if err != nil {
+				return err
+			}
+			if err := f.Close(); err != nil {
+				return err
+			}
+			if !sameSegment(old.stat, info) {
+				return errors.Join(ErrIntegrity, fmt.Errorf("previous segment %s changed", s.name))
+			}
+			*s = *old
+			total += old.count
+			continue
+		}
 		if err := s.readVerified(g.dir, b); err != nil {
 			return err
 		}
@@ -27,7 +50,8 @@ func (g *generation) validate(ctx context.Context, m manifest, buf []byte) error
 		if err != nil {
 			return err
 		}
-		total += uint64(count)
+		s.count = uint64(count)
+		total += s.count
 		if s.last-s.first+1 == uint64(count) {
 			bits := localBits[:(count+7)/8]
 			clear(bits)

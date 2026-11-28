@@ -2,16 +2,34 @@ package main
 
 import (
 	"context"
+	"net"
 	"net/http"
+	"os"
 
 	"bog/internal/httpapi"
 	"bog/internal/readiness"
-	"bog/internal/store"
-	"bog/internal/wal"
 )
 
-func newReadyHandler(ctx context.Context, c config, s *store.Store, w *wal.Log) http.Handler {
-	return readiness.NewHandler(ctx, c.dir, w, func(appender readiness.Appender) http.Handler {
-		return httpapi.NewWithQueryLimits(s, appender, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget)
+func newReadyHandler(ctx context.Context, c config, rt *retainedRuntime, dir *os.File, addr net.Addr) (http.Handler, *httpapi.API) {
+	var api *httpapi.API
+	handler := readiness.NewHandlerForDirectory(ctx, dir, rt, func(appender readiness.Appender) http.Handler {
+		api = httpapi.NewWithPageSourceAndQueryResources(rt, appender, c.maxResponseBytes, c.queryConcurrency, c.queryWorkBudget,
+			httpapi.QueryResourceLimits{ResponseBytes: 40 << 20, ScanBytes: 144 << 20, Captures: 64})
+		api.LimitIngestMemory(56 << 20)
+		listen, ok := addr.(*net.TCPAddr)
+		if os.Getenv("BOG_CAPACITY_CONTROL") != "1" || !ok || listen.IP.To4() == nil || !listen.IP.IsLoopback() {
+			return api
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/", api)
+		mux.HandleFunc("/_capacity/compaction", rt.capacityControl(api))
+		return mux
 	})
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if rt.stopped.Load() {
+			http.Error(w, "server draining", http.StatusServiceUnavailable)
+			return
+		}
+		handler.ServeHTTP(w, req)
+	}), api
 }

@@ -88,9 +88,17 @@ func (c *Catalog) reclaim(ctx context.Context, open directoryOpener) (err error)
 		return err
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	current, err := loadAt(ctx, dir)
-	if err != nil {
+	if err := checkpoint.CheckPublication(dir); err != nil {
 		return err
+	}
+	c.mu.Lock()
+	current := c.current
+	c.mu.Unlock()
+	if current == nil || current.manifest == manifestName || !os.SameFile(current.dirInfo, info) {
+		current, err = loadAt(ctx, dir)
+		if err != nil {
+			return err
+		}
 	}
 	candidates := c.retired[i].segments
 	protected := make(map[string]bool, len(current.segments))

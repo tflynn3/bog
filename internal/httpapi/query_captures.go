@@ -200,3 +200,10 @@ func (s *queryCaptures) close(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+func (s *queryCaptures) recordReleaseError(err error) {
+	log.Printf("release query capture: %v", err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = errors.Join(s.err, err)
+}

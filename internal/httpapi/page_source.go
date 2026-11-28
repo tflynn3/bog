@@ -27,7 +27,8 @@ var (
 // requested ID. Ordinary requests return at most Limit rows and need no
 // retained capture, positions, or lookahead.
 // HTTP replays the same source anchor and limit even if the client changes
-// limits. The command injects the coordinated retained adapter for #53.
+// limits. An ordinary source may also return a capture and positions to fill
+// short scans against one view. HTTP will release it after delivery. The command injects the coordinated retained adapter for #53.
 type PageSource interface {
 	Page(context.Context, PageRequest, *store.QueryWork) (PageResult, error)
 	// Release is idempotent. It bars new operations while admitted operations
